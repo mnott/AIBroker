@@ -213,12 +213,11 @@ class MessageRouter {
 | Terminal adapter (Linux) | Not started |
 | Claudaemon adapter | Not started |
 | Whazaa integration (import from AIBroker) | Not started |
-| Telex integration (import from AIBroker) | Not started |
+| Telex integration (import from AIBroker) | Done — log, state, persistence, iterm, tts re-exported from AIBroker |
 
 ## Next Steps
 
-1. **Wire up Telex** — Replace Telex's local watcher modules with AIBroker imports
-2. **Wire up Whazaa** — Same for Whazaa
-3. **Implement APIBackend** — Direct HTTP calls to Anthropic/OpenAI/ollama
-4. **Generic terminal adapter** — For Linux (no AppleScript dependency)
-5. **Claudaemon integration** — WebSocket channel + potential backend
+1. **Wire up Whazaa** — Same migration pattern as Telex
+2. **Implement APIBackend** — Direct HTTP calls to Anthropic/OpenAI/ollama
+3. **Generic terminal adapter** — For Linux (no AppleScript dependency)
+4. **Claudaemon integration** — WebSocket channel + potential backend
