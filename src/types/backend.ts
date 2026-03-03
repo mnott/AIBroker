@@ -35,6 +35,8 @@ export interface APIBackendConfig {
   permissionMode?: string;
   /** Whitelist of allowed tools */
   allowedTools?: string[];
+  /** Skip auto-creating the initial "Default" session (for HybridSessionManager) */
+  skipDefaultSession?: boolean;
 }
 
 export type BackendConfig = SessionBackendConfig | APIBackendConfig;

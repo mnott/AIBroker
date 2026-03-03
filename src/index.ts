@@ -57,6 +57,8 @@ export {
 export { MessageRouter, router } from "./core/router.js";
 export { deliverViaApi } from "./core/transport.js";
 export type { TransportCallbacks } from "./core/transport.js";
+export { HybridSessionManager, hybridManager, setHybridManager } from "./core/hybrid.js";
+export type { HybridSession, SessionKind } from "./core/hybrid.js";
 
 // ── IPC ──
 export { WatcherClient } from "./ipc/client.js";

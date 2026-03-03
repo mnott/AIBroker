@@ -86,8 +86,10 @@ export class APIBackend implements Backend {
     this.model = config.model;
     this.config = config;
 
-    // Create default session
-    this.createSession("Default", config.cwd ?? homedir());
+    // Create default session (unless suppressed — e.g. HybridSessionManager creates its own)
+    if (!config.skipDefaultSession) {
+      this.createSession("Default", config.cwd ?? homedir());
+    }
   }
 
   /** Get the active session ID */
