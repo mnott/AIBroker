@@ -15,6 +15,11 @@
     "dev": "tsc --watch",
     "prepublishOnly": "npm run build"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mnott/AIBroker.git"
+  },
+  "keywords": ["mcp", "ai", "broker", "claude", "claude-code", "whatsapp", "telegram", "tts", "iterm2"],
   "license": "MIT",
   "author": "Matthias Nott",
   "engines": {
