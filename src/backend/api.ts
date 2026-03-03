@@ -11,6 +11,7 @@
 import type { Backend, APIBackendConfig } from "../types/backend.js";
 import { log } from "../core/log.js";
 import { homedir } from "os";
+import { spawn } from "child_process";
 
 /** Metadata for a single API session */
 export interface APISession {
@@ -156,7 +157,6 @@ export class APIBackend implements Backend {
           maxBudgetUsd: this.config.maxBudgetUsd ?? 1.0,
           ...(resumeId ? { resume: resumeId } : {}),
           spawnClaudeCodeProcess: ({ args, signal }) => {
-            const { spawn } = require("child_process") as typeof import("child_process");
             return spawn("claude", args, {
               env: cleanEnv,
               stdio: ["pipe", "pipe", "pipe"],
