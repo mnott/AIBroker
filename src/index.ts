@@ -55,6 +55,8 @@ export {
   saveSessionRegistry,
 } from "./core/persistence.js";
 export { MessageRouter, router } from "./core/router.js";
+export { deliverViaApi } from "./core/transport.js";
+export type { TransportCallbacks } from "./core/transport.js";
 
 // ── IPC ──
 export { WatcherClient } from "./ipc/client.js";
@@ -115,4 +117,4 @@ export { SessionBackend } from "./adapters/session/backend.js";
 
 // ── Backend ──
 export { APIBackend } from "./backend/api.js";
-export type { APISession } from "./backend/api.js";
+export type { APISession, SessionStatus, SessionState } from "./backend/api.js";
