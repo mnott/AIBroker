@@ -19,7 +19,7 @@ export * from "./types/index.js";
 // ── Core ──
 export { log, setLogPrefix } from "./core/log.js";
 export { MIME_MAP, lookupMime } from "./core/mime.js";
-export { applySharedMarkdownTransforms, markdownToWhatsApp } from "./core/markdown.js";
+export { applySharedMarkdownTransforms, markdownToWhatsApp, stripMarkdown } from "./core/markdown.js";
 export {
   sessionRegistry,
   managedSessions,

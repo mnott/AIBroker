@@ -10,6 +10,7 @@ import type { APIBackend } from "../backend/api.js";
 import { textToVoiceNote } from "../adapters/kokoro/tts.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { loadVoiceConfig } from "./persistence.js";
+import { stripMarkdown } from "./markdown.js";
 import { log } from "./log.js";
 
 /** Transport-provided callbacks for sending responses back to the user. */
@@ -43,7 +44,9 @@ export async function deliverViaApi(
 
     if (isVoice) {
       const voice = loadVoiceConfig().defaultVoice;
-      const chunks = splitIntoChunks(response);
+      // Strip markdown — TTS reads asterisks, backticks etc. literally
+      const plainText = stripMarkdown(response);
+      const chunks = splitIntoChunks(plainText);
       for (let i = 0; i < chunks.length; i++) {
         if (i > 0) await new Promise((r) => setTimeout(r, 1000));
         const audioBuffer = await textToVoiceNote(chunks[i], voice);

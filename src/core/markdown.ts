@@ -59,6 +59,40 @@ export function applySharedMarkdownTransforms(
 }
 
 /**
+ * Strip all markdown formatting, leaving plain conversational text for TTS.
+ * TTS engines read asterisks, backticks, etc. literally — this removes them.
+ */
+export function stripMarkdown(text: string): string {
+  return text
+    // Headings → just the title text
+    .replace(/^#{1,6}\s+(.+)$/gm, "$1")
+    // Horizontal rules → empty line
+    .replace(/^---+$/gm, "")
+    // Blockquotes → just the content
+    .replace(/^>\s?(.*)$/gm, "$1")
+    // Checkboxes → plain text
+    .replace(/^(\s*)- \[x\]\s+/gm, "$1")
+    .replace(/^(\s*)- \[ \]\s+/gm, "$1")
+    // Unordered list markers → nothing (keep the text)
+    .replace(/^(\s*)[-*]\s+/gm, "$1")
+    // Bold **text** → text
+    .replace(/\*\*(.+?)\*\*/gs, "$1")
+    // Italic *text* → text
+    .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/gs, "$1")
+    // Italic _text_ → text
+    .replace(/(?<![a-zA-Z0-9])_(.+?)_(?![a-zA-Z0-9])/gs, "$1")
+    // Inline code `text` → text
+    .replace(/`([^`]+)`/g, "$1")
+    // Code blocks ```text``` → text
+    .replace(/```[\s\S]*?```/g, (m) => m.replace(/```/g, "").trim())
+    // Links [text](url) → text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    // Collapse multiple blank lines
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
  * WhatsApp markdown formatter.
  * Uses * for bold, _ for italic.
  */
