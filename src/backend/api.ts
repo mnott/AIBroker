@@ -141,9 +141,18 @@ export class APIBackend implements Backend {
       const chunks: string[] = [];
       let claudeSessionId: string | undefined;
 
-      // Must unset CLAUDECODE env var to allow nested Claude subprocess
+      // Build clean env: unset CLAUDECODE to allow nested subprocess,
+      // set IS_SANDBOX=1 to match the user's shell alias convention,
+      // ensure PATH includes ~/.local/bin where Claude CLI lives.
       const cleanEnv = { ...process.env };
       delete cleanEnv.CLAUDECODE;
+      cleanEnv.IS_SANDBOX = "1";
+      if (!cleanEnv.PATH?.includes(".local/bin")) {
+        cleanEnv.PATH = `${homedir()}/.local/bin:${cleanEnv.PATH ?? ""}`;
+      }
+
+      // Resolve Claude CLI binary path — shell aliases aren't available in spawn()
+      const claudeBin = `${homedir()}/.local/bin/claude`;
 
       for await (const event of query({
         prompt: message,
@@ -157,7 +166,7 @@ export class APIBackend implements Backend {
           maxBudgetUsd: this.config.maxBudgetUsd ?? 1.0,
           ...(resumeId ? { resume: resumeId } : {}),
           spawnClaudeCodeProcess: ({ args, signal }) => {
-            return spawn("claude", args, {
+            return spawn(claudeBin, args, {
               env: cleanEnv,
               stdio: ["pipe", "pipe", "pipe"],
               signal,
