@@ -115,3 +115,4 @@ export { SessionBackend } from "./adapters/session/backend.js";
 
 // ── Backend ──
 export { APIBackend } from "./backend/api.js";
+export type { APISession } from "./backend/api.js";
