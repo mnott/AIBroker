@@ -43,8 +43,7 @@ describe("mimetypeToDocExt", () => {
 
   it("maps Office MIME types", () => {
     assert.equal(mimetypeToDocExt("application/vnd.openxmlformats-officedocument.wordprocessingml.document"), "docx");
-    // "msword" contains "word" so the "word" check matches first → "docx"
-    assert.equal(mimetypeToDocExt("application/msword"), "docx");
+    assert.equal(mimetypeToDocExt("application/msword"), "doc");
     assert.equal(mimetypeToDocExt("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), "xlsx");
     assert.equal(mimetypeToDocExt("application/vnd.ms-excel"), "xls");
     assert.equal(mimetypeToDocExt("application/vnd.openxmlformats-officedocument.presentationml.presentation"), "pptx");

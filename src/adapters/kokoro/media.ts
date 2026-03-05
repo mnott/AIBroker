@@ -42,8 +42,8 @@ export function mimetypeToExt(mimetype: string | null | undefined): string {
 export function mimetypeToDocExt(mimetype: string | null | undefined): string {
   if (!mimetype) return "bin";
   if (mimetype.includes("pdf")) return "pdf";
-  if (mimetype.includes("word") || mimetype.includes("docx")) return "docx";
   if (mimetype.includes("msword")) return "doc";
+  if (mimetype.includes("word") || mimetype.includes("docx")) return "docx";
   if (mimetype.includes("spreadsheet") || mimetype.includes("xlsx")) return "xlsx";
   if (mimetype.includes("ms-excel")) return "xls";
   if (mimetype.includes("presentation") || mimetype.includes("pptx")) return "pptx";
