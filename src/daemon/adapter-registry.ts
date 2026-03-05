@@ -130,7 +130,8 @@ export class AdapterRegistry {
   dispatchIncoming(source: string, text: string, timestamp: number): void {
     log(`[hub] incoming from ${source}: ${text.slice(0, 80)}`);
 
-    const message = createBrokerMessage(source, "command", { text }, undefined);
+    const type = text.trim().startsWith("/") ? "command" : "text";
+    const message = createBrokerMessage(source, type, { text }, undefined);
     message.timestamp = timestamp;
 
     // Route through the standard pipeline
