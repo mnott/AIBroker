@@ -144,6 +144,30 @@ export class HybridSessionManager {
     return this._activeIndex >= 0 ? this.sessions[this._activeIndex] : undefined;
   }
 
+  /**
+   * Remove visual sessions whose iTerm2 tab no longer exists.
+   * Call with the set of live iTerm2 session IDs from snapshotAllSessions().
+   */
+  pruneDeadVisualSessions(liveIds: Set<string>): number {
+    let pruned = 0;
+    for (let i = this.sessions.length - 1; i >= 0; i--) {
+      const s = this.sessions[i];
+      if (s.kind === "visual" && !liveIds.has(s.backendSessionId)) {
+        this.sessions.splice(i, 1);
+        pruned++;
+        log(`HybridManager: pruned dead visual session "${s.name}" (${s.backendSessionId.slice(0, 8)}...)`);
+        // Adjust active index
+        if (i < this._activeIndex) {
+          this._activeIndex--;
+        } else if (i === this._activeIndex) {
+          this._activeIndex = Math.min(this._activeIndex, this.sessions.length - 1);
+        }
+      }
+    }
+    if (this.sessions.length === 0) this._activeIndex = -1;
+    return pruned;
+  }
+
   /** All sessions in creation order. */
   listSessions(): HybridSession[] {
     return [...this.sessions];

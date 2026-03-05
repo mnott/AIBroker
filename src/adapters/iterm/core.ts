@@ -190,6 +190,8 @@ export function writeToTty(ttyPath: string, text: string): boolean {
 export interface SessionSnapshot {
   id: string;
   name: string;
+  profileName: string;
+  tabTitle: string | null;
   tty: string;
   atPrompt: boolean;
   paiName: string | null;
@@ -204,6 +206,7 @@ tell application "iTerm2"
       repeat with aSession in sessions of aTab
         set sessionId to id of aSession
         set sessionName to name of aSession
+        set sessionProfile to profile name of aSession
         set sessionTty to tty of aSession
         set isAtPrompt to (is at shell prompt of aSession)
         tell aSession
@@ -212,8 +215,13 @@ tell application "iTerm2"
           on error
             set paiName to ""
           end try
+          try
+            set tabTitle to (variable named "tab.title")
+          on error
+            set tabTitle to ""
+          end try
         end tell
-        set output to output & sessionId & (ASCII character 9) & sessionName & (ASCII character 9) & sessionTty & (ASCII character 9) & (isAtPrompt as text) & (ASCII character 9) & paiName & linefeed
+        set output to output & sessionId & (ASCII character 9) & sessionName & (ASCII character 9) & sessionProfile & (ASCII character 9) & sessionTty & (ASCII character 9) & (isAtPrompt as text) & (ASCII character 9) & paiName & (ASCII character 9) & tabTitle & linefeed
       end repeat
     end repeat
   end repeat
@@ -226,13 +234,15 @@ end tell`;
   const sessions: SessionSnapshot[] = [];
   for (const line of result.split("\n").filter(Boolean)) {
     const parts = line.split("\t");
-    if (parts.length < 4) continue;
+    if (parts.length < 5) continue;
     sessions.push({
       id: parts[0],
       name: parts[1],
-      tty: parts[2],
-      atPrompt: parts[3] === "true",
-      paiName: (parts[4] && parts[4] !== "missing value" && parts[4] !== "") ? parts[4] : null,
+      profileName: parts[2],
+      tabTitle: (parts[6] && parts[6] !== "missing value" && parts[6] !== "") ? parts[6] : null,
+      tty: parts[3],
+      atPrompt: parts[4] === "true",
+      paiName: (parts[5] && parts[5] !== "missing value" && parts[5] !== "") ? parts[5] : null,
     });
   }
   return sessions;

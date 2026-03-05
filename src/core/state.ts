@@ -91,6 +91,15 @@ export function setCommandHandler(handler: CommandHandler | null): void {
   commandHandler = handler;
 }
 
+// ── Message Source (routing context: which transport originated the current message) ──
+
+export type MessageSource = string;  // "whatsapp" | "pailot" | "telex" | ...
+export let messageSource: MessageSource = "whatsapp";
+
+export function setMessageSource(src: MessageSource): void {
+  messageSource = src;
+}
+
 // ── Self-Echo Suppression ──
 
 export const sentMessageIds = new Set<string | number>();

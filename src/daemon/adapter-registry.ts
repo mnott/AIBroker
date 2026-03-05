@@ -8,6 +8,7 @@
 import { commandHandler } from "../core/state.js";
 import { log } from "../core/log.js";
 import { WatcherClient } from "../ipc/client.js";
+import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage, RouteResult } from "../types/broker.js";
 
 export interface AdapterDescriptor {
@@ -38,16 +39,34 @@ export class AdapterRegistry {
   }
 
   /**
-   * Phase 1 dispatch — routes plain text to the commandHandler.
-   * Kept for backward compatibility with the PAILot WsGateway callback.
+   * Dispatch an incoming message from an adapter source through the
+   * BrokerMessage routing pipeline.
+   *
+   * Phase 1 called commandHandler directly. Phase 3 creates a proper
+   * BrokerMessage and routes it so PAILot messages flow through the
+   * same adapter pipeline as everything else (PAILot -> hub -> Whazaa).
+   *
+   * Falls back to commandHandler if no adapters are registered (embedded-like).
    */
   dispatchIncoming(source: string, text: string, timestamp: number): void {
     log(`[hub] incoming from ${source}: ${text.slice(0, 80)}`);
-    if (commandHandler) {
-      void commandHandler(text, timestamp);
-    } else {
-      log(`[hub] no command handler registered — message dropped`);
-    }
+
+    const message = createBrokerMessage(source, "command", { text }, undefined);
+    message.timestamp = timestamp;
+
+    // Route through the standard pipeline
+    void this.route(message).then((result) => {
+      if (!result.ok) {
+        // Fallback: if routing failed (e.g. no adapters registered),
+        // try the local commandHandler for backward compatibility
+        log(`[hub] route failed (${result.error}), falling back to commandHandler`);
+        if (commandHandler) {
+          void commandHandler(text, timestamp);
+        } else {
+          log(`[hub] no command handler and no adapters — message dropped`);
+        }
+      }
+    });
   }
 
   // ── Phase 2: BrokerMessage Routing ──

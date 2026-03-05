@@ -116,9 +116,10 @@ export async function transcribeAudio(
 
 /**
  * Split text into chunks suitable for sequential TTS voice notes.
- * Splits at paragraph breaks, then sentence boundaries, targeting ~800 chars per chunk.
+ * Splits at paragraph breaks, then sentence boundaries, then commas,
+ * then word boundaries. Guarantees no chunk exceeds maxChars.
  */
-export function splitIntoChunks(text: string, maxChars = 800): string[] {
+export function splitIntoChunks(text: string, maxChars = 500): string[] {
   if (text.length <= maxChars) return [text];
 
   const paragraphs = text.split(/\n\n+/);
@@ -141,12 +142,53 @@ export function splitIntoChunks(text: string, maxChars = 800): string[] {
           current += sentence;
         } else {
           if (current) chunks.push(current.trim());
-          current = sentence;
+          if (sentence.length > maxChars) {
+            // Sentence too long — split at commas/word boundaries
+            const subs = splitAtBoundaries(sentence, maxChars);
+            for (let i = 0; i < subs.length - 1; i++) chunks.push(subs[i]);
+            current = subs[subs.length - 1];
+          } else {
+            current = sentence;
+          }
         }
       }
     }
   }
   if (current.trim()) chunks.push(current.trim());
 
+  return chunks;
+}
+
+/** Split a long segment at comma boundaries, falling back to word boundaries. */
+function splitAtBoundaries(text: string, maxChars: number): string[] {
+  // Try comma boundaries first
+  const parts = text.split(/,\s*/);
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const part of parts) {
+    const sep = current ? ", " : "";
+    if (current.length + sep.length + part.length <= maxChars) {
+      current += sep + part;
+    } else {
+      if (current) chunks.push(current.trim());
+      if (part.length > maxChars) {
+        // No commas — split at word boundaries
+        const words = part.split(/\s+/);
+        current = "";
+        for (const word of words) {
+          if (current.length + word.length + 1 <= maxChars) {
+            current += (current ? " " : "") + word;
+          } else {
+            if (current) chunks.push(current.trim());
+            current = word;
+          }
+        }
+      } else {
+        current = part;
+      }
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
   return chunks;
 }
