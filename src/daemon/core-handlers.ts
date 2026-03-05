@@ -104,13 +104,21 @@ export function registerCoreHandlers(
     return {
       ok: true,
       result: {
-        version: "1.0.0",
+        version: "0.6.0",
         adapters: registry.list().map(a => a.name),
         activeSessions: manager.listSessions().length,
         activeSession: manager.activeSession?.name ?? null,
         adapterHealth,
       },
     };
+  });
+
+  /**
+   * ping — Lightweight heartbeat for adapter health checks.
+   * Returns immediately with the hub uptime. No side effects.
+   */
+  server.on("ping", async (_req) => {
+    return { ok: true, result: { pong: true, uptime: process.uptime() } };
   });
 
   // ── TTS / Voice Pipeline ──

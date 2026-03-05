@@ -67,6 +67,19 @@ export type { HybridSession, SessionKind } from "./core/hybrid.js";
 export { WatcherClient } from "./ipc/client.js";
 export { IpcServer } from "./ipc/server.js";
 export type { IpcHandler } from "./ipc/server.js";
+export {
+  validateAdapterHealth,
+  validateSessionList,
+  validateHubStatus,
+  validateTtsResult,
+  validateTranscription,
+} from "./ipc/validate.js";
+export type {
+  ValidatedSession,
+  ValidatedHubStatus,
+  ValidatedTtsResult,
+  ValidatedTranscription,
+} from "./ipc/validate.js";
 
 // ── Adapters > iTerm2 ──
 export {

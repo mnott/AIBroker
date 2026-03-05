@@ -11,6 +11,7 @@ import { WatcherClient } from "../ipc/client.js";
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage, RouteResult } from "../types/broker.js";
 import type { AdapterHealth } from "../types/adapter.js";
+import { validateAdapterHealth } from "../ipc/validate.js";
 import type { CommandContext } from "./command-context.js";
 
 export interface AdapterDescriptor {
@@ -84,7 +85,7 @@ export class AdapterRegistry {
           setTimeout(() => reject(new Error("health poll timed out")), HEALTH_TIMEOUT_MS),
         ),
       ]);
-      health = result as unknown as AdapterHealth;
+      health = validateAdapterHealth(result);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       health = {

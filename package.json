@@ -1,6 +1,6 @@
 {
   "name": "aibroker",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Platform-agnostic AI message broker — routes between user channels and AI backends",
   "type": "module",
   "main": "dist/index.js",
