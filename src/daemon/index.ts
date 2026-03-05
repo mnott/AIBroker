@@ -5,7 +5,7 @@
  * APIBackend, TTS, persistence. Adapters connect via the hub IPC socket.
  */
 
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { unlinkSync, readFileSync, existsSync } from "node:fs";
 import { setLogPrefix, log } from "../core/log.js";
@@ -21,6 +21,19 @@ import { loadSessionRegistry, loadVoiceConfig } from "../core/persistence.js";
 import { setCommandHandler } from "../core/state.js";
 import { createHubCommandHandler } from "./commands.js";
 import type { CommandContext } from "./command-context.js";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+function getVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(__dirname, "..", "..", "package.json"), "utf-8"));
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
 
 export const DAEMON_SOCKET_PATH = "/tmp/aibroker.sock";
 
@@ -112,7 +125,7 @@ export async function startDaemon(options?: {
     adapterRegistry.dispatchIncoming("pailot", text, timestamp);
   });
 
-  console.log(`AIBroker daemon started`);
+  console.log(`AIBroker daemon v${getVersion()} started`);
   console.log(`  Socket:  ${socketPath}`);
   console.log(`  AppDir:  ${appDir}`);
 
