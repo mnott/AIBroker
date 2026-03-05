@@ -7,7 +7,7 @@
 
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { unlinkSync } from "node:fs";
+import { unlinkSync, readFileSync, existsSync } from "node:fs";
 import { setLogPrefix, log } from "../core/log.js";
 import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
@@ -32,6 +32,37 @@ export async function startDaemon(options?: {
   const appDir = options?.appDir ?? join(homedir(), ".aibroker");
   const socketPath = options?.socketPath ?? DAEMON_SOCKET_PATH;
   setAppDir(appDir);
+
+  // Load environment from ~/.aibroker/env (KEY=VALUE, one per line)
+  // This allows launchd-managed daemons to pick up API tokens without
+  // needing them in the plist or shell profile.
+  const envFile = join(appDir, "env");
+  if (existsSync(envFile)) {
+    try {
+      const lines = readFileSync(envFile, "utf-8").split("\n");
+      let loaded = 0;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const eq = trimmed.indexOf("=");
+        if (eq === -1) continue;
+        const key = trimmed.slice(0, eq).trim();
+        let value = trimmed.slice(eq + 1).trim();
+        // Strip surrounding quotes
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        if (!process.env[key]) {
+          process.env[key] = value;
+          loaded++;
+        }
+      }
+      if (loaded > 0) log(`Loaded ${loaded} env var(s) from ${envFile}`);
+    } catch (err) {
+      log(`Warning: could not read ${envFile}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   // Initialize session management
   const apiBackend = new APIBackend({
