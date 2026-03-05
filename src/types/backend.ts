@@ -10,7 +10,30 @@ export interface Backend {
   readonly name: string;
   readonly type: "session" | "api";
   deliver(message: string, sessionId?: string): Promise<string | undefined>;
+
+  // Optional lifecycle and session management (non-breaking additions)
+  health?(): Promise<BackendHealth>;
+  listSessions?(): BackendSession[];
+  createSession?(name: string, cwd?: string): BackendSession;
+  removeSession?(sessionId: string): Promise<void>;
+  sessionStatus?(sessionId: string): BackendSessionStatus | undefined;
 }
+
+export interface BackendHealth {
+  status: "ok" | "degraded" | "down";
+  activeSessions: number;
+  detail?: string;
+}
+
+export interface BackendSession {
+  id: string;
+  name: string;
+  cwd?: string;
+  /** Timestamp when the session was created (milliseconds since epoch) */
+  createdAt?: number;
+}
+
+export type BackendSessionStatus = "idle" | "busy" | "error" | "terminated";
 
 export interface SessionBackendConfig {
   type: "session";
@@ -39,4 +62,20 @@ export interface APIBackendConfig {
   skipDefaultSession?: boolean;
 }
 
-export type BackendConfig = SessionBackendConfig | APIBackendConfig;
+export interface OllamaBackendConfig {
+  type: "ollama";
+  model: string;
+  baseUrl?: string;
+}
+
+export interface CustomBackendConfig {
+  type: "custom";
+  modulePath: string;
+  options: Record<string, unknown>;
+}
+
+export type BackendConfig =
+  | SessionBackendConfig
+  | APIBackendConfig
+  | OllamaBackendConfig
+  | CustomBackendConfig;

@@ -10,6 +10,7 @@ import { log } from "../core/log.js";
 import { WatcherClient } from "../ipc/client.js";
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage, RouteResult } from "../types/broker.js";
+import type { AdapterHealth } from "../types/adapter.js";
 
 export interface AdapterDescriptor {
   name: string;       // "whazaa", "telex", "pailot"
@@ -17,8 +18,12 @@ export interface AdapterDescriptor {
   registeredAt: number;
 }
 
+const HEALTH_TIMEOUT_MS = 5_000;
+
 export class AdapterRegistry {
   private readonly adapters = new Map<string, AdapterDescriptor>();
+  private readonly lastHealth = new Map<string, AdapterHealth>();
+  private pollInterval: ReturnType<typeof setInterval> | null = null;
 
   register(descriptor: AdapterDescriptor): void {
     this.adapters.set(descriptor.name, descriptor);
@@ -27,7 +32,72 @@ export class AdapterRegistry {
 
   unregister(name: string): void {
     this.adapters.delete(name);
+    this.lastHealth.delete(name);
     log(`Adapter unregistered: ${name}`);
+  }
+
+  // ── Health Polling ──
+
+  startHealthPolling(intervalMs: number = 60_000): void {
+    if (this.pollInterval !== null) return;
+    log(`[hub] health polling started (interval: ${intervalMs}ms)`);
+    this.pollInterval = setInterval(() => { void this.pollAllAdapters(); }, intervalMs);
+  }
+
+  stopHealthPolling(): void {
+    if (this.pollInterval === null) return;
+    clearInterval(this.pollInterval);
+    this.pollInterval = null;
+    log(`[hub] health polling stopped`);
+  }
+
+  getAdapterHealth(name: string): AdapterHealth | undefined {
+    return this.lastHealth.get(name);
+  }
+
+  getAllHealth(): Map<string, AdapterHealth> {
+    return new Map(this.lastHealth);
+  }
+
+  private async pollAllAdapters(): Promise<void> {
+    const adapters = this.list();
+    await Promise.all(adapters.map(a => this.pollAdapter(a)));
+  }
+
+  private async pollAdapter(adapter: AdapterDescriptor): Promise<void> {
+    const previous = this.lastHealth.get(adapter.name);
+    let health: AdapterHealth;
+
+    try {
+      const client = new WatcherClient(adapter.socketPath);
+      const result = await Promise.race([
+        client.call_raw("health", {}),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("health poll timed out")), HEALTH_TIMEOUT_MS),
+        ),
+      ]);
+      health = result as unknown as AdapterHealth;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      health = {
+        status: "down",
+        connectionStatus: "disconnected",
+        stats: { messagesReceived: 0, messagesSent: 0, errors: 0 },
+        lastMessageAgo: null,
+        detail: msg,
+      };
+    }
+
+    this.lastHealth.set(adapter.name, health);
+
+    // Log on status change
+    if (previous === undefined || previous.status !== health.status) {
+      if (health.status === "ok") {
+        log(`[hub] adapter ${adapter.name} health: ok`);
+      } else {
+        log(`[hub] WARNING: adapter ${adapter.name} health: ${health.status}${health.detail ? ` — ${health.detail}` : ""}`);
+      }
+    }
   }
 
   get(name: string): AdapterDescriptor | undefined {

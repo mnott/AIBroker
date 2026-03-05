@@ -1,0 +1,59 @@
+/**
+ * connection.ts — Connect to {{DISPLAY_NAME}}
+ *
+ * TODO: Implement the upstream service connection here.
+ * This is the adapter-specific part — use the SDK/library for your service.
+ *
+ * Replace this stub with a real connection using the appropriate SDK, e.g.:
+ *   - @whiskeysockets/baileys  for WhatsApp
+ *   - gramjs / telegram        for Telegram
+ *   - discord.js               for Discord
+ *   - signal-cli               for Signal
+ *
+ * The onMessage callback receives every incoming message text so the watcher
+ * can route it through the command handler / hub forwarding.
+ */
+
+export interface ConnectionResult {
+  /** Call to cleanly disconnect from the upstream service. */
+  cleanup: () => void;
+  /**
+   * Trigger a new login flow (QR code, pairing, etc.) and return a
+   * human-readable status string to send back to the user.
+   */
+  triggerLogin: () => Promise<string>;
+}
+
+/**
+ * Establish the upstream connection.
+ *
+ * @param onMessage - Called for each incoming message the adapter should process.
+ *                    Receives the message text and the message timestamp (epoch ms).
+ */
+export async function connectWatcher(
+  onMessage: (text: string, timestamp: number) => void,
+): Promise<ConnectionResult> {
+  // TODO: Replace this stub with your actual connection logic.
+  //
+  // Typical pattern:
+  //   1. Load credentials from appDir (set by setAppDir() in index.ts)
+  //   2. Connect to the upstream service
+  //   3. Subscribe to incoming messages, calling onMessage() for each
+  //   4. Return cleanup() and triggerLogin() implementations
+  //
+  console.log("[{{ADAPTER_NAME}}] Connection stub — implement connectWatcher()");
+
+  // Suppress unused-parameter warning in stub
+  void onMessage;
+
+  return {
+    cleanup: () => {
+      // TODO: close WebSocket, stop polling, revoke auth, etc.
+      console.log("[{{ADAPTER_NAME}}] cleanup() called");
+    },
+    triggerLogin: async () => {
+      // TODO: start QR code / pairing flow, return status string
+      return "Login not yet implemented for {{DISPLAY_NAME}}";
+    },
+  };
+}

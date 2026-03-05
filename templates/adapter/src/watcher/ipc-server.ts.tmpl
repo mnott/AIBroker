@@ -1,0 +1,226 @@
+/**
+ * ipc-server.ts — Adapter-side IPC server for {{DISPLAY_NAME}}
+ *
+ * Registers the handlers that the AIBroker hub (and MCP tools) can call
+ * on this adapter's Unix Domain Socket.
+ *
+ * Required handlers (called by the hub):
+ *   deliver          — hub pushes a BrokerMessage to this adapter for outbound delivery
+ *   health           — hub polls adapter health
+ *   connection_status — returns the upstream connection status string
+ *
+ * Optional handlers (called by MCP tools or the hub):
+ *   send             — send a text message
+ *   send_voice       — send a voice note (OGG Opus path)
+ *   send_file        — send a file attachment
+ *   login            — trigger a new login / QR pairing flow
+ *   status           — human-readable status summary
+ */
+
+import { IpcServer, log } from "aibroker";
+import type { BrokerMessage } from "aibroker";
+
+import { ADAPTER_SOCKET_PATH, adapterStats, connectionStatus, getLastMessageAgo } from "./state.js";
+import { sendText, sendVoice, sendFile } from "./send.js";
+
+let triggerLoginFn: (() => Promise<string>) | null = null;
+
+/**
+ * Create, register handlers on, and start the adapter IPC server.
+ *
+ * @param triggerLogin - Async function that starts a fresh login flow and
+ *                       returns a human-readable status string.
+ * @returns The IpcServer instance (already started).
+ */
+export function startIpcServer(triggerLogin: () => Promise<string>): IpcServer {
+  triggerLoginFn = triggerLogin;
+
+  const server = new IpcServer(ADAPTER_SOCKET_PATH);
+
+  // ── Hub-required handlers ──────────────────────────────────────────────────
+
+  /**
+   * deliver — Hub pushes a BrokerMessage for outbound delivery.
+   *
+   * The hub calls this when it has routed a message to this adapter.
+   * Inspect message.type to decide how to deliver:
+   *   "text"    → sendText
+   *   "voice"   → sendVoice
+   *   "file"    → sendFile
+   *   "command" → run through local command handler
+   */
+  server.on("deliver", async (req) => {
+    const { message } = req.params as { message: BrokerMessage };
+    if (!message || !message.type) {
+      return { ok: false, error: "Invalid BrokerMessage: type is required" };
+    }
+
+    log(`[{{ADAPTER_NAME}}] deliver: type=${message.type} source=${message.source}`);
+
+    try {
+      const payload = message.payload ?? {};
+      const recipient = typeof payload.recipient === "string" ? payload.recipient : undefined;
+
+      switch (message.type) {
+        case "text": {
+          const text = typeof payload.text === "string" ? payload.text : String(payload.text ?? "");
+          await sendText(text, recipient);
+          break;
+        }
+        case "voice": {
+          const audioPath = typeof payload.audioPath === "string" ? payload.audioPath : null;
+          if (!audioPath) return { ok: false, error: "deliver(voice): audioPath is required" };
+          await sendVoice(audioPath, recipient);
+          break;
+        }
+        case "file": {
+          const filePath = typeof payload.filePath === "string" ? payload.filePath : null;
+          if (!filePath) return { ok: false, error: "deliver(file): filePath is required" };
+          const caption = typeof payload.caption === "string" ? payload.caption : undefined;
+          const mimetype = typeof payload.mimetype === "string" ? payload.mimetype : undefined;
+          await sendFile(filePath, caption, mimetype, recipient);
+          break;
+        }
+        case "command": {
+          // Commands from the hub (e.g. routed from another adapter) — deliver as text
+          const text = typeof payload.text === "string" ? payload.text : String(payload.text ?? "");
+          await sendText(text, recipient);
+          break;
+        }
+        default:
+          log(`[{{ADAPTER_NAME}}] deliver: unhandled message type "${message.type}"`);
+          return { ok: false, error: `Unhandled message type: ${message.type}` };
+      }
+
+      return { ok: true, result: { delivered: true } };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`[{{ADAPTER_NAME}}] deliver error: ${msg}`);
+      adapterStats.errors++;
+      return { ok: false, error: msg };
+    }
+  });
+
+  /**
+   * health — Hub polls this to determine adapter liveness.
+   *
+   * Returns AdapterHealth-compatible shape.
+   */
+  server.on("health", async (_req) => {
+    const isConnected = connectionStatus === "connected";
+    return {
+      ok: true,
+      result: {
+        status: isConnected ? "ok" : connectionStatus === "connecting" ? "degraded" : "down",
+        connectionStatus,
+        stats: {
+          messagesReceived: adapterStats.messagesReceived,
+          messagesSent: adapterStats.messagesSent,
+          errors: adapterStats.errors,
+        },
+        lastMessageAgo: getLastMessageAgo(),
+      },
+    };
+  });
+
+  /**
+   * connection_status — Returns the upstream connection status as a string.
+   */
+  server.on("connection_status", async (_req) => {
+    return {
+      ok: true,
+      result: { status: connectionStatus },
+    };
+  });
+
+  // ── Optional outbound handlers ─────────────────────────────────────────────
+
+  /**
+   * send — Send a text message.
+   */
+  server.on("send", async (req) => {
+    const { message, recipient } = req.params as { message?: string; recipient?: string };
+    if (!message) return { ok: false, error: "message is required" };
+    try {
+      await sendText(message, recipient);
+      return { ok: true, result: { sent: true } };
+    } catch (err) {
+      adapterStats.errors++;
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  /**
+   * send_voice — Send a voice note from a file path (OGG Opus).
+   */
+  server.on("send_voice", async (req) => {
+    const { audioPath, recipient } = req.params as { audioPath?: string; recipient?: string };
+    if (!audioPath) return { ok: false, error: "audioPath is required" };
+    try {
+      await sendVoice(audioPath, recipient);
+      return { ok: true, result: { sent: true } };
+    } catch (err) {
+      adapterStats.errors++;
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  /**
+   * send_file — Send a file attachment.
+   */
+  server.on("send_file", async (req) => {
+    const { filePath, caption, mimetype, recipient } = req.params as {
+      filePath?: string;
+      caption?: string;
+      mimetype?: string;
+      recipient?: string;
+    };
+    if (!filePath) return { ok: false, error: "filePath is required" };
+    try {
+      await sendFile(filePath, caption, mimetype, recipient);
+      return { ok: true, result: { sent: true } };
+    } catch (err) {
+      adapterStats.errors++;
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  /**
+   * login — Trigger a fresh login / QR pairing flow.
+   */
+  server.on("login", async (_req) => {
+    if (!triggerLoginFn) return { ok: false, error: "Login not available" };
+    try {
+      const result = await triggerLoginFn();
+      return { ok: true, result: { message: result } };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  /**
+   * status — Human-readable adapter status summary.
+   */
+  server.on("status", async (_req) => {
+    const agoMs = getLastMessageAgo();
+    const agoStr = agoMs !== null
+      ? `${Math.round(agoMs / 1000)}s ago`
+      : "never";
+    return {
+      ok: true,
+      result: {
+        adapter: "{{ADAPTER_NAME}}",
+        displayName: "{{DISPLAY_NAME}}",
+        connectionStatus,
+        messagesReceived: adapterStats.messagesReceived,
+        messagesSent: adapterStats.messagesSent,
+        errors: adapterStats.errors,
+        lastMessageAgo: agoStr,
+      },
+    };
+  });
+
+  server.start();
+  log(`[{{ADAPTER_NAME}}] IPC server started on ${ADAPTER_SOCKET_PATH}`);
+  return server;
+}

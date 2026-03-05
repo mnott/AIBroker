@@ -1,0 +1,39 @@
+/**
+ * state.ts — {{DISPLAY_NAME}} adapter local state
+ *
+ * Tracks connection status, per-run statistics, and the socket path
+ * for the adapter's IPC server. All fields are module-level singletons
+ * written by the watcher and read by the IPC server handlers.
+ */
+
+import type { AdapterConnectionStatus } from "aibroker";
+
+// ── Connection tracking ──────────────────────────────────────────────────────
+
+/** Current upstream connection status. */
+export let connectionStatus: AdapterConnectionStatus = "disconnected";
+
+export function setConnectionStatus(s: AdapterConnectionStatus): void {
+  connectionStatus = s;
+}
+
+// ── Per-run statistics ───────────────────────────────────────────────────────
+
+/** Statistics reset on each watcher restart (not persisted). */
+export const adapterStats = {
+  messagesReceived: 0,
+  messagesSent: 0,
+  errors: 0,
+  lastMessageAt: null as number | null,
+};
+
+// ── Socket path ──────────────────────────────────────────────────────────────
+
+/** Unix Domain Socket path for the adapter's IPC server. */
+export const ADAPTER_SOCKET_PATH = "/tmp/{{ADAPTER_NAME}}-watcher.sock";
+
+/** Timestamp of the last incoming message (epoch ms). */
+export function getLastMessageAgo(): number | null {
+  if (adapterStats.lastMessageAt === null) return null;
+  return Date.now() - adapterStats.lastMessageAt;
+}

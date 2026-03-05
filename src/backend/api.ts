@@ -11,7 +11,7 @@
  * so consumers can show meaningful status via /ss.
  */
 
-import type { Backend, APIBackendConfig } from "../types/backend.js";
+import type { Backend, APIBackendConfig, BackendHealth } from "../types/backend.js";
 import { log } from "../core/log.js";
 import { homedir } from "os";
 import { spawn } from "child_process";
@@ -235,11 +235,36 @@ export class APIBackend implements Backend {
   }
 
   async deliver(message: string, sessionId?: string): Promise<string | undefined> {
-    if (this.provider !== "anthropic") {
-      log(`APIBackend: provider '${this.provider}' not yet supported, only 'anthropic'`);
-      return `Error: provider '${this.provider}' is not yet implemented. Use provider 'anthropic'.`;
+    switch (this.provider) {
+      case "anthropic": return this.anthropicDeliver(message, sessionId);
+      case "ollama":    return this.ollamaDeliver(message, sessionId);
+      case "openai":    return this.openaiDeliver(message, sessionId);
+      default:          throw new Error(`Unknown provider: ${this.provider}`);
+    }
+  }
+
+  async health(): Promise<BackendHealth> {
+    const activeSessions = this.sessions.size;
+
+    if (this.provider === "ollama") {
+      try {
+        const baseUrl = this.config.baseUrl ?? "http://localhost:11434";
+        const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
+        if (!res.ok) {
+          return { status: "degraded", activeSessions, detail: `provider=ollama, /api/tags returned ${res.status}` };
+        }
+        return { status: "ok", activeSessions, detail: `provider=ollama, model=${this.model}` };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { status: "down", activeSessions, detail: `provider=ollama, unreachable: ${msg}` };
+      }
     }
 
+    // For anthropic and openai, no cheap health-check without burning tokens
+    return { status: "ok", activeSessions, detail: `provider=${this.provider}, model=${this.model}` };
+  }
+
+  private async anthropicDeliver(message: string, sessionId?: string): Promise<string | undefined> {
     // Resolve session — use explicit ID, fall back to active
     const targetId = sessionId ?? this._activeSessionId;
     const session = targetId ? this.sessions.get(targetId) : undefined;
@@ -364,5 +389,54 @@ export class APIBackend implements Backend {
       status.lastErrors = [msg];
       return `Error from Claude subprocess: ${msg}`;
     }
+  }
+
+  private async ollamaDeliver(message: string, _sessionId?: string): Promise<string | undefined> {
+    const baseUrl = this.config.baseUrl ?? "http://localhost:11434";
+    log(`APIBackend: delivering to Ollama ${this.model} at ${baseUrl}`);
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: this.model,
+        messages: [{ role: "user", content: message }],
+        stream: false,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`Ollama error: ${response.status} ${response.statusText}`);
+    }
+    const data = await response.json() as Record<string, unknown>;
+    const msg = data.message as Record<string, unknown> | undefined;
+    const content = typeof msg?.content === "string" ? msg.content : undefined;
+    log(`APIBackend: Ollama response (${content?.length ?? 0} chars)`);
+    return content;
+  }
+
+  private async openaiDeliver(message: string, _sessionId?: string): Promise<string | undefined> {
+    const apiKey = this.config.apiKey ?? process.env.OPENAI_API_KEY;
+    if (!apiKey) throw new Error("OpenAI API key not set — provide apiKey in config or set OPENAI_API_KEY");
+    const baseUrl = this.config.baseUrl ?? "https://api.openai.com";
+    log(`APIBackend: delivering to OpenAI ${this.model}`);
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: this.model,
+        messages: [{ role: "user", content: message }],
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`OpenAI error: ${response.status} ${response.statusText}`);
+    }
+    const data = await response.json() as Record<string, unknown>;
+    const choices = data.choices as Array<Record<string, unknown>> | undefined;
+    const content = (choices?.[0]?.message as Record<string, unknown> | undefined)?.content;
+    const text = typeof content === "string" ? content : undefined;
+    log(`APIBackend: OpenAI response (${text?.length ?? 0} chars)`);
+    return text;
   }
 }

@@ -4,3 +4,4 @@ export * from "./voice.js";
 export * from "./transport.js";
 export * from "./backend.js";
 export * from "./broker.js";
+export * from "./adapter.js";

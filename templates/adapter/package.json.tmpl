@@ -1,0 +1,23 @@
+{
+  "name": "{{ADAPTER_NAME}}",
+  "version": "0.1.0",
+  "description": "AIBroker adapter for {{DISPLAY_NAME}}",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "{{ADAPTER_NAME}}": "dist/watcher/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "watch": "node dist/watcher/cli.js watch",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "aibroker": "^0.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}

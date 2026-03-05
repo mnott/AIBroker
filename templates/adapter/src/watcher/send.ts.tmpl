@@ -1,0 +1,62 @@
+/**
+ * send.ts — Outbound message delivery for {{DISPLAY_NAME}}
+ *
+ * These functions are called by the IPC server handlers when the hub (or an
+ * MCP tool) wants to send a message to the upstream service.
+ *
+ * TODO: Replace each stub with real delivery logic using your SDK.
+ */
+
+import { adapterStats } from "./state.js";
+
+// ── Text ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Send a plain-text message to the upstream service.
+ *
+ * @param text      The message body.
+ * @param recipient Optional channel/user/room identifier. Defaults to self-chat.
+ */
+export async function sendText(text: string, recipient?: string): Promise<void> {
+  // TODO: deliver text via your SDK
+  console.log(`[{{ADAPTER_NAME}}] sendText stub — text="${text.slice(0, 60)}" recipient=${recipient ?? "(default)"}`);
+  adapterStats.messagesSent++;
+}
+
+// ── Voice ────────────────────────────────────────────────────────────────────
+
+/**
+ * Send an audio file as a voice note.
+ *
+ * The file at audioPath is an OGG/Opus buffer produced by Kokoro TTS.
+ * Most messaging platforms accept OGG Opus for voice notes.
+ *
+ * @param audioPath Path to the OGG Opus audio file on disk.
+ * @param recipient Optional channel/user/room identifier.
+ */
+export async function sendVoice(audioPath: string, recipient?: string): Promise<void> {
+  // TODO: upload and send audio file via your SDK
+  console.log(`[{{ADAPTER_NAME}}] sendVoice stub — path="${audioPath}" recipient=${recipient ?? "(default)"}`);
+  adapterStats.messagesSent++;
+}
+
+// ── File ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Send an arbitrary file as a document attachment.
+ *
+ * @param filePath  Path to the file on disk.
+ * @param caption   Optional caption shown beneath the attachment.
+ * @param mimetype  Optional MIME type override. Detected automatically if omitted.
+ * @param recipient Optional channel/user/room identifier.
+ */
+export async function sendFile(
+  filePath: string,
+  caption?: string,
+  mimetype?: string,
+  recipient?: string,
+): Promise<void> {
+  // TODO: upload and send file via your SDK
+  console.log(`[{{ADAPTER_NAME}}] sendFile stub — path="${filePath}" caption="${caption ?? ""}" mime="${mimetype ?? "auto"}" recipient=${recipient ?? "(default)"}`);
+  adapterStats.messagesSent++;
+}

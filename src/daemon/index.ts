@@ -56,6 +56,7 @@ export async function startDaemon(options?: {
   const ipcServer = new IpcServer(socketPath);
   registerCoreHandlers(ipcServer, adapterRegistry, apiBackend, manager);
   ipcServer.start();
+  adapterRegistry.startHealthPolling();
 
   // PAILot WebSocket gateway
   startWsGateway((text: string, timestamp: number) => {
@@ -69,6 +70,7 @@ export async function startDaemon(options?: {
   // Graceful shutdown — ensure socket cleanup even on abrupt exit
   const shutdown = (signal: string) => {
     console.log(`\n[aibroker] ${signal} received. Stopping.`);
+    adapterRegistry.stopHealthPolling();
     stopWsGateway();
     ipcServer.stop();
     // Belt-and-suspenders: remove socket in case ipcServer.stop() didn't

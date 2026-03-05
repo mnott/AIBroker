@@ -25,6 +25,7 @@ import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus } from "../adapters/pailot/gateway.js";
 import { saveVoiceConfig } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig } from "../core/state.js";
+import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 
 export function registerCoreHandlers(
   server: IpcServer,
@@ -94,6 +95,10 @@ export function registerCoreHandlers(
   });
 
   server.on("status", async (_req) => {
+    const adapterHealth: Record<string, unknown> = {};
+    for (const [name, health] of registry.getAllHealth()) {
+      adapterHealth[name] = health;
+    }
     return {
       ok: true,
       result: {
@@ -101,8 +106,44 @@ export function registerCoreHandlers(
         adapters: registry.list().map(a => a.name),
         activeSessions: manager.listSessions().length,
         activeSession: manager.activeSession?.name ?? null,
+        adapterHealth,
       },
     };
+  });
+
+  // ── PAI Named Sessions ──
+
+  server.on("pai_projects", async (_req) => {
+    const projects = await listPaiProjects();
+    return { ok: true, result: { projects } };
+  });
+
+  server.on("pai_find", async (req) => {
+    const { name } = req.params as { name: string };
+    if (!name) return { ok: false, error: "name is required" };
+    const project = await findPaiProject(name);
+    if (!project) return { ok: false, error: `Project "${name}" not found` };
+    return { ok: true, result: { project } };
+  });
+
+  server.on("pai_launch", async (req) => {
+    const { name } = req.params as { name: string };
+    if (!name) return { ok: false, error: "name is required" };
+
+    let itermSessionId: string;
+    let sessionId: string;
+    try {
+      ({ itermSessionId, sessionId } = await launchPaiProject(name));
+    } catch (err: unknown) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+
+    // Register the visual session with HybridSessionManager
+    const project = await findPaiProject(name);
+    const displayName = project?.displayName || project?.name || name;
+    manager.registerVisualSession(displayName, project?.rootPath ?? "", itermSessionId);
+
+    return { ok: true, result: { itermSessionId, sessionId, name } };
   });
 
   // ── Phase 2: Message Routing ──

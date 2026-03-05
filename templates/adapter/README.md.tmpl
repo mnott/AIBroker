@@ -1,0 +1,98 @@
+# {{ADAPTER_NAME}}
+
+AIBroker adapter for {{DISPLAY_NAME}}.
+
+## Overview
+
+This adapter bridges {{DISPLAY_NAME}} and the [AIBroker](https://github.com/mnott/AIBroker) hub, enabling bidirectional message routing between {{DISPLAY_NAME}} and AI backends (Claude Code, Anthropic API, etc.).
+
+## Setup
+
+### 1. Install dependencies
+
+```bash
+npm install
+```
+
+### 2. Implement the connection
+
+Open `src/watcher/connection.ts` and implement `connectWatcher()` with your {{DISPLAY_NAME}} SDK.
+
+The function must:
+- Connect to {{DISPLAY_NAME}} using your credentials
+- Call `onMessage(text, timestamp)` for each incoming message
+- Return `cleanup()` (disconnect) and `triggerLogin()` (fresh auth flow)
+
+### 3. Implement outbound delivery
+
+Open `src/watcher/send.ts` and implement `sendText()`, `sendVoice()`, and `sendFile()`.
+
+### 4. Build
+
+```bash
+npm run build
+```
+
+### 5. Run
+
+```bash
+# Standalone (embedded) mode — no hub required
+npm run watch
+
+# Or: with AIBroker hub running
+aibroker start   # in another terminal
+npm run watch    # adapter auto-detects and registers with hub
+```
+
+## Architecture
+
+```
+{{DISPLAY_NAME}} <── connectWatcher() ──> watcher/index.ts
+                                              │
+                          createMessageHandler()  startIpcServer()
+                                              │         │
+                                        commands.ts  ipc-server.ts
+                                              │
+                                    AIBroker hub / embedded
+```
+
+## Configuration
+
+Set these environment variables before running:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AIBROKER_MODEL` | `sonnet` | AI model for API sessions |
+| `AIBROKER_CWD` | `~` | Working directory for AI sessions |
+| `AIBROKER_MAX_TURNS` | `30` | Max turns per API session |
+| `AIBROKER_MAX_BUDGET` | `1.0` | Max USD budget per API session |
+| `AIBROKER_PERMISSION_MODE` | `acceptEdits` | Claude permission mode |
+
+## Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/h`, `/help` | Show help |
+| `/s`, `/sessions` | List all sessions |
+| `/ss`, `/status` | Show active session status |
+| `/n [name]` | Create a new API session |
+| `/1`, `/2`, ... | Switch to session by index |
+
+## IPC Methods
+
+The adapter exposes these methods on its Unix socket (`/tmp/{{ADAPTER_NAME}}-watcher.sock`):
+
+| Method | Description |
+|--------|-------------|
+| `deliver` | Hub pushes a BrokerMessage for outbound delivery |
+| `health` | Returns adapter health (status, stats, lastMessageAgo) |
+| `connection_status` | Returns upstream connection status string |
+| `send` | Send a text message |
+| `send_voice` | Send a voice note (OGG Opus path) |
+| `send_file` | Send a file attachment |
+| `login` | Trigger a fresh login / QR pairing flow |
+| `status` | Human-readable adapter status summary |
+
+## License
+
+MIT

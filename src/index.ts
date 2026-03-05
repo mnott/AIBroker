@@ -140,5 +140,13 @@ export type { APISession, SessionStatus, SessionState } from "./backend/api.js";
 export { startDaemon, DAEMON_SOCKET_PATH } from "./daemon/index.js";
 export { AdapterRegistry } from "./daemon/adapter-registry.js";
 export type { AdapterDescriptor } from "./daemon/adapter-registry.js";
+export {
+  listPaiProjects,
+  findPaiProject,
+  launchPaiProject,
+  getEffectiveConfig,
+  invalidatePaiProjectCache,
+} from "./daemon/pai-projects.js";
+export type { PaiProject } from "./daemon/pai-projects.js";
 export { createBrokerMessage } from "./types/broker.js";
 export type { BrokerMessage, BrokerMessageType, BrokerMessagePayload, RouteResult } from "./types/broker.js";
