@@ -87,15 +87,16 @@ Generate all files listed below. Use the scaffold templates in `templates/adapte
 
 **`src/watcher/commands.ts`** — from `templates/adapter/src/watcher/commands.ts.tmpl`
 - Replace placeholders only
-- Add any service-specific slash commands if the service warrants them (e.g. `/channel #general` to switch rooms)
+- This is a thin handler — only /restart and /login are local
+- All other commands are forwarded to the hub by index.ts
 
 **`src/watcher/ipc-server.ts`** — from `templates/adapter/src/watcher/ipc-server.ts.tmpl`
 - Replace placeholders only
-- The four required IPC handlers must be present: `deliver`, `health`, `connection_status`, `login`
+- The required IPC handlers are already present: `deliver`, `health`, `connection_status`, `login`
 
 **`src/watcher/index.ts`** — from `templates/adapter/src/watcher/index.ts.tmpl`
 - Replace placeholders only
-- The hub detection pattern must remain intact
+- The hub-required pattern (connectToHub with retry, heartbeat, re-registration) is built in
 
 **`src/watcher/cli.ts`** — from `templates/adapter/src/watcher/cli.ts.tmpl`
 - Replace placeholders only
@@ -146,15 +147,24 @@ After generating the adapter files, register the adapter with the AIBroker hub:
 After generating all files:
 
 ```bash
-# Build
+# Ensure the AIBroker hub is running
+aibroker start
+
+# Build and start the adapter
 cd /path/to/{{ADAPTER_NAME}}
 npm install
 npm run build
-
-# Start the watcher (runs the upstream connection)
 node dist/watcher/cli.js watch
+```
 
-# In a separate terminal, verify the IPC server is responding
+The adapter will:
+1. Connect to the AIBroker hub (fails if hub is not running)
+2. Connect to the upstream service
+3. Register with the hub
+4. Start its IPC server
+
+Verify the IPC server is responding:
+```bash
 node -e "
 import { WatcherClient } from 'aibroker';
 const c = new WatcherClient('/tmp/{{ADAPTER_NAME}}-watcher.sock');
@@ -204,6 +214,22 @@ interface MessengerAdapter {
 }
 ```
 
+### AdapterHealth contract
+
+```typescript
+interface AdapterHealth {
+  status: "ok" | "degraded" | "down";
+  connectionStatus: "connected" | "connecting" | "disconnected" | "error";
+  stats: {
+    messagesReceived: number;
+    messagesSent: number;
+    errors: number;
+  };
+  lastMessageAgo: number | null;
+  detail?: string;
+}
+```
+
 ### BrokerMessage (hub envelope)
 
 ```typescript
@@ -212,11 +238,12 @@ interface BrokerMessage {
   timestamp: number;   // epoch ms
   source: string;      // adapter name that sent it
   target?: string;     // target adapter name (omit for default routing)
-  type: "text" | "voice" | "file" | "command" | "status";
+  type: "text" | "voice" | "file" | "image" | "command" | "status";
   payload: {
     text?: string;
     filePath?: string;
     audioPath?: string;
+    buffer?: string;     // base64-encoded binary data (images, voice)
     mimetype?: string;
     caption?: string;
     recipient?: string;
@@ -231,7 +258,7 @@ interface BrokerMessage {
 | Handler | Called by | Must return |
 |---------|-----------|-------------|
 | `deliver` | Hub, when routing a BrokerMessage to this adapter | `{ ok: true, result: { delivered: true } }` or `{ ok: false, error: string }` |
-| `health` | Hub health polling | `{ ok: true, result: AdapterHealth }` |
+| `health` | Hub health polling (every 10s) | `{ ok: true, result: AdapterHealth }` |
 | `connection_status` | Hub, MCP tools | `{ ok: true, result: { status: AdapterConnectionStatus } }` |
 | `login` | User, via MCP tool | `{ ok: true, result: { message: string } }` |
 | `send` | MCP tool | `{ ok: true, result: { sent: true } }` |
@@ -239,30 +266,24 @@ interface BrokerMessage {
 | `send_file` | MCP tool | `{ ok: true, result: { sent: true } }` |
 | `status` | MCP tool | Human-readable status object |
 
-### Hub detection pattern
+### Hub-required architecture
 
-The watcher probes the AIBroker daemon socket at startup:
+The adapter **requires** the AIBroker hub daemon to be running:
 
-```typescript
-async function detectHubMode(): Promise<boolean> {
-  const client = new WatcherClient(DAEMON_SOCKET_PATH);
-  try {
-    const result = await Promise.race([
-      client.call_raw("status", {}),
-      new Promise<null>((_, reject) => setTimeout(() => reject(new Error("timeout")), 2000)),
-    ]);
-    return result !== null;
-  } catch {
-    return false;
-  }
-}
+```
+Adapter startup:
+  1. connectToHub() — probe hub via "ping", retry 3x, fail if unreachable
+  2. connectWatcher() — establish upstream service connection
+  3. startIpcServer() — start adapter IPC server on its socket
+  4. register_adapter — announce to hub so it can push outbound messages
+  5. heartbeat loop — ping hub every 30s, re-register if it restarts
 ```
 
-If `detectHubMode()` returns `true`, the adapter:
-- Forwards incoming messages to the hub via `route_message`
-- Registers itself via `register_adapter` so the hub can push outbound messages back
-
-If `false`, the adapter handles everything locally (embedded mode).
+Adapters do NOT:
+- Create their own APIBackend or HybridSessionManager
+- Handle commands locally (except /restart and /login)
+- Run TTS, STT, screenshots, or image generation
+- Manage sessions
 
 ---
 
@@ -275,6 +296,7 @@ If `false`, the adapter handles everything locally (embedded mode).
 - Key file — send: `src/watcher/send.ts`
 - Key file — IPC: `src/watcher/ipc-server.ts`
 - Key file — MCP tools: `src/index.ts`
+- Key file — watcher: `src/watcher/index.ts` (thin hub-required adapter pattern)
 - Key pattern — Baileys saves auth state to `~/.whazaa/auth/` via `useMultiFileAuthState()`
 
 The Whazaa pattern for `connectWatcher()` is:

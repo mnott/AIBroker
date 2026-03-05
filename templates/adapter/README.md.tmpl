@@ -6,6 +6,8 @@ AIBroker adapter for {{DISPLAY_NAME}}.
 
 This adapter bridges {{DISPLAY_NAME}} and the [AIBroker](https://github.com/mnott/AIBroker) hub, enabling bidirectional message routing between {{DISPLAY_NAME}} and AI backends (Claude Code, Anthropic API, etc.).
 
+**Requires the AIBroker daemon to be running.** The adapter is a thin transport pipe — all command handling, session management, TTS, and media processing are owned by the hub.
+
 ## Setup
 
 ### 1. Install dependencies
@@ -36,12 +38,11 @@ npm run build
 ### 5. Run
 
 ```bash
-# Standalone (embedded) mode — no hub required
-npm run watch
+# Start the AIBroker hub first
+aibroker start
 
-# Or: with AIBroker hub running
-aibroker start   # in another terminal
-npm run watch    # adapter auto-detects and registers with hub
+# Then start the adapter — it auto-registers with the hub
+npm run watch
 ```
 
 ## Architecture
@@ -49,34 +50,16 @@ npm run watch    # adapter auto-detects and registers with hub
 ```
 {{DISPLAY_NAME}} <── connectWatcher() ──> watcher/index.ts
                                               │
-                          createMessageHandler()  startIpcServer()
-                                              │         │
-                                        commands.ts  ipc-server.ts
-                                              │
-                                    AIBroker hub / embedded
+                                     forward to hub    startIpcServer()
+                                              │              │
+                                    AIBroker hub ◄── deliver ─┘
 ```
 
-## Configuration
-
-Set these environment variables before running:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AIBROKER_MODEL` | `sonnet` | AI model for API sessions |
-| `AIBROKER_CWD` | `~` | Working directory for AI sessions |
-| `AIBROKER_MAX_TURNS` | `30` | Max turns per API session |
-| `AIBROKER_MAX_BUDGET` | `1.0` | Max USD budget per API session |
-| `AIBROKER_PERMISSION_MODE` | `acceptEdits` | Claude permission mode |
-
-## Slash Commands
-
-| Command | Description |
-|---------|-------------|
-| `/h`, `/help` | Show help |
-| `/s`, `/sessions` | List all sessions |
-| `/ss`, `/status` | Show active session status |
-| `/n [name]` | Create a new API session |
-| `/1`, `/2`, ... | Switch to session by index |
+The adapter:
+- Forwards all incoming messages to the hub via `route_message`
+- Receives outbound messages from the hub via the `deliver` IPC handler
+- Only handles `/restart` and `/login` locally
+- Maintains a 30s heartbeat with the hub; re-registers if hub restarts
 
 ## IPC Methods
 

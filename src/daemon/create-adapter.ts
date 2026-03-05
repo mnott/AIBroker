@@ -169,7 +169,8 @@ function printNextSteps(adapterName: string, displayName: string, outputDir: str
   console.log(`     npm run build`);
   console.log(`     npm run watch`);
   console.log();
-  console.log(`  The adapter will auto-detect the AIBroker hub if it is running.`);
+  console.log(`  The AIBroker daemon must be running: aibroker start`);
+  console.log(`  The adapter will register with the hub on startup.`);
   console.log(`  IPC socket: /tmp/${adapterName}-watcher.sock`);
   console.log();
 }

@@ -1,146 +1,44 @@
 /**
- * commands.ts — Slash command handler for {{DISPLAY_NAME}}
+ * commands.ts — Thin adapter-local command handler for {{DISPLAY_NAME}}
  *
- * Parses incoming message text. If the text starts with "/" it is treated as
- * a slash command; otherwise it is delivered as a plain message to the active
- * AI session via the HybridSessionManager.
- *
- * Extend this file with adapter-specific slash commands as needed.
+ * Only handles commands that require direct upstream service access
+ * (/restart, /login). All other commands are forwarded to the AIBroker
+ * hub daemon via route_message in index.ts.
  */
 
-import {
-  hybridManager,
-  deliverViaApi,
-  log,
-} from "aibroker";
+import { log } from "aibroker";
 import { sendText } from "./send.js";
 
-// ── Command handler factory ───────────────────────────────────────────────────
-
 /**
- * Build and return the message handler closure used by the watcher.
+ * Create the local message handler for adapter-specific commands.
  *
- * The closure captures mutable state via getter/setter callbacks so the
- * watcher's `watch()` function can keep its own local variables authoritative
- * while sharing them with the handler.
+ * Only /restart and /login are handled here. Everything else should have
+ * been routed to the hub by index.ts — this handler is the fallback for
+ * commands that need direct adapter access.
  */
 export function createMessageHandler(): (text: string, timestamp: number) => void {
   return function handleMessage(text: string, _timestamp: number): void {
     const trimmed = text.trim();
 
-    if (!trimmed.startsWith("/")) {
-      // Plain text — deliver to the active AI session
-      void deliverMessage(trimmed);
+    if (trimmed === "/restart") {
+      log("/restart: watcher restart requested");
+      sendText("Restarting {{ADAPTER_NAME}} watcher...").catch(() => {});
+      setTimeout(() => {
+        log("/restart: exiting — process manager will restart us");
+        process.exit(0);
+      }, 1500);
       return;
     }
 
-    // Slash command dispatch
-    void handleSlashCommand(trimmed);
+    // /login is handled via the triggerLogin callback in index.ts,
+    // not here. This is just a safety net.
+    if (trimmed === "/login") {
+      sendText("Use the login flow — handled by the watcher.").catch(() => {});
+      return;
+    }
+
+    // Everything else should have gone to the hub. If we get here,
+    // something went wrong with routing.
+    log(`[{{ADAPTER_NAME}}] commands.ts: unexpected local message: ${trimmed.slice(0, 60)}`);
   };
-}
-
-// ── Slash command dispatcher ─────────────────────────────────────────────────
-
-async function handleSlashCommand(cmd: string): Promise<void> {
-  const [base, ...args] = cmd.split(/\s+/);
-
-  switch (base) {
-    case "/h":
-    case "/help":
-      await sendText(buildHelp());
-      return;
-
-    case "/s":
-    case "/sessions": {
-      const mgr = hybridManager;
-      if (!mgr) { await sendText("No session manager active."); return; }
-      await sendText(mgr.formatSessionList());
-      return;
-    }
-
-    case "/ss":
-    case "/status": {
-      const mgr = hybridManager;
-      if (!mgr) { await sendText("No session manager active."); return; }
-      const status = mgr.formatActiveStatus();
-      await sendText(status ?? "Active session is a visual terminal — no text status available.");
-      return;
-    }
-
-    case "/n":
-    case "/new": {
-      const mgr = hybridManager;
-      if (!mgr) { await sendText("No session manager active."); return; }
-      const cwd = process.env.AIBROKER_CWD ?? process.env.HOME ?? "/";
-      const name = args[0] ?? `Session ${Date.now()}`;
-      const session = mgr.createApiSession(name, cwd);
-      await sendText(`Created new API session: "${session.name}" (${session.id})`);
-      return;
-    }
-
-    default:
-      // Numeric shortcut: /1, /2, /3 — switch to session by index
-      if (/^\/\d+$/.test(base)) {
-        const idx = parseInt(base.slice(1), 10);
-        const mgr = hybridManager;
-        if (!mgr) { await sendText("No session manager active."); return; }
-        const session = mgr.switchToIndex(idx);
-        if (session) {
-          await sendText(`Switched to: "${session.name}" (${session.kind})`);
-        } else {
-          await sendText(`No session at index ${idx}.`);
-        }
-        return;
-      }
-
-      log(`[{{ADAPTER_NAME}}] Unknown command: ${cmd}`);
-      await sendText(`Unknown command: ${cmd}\nType /h for help.`);
-  }
-}
-
-// ── Message delivery ─────────────────────────────────────────────────────────
-
-async function deliverMessage(text: string): Promise<void> {
-  const mgr = hybridManager;
-  if (!mgr) {
-    log("[{{ADAPTER_NAME}}] No hybrid manager — dropping message");
-    return;
-  }
-
-  const active = mgr.activeSession;
-  if (!active) {
-    await sendText("No active session. Use /n to create one.");
-    return;
-  }
-
-  if (active.kind === "api") {
-    // Deliver via APIBackend — response comes back asynchronously via deliverViaApi
-    const response = await deliverViaApi(text, async (responseText: string) => {
-      await sendText(responseText);
-    });
-    if (response) {
-      // Synchronous response (some backends return inline)
-      await sendText(response);
-    }
-  } else {
-    // Visual (iTerm2) session — TODO: type into terminal if iTerm2 adapter is available
-    log(`[{{ADAPTER_NAME}}] Visual session delivery not yet implemented`);
-    await sendText("Visual session delivery not yet implemented for this adapter.");
-  }
-}
-
-// ── Help text ────────────────────────────────────────────────────────────────
-
-function buildHelp(): string {
-  return [
-    "*{{DISPLAY_NAME}} Adapter — Commands*",
-    "",
-    "/h, /help       — This help message",
-    "/s, /sessions   — List all sessions",
-    "/ss, /status    — Show active session status",
-    "/n [name]       — Create a new API session",
-    "/1, /2, ...     — Switch to session by index",
-    "",
-    "Any other text is delivered to the active AI session.",
-  ].join("\n");
 }

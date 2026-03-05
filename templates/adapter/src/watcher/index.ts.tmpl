@@ -1,17 +1,11 @@
 /**
  * watcher/index.ts — {{DISPLAY_NAME}} adapter entry point
  *
- * Wires together:
- *   1. Hub detection  — probe AIBroker daemon; enter hub or embedded mode
- *   2. Connection     — connectWatcher() establishes the upstream service link
- *   3. Command router — createMessageHandler() dispatches text / slash commands
- *   4. IPC server     — startIpcServer() accepts calls from hub and MCP tools
- *   5. Hub registration — if hub is running, announce this adapter's socket
+ * Thin transport adapter: connects to {{DISPLAY_NAME}}, forwards all messages
+ * to the AIBroker hub daemon for processing, and delivers hub responses back
+ * via the upstream service.
  *
- * Lifecycle:
- *   watch() → detectHubMode() → connectWatcher() → startIpcServer()
- *          → [hub mode] register_adapter on hub
- *          → await forever (exits on SIGINT / SIGTERM)
+ * Requires the AIBroker daemon to be running. Does not function standalone.
  */
 
 import { unlinkSync } from "node:fs";
@@ -22,11 +16,6 @@ import {
   WatcherClient,
   DAEMON_SOCKET_PATH,
   setAppDir,
-  loadSessionRegistry,
-  APIBackend,
-  HybridSessionManager,
-  setHybridManager,
-  router,
   log,
   setLogPrefix,
   createBrokerMessage,
@@ -41,84 +30,97 @@ import {
   setConnectionStatus,
 } from "./state.js";
 
-// ── Hub detection ─────────────────────────────────────────────────────────────
+// ── Hub connection ──────────────────────────────────────────────────────────
 
 /**
- * Probe the AIBroker hub daemon.
- *
- * Returns true if the hub is reachable on its standard socket within 2 seconds.
- * On any failure the adapter runs in embedded (standalone) mode.
+ * Connect to the AIBroker hub daemon. Retries up to 3 times with 2s delay.
+ * Throws if the hub is not reachable — adapter cannot function without it.
  */
-async function detectHubMode(): Promise<boolean> {
+async function connectToHub(): Promise<WatcherClient> {
   const client = new WatcherClient(DAEMON_SOCKET_PATH);
-  try {
-    const result = await Promise.race([
-      client.call_raw("status", {}),
-      new Promise<null>((_, reject) => setTimeout(() => reject(new Error("timeout")), 2000)),
-    ]);
-    return result !== null;
-  } catch {
-    return false;
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 2000;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const result = await Promise.race([
+        client.call_raw("ping", {}),
+        new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error("timeout")), 2000),
+        ),
+      ]);
+      if (result !== null) return client;
+    } catch {
+      if (attempt < MAX_RETRIES) {
+        log(`Hub not reachable (attempt ${attempt}/${MAX_RETRIES}), retrying in ${RETRY_DELAY}ms...`);
+        await new Promise((r) => setTimeout(r, RETRY_DELAY));
+      }
+    }
   }
+
+  throw new Error(
+    `AIBroker daemon not reachable at ${DAEMON_SOCKET_PATH}. ` +
+    `Start it with: aibroker start`
+  );
+}
+
+/**
+ * Slash commands handled locally (require direct upstream service access).
+ * Everything else goes to the hub.
+ */
+const LOCAL_SLASH_COMMANDS = new Set(["/restart", "/login"]);
+
+function isLocalSlashCommand(text: string): boolean {
+  return LOCAL_SLASH_COMMANDS.has(text.trim());
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 /**
- * Start the {{DISPLAY_NAME}} adapter watcher.
+ * Start the {{DISPLAY_NAME}} adapter watcher — thin transport adapter.
  *
- * Suspends the event loop indefinitely via `await new Promise(() => {})`.
- * Exits only on SIGINT or SIGTERM.
+ * All command handling, session management, TTS, and screenshots are owned
+ * by the AIBroker hub daemon. This process only:
+ * 1. Connects to the upstream service
+ * 2. Forwards incoming messages to the hub
+ * 3. Delivers hub-originated messages via the upstream service (through IPC "deliver")
+ * 4. Handles /restart and /login locally
  */
 export async function watch(): Promise<void> {
   setLogPrefix("{{ADAPTER_NAME}}-watch");
   setAppDir(join(homedir(), ".{{ADAPTER_NAME}}"));
 
-  // Initialise hybrid session manager
-  const apiBackend = new APIBackend({
-    type: "api",
-    provider: "anthropic",
-    model: process.env.AIBROKER_MODEL ?? "sonnet",
-    cwd: process.env.AIBROKER_CWD,
-    maxTurns: Number(process.env.AIBROKER_MAX_TURNS) || 30,
-    maxBudgetUsd: Number(process.env.AIBROKER_MAX_BUDGET) || 1.0,
-    permissionMode: process.env.AIBROKER_PERMISSION_MODE ?? "acceptEdits",
-    skipDefaultSession: true,
-  });
-  const manager = new HybridSessionManager(apiBackend);
-  setHybridManager(manager);
-  manager.createApiSession("Default", process.env.AIBROKER_CWD ?? homedir());
-  router.setDefaultBackend(apiBackend);
-
-  // Detect whether the AIBroker hub daemon is running
-  const hubMode = await detectHubMode();
-  const hubClient = hubMode ? new WatcherClient(DAEMON_SOCKET_PATH) : null;
+  // Connect to AIBroker hub (required — no standalone mode)
+  let hubClient: WatcherClient;
+  try {
+    hubClient = await connectToHub();
+  } catch (err) {
+    console.error(`[{{ADAPTER_NAME}}-watch] FATAL: ${err instanceof Error ? err.message : String(err)}`);
+    console.error("[{{ADAPTER_NAME}}-watch] The AIBroker daemon must be running. Exiting.");
+    process.exit(1);
+  }
 
   console.log(`{{DISPLAY_NAME}} Adapter Watch`);
   console.log(`  Socket:  ${ADAPTER_SOCKET_PATH}`);
-  console.log(`  Mode:    ${hubMode ? "hub (daemon detected)" : "embedded (standalone)"}`);
+  console.log(`  Hub:     ${DAEMON_SOCKET_PATH}`);
   console.log();
-
-  // Restore persisted session state
-  loadSessionRegistry();
 
   // Graceful shutdown
   let cleanupConnection: (() => void) | null = null;
 
   const shutdown = (signal: string) => {
     console.log(`\n[{{ADAPTER_NAME}}-watch] ${signal} received. Stopping.`);
+    clearInterval(heartbeatTimer);
     setConnectionStatus("disconnected");
     if (cleanupConnection) cleanupConnection();
-    if (hubClient) {
-      hubClient.call_raw("unregister_adapter", { name: "{{ADAPTER_NAME}}" }).catch(() => {});
-    }
+    hubClient.call_raw("unregister_adapter", { name: "{{ADAPTER_NAME}}" }).catch(() => {});
     try { unlinkSync(ADAPTER_SOCKET_PATH); } catch { /* ignore */ }
     process.exit(0);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-  // Build the message handler
+  // Local handler for /restart and /login only
   const handleMessage = createMessageHandler();
 
   // Connect to the upstream service
@@ -131,25 +133,25 @@ export async function watch(): Promise<void> {
       adapterStats.messagesReceived++;
       adapterStats.lastMessageAt = timestamp;
 
-      if (hubMode && hubClient) {
-        // Hub mode: forward non-local messages to the hub for routing
-        const message = createBrokerMessage(
-          "{{ADAPTER_NAME}}",
-          text.trim().startsWith("/") ? "command" : "text",
-          { text },
-        );
-        message.timestamp = timestamp;
-
-        hubClient.call_raw("route_message", {
-          message: message as unknown as Record<string, unknown>,
-        }).catch((err) => {
-          log(`Hub route_message failed, handling locally: ${err instanceof Error ? err.message : String(err)}`);
-          handleMessage(text, timestamp);
-        });
-      } else {
-        // Embedded mode: handle everything locally
+      // Local commands stay in the adapter
+      if (isLocalSlashCommand(text)) {
         handleMessage(text, timestamp);
+        return;
       }
+
+      // Everything else → hub
+      const message = createBrokerMessage(
+        "{{ADAPTER_NAME}}",
+        text.trim().startsWith("/") ? "command" : "text",
+        { text },
+      );
+      message.timestamp = timestamp;
+
+      hubClient.call_raw("route_message", {
+        message: message as unknown as Record<string, unknown>,
+      }).catch((err) => {
+        log(`Hub route_message failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
     },
   );
 
@@ -159,18 +161,40 @@ export async function watch(): Promise<void> {
   // Start the adapter IPC server
   startIpcServer(triggerLogin);
 
-  // Register with hub if running
-  if (hubMode && hubClient) {
-    log("Hub mode: registering with AIBroker hub daemon");
-    hubClient.call_raw("register_adapter", {
-      name: "{{ADAPTER_NAME}}",
-      socketPath: ADAPTER_SOCKET_PATH,
-    }).then(() => {
-      log("Registered with AIBroker hub daemon");
-    }).catch((err) => {
-      log(`Hub registration failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
-  }
+  // Register with hub
+  hubClient.call_raw("register_adapter", {
+    name: "{{ADAPTER_NAME}}",
+    socketPath: ADAPTER_SOCKET_PATH,
+  }).then(() => {
+    log("Registered with AIBroker hub daemon");
+  }).catch((err) => {
+    log(`Hub registration failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+
+  // Hub heartbeat — re-register if the daemon restarts
+  const HUB_HEARTBEAT_INTERVAL = 30_000; // 30 seconds
+  const heartbeatTimer = setInterval(async () => {
+    try {
+      const result = await Promise.race([
+        hubClient.call_raw("ping", {}),
+        new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error("timeout")), 5000),
+        ),
+      ]);
+      if (result === null) throw new Error("null response");
+    } catch {
+      // Hub unreachable — try to re-register
+      log("Hub heartbeat failed — attempting re-registration...");
+      hubClient.call_raw("register_adapter", {
+        name: "{{ADAPTER_NAME}}",
+        socketPath: ADAPTER_SOCKET_PATH,
+      }).then(() => {
+        log("Re-registered with AIBroker hub daemon");
+      }).catch((err) => {
+        log(`Hub re-registration failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+  }, HUB_HEARTBEAT_INTERVAL);
 
   // Keep process alive
   await new Promise(() => {});

@@ -81,6 +81,18 @@ export function startIpcServer(triggerLogin: () => Promise<string>): IpcServer {
           await sendFile(filePath, caption, mimetype, recipient);
           break;
         }
+        case "image": {
+          // Image delivery — payload contains base64-encoded buffer and optional caption
+          const buffer = typeof payload.buffer === "string"
+            ? Buffer.from(payload.buffer, "base64")
+            : null;
+          if (!buffer) return { ok: false, error: "deliver(image): buffer is required" };
+          const imgCaption = typeof payload.text === "string" ? payload.text : undefined;
+          // TODO: implement image sending via your SDK. For now, fall back to caption text.
+          if (imgCaption) await sendText(imgCaption, recipient);
+          log(`[{{ADAPTER_NAME}}] deliver(image): ${buffer.length} bytes — implement image sending`);
+          break;
+        }
         case "command": {
           // Commands from the hub (e.g. routed from another adapter) — deliver as text
           const text = typeof payload.text === "string" ? payload.text : String(payload.text ?? "");
