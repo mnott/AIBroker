@@ -7,6 +7,7 @@
 
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { unlinkSync } from "node:fs";
 import { setLogPrefix } from "../core/log.js";
 import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
@@ -65,15 +66,23 @@ export async function startDaemon(options?: {
   console.log(`  Socket:  ${socketPath}`);
   console.log(`  AppDir:  ${appDir}`);
 
-  // Graceful shutdown
+  // Graceful shutdown — ensure socket cleanup even on abrupt exit
   const shutdown = (signal: string) => {
     console.log(`\n[aibroker] ${signal} received. Stopping.`);
     stopWsGateway();
     ipcServer.stop();
+    // Belt-and-suspenders: remove socket in case ipcServer.stop() didn't
+    try { unlinkSync(socketPath); } catch { /* already gone */ }
     process.exit(0);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+  // Clean up on uncaught exceptions too
+  process.on("uncaughtException", (err) => {
+    console.error(`[aibroker] Uncaught exception:`, err);
+    try { unlinkSync(socketPath); } catch { /* ignore */ }
+    process.exit(1);
+  });
 
   await new Promise(() => {});
 }
