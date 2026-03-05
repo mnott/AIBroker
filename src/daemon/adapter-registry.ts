@@ -181,7 +181,10 @@ export class AdapterRegistry {
         const ctx: CommandContext = {
           reply: async (text: string) => {
             if (sourceAdapter) {
-              const replyMsg = createBrokerMessage("hub", "text", { text });
+              const replyMsg = createBrokerMessage("hub", "text", {
+                text,
+                recipient: message.payload.recipient,
+              });
               await this.deliverToAdapter(sourceAdapter, replyMsg);
             } else {
               log(`[hub] no adapter for reply to ${message.source}`);
@@ -192,11 +195,23 @@ export class AdapterRegistry {
               const replyMsg = createBrokerMessage("hub", "image", {
                 text: caption,
                 buffer: buffer.toString("base64"),
+                recipient: message.payload.recipient,
+              });
+              await this.deliverToAdapter(sourceAdapter, replyMsg);
+            }
+          },
+          replyVoice: async (audioBuffer: Buffer, caption: string) => {
+            if (sourceAdapter) {
+              const replyMsg = createBrokerMessage("hub", "voice", {
+                buffer: audioBuffer.toString("base64"),
+                text: caption,
+                recipient: message.payload.recipient,
               });
               await this.deliverToAdapter(sourceAdapter, replyMsg);
             }
           },
           source: message.source,
+          recipient: message.payload.recipient,
         };
         await handler(message.payload.text ?? "", message.timestamp, ctx);
         return { ok: true, deliveredTo: "hub" };

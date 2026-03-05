@@ -708,7 +708,7 @@ end tell`;
     if (activeHybrid?.kind === "api") {
       deliverViaApi(hybridManager!.apiBackend, textToDeliver, activeHybrid.backendSessionId, {
         sendText: (replyText) => ctx.reply(replyText),
-        sendVoice: (_buffer, _transcript) => ctx.reply("[voice reply — not supported in hub mode yet]"),
+        sendVoice: (buffer, transcript) => ctx.replyVoice(buffer, transcript ?? ""),
       });
       return;
     }

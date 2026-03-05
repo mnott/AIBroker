@@ -62,6 +62,7 @@ export async function startDaemon(options?: {
     const fallbackCtx: CommandContext = {
       reply: async (msg) => { log(`[hub fallback reply] ${msg.slice(0, 80)}`); },
       replyImage: async () => { log("[hub fallback] image reply not supported in embedded mode"); },
+      replyVoice: async () => { log("[hub fallback] voice reply not supported in embedded mode"); },
       source: "hub",
     };
     return hubCommandHandler(text, timestamp, fallbackCtx);

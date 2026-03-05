@@ -6,8 +6,8 @@
  * of calling transport-specific functions directly, commands receive a
  * CommandContext that abstracts the reply channel.
  *
- * The hub creates a CommandContext for each incoming message, wiring `reply`
- * and `replyImage` through the adapter registry's delivery mechanism.
+ * The hub creates a CommandContext for each incoming message, wiring `reply`,
+ * `replyImage`, and `replyVoice` through the adapter registry's delivery mechanism.
  */
 
 export interface CommandContext {
@@ -17,6 +17,12 @@ export interface CommandContext {
   /** Send an image reply (screenshot etc.) back through the originating adapter. */
   replyImage: (buffer: Buffer, caption: string) => Promise<void>;
 
+  /** Send a voice note reply back through the originating adapter. */
+  replyVoice: (audioBuffer: Buffer, caption: string) => Promise<void>;
+
   /** The adapter that originated the message ("whazaa", "telex", "pailot"). */
   source: string;
+
+  /** External recipient identifier (phone JID, chat ID) if known. */
+  recipient?: string;
 }
