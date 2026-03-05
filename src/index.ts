@@ -8,6 +8,7 @@
  * - adapters/iterm/  — macOS iTerm2 integration (AppleScript, session management)
  * - adapters/kokoro/ — Kokoro TTS synthesis + Whisper audio transcription
  * - adapters/session/ — SessionBackend: deliver messages via iTerm2 typeIntoSession
+ * - adapters/pailot/  — WebSocket gateway for PAILot iOS app connections
  *
  * Hard rule: this package NEVER imports @whiskeysockets/baileys,
  * telegram/gramjs, better-sqlite3, qrcode, or any transport SDK.
@@ -41,10 +42,12 @@ export {
   commandHandler,
   setCommandHandler,
   sentMessageIds,
+  messageSource,
+  setMessageSource,
   dispatchIncomingMessage,
   enqueueContactMessage,
 } from "./core/state.js";
-export type { CommandHandler } from "./core/state.js";
+export type { CommandHandler, MessageSource } from "./core/state.js";
 export {
   setAppDir,
   getAppDir,
@@ -114,9 +117,26 @@ export {
   WHISPER_MODEL,
 } from "./adapters/kokoro/media.js";
 
+// ── Adapters > PAILot Gateway ──
+export {
+  startWsGateway,
+  stopWsGateway,
+  broadcastText,
+  broadcastImage,
+  broadcastVoice,
+  broadcastStatus,
+  hasPailotClients,
+  setScreenshotHandler,
+} from "./adapters/pailot/gateway.js";
+
 // ── Adapters > Session Backend ──
 export { SessionBackend } from "./adapters/session/backend.js";
 
 // ── Backend ──
 export { APIBackend } from "./backend/api.js";
 export type { APISession, SessionStatus, SessionState } from "./backend/api.js";
+
+// ── Daemon ──
+export { startDaemon, DAEMON_SOCKET_PATH } from "./daemon/index.js";
+export { AdapterRegistry } from "./daemon/adapter-registry.js";
+export type { AdapterDescriptor } from "./daemon/adapter-registry.js";

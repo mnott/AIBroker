@@ -49,9 +49,10 @@ export class WatcherClient {
     return this.call("status", {});
   }
 
-  async send(message: string, recipient?: string): Promise<Record<string, unknown>> {
+  async send(message: string, recipient?: string, channel?: string): Promise<Record<string, unknown>> {
     const params: Record<string, unknown> = { message };
     if (recipient !== undefined) params.recipient = recipient;
+    if (channel !== undefined) params.channel = channel;
     return this.call("send", params);
   }
 
@@ -87,7 +88,7 @@ export class WatcherClient {
     return this.call("history", params as Record<string, unknown>);
   }
 
-  async tts(params: { text: string; voice?: string; jid?: string; recipient?: string }): Promise<Record<string, unknown>> {
+  async tts(params: { text: string; voice?: string; jid?: string; recipient?: string; channel?: string }): Promise<Record<string, unknown>> {
     return this.call("tts", params as Record<string, unknown>);
   }
 
@@ -137,6 +138,16 @@ export class WatcherClient {
 
   async restart(): Promise<Record<string, unknown>> {
     return this.call("restart", {});
+  }
+
+  async broadcastStatus(status: string): Promise<Record<string, unknown>> {
+    return this.call("broadcast_status", { status });
+  }
+
+  // ── Generic call (for daemon CLI and adapter registration) ──
+
+  async call_raw(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.call(method, params);
   }
 
   // ── Internal transport ──
