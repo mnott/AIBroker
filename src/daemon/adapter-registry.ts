@@ -11,6 +11,7 @@ import { WatcherClient } from "../ipc/client.js";
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage, RouteResult } from "../types/broker.js";
 import type { AdapterHealth } from "../types/adapter.js";
+import type { CommandContext } from "./command-context.js";
 
 export interface AdapterDescriptor {
   name: string;       // "whazaa", "telex", "pailot"
@@ -20,10 +21,17 @@ export interface AdapterDescriptor {
 
 const HEALTH_TIMEOUT_MS = 5_000;
 
+type HubCommandHandler = (text: string, timestamp: number, ctx: CommandContext) => void | Promise<void>;
+
 export class AdapterRegistry {
   private readonly adapters = new Map<string, AdapterDescriptor>();
   private readonly lastHealth = new Map<string, AdapterHealth>();
   private pollInterval: ReturnType<typeof setInterval> | null = null;
+  private hubCommandHandler: HubCommandHandler | null = null;
+
+  setCommandHandler(handler: HubCommandHandler): void {
+    this.hubCommandHandler = handler;
+  }
 
   register(descriptor: AdapterDescriptor): void {
     this.adapters.set(descriptor.name, descriptor);
@@ -163,8 +171,36 @@ export class AdapterRegistry {
       return this.deliverToAdapter(adapter, message);
     }
 
-    // Commands with no explicit target -> hub commandHandler
-    if (message.type === "command") {
+    // Commands and text messages with no explicit target -> hub command handler
+    // Text messages from adapters are user input that needs to reach iTerm2/API sessions.
+    if (message.type === "command" || message.type === "text") {
+      const handler = this.hubCommandHandler;
+      if (handler) {
+        const sourceAdapter = this.adapters.get(message.source);
+        const ctx: CommandContext = {
+          reply: async (text: string) => {
+            if (sourceAdapter) {
+              const replyMsg = createBrokerMessage("hub", "text", { text });
+              await this.deliverToAdapter(sourceAdapter, replyMsg);
+            } else {
+              log(`[hub] no adapter for reply to ${message.source}`);
+            }
+          },
+          replyImage: async (buffer: Buffer, caption: string) => {
+            if (sourceAdapter) {
+              const replyMsg = createBrokerMessage("hub", "image", {
+                text: caption,
+                buffer: buffer.toString("base64"),
+              });
+              await this.deliverToAdapter(sourceAdapter, replyMsg);
+            }
+          },
+          source: message.source,
+        };
+        await handler(message.payload.text ?? "", message.timestamp, ctx);
+        return { ok: true, deliveredTo: "hub" };
+      }
+      // Fallback to old-style commandHandler
       if (commandHandler) {
         await commandHandler(message.payload.text ?? "", message.timestamp);
         return { ok: true, deliveredTo: "hub" };

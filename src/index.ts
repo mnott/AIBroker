@@ -138,6 +138,9 @@ export type { APISession, SessionStatus, SessionState } from "./backend/api.js";
 
 // ── Daemon ──
 export { startDaemon, DAEMON_SOCKET_PATH } from "./daemon/index.js";
+export type { CommandContext } from "./daemon/command-context.js";
+export { createHubCommandHandler } from "./daemon/commands.js";
+export { handleScreenshot } from "./daemon/screenshot.js";
 export { AdapterRegistry } from "./daemon/adapter-registry.js";
 export type { AdapterDescriptor } from "./daemon/adapter-registry.js";
 export {

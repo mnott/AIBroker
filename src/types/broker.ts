@@ -9,7 +9,7 @@
 
 import { randomUUID } from "node:crypto";
 
-export type BrokerMessageType = "text" | "voice" | "file" | "command" | "status";
+export type BrokerMessageType = "text" | "voice" | "image" | "file" | "command" | "status";
 
 export interface BrokerMessagePayload {
   text?: string;

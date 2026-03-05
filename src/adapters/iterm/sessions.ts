@@ -54,8 +54,29 @@ export function setItermSessionVar(itermSessionId: string, name: string): void {
 }
 
 export function setItermTabName(itermSessionId: string, name: string): void {
-  const escaped = name.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\n\r]/g, " ");
-  setItermSessionProperty(itermSessionId, `set name to "${escaped}"`);
+  // Use xterm escape sequence ESC ]1;title BEL to set the tab title
+  const escapedName = name.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\n\r]/g, " ");
+  const escapedId = itermSessionId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const script = `tell application "iTerm2"
+  repeat with aWindow in windows
+    repeat with aTab in tabs of aWindow
+      repeat with aSession in sessions of aTab
+        if id of aSession is "${escapedId}" then
+          tell aSession to write text ((ASCII character 27) & "]1;${escapedName}" & (ASCII character 7)) newline no
+          return
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell`;
+  try {
+    execSync(`osascript <<'APPLESCRIPT'\n${script}\nAPPLESCRIPT`, {
+      timeout: 5000,
+      shell: "/bin/bash",
+    });
+  } catch {
+    // silently ignore
+  }
 }
 
 export function getItermSessionVar(itermSessionId: string): string | null {

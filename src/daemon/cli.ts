@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * daemon/cli.ts — CLI for the aibroker daemon.
  *

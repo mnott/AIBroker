@@ -21,11 +21,13 @@ import type { IpcServer } from "../ipc/server.js";
 import type { AdapterRegistry } from "./adapter-registry.js";
 import type { APIBackend } from "../backend/api.js";
 import type { HybridSessionManager } from "../core/hybrid.js";
+import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
-import { broadcastStatus } from "../adapters/pailot/gateway.js";
+import { broadcastStatus, broadcastVoice, broadcastImage } from "../adapters/pailot/gateway.js";
 import { saveVoiceConfig } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig } from "../core/state.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
+import { log } from "../core/log.js";
 
 export function registerCoreHandlers(
   server: IpcServer,
@@ -111,6 +113,118 @@ export function registerCoreHandlers(
     };
   });
 
+  // ── TTS / Voice Pipeline ──
+
+  /**
+   * tts — Convert text to voice note and deliver to requesting adapter.
+   *
+   * The hub generates the audio (Kokoro TTS) and sends the OGG buffer
+   * back to the adapter that requested it (via the "source" field).
+   */
+  server.on("tts", async (req) => {
+    const { text, voice, source, recipient } = req.params as {
+      text?: string;
+      voice?: string;
+      source?: string;
+      recipient?: string;
+    };
+    if (!text) return { ok: false, error: "text is required" };
+
+    const resolvedVoice = voice ?? voiceConfig.defaultVoice;
+
+    try {
+      const { textToVoiceNote } = await import("../adapters/kokoro/tts.js");
+      const audioBuffer = await textToVoiceNote(text, resolvedVoice);
+
+      // If a source adapter is specified, deliver the voice note through it
+      if (source) {
+        const adapter = registry.get(source);
+        if (adapter) {
+          const msg = createBrokerMessage("hub", "voice", {
+            buffer: audioBuffer.toString("base64"),
+            text: text.slice(0, 100),
+            recipient,
+            metadata: { voice: resolvedVoice },
+          });
+          await registry.deliverToAdapter(adapter, msg);
+        }
+      }
+
+      // Also broadcast to PAILot clients
+      broadcastVoice(audioBuffer, text.slice(0, 200));
+
+      return { ok: true, result: { generated: true, voice: resolvedVoice, bytes: audioBuffer.length } };
+    } catch (err) {
+      return { ok: false, error: `TTS failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
+  /**
+   * speak — Play text locally via afplay (no network delivery).
+   */
+  server.on("speak", async (req) => {
+    const { text, voice } = req.params as { text?: string; voice?: string };
+    if (!text) return { ok: false, error: "text is required" };
+
+    try {
+      const { speakLocally } = await import("../adapters/kokoro/tts.js");
+      await speakLocally(text, voice ?? voiceConfig.defaultVoice);
+      return { ok: true, result: { speaking: true } };
+    } catch (err) {
+      return { ok: false, error: `Speak failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
+  /**
+   * dictate — Record from mic and transcribe via Whisper.
+   */
+  server.on("dictate", async (req) => {
+    const { maxDuration } = req.params as { maxDuration?: number };
+
+    try {
+      const { recordFromMic, transcribeLocalAudio } = await import("../adapters/iterm/dictation.js");
+      const audioPath = await recordFromMic(maxDuration ?? 30);
+      const text = await transcribeLocalAudio(audioPath);
+      return { ok: true, result: { text, audioPath } };
+    } catch (err) {
+      return { ok: false, error: `Dictation failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
+  /**
+   * transcribe — Transcribe an audio buffer via Whisper.
+   */
+  server.on("transcribe", async (req) => {
+    const { audioBase64, mimetype } = req.params as { audioBase64?: string; mimetype?: string };
+    if (!audioBase64) return { ok: false, error: "audioBase64 is required" };
+
+    try {
+      const { transcribeAudio, mimetypeToExt } = await import("../adapters/kokoro/media.js");
+      const { writeFileSync, unlinkSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const ext = mimetypeToExt(mimetype ?? "audio/ogg");
+      const tmpPath = join(tmpdir(), `aibroker-transcribe-${Date.now()}.${ext}`);
+      writeFileSync(tmpPath, Buffer.from(audioBase64, "base64"));
+      try {
+        const text = await transcribeAudio(tmpPath);
+        return { ok: true, result: { text } };
+      } finally {
+        try { unlinkSync(tmpPath); } catch { /* ignore */ }
+      }
+    } catch (err) {
+      return { ok: false, error: `Transcription failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
+  /**
+   * list_voices — List available TTS voices.
+   */
+  server.on("list_voices", async (_req) => {
+    const { listVoices } = await import("../adapters/kokoro/tts.js");
+    return { ok: true, result: { voices: listVoices() } };
+  });
+
   // ── PAI Named Sessions ──
 
   server.on("pai_projects", async (_req) => {
@@ -144,6 +258,75 @@ export function registerCoreHandlers(
     manager.registerVisualSession(displayName, project?.rootPath ?? "", itermSessionId);
 
     return { ok: true, result: { itermSessionId, sessionId, name } };
+  });
+
+  // ── Phase 6: Image Generation ──
+
+  /**
+   * generate_image — Generate an image from a text prompt.
+   *
+   * Optionally sends an "on it..." ack and delivers the generated image
+   * back to the requesting adapter.
+   */
+  server.on("generate_image", async (req) => {
+    const { prompt, source, recipient, ack, width, height } = req.params as {
+      prompt?: string;
+      source?: string;
+      recipient?: string;
+      ack?: boolean;
+      width?: number;
+      height?: number;
+    };
+    if (!prompt) return { ok: false, error: "prompt is required" };
+
+    // Send "on it..." ack to the requesting adapter
+    if (ack !== false && source) {
+      const adapter = registry.get(source);
+      if (adapter) {
+        const ackMsg = createBrokerMessage("hub", "text", {
+          text: "On it... generating your image.",
+          recipient,
+        });
+        registry.deliverToAdapter(adapter, ackMsg).catch(() => {});
+      }
+    }
+
+    try {
+      const { generateImage } = await import("./image-gen.js");
+      const result = await generateImage({ prompt, width, height });
+
+      // Deliver image to requesting adapter
+      if (source && result.images.length > 0) {
+        const adapter = registry.get(source);
+        if (adapter) {
+          const imgMsg = createBrokerMessage("hub", "image", {
+            buffer: result.images[0].toString("base64"),
+            caption: prompt.slice(0, 200),
+            recipient,
+            metadata: { model: result.model, durationMs: result.durationMs },
+          });
+          await registry.deliverToAdapter(adapter, imgMsg);
+        }
+      }
+
+      // Also broadcast to PAILot clients
+      if (result.images.length > 0) {
+        broadcastImage(result.images[0], prompt.slice(0, 200));
+      }
+
+      return {
+        ok: true,
+        result: {
+          generated: true,
+          model: result.model,
+          durationMs: result.durationMs,
+          imageCount: result.images.length,
+          bytes: result.images.reduce((s, b) => s + b.length, 0),
+        },
+      };
+    } catch (err) {
+      return { ok: false, error: `Image generation failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
   });
 
   // ── Phase 2: Message Routing ──

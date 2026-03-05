@@ -8,7 +8,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { unlinkSync } from "node:fs";
-import { setLogPrefix } from "../core/log.js";
+import { setLogPrefix, log } from "../core/log.js";
 import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
@@ -18,6 +18,9 @@ import { APIBackend } from "../backend/api.js";
 import { HybridSessionManager, setHybridManager } from "../core/hybrid.js";
 import { router } from "../core/router.js";
 import { loadSessionRegistry, loadVoiceConfig } from "../core/persistence.js";
+import { setCommandHandler } from "../core/state.js";
+import { createHubCommandHandler } from "./commands.js";
+import type { CommandContext } from "./command-context.js";
 
 export const DAEMON_SOCKET_PATH = "/tmp/aibroker.sock";
 
@@ -49,8 +52,22 @@ export async function startDaemon(options?: {
   loadSessionRegistry();
   loadVoiceConfig();
 
-  // Adapter registry (Phase 2 will expand this)
+  // Adapter registry
   const adapterRegistry = new AdapterRegistry();
+
+  // Create the hub command handler
+  const hubCommandHandler = createHubCommandHandler();
+  // Wrap it as a CommandHandler for backward compat (embedded mode fallback)
+  setCommandHandler((text, timestamp) => {
+    const fallbackCtx: CommandContext = {
+      reply: async (msg) => { log(`[hub fallback reply] ${msg.slice(0, 80)}`); },
+      replyImage: async () => { log("[hub fallback] image reply not supported in embedded mode"); },
+      source: "hub",
+    };
+    return hubCommandHandler(text, timestamp, fallbackCtx);
+  });
+  // Wire the full handler with adapter-aware context into the registry
+  adapterRegistry.setCommandHandler(hubCommandHandler);
 
   // IPC server on the hub socket
   const ipcServer = new IpcServer(socketPath);

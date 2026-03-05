@@ -30,7 +30,7 @@ import {
   activeItermSessionId,
   setActiveItermSessionId,
 } from "../../core/state.js";
-import { setItermSessionVar, setItermTabName } from "../iterm/sessions.js";
+import { setItermSessionVar, setItermTabName, killSession } from "../iterm/sessions.js";
 import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, pasteTextIntoSession, snapshotAllSessions } from "../iterm/core.js";
 import { hybridManager } from "../../core/hybrid.js";
 
@@ -110,13 +110,22 @@ function handleSessionsCommand(ws: WebSocket): void {
   const liveIds = new Set(liveSnapshots.map(s => s.id));
   hybridManager.pruneDeadVisualSessions(liveIds);
 
+  // Auto-discover new sessions that aren't in the hybrid manager yet
+  const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+  for (const snap of liveSnapshots) {
+    if (!knownIds.has(snap.id) && (snap.paiName || snap.name.toLowerCase().includes("claude"))) {
+      const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+      hybridManager.registerVisualSession(displayName, "", snap.id);
+    }
+  }
+
   const hybridSessions = hybridManager.listSessions();
   const active = hybridManager.activeSession;
 
   const sessions: WsSession[] = hybridSessions.map((s, i) => ({
     index: i + 1,
     name: s.name,
-    type: s.kind === "visual" ? "claude" as const : "claude" as const,
+    type: "claude" as const,
     kind: s.kind,
     isActive: active ? s.id === active.id : false,
     id: s.backendSessionId,
@@ -211,6 +220,36 @@ function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void
 
   sendTo(ws, { type: "session_renamed", sessionId, name });
   log(`[PAILot] renamed session ${sessionId} to "${name}"`);
+}
+
+function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void {
+  const sessionId = args.sessionId as string | undefined;
+
+  if (!sessionId || !hybridManager) {
+    sendTo(ws, { type: "error", message: "Missing sessionId" });
+    return;
+  }
+
+  // Find session by backendSessionId
+  const sessions = hybridManager.listSessions();
+  const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
+  if (idx < 0) {
+    sendTo(ws, { type: "error", message: "Session not found" });
+    return;
+  }
+
+  const target = sessions[idx];
+  // Kill the iTerm2 session if it's visual
+  if (target.kind === "visual" && target.backendSessionId) {
+    killSession(target.backendSessionId);
+  }
+  const removed = hybridManager.removeByIndex(idx + 1);
+  if (removed) {
+    log(`[PAILot] removed ${removed.kind} session "${removed.name}" (${removed.id})`);
+  }
+
+  // Send updated session list
+  handleSessionsCommand(ws);
 }
 
 async function handleNavCommand(ws: WebSocket, args: Record<string, unknown>): Promise<void> {
@@ -430,6 +469,9 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
               return;
             case "rename":
               handleRenameCommand(ws, args);
+              return;
+            case "remove":
+              handleRemoveCommand(ws, args);
               return;
             case "screenshot":
               // For API sessions, send text status instead of screenshot
