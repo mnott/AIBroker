@@ -14,6 +14,8 @@ export type BrokerMessageType = "text" | "voice" | "image" | "video" | "file" | 
 export interface BrokerMessagePayload {
   text?: string;
   filePath?: string;
+  /** Path to audio file on disk (for voice messages). */
+  audioPath?: string;
   /** Base64-encoded binary data (for voice/file over JSON IPC). */
   buffer?: string;
   mimetype?: string;
