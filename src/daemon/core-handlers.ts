@@ -21,6 +21,7 @@ import type { IpcServer } from "../ipc/server.js";
 import type { AdapterRegistry } from "./adapter-registry.js";
 import type { APIBackend } from "../backend/api.js";
 import type { HybridSessionManager } from "../core/hybrid.js";
+import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus } from "../adapters/pailot/gateway.js";
 import { saveVoiceConfig } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig } from "../core/state.js";
@@ -102,5 +103,25 @@ export function registerCoreHandlers(
         activeSession: manager.activeSession?.name ?? null,
       },
     };
+  });
+
+  // ── Phase 2: Message Routing ──
+
+  /**
+   * route_message — Adapters send messages to the hub for routing.
+   *
+   * The hub inspects the BrokerMessage target and type, then delivers
+   * to the appropriate adapter via its IPC socket ("deliver" method).
+   */
+  server.on("route_message", async (req) => {
+    const { message } = req.params as { message: BrokerMessage };
+    if (!message || !message.source || !message.type) {
+      return { ok: false, error: "Invalid BrokerMessage: source and type are required" };
+    }
+    const result = await registry.route(message);
+    if (result.ok) {
+      return { ok: true, result: result as unknown as Record<string, unknown> };
+    }
+    return { ok: false, error: result.error ?? "Routing failed" };
   });
 }
