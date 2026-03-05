@@ -332,7 +332,11 @@ export function registerCoreHandlers(
   // ── Phase 7: Vision & Understanding ──
 
   /**
-   * analyze_image — Analyze an image using Claude Code (covered by Max plan).
+   * analyze_image — Save image and deliver to active Claude Code session.
+   *
+   * The image is saved to ~/.aibroker/media/ and the path is routed through
+   * the command handler to the active iTerm2 session. Claude Code in that
+   * session reads the image with its Read tool (covered by Max plan).
    */
   server.on("analyze_image", async (req) => {
     const { imageBase64, mimetype, prompt, source, recipient } = req.params as {
@@ -345,23 +349,22 @@ export function registerCoreHandlers(
     if (!imageBase64) return { ok: false, error: "imageBase64 is required" };
 
     try {
-      const { analyzeImage } = await import("./vision.js");
+      const { saveReceivedImage } = await import("./vision.js");
       const imageBuffer = Buffer.from(imageBase64, "base64");
-      const result = await analyzeImage({ imageBuffer, mimetype, prompt });
+      const { path, sizeBytes } = saveReceivedImage(imageBuffer, mimetype);
 
-      // Deliver the analysis text back to the requesting adapter
-      if (source && result.text) {
-        const adapter = registry.get(source);
-        if (adapter) {
-          const replyMsg = createBrokerMessage("hub", "text", {
-            text: result.text,
-            recipient,
-          });
-          await registry.deliverToAdapter(adapter, replyMsg);
-        }
-      }
+      // Route through the command handler → active iTerm2 session
+      const userPrompt = prompt ?? "Analyze this image.";
+      const messageText = `[Image: ${path}] ${userPrompt}`;
 
-      return { ok: true, result: { text: result.text, model: result.model, durationMs: result.durationMs } };
+      const sourceAdapter = source ? registry.get(source) : undefined;
+      const msg = createBrokerMessage(source ?? "hub", "command", {
+        text: messageText,
+        recipient,
+      });
+      await registry.route(msg);
+
+      return { ok: true, result: { saved: true, path, sizeBytes } };
     } catch (err) {
       return { ok: false, error: `Image analysis failed: ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -369,6 +372,9 @@ export function registerCoreHandlers(
 
   /**
    * analyze_video — Analyze a video using Gemini 2.0 Flash (free tier).
+   *
+   * Video can't be read by Claude Code's Read tool, so we use Gemini's
+   * native video understanding and deliver the text result back.
    */
   server.on("analyze_video", async (req) => {
     const { videoBase64, mimetype, prompt, source, recipient } = req.params as {
@@ -393,23 +399,23 @@ export function registerCoreHandlers(
     }
 
     try {
-      const { analyzeVideo } = await import("./vision.js");
+      const { analyzeVideo, saveReceivedVideo } = await import("./vision.js");
+
       const videoBuffer = Buffer.from(videoBase64, "base64");
+      const { path } = saveReceivedVideo(videoBuffer, mimetype);
       const result = await analyzeVideo({ videoBuffer, mimetype, prompt });
 
-      // Deliver the analysis text back
-      if (source && result.text) {
-        const adapter = registry.get(source);
-        if (adapter) {
-          const replyMsg = createBrokerMessage("hub", "text", {
-            text: result.text,
-            recipient,
-          });
-          await registry.deliverToAdapter(adapter, replyMsg);
-        }
+      // Deliver the analysis text to the active session
+      if (result.text) {
+        const analysisText = `[Video analysis of ${path}]\n\n${result.text}`;
+        const msg = createBrokerMessage(source ?? "hub", "command", {
+          text: analysisText,
+          recipient,
+        });
+        await registry.route(msg);
       }
 
-      return { ok: true, result: { text: result.text, model: result.model, durationMs: result.durationMs } };
+      return { ok: true, result: { text: result.text, model: result.model, durationMs: result.durationMs, path } };
     } catch (err) {
       return { ok: false, error: `Video analysis failed: ${err instanceof Error ? err.message : String(err)}` };
     }

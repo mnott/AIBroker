@@ -1,105 +1,54 @@
 /**
  * daemon/vision.ts — Image and video understanding.
  *
- * Image analysis: Uses Claude Code subprocess via Agent SDK (covered by Max plan).
- * The image is written to a temp file, and Claude Code's Read tool analyzes it.
+ * Image analysis: Delivered to the active Claude Code session via iTerm2.
+ * The image is written to a temp file, and the path is typed into the session
+ * so Claude's built-in Read tool can analyze it. Covered by Max plan.
  *
  * Video analysis: Google Gemini 2.0 Flash REST API (free tier: 15 RPM, 1M tokens/day).
  * Only model with native video understanding — no frame extraction needed.
  *
- * No separate API keys needed for image analysis (uses Max plan).
  * Requires GEMINI_API_KEY for video analysis (free tier available).
  */
 
-import { writeFileSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { spawn } from "node:child_process";
+import { join } from "node:path";
 import { log } from "../core/log.js";
 
-interface AnalyzeResult {
-  text: string;
-  model: string;
-  durationMs: number;
-}
+/** Directory for received media files. */
+const MEDIA_DIR = join(homedir(), ".aibroker", "media");
 
-// ── Image Analysis (Claude Code via Agent SDK — Max plan) ──
-
-interface AnalyzeImageOptions {
-  imageBuffer: Buffer;
-  mimetype?: string;
-  prompt?: string;
+interface SaveImageResult {
+  path: string;
+  sizeBytes: number;
 }
 
 /**
- * Analyze an image using Claude Code subprocess (covered by Max plan).
- *
- * Writes the image to a temp file, spawns Claude Code via Agent SDK,
- * which reads the image using its built-in Read tool.
+ * Save a received image to disk and return the path.
+ * The path can be typed into an active Claude Code session for analysis.
  */
-export async function analyzeImage(opts: AnalyzeImageOptions): Promise<AnalyzeResult> {
-  const ext = mimeToExt(opts.mimetype ?? "image/png");
-  const tmpPath = join(tmpdir(), `aibroker-vision-${Date.now()}.${ext}`);
-  const prompt = opts.prompt ?? "Describe this image in detail.";
-  const startMs = Date.now();
+export function saveReceivedImage(imageBuffer: Buffer, mimetype?: string): SaveImageResult {
+  mkdirSync(MEDIA_DIR, { recursive: true });
+  const ext = mimeToExt(mimetype ?? "image/png");
+  const filename = `img-${Date.now()}.${ext}`;
+  const path = join(MEDIA_DIR, filename);
+  writeFileSync(path, imageBuffer);
+  log(`Vision: saved image (${imageBuffer.length} bytes) to ${path}`);
+  return { path, sizeBytes: imageBuffer.length };
+}
 
-  log(`Vision: analyzing image (${opts.imageBuffer.length} bytes) via Claude Code`);
-
-  writeFileSync(tmpPath, opts.imageBuffer);
-
-  try {
-    const { query } = await import("@anthropic-ai/claude-agent-sdk");
-
-    const cleanEnv = { ...process.env };
-    delete cleanEnv.CLAUDECODE;
-    cleanEnv.IS_SANDBOX = "1";
-    if (!cleanEnv.PATH?.includes(".local/bin")) {
-      cleanEnv.PATH = `${homedir()}/.local/bin:${cleanEnv.PATH ?? ""}`;
-    }
-    const claudeBin = `${homedir()}/.local/bin/claude`;
-
-    const chunks: string[] = [];
-
-    for await (const event of query({
-      prompt: `Read and analyze this image file: ${tmpPath}\n\n${prompt}\n\nRespond with ONLY your analysis, no preamble.`,
-      options: {
-        model: "claude-sonnet-4-20250514",
-        cwd: tmpdir(),
-        permissionMode: "acceptEdits" as const,
-        maxTurns: 3,
-        maxBudgetUsd: 0.10,
-        spawnClaudeCodeProcess: ({ args, signal }) => {
-          return spawn(claudeBin, args, {
-            env: cleanEnv,
-            stdio: ["pipe", "pipe", "pipe"],
-            signal,
-          });
-        },
-      },
-    })) {
-      const ev = event as Record<string, unknown>;
-      if (event.type === "assistant") {
-        const msg = ev.message as Record<string, unknown> | undefined;
-        const content = msg?.content;
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block) {
-              chunks.push(block.text as string);
-            }
-          }
-        }
-      }
-    }
-
-    const durationMs = Date.now() - startMs;
-    const text = chunks.join("\n").trim();
-    log(`Vision: image analysis completed in ${durationMs}ms (${text.length} chars)`);
-
-    return { text, model: "claude-sonnet-4-20250514", durationMs };
-  } finally {
-    try { unlinkSync(tmpPath); } catch { /* ignore */ }
-  }
+/**
+ * Save a received video to disk and return the path.
+ */
+export function saveReceivedVideo(videoBuffer: Buffer, mimetype?: string): SaveImageResult {
+  mkdirSync(MEDIA_DIR, { recursive: true });
+  const ext = mimeToExt(mimetype ?? "video/mp4");
+  const filename = `vid-${Date.now()}.${ext}`;
+  const path = join(MEDIA_DIR, filename);
+  writeFileSync(path, videoBuffer);
+  log(`Vision: saved video (${videoBuffer.length} bytes) to ${path}`);
+  return { path, sizeBytes: videoBuffer.length };
 }
 
 // ── Video Analysis (Gemini 2.0 Flash — free tier) ──
@@ -114,11 +63,18 @@ interface AnalyzeVideoOptions {
   model?: string;
 }
 
+interface AnalyzeResult {
+  text: string;
+  model: string;
+  durationMs: number;
+}
+
 /**
  * Analyze a video using Gemini's native video understanding.
  * Free tier: 15 requests/minute, 1M tokens/day.
  *
- * Uses File API for uploads > 20MB, inline data for smaller videos.
+ * Used as a fallback when no active Claude Code session is available,
+ * or for direct video analysis requests.
  */
 export async function analyzeVideo(opts: AnalyzeVideoOptions): Promise<AnalyzeResult> {
   const apiKey = process.env.GEMINI_API_KEY;
