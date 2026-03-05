@@ -16,9 +16,9 @@ import { join } from "node:path";
 import { writeFileSync, readFileSync, existsSync, unlinkSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
-const DEBUG_LOG = "/tmp/pailot-ws-debug.log";
+const DEBUG_LOG = process.env.PAILOT_DEBUG ? "/tmp/pailot-ws-debug.log" : null;
 function dbg(msg: string): void {
-  appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  if (DEBUG_LOG) appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
 }
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
@@ -448,8 +448,8 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
     ws.on("message", (raw) => {
       try {
         const rawStr = raw.toString();
-        dbg(`RAW msg (${rawStr.length} chars): type=${JSON.parse(rawStr).type}, hasAudio=${!!JSON.parse(rawStr).audioBase64}, content=${(JSON.parse(rawStr).content ?? "").slice(0, 50)}`);
         const msg = JSON.parse(rawStr);
+        dbg(`RAW msg (${rawStr.length} chars): type=${msg.type}, hasAudio=${!!msg.audioBase64}, content=${(msg.content ?? "").slice(0, 50)}`);
 
         // Structured commands from PAILot app
         if (msg.type === "command") {
