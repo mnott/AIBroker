@@ -28,6 +28,23 @@ import { saveVoiceConfig } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig } from "../core/state.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { log } from "../core/log.js";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+function getPackageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(__dirname, "..", "..", "package.json"), "utf-8"));
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+const HUB_VERSION = getPackageVersion();
 
 export function registerCoreHandlers(
   server: IpcServer,
@@ -104,7 +121,7 @@ export function registerCoreHandlers(
     return {
       ok: true,
       result: {
-        version: "0.6.0",
+        version: HUB_VERSION,
         adapters: registry.list().map(a => a.name),
         activeSessions: manager.listSessions().length,
         activeSession: manager.activeSession?.name ?? null,
