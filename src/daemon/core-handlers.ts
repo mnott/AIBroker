@@ -329,6 +329,92 @@ export function registerCoreHandlers(
     }
   });
 
+  // ── Phase 7: Vision & Understanding ──
+
+  /**
+   * analyze_image — Analyze an image using Claude Code (covered by Max plan).
+   */
+  server.on("analyze_image", async (req) => {
+    const { imageBase64, mimetype, prompt, source, recipient } = req.params as {
+      imageBase64?: string;
+      mimetype?: string;
+      prompt?: string;
+      source?: string;
+      recipient?: string;
+    };
+    if (!imageBase64) return { ok: false, error: "imageBase64 is required" };
+
+    try {
+      const { analyzeImage } = await import("./vision.js");
+      const imageBuffer = Buffer.from(imageBase64, "base64");
+      const result = await analyzeImage({ imageBuffer, mimetype, prompt });
+
+      // Deliver the analysis text back to the requesting adapter
+      if (source && result.text) {
+        const adapter = registry.get(source);
+        if (adapter) {
+          const replyMsg = createBrokerMessage("hub", "text", {
+            text: result.text,
+            recipient,
+          });
+          await registry.deliverToAdapter(adapter, replyMsg);
+        }
+      }
+
+      return { ok: true, result: { text: result.text, model: result.model, durationMs: result.durationMs } };
+    } catch (err) {
+      return { ok: false, error: `Image analysis failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
+  /**
+   * analyze_video — Analyze a video using Gemini 2.0 Flash (free tier).
+   */
+  server.on("analyze_video", async (req) => {
+    const { videoBase64, mimetype, prompt, source, recipient } = req.params as {
+      videoBase64?: string;
+      mimetype?: string;
+      prompt?: string;
+      source?: string;
+      recipient?: string;
+    };
+    if (!videoBase64) return { ok: false, error: "videoBase64 is required" };
+
+    // Ack — video analysis takes longer
+    if (source) {
+      const adapter = registry.get(source);
+      if (adapter) {
+        const ackMsg = createBrokerMessage("hub", "text", {
+          text: "Analyzing your video...",
+          recipient,
+        });
+        registry.deliverToAdapter(adapter, ackMsg).catch(() => {});
+      }
+    }
+
+    try {
+      const { analyzeVideo } = await import("./vision.js");
+      const videoBuffer = Buffer.from(videoBase64, "base64");
+      const result = await analyzeVideo({ videoBuffer, mimetype, prompt });
+
+      // Deliver the analysis text back
+      if (source && result.text) {
+        const adapter = registry.get(source);
+        if (adapter) {
+          const replyMsg = createBrokerMessage("hub", "text", {
+            text: result.text,
+            recipient,
+          });
+          await registry.deliverToAdapter(adapter, replyMsg);
+        }
+      }
+
+      return { ok: true, result: { text: result.text, model: result.model, durationMs: result.durationMs } };
+    } catch (err) {
+      return { ok: false, error: `Video analysis failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
   // ── Phase 2: Message Routing ──
 
   /**
