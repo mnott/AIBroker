@@ -68,9 +68,21 @@ export function startIpcServer(triggerLogin: () => Promise<string>): IpcServer {
           break;
         }
         case "voice": {
-          const audioPath = typeof payload.audioPath === "string" ? payload.audioPath : null;
-          if (!audioPath) return { ok: false, error: "deliver(voice): audioPath is required" };
-          await sendVoice(audioPath, recipient);
+          // Hub sends pre-encoded audio as base64 buffer, or audioPath as fallback
+          const voiceB64 = typeof payload.buffer === "string" ? payload.buffer : "";
+          if (voiceB64) {
+            // Pre-encoded audio from hub — write to temp file and send
+            const { writeFileSync } = await import("node:fs");
+            const { join } = await import("node:path");
+            const { tmpdir } = await import("node:os");
+            const tmpPath = join(tmpdir(), `{{ADAPTER_NAME}}-voice-${Date.now()}.ogg`);
+            writeFileSync(tmpPath, Buffer.from(voiceB64, "base64"));
+            await sendVoice(tmpPath, recipient);
+          } else {
+            const audioPath = typeof payload.audioPath === "string" ? payload.audioPath : null;
+            if (!audioPath) return { ok: false, error: "deliver(voice): buffer or audioPath is required" };
+            await sendVoice(audioPath, recipient);
+          }
           break;
         }
         case "file": {
