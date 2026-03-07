@@ -31,6 +31,7 @@ import {
   setActiveItermSessionId,
 } from "../../core/state.js";
 import { setItermSessionVar, setItermTabName, killSession, createClaudeSession } from "../iterm/sessions.js";
+import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
 import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, pasteTextIntoSession, snapshotAllSessions } from "../iterm/core.js";
 import { hybridManager } from "../../core/hybrid.js";
 
@@ -363,21 +364,31 @@ function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void
   handleSessionsCommand(ws);
 }
 
-function handleCreateCommand(ws: WebSocket): void {
-  const sessionId = createClaudeSession();
+function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}): void {
+  const projectName = args.project as string | undefined;
+  const path = args.path as string | undefined;
+
+  // PAI project launch — async path
+  if (projectName) {
+    handleCreateFromProject(ws, projectName);
+    return;
+  }
+
+  // Custom path — cd then claude
+  const command = path ? `cd ${path.replace(/"/g, '\\"')} && claude` : "claude";
+  const name = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
+
+  const sessionId = createClaudeSession(command);
   if (!sessionId) {
     sendTo(ws, { type: "error", message: "Failed to create new session" });
     return;
   }
 
-  // Tag it with paiName so it shows up in filtering
-  setItermSessionVar(sessionId, "Claude");
-  setItermTabName(sessionId, "Claude");
+  setItermSessionVar(sessionId, name);
+  setItermTabName(sessionId, name);
 
-  // Register in hybrid manager
   if (hybridManager) {
-    hybridManager.registerVisualSession("Claude", "", sessionId);
-    // Switch to the new session
+    hybridManager.registerVisualSession(name, "", sessionId);
     const sessions = hybridManager.listSessions();
     const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
     if (idx >= 0) {
@@ -386,9 +397,49 @@ function handleCreateCommand(ws: WebSocket): void {
     }
   }
 
-  log(`[PAILot] created new Claude session (${sessionId.slice(0, 8)}...)`);
-  sendTo(ws, { type: "session_switched", name: "Claude", sessionId });
+  log(`[PAILot] created new session "${name}" (${sessionId.slice(0, 8)}...)`);
+  sendTo(ws, { type: "session_switched", name, sessionId });
   handleSessionsCommand(ws);
+}
+
+async function handleCreateFromProject(ws: WebSocket, projectName: string): Promise<void> {
+  try {
+    const { itermSessionId } = await launchPaiProject(projectName);
+    const displayName = projectName;
+
+    if (hybridManager) {
+      hybridManager.registerVisualSession(displayName, "", itermSessionId);
+      const sessions = hybridManager.listSessions();
+      const idx = sessions.findIndex(s => s.backendSessionId === itermSessionId);
+      if (idx >= 0) {
+        hybridManager.switchToIndex(idx + 1);
+        setActiveItermSessionId(itermSessionId);
+      }
+    }
+
+    log(`[PAILot] launched PAI project "${projectName}" (${itermSessionId.slice(0, 8)}...)`);
+    sendTo(ws, { type: "session_switched", name: displayName, sessionId: itermSessionId });
+    handleSessionsCommand(ws);
+  } catch (err) {
+    log(`[PAILot] project launch failed: ${err}`);
+    sendTo(ws, { type: "error", message: `Failed to launch project: ${err instanceof Error ? err.message : String(err)}` });
+  }
+}
+
+async function handleProjectsCommand(ws: WebSocket): Promise<void> {
+  try {
+    const projects = await listPaiProjects();
+    const list = projects.map(p => ({
+      name: p.displayName || p.name,
+      slug: p.slug,
+      path: p.rootPath,
+      sessions: p.sessionCount,
+    }));
+    sendTo(ws, { type: "projects", projects: list });
+  } catch (err) {
+    log(`[PAILot] projects list failed: ${err}`);
+    sendTo(ws, { type: "projects", projects: [] });
+  }
 }
 
 async function handleNavCommand(ws: WebSocket, args: Record<string, unknown>): Promise<void> {
@@ -625,7 +676,10 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
               handleRemoveCommand(ws, args);
               return;
             case "create":
-              handleCreateCommand(ws);
+              handleCreateCommand(ws, args);
+              return;
+            case "projects":
+              handleProjectsCommand(ws);
               return;
             case "screenshot":
               // For API sessions, send text status instead of screenshot
