@@ -51,6 +51,58 @@ interface WsSession {
 let wss: WebSocketServer | null = null;
 const clients = new Set<WebSocket>();
 
+// --- Message outbox for offline clients ---
+// Buffers messages when no client is connected so they can be replayed on reconnect.
+// Only text messages are buffered fully; voice/image are counted but not stored (too large).
+const MAX_OUTBOX = 50;
+interface OutboxEntry {
+  msg: Record<string, unknown>;
+  timestamp: number;
+}
+const outbox: OutboxEntry[] = [];
+let missedVoiceCount = 0;
+let missedImageCount = 0;
+
+function addToOutbox(msg: Record<string, unknown>): void {
+  const type = msg.type as string;
+  // Skip typing indicators — not useful to replay
+  if (type === "typing") return;
+  // Count but don't buffer screenshots (very large, less important)
+  if (type === "image") { missedImageCount++; return; }
+  // Buffer text, voice, sessions, errors, etc.
+  outbox.push({ msg, timestamp: Date.now() });
+  if (outbox.length > MAX_OUTBOX) outbox.shift();
+}
+
+function drainOutbox(ws: WebSocket): void {
+  if (outbox.length === 0 && missedVoiceCount === 0 && missedImageCount === 0) return;
+
+  // Send a summary of what was missed
+  const textCount = outbox.filter(e => (e.msg.type as string) === "text").length;
+  const voiceCount = outbox.filter(e => (e.msg.type as string) === "voice").length;
+  const otherCount = outbox.length - textCount - voiceCount;
+  const parts: string[] = [];
+  if (textCount > 0) parts.push(`${textCount} text message(s)`);
+  if (voiceCount > 0) parts.push(`${voiceCount} voice note(s)`);
+  if (missedImageCount > 0) parts.push(`${missedImageCount} image(s)`);
+  if (otherCount > 0) parts.push(`${otherCount} other`);
+
+  sendTo(ws, {
+    type: "text",
+    content: `📬 While you were away: ${parts.join(", ")}`,
+  });
+
+  // Replay buffered text messages
+  for (const entry of outbox) {
+    sendTo(ws, entry.msg);
+  }
+
+  // Clear outbox
+  outbox.length = 0;
+  missedVoiceCount = 0;
+  missedImageCount = 0;
+}
+
 // Reference to the screenshot handler — set via setScreenshotHandler()
 // to avoid circular imports (screenshot.ts imports from state.ts which
 // would create a cycle if we imported it here directly).
@@ -414,12 +466,18 @@ function sendTo(ws: WebSocket, msg: Record<string, unknown>): void {
 }
 
 function broadcast(msg: Record<string, unknown>): void {
-  if (clients.size === 0) return;
+  // Check if any client is actually ready to receive
+  let delivered = false;
   const payload = JSON.stringify(msg);
   for (const ws of clients) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(payload);
+      delivered = true;
     }
+  }
+  // No connected clients — buffer for later
+  if (!delivered) {
+    addToOutbox(msg);
   }
 }
 
@@ -595,6 +653,7 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
         // Voice message — transcribe with Whisper then route
         if (msg.type === "voice" && msg.audioBase64) {
           dbg(`Voice message received, audioBase64 length: ${(msg.audioBase64 as string).length}`);
+          broadcast({ type: "typing", typing: true });
           const voiceMsgId = typeof msg.messageId === "string" ? msg.messageId : undefined;
           transcribeAndRoute(msg.audioBase64 as string, onMessage, voiceMsgId).catch((err) => {
             log(`[PAILot] voice transcription error: ${err}`);
@@ -630,6 +689,7 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
 
         log(`[PAILot] ← ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
 
+        broadcast({ type: "typing", typing: true });
         setMessageSource("pailot");
         onMessage(text, Date.now());
         setMessageSource("whatsapp");
@@ -648,8 +708,9 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
       clients.delete(ws);
     });
 
-    // Welcome
+    // Welcome + replay missed messages
     sendTo(ws, { type: "text", content: "Connected to PAILot gateway." });
+    drainOutbox(ws);
   });
 
   wss.on("error", (err) => {
@@ -661,6 +722,7 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
  * Broadcast a text message to all connected PAILot clients.
  */
 export function broadcastText(text: string): void {
+  broadcast({ type: "typing", typing: false });
   broadcast({ type: "text", content: text });
 }
 
@@ -669,6 +731,7 @@ export function broadcastText(text: string): void {
  * Converts OGG Opus to M4A (AAC) since iOS can't play OGG natively.
  */
 export async function broadcastVoice(audioBuffer: Buffer, transcript: string): Promise<void> {
+  broadcast({ type: "typing", typing: false });
   let sendBuffer = audioBuffer;
 
   // Convert OGG Opus → M4A for iOS compatibility
