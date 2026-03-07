@@ -7,7 +7,7 @@
  * all tool calls through the hub to the appropriate adapter.
  *
  * Tool groups:
- *   - aibroker_*  (14) — hub-level: status, sessions, TTS, dictation, image gen
+ *   - aibroker_*  (17) — hub-level: status, sessions, TTS, dictation, image gen, session orchestration
  *   - whatsapp_*  (11) — proxied to whazaa adapter via adapter_call
  *   - telegram_*  (11) — proxied to telex adapter via adapter_call
  *   - pailot_*     (3) — direct hub calls for PAILot mobile app
@@ -253,6 +253,55 @@ server.tool(
   async ({ name }) => {
     try {
       const r = await hub.call_raw("pai_launch", { name });
+      return ok(JSON.stringify(r, null, 2));
+    } catch (e) { return err(e); }
+  },
+);
+
+// ── Session Orchestration ──
+
+server.tool(
+  "aibroker_session_content",
+  "Read raw terminal content from iTerm2 Claude Code sessions. Returns last N lines + busy/idle state + whether content changed since last probe. Omit sessionId for all sessions.",
+  {
+    sessionId: z.string().optional().describe("iTerm2 session ID. Omit to read all sessions."),
+    lines: z.number().min(10).max(500).optional().describe("Number of lines to read (default 100)"),
+  },
+  async ({ sessionId, lines }) => {
+    try {
+      const r = await hub.call_raw("session_content", { sessionId, lines });
+      return ok(JSON.stringify(r, null, 2));
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_cache_status",
+  "Store a parsed summary for a session. Call after parsing raw terminal content from aibroker_session_content. The summary is cached so future probes skip re-parsing if content unchanged.",
+  {
+    sessionId: z.string().describe("iTerm2 session ID"),
+    sessionName: z.string().optional().describe("Human-readable session name"),
+    summary: z.string().describe("1-2 sentence parsed summary of what the session is doing"),
+    contentHash: z.string().optional().describe("Content hash from session_content (for change detection)"),
+    state: z.enum(["idle", "busy", "error", "disconnected"]).optional().describe("Session state (default: idle)"),
+  },
+  async ({ sessionId, sessionName, summary, contentHash, state }) => {
+    try {
+      const r = await hub.call_raw("cache_status", { sessionId, sessionName, summary, contentHash, state });
+      return ok(JSON.stringify(r, null, 2));
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_get_cached_status",
+  "Retrieve cached session status summaries without re-probing terminal content. Fast lookup of previously parsed summaries.",
+  {
+    sessionId: z.string().optional().describe("iTerm2 session ID. Omit for all cached snapshots."),
+  },
+  async ({ sessionId }) => {
+    try {
+      const r = await hub.call_raw("get_cached_status", { sessionId });
       return ok(JSON.stringify(r, null, 2));
     } catch (e) { return err(e); }
   },

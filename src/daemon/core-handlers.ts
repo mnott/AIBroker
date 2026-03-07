@@ -30,6 +30,8 @@ import { voiceConfig, setVoiceConfig } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
+import { readSessionContent, readAllSessionContent } from "./session-content.js";
+import { statusCache, hashContent } from "../core/status-cache.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -447,6 +449,118 @@ export function registerCoreHandlers(
     } catch (err) {
       return { ok: false, error: `Video analysis failed: ${err instanceof Error ? err.message : String(err)}` };
     }
+  });
+
+  // ── Session Orchestration (Phase 1) ──
+
+  /**
+   * session_content — Read raw terminal content from iTerm2 sessions.
+   *
+   * If sessionId is provided, reads that specific session.
+   * If omitted, reads all sessions. Returns raw content + busy/idle flag
+   * + whether content has changed since last probe (via content hash).
+   */
+  server.on("session_content", async (req) => {
+    const { sessionId, lines } = req.params as {
+      sessionId?: string;
+      lines?: number;
+    };
+
+    const lineCount = lines ?? 100;
+
+    if (sessionId) {
+      const content = readSessionContent(sessionId, lineCount);
+      if (!content) return { ok: false, error: `Session ${sessionId} not found in iTerm2` };
+
+      const contentHash = hashContent(content.content);
+      const changed = statusCache.hasChanged(sessionId, contentHash);
+      const cached = statusCache.get(sessionId);
+
+      if (!changed) {
+        statusCache.touch(sessionId);
+      }
+
+      return {
+        ok: true,
+        result: {
+          session: {
+            ...content,
+            contentHash,
+            changed,
+            cachedSummary: cached?.summary ?? null,
+            cachedAt: cached?.timestamp ?? null,
+          },
+        },
+      };
+    }
+
+    // All sessions
+    const contents = readAllSessionContent(lineCount);
+    const sessions = contents.map((c) => {
+      const contentHash = hashContent(c.content);
+      const changed = statusCache.hasChanged(c.sessionId, contentHash);
+      const cached = statusCache.get(c.sessionId);
+      if (!changed) statusCache.touch(c.sessionId);
+
+      return {
+        ...c,
+        contentHash,
+        changed,
+        cachedSummary: cached?.summary ?? null,
+        cachedAt: cached?.timestamp ?? null,
+      };
+    });
+
+    return { ok: true, result: { sessions } };
+  });
+
+  /**
+   * cache_status — Store a parsed summary for a session.
+   *
+   * Called by the requesting session's AI after parsing raw terminal content.
+   * The summary is cached with the content hash so future probes can skip parsing
+   * if content hasn't changed.
+   */
+  server.on("cache_status", async (req) => {
+    const { sessionId, sessionName, summary, contentHash, state } = req.params as {
+      sessionId?: string;
+      sessionName?: string;
+      summary?: string;
+      contentHash?: string;
+      state?: "idle" | "busy" | "error" | "disconnected";
+    };
+    if (!sessionId) return { ok: false, error: "sessionId is required" };
+    if (!summary) return { ok: false, error: "summary is required" };
+
+    statusCache.set(sessionId, {
+      sessionId,
+      sessionName: sessionName ?? sessionId,
+      timestamp: Date.now(),
+      state: state ?? "idle",
+      summary,
+      contentHash: contentHash ?? "",
+      lastProbeAt: Date.now(),
+    });
+
+    return { ok: true, result: { cached: true, sessionId } };
+  });
+
+  /**
+   * get_cached_status — Retrieve cached session summaries without re-probing.
+   *
+   * If sessionId is provided, returns that session's cached snapshot.
+   * If omitted, returns all cached snapshots.
+   */
+  server.on("get_cached_status", async (req) => {
+    const { sessionId } = req.params as { sessionId?: string };
+
+    if (sessionId) {
+      const cached = statusCache.get(sessionId);
+      if (!cached) return { ok: true, result: { snapshot: null } };
+      return { ok: true, result: { snapshot: cached } };
+    }
+
+    return { ok: true, result: { snapshots: statusCache.getAll() } };
   });
 
   // ── Unified MCP Support ──
