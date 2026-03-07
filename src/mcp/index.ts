@@ -84,6 +84,29 @@ const server = new McpServer(
       "All outgoing messages are tagged so companion apps can distinguish PAI from user:",
       "- **Text messages**: prefixed with U+FEFF (zero-width no-break space, invisible in WhatsApp).",
       "- **All messages (text + voice)**: Baileys message IDs start with `3EB0`. User phone IDs do not.",
+      "",
+      "### Session Orchestration",
+      "",
+      "AIBroker can read terminal content from all running Claude Code sessions.",
+      "Use these tools to check what other sessions are doing without switching to them.",
+      "",
+      "**Workflow for checking session status:**",
+      "1. Call `aibroker_session_content()` (no args = all sessions, or pass `sessionId` for one)",
+      "2. You receive raw terminal output + `atPrompt` (idle) flag + `changed` (content changed since last check)",
+      "3. If `changed` is true: parse the raw content into a 1-2 sentence summary",
+      "4. Cache your summary via `aibroker_cache_status({ sessionId, summary, contentHash, state })`",
+      "5. If `changed` is false: use `cachedSummary` from the response (skip re-parsing)",
+      "",
+      "**Quick status check (no re-parsing):**",
+      "Call `aibroker_get_cached_status()` to get all previously cached summaries instantly.",
+      "",
+      "**State mapping:**",
+      "- `atPrompt: true` → state: `idle` (session waiting for input)",
+      "- `atPrompt: false` → state: `busy` (Claude is working)",
+      "",
+      "**Response format:**",
+      "Present status as a compact table with session name, state (idle/busy), and summary.",
+      "For voice responses, read it as a natural sentence.",
     ].join("\n"),
   },
 );
@@ -654,7 +677,8 @@ server.tool(
   { message: z.string().min(1).describe("Message text") },
   async ({ message }) => {
     try {
-      await hub.call_raw("pailot_send", { text: message });
+      const sessionId = process.env.ITERM_SESSION_ID?.split(":")[1];
+      await hub.call_raw("pailot_send", { text: message, sessionId });
       return ok("Sent.");
     } catch (e) { return err(e); }
   },
@@ -669,7 +693,8 @@ server.tool(
   },
   async ({ message, voice }) => {
     try {
-      const r = await hub.call_raw("pailot_send", { text: message, voice: true, voiceName: voice }) as any;
+      const sessionId = process.env.ITERM_SESSION_ID?.split(":")[1];
+      const r = await hub.call_raw("pailot_send", { text: message, voice: true, voiceName: voice, sessionId }) as any;
       const chunks = r?.chunks ?? 1;
       return ok(chunks > 1 ? `Sent ${chunks} voice notes.` : "Sent.");
     } catch (e) { return err(e); }

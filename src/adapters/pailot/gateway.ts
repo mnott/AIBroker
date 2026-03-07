@@ -720,17 +720,19 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
 
 /**
  * Broadcast a text message to all connected PAILot clients.
+ * @param sessionId — iTerm session ID of the originating Claude session
  */
-export function broadcastText(text: string): void {
+export function broadcastText(text: string, sessionId?: string): void {
   broadcast({ type: "typing", typing: false });
-  broadcast({ type: "text", content: text });
+  broadcast({ type: "text", content: text, ...(sessionId && { sessionId }) });
 }
 
 /**
  * Broadcast a voice note to all connected PAILot clients.
  * Converts OGG Opus to M4A (AAC) since iOS can't play OGG natively.
+ * @param sessionId — iTerm session ID of the originating Claude session
  */
-export async function broadcastVoice(audioBuffer: Buffer, transcript: string): Promise<void> {
+export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string): Promise<void> {
   broadcast({ type: "typing", typing: false });
   let sendBuffer = audioBuffer;
 
@@ -755,17 +757,20 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string): P
     type: "voice",
     content: transcript,
     audioBase64: sendBuffer.toString("base64"),
+    ...(sessionId && { sessionId }),
   });
 }
 
 /**
  * Broadcast a screenshot/image to all connected PAILot clients.
+ * @param sessionId — iTerm session ID of the originating Claude session
  */
-export function broadcastImage(imageBuffer: Buffer, caption?: string): void {
+export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string): void {
   broadcast({
     type: "image",
     imageBase64: imageBuffer.toString("base64"),
     caption: caption ?? "Screenshot",
+    ...(sessionId && { sessionId }),
   });
 }
 

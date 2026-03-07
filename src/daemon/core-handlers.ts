@@ -600,10 +600,11 @@ export function registerCoreHandlers(
    * pailot_send — Send text or voice to PAILot app clients via WS gateway.
    */
   server.on("pailot_send", async (req) => {
-    const { text, voice, voiceName } = req.params as {
+    const { text, voice, voiceName, sessionId } = req.params as {
       text?: string;
       voice?: boolean;
       voiceName?: string;
+      sessionId?: string;
     };
     if (!text) return { ok: false, error: "text is required" };
 
@@ -619,11 +620,11 @@ export function registerCoreHandlers(
           // First chunk gets the full original text as transcript;
           // subsequent chunks get empty transcript (audio only)
           const transcript = i === 0 ? plainText : "";
-          await broadcastVoice(audioBuffer, transcript);
+          await broadcastVoice(audioBuffer, transcript, sessionId);
         }
         return { ok: true, result: { sent: true, chunks: chunks.length } };
       } else {
-        broadcastText(text);
+        broadcastText(text, sessionId);
       }
       return { ok: true, result: { sent: true } };
     } catch (e) {
