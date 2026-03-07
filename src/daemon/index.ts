@@ -158,8 +158,7 @@ export async function startDaemon(options?: {
   setScreenshotHandler(async (source) => {
     const ctx: CommandContext = {
       reply: async (text) => { broadcastText(text); },
-      // no-op: handleScreenshot() already calls broadcastImage() directly
-      replyImage: async () => {},
+      replyImage: async (buf, caption) => { broadcastImage(buf, caption); },
       replyVoice: async () => {},
       source: source ?? "pailot",
     };
