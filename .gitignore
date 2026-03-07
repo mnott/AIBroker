@@ -31,6 +31,7 @@ yarn-error.log*
 # Session notes and task tracking (local only)
 Notes/
 tasks/
+memory/
 
 # Whisper test artifacts
 test_noise.*
