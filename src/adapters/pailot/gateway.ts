@@ -79,12 +79,17 @@ function isClaudeRelated(snap: ReturnType<typeof snapshotAllSessions>[0]): boole
   return false;
 }
 
-/** Detect which iTerm2 session is currently focused and sync the hybrid manager to it. */
-function handleSyncCommand(ws: WebSocket): void {
+/** Detect which iTerm2 session is currently focused and sync the hybrid manager to it.
+ *  If the client passes activeSessionId, preserve that selection instead of
+ *  jumping to whatever iTerm has focused on the Mac.
+ */
+function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void {
   if (!hybridManager) {
     handleSessionsCommand(ws);
     return;
   }
+
+  const clientActiveId = typeof args?.activeSessionId === "string" ? args.activeSessionId : undefined;
 
   // Auto-discover Claude-related iTerm2 tabs so freshly-started daemons can match
   const liveSnapshots = snapshotAllSessions();
@@ -102,7 +107,21 @@ function handleSyncCommand(ws: WebSocket): void {
     }
   }
 
-  // Ask iTerm2 which session is focused right now
+  // If the client had a session open, try to restore it
+  if (clientActiveId) {
+    const sessions = hybridManager.listSessions();
+    const idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
+    if (idx >= 0) {
+      hybridManager.switchToIndex(idx + 1);
+      setActiveItermSessionId(clientActiveId);
+      log(`[PAILot] sync: restored client session "${sessions[idx].name}" (${clientActiveId.slice(0, 8)}...)`);
+      handleSessionsCommand(ws);
+      return;
+    }
+    // Client's session no longer exists — fall through to iTerm focus
+  }
+
+  // No client preference — ask iTerm2 which session is focused right now
   const focusedId = runAppleScript(`tell application "iTerm2"
   try
     return id of current session of current tab of current window
@@ -435,7 +454,8 @@ const execFileAsync = promisify(execFile);
 
 async function transcribeAndRoute(
   audioBase64: string,
-  onMessage: (text: string, timestamp: number) => void | Promise<void>
+  onMessage: (text: string, timestamp: number) => void | Promise<void>,
+  messageId?: string,
 ): Promise<void> {
   const base = `pailot-voice-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const audioFile = join(tmpdir(), `${base}.m4a`);
@@ -480,6 +500,11 @@ async function transcribeAndRoute(
     }
 
     log(`[PAILot] Transcription: ${transcript.slice(0, 80)}${transcript.length > 80 ? "..." : ""}`);
+
+    // Reflect transcript back to the app so the voice bubble shows text
+    if (messageId) {
+      broadcast({ type: "transcript", messageId, content: transcript });
+    }
 
     // Batch: accumulate transcripts and reset the timer
     voiceBatchTranscripts.push(transcript);
@@ -530,7 +555,7 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
               handleSessionsCommand(ws);
               return;
             case "sync":
-              handleSyncCommand(ws);
+              handleSyncCommand(ws, args);
               return;
             case "switch":
               handleSwitchCommand(ws, args);
@@ -570,7 +595,8 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
         // Voice message — transcribe with Whisper then route
         if (msg.type === "voice" && msg.audioBase64) {
           dbg(`Voice message received, audioBase64 length: ${(msg.audioBase64 as string).length}`);
-          transcribeAndRoute(msg.audioBase64 as string, onMessage).catch((err) => {
+          const voiceMsgId = typeof msg.messageId === "string" ? msg.messageId : undefined;
+          transcribeAndRoute(msg.audioBase64 as string, onMessage, voiceMsgId).catch((err) => {
             log(`[PAILot] voice transcription error: ${err}`);
           });
           return;

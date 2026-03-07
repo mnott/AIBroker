@@ -620,8 +620,9 @@ server.tool(
   },
   async ({ message, voice }) => {
     try {
-      await hub.call_raw("pailot_send", { text: message, voice: true, voiceName: voice });
-      return ok("Sent.");
+      const r = await hub.call_raw("pailot_send", { text: message, voice: true, voiceName: voice }) as any;
+      const chunks = r?.chunks ?? 1;
+      return ok(chunks > 1 ? `Sent ${chunks} voice notes.` : "Sent.");
     } catch (e) { return err(e); }
   },
 );

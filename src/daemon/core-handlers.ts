@@ -27,6 +27,8 @@ import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig } from "../core/state.js";
+import { splitIntoChunks } from "../adapters/kokoro/media.js";
+import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
@@ -495,8 +497,17 @@ export function registerCoreHandlers(
       if (voice) {
         const { textToVoiceNote } = await import("../adapters/kokoro/tts.js");
         const resolvedVoice = voiceName ?? voiceConfig.defaultVoice;
-        const audioBuffer = await textToVoiceNote(text, resolvedVoice);
-        broadcastVoice(audioBuffer, text.slice(0, 200));
+        const plainText = stripMarkdown(text);
+        const chunks = splitIntoChunks(plainText);
+        for (let i = 0; i < chunks.length; i++) {
+          if (i > 0) await new Promise((r) => setTimeout(r, 1000));
+          const audioBuffer = await textToVoiceNote(chunks[i], resolvedVoice);
+          // First chunk gets the full original text as transcript;
+          // subsequent chunks get empty transcript (audio only)
+          const transcript = i === 0 ? plainText : "";
+          await broadcastVoice(audioBuffer, transcript);
+        }
+        return { ok: true, result: { sent: true, chunks: chunks.length } };
       } else {
         broadcastText(text);
       }
