@@ -26,7 +26,7 @@ import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig } from "../core/persistence.js";
-import { voiceConfig, setVoiceConfig } from "../core/state.js";
+import { voiceConfig, setVoiceConfig, activeItermSessionId } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
@@ -600,13 +600,15 @@ export function registerCoreHandlers(
    * pailot_send — Send text or voice to PAILot app clients via WS gateway.
    */
   server.on("pailot_send", async (req) => {
-    const { text, voice, voiceName, sessionId } = req.params as {
+    const { text, voice, voiceName, sessionId: callerSessionId } = req.params as {
       text?: string;
       voice?: boolean;
       voiceName?: string;
       sessionId?: string;
     };
     if (!text) return { ok: false, error: "text is required" };
+    // MCP server may not have ITERM_SESSION_ID — fall back to daemon's active session
+    const sessionId = callerSessionId || activeItermSessionId || undefined;
 
     try {
       if (voice) {

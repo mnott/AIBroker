@@ -93,7 +93,7 @@ function drainOutbox(ws: WebSocket): void {
     content: `📬 While you were away: ${parts.join(", ")}`,
   });
 
-  // Replay buffered text messages
+  // Replay buffered messages
   for (const entry of outbox) {
     sendTo(ws, entry.msg);
   }
@@ -139,6 +139,7 @@ function isClaudeRelated(snap: ReturnType<typeof snapshotAllSessions>[0]): boole
 function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void {
   if (!hybridManager) {
     handleSessionsCommand(ws);
+    drainOutbox(ws);
     return;
   }
 
@@ -169,6 +170,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
       setActiveItermSessionId(clientActiveId);
       log(`[PAILot] sync: restored client session "${sessions[idx].name}" (${clientActiveId.slice(0, 8)}...)`);
       handleSessionsCommand(ws);
+      drainOutbox(ws);
       return;
     }
     // Client's session no longer exists — fall through to iTerm focus
@@ -196,8 +198,9 @@ end tell`)?.trim() ?? "";
     }
   }
 
-  // Return sessions with updated active state
+  // Return sessions with updated active state, then drain buffered messages
   handleSessionsCommand(ws);
+  drainOutbox(ws);
 }
 
 function handleSessionsCommand(ws: WebSocket): void {
@@ -640,6 +643,44 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
 
   wss.on("listening", () => {
     log(`WebSocket gateway listening on ws://0.0.0.0:${WS_PORT}`);
+
+    // Pre-populate hybrid manager with live iTerm sessions so messages
+    // can be tagged with sessionId even before a PAILot client connects.
+    if (hybridManager) {
+      try {
+        const liveSnapshots = snapshotAllSessions();
+        const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+        const seenTabs = new Set<string>();
+        for (const snap of liveSnapshots) {
+          if (!isClaudeRelated(snap)) continue;
+          const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+          if (seenTabs.has(displayName)) continue;
+          seenTabs.add(displayName);
+          if (!knownIds.has(snap.id)) {
+            hybridManager.registerVisualSession(displayName, "", snap.id);
+          }
+        }
+        // Also set the active session based on current iTerm focus
+        const focusedId = runAppleScript(`tell application "iTerm2"
+  try
+    return id of current session of current tab of current window
+  on error
+    return ""
+  end try
+end tell`)?.trim() ?? "";
+        if (focusedId) {
+          const sessions = hybridManager.listSessions();
+          const idx = sessions.findIndex(s => s.backendSessionId === focusedId);
+          if (idx >= 0) {
+            hybridManager.switchToIndex(idx + 1);
+            setActiveItermSessionId(focusedId);
+          }
+        }
+        log(`Pre-registered ${hybridManager.listSessions().length} session(s) from live iTerm`);
+      } catch (err) {
+        log(`Failed to pre-register sessions: ${err}`);
+      }
+    }
   });
 
   wss.on("connection", (ws, req) => {
@@ -652,6 +693,12 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
         const rawStr = raw.toString();
         const msg = JSON.parse(rawStr);
         dbg(`RAW msg (${rawStr.length} chars): type=${msg.type}, hasAudio=${!!msg.audioBase64}, content=${(msg.content ?? "").slice(0, 50)}`);
+
+        // Heartbeat ping — reply with pong immediately
+        if (msg.type === "ping") {
+          sendTo(ws, { type: "pong" });
+          return;
+        }
 
         // Structured commands from PAILot app
         if (msg.type === "command") {
@@ -762,9 +809,9 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
       clients.delete(ws);
     });
 
-    // Welcome + replay missed messages
+    // Welcome — outbox drains after client sends "sync" command
+    // (so activeSessionId is set before messages arrive)
     sendTo(ws, { type: "text", content: "Connected to PAILot gateway." });
-    drainOutbox(ws);
   });
 
   wss.on("error", (err) => {
@@ -776,9 +823,17 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
  * Broadcast a text message to all connected PAILot clients.
  * @param sessionId — iTerm session ID of the originating Claude session
  */
+function resolveSessionId(sessionId?: string): string | undefined {
+  if (sessionId) return sessionId;
+  if (activeItermSessionId) return activeItermSessionId;
+  // Last resort: ask hybrid manager for the active session's backend ID
+  return hybridManager?.activeSession?.backendSessionId || undefined;
+}
+
 export function broadcastText(text: string, sessionId?: string): void {
+  const resolvedSession = resolveSessionId(sessionId);
   broadcast({ type: "typing", typing: false });
-  broadcast({ type: "text", content: text, ...(sessionId && { sessionId }) });
+  broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) });
 }
 
 /**
@@ -787,6 +842,7 @@ export function broadcastText(text: string, sessionId?: string): void {
  * @param sessionId — iTerm session ID of the originating Claude session
  */
 export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string): Promise<void> {
+  const resolvedSession = resolveSessionId(sessionId);
   broadcast({ type: "typing", typing: false });
   let sendBuffer = audioBuffer;
 
@@ -811,7 +867,7 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
     type: "voice",
     content: transcript,
     audioBase64: sendBuffer.toString("base64"),
-    ...(sessionId && { sessionId }),
+    ...(resolvedSession && { sessionId: resolvedSession }),
   });
 }
 
@@ -820,11 +876,12 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
  * @param sessionId — iTerm session ID of the originating Claude session
  */
 export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string): void {
+  const resolvedSession = resolveSessionId(sessionId);
   broadcast({
     type: "image",
     imageBase64: imageBuffer.toString("base64"),
     caption: caption ?? "Screenshot",
-    ...(sessionId && { sessionId }),
+    ...(resolvedSession && { sessionId: resolvedSession }),
   });
 }
 
