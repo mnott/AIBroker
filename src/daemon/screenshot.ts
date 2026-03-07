@@ -108,14 +108,16 @@ end tell`;
 
       lastScreenshotContent = stdout;
 
-      // Send to PAILot
-      const cleaned = stdout
-        .split("\n")
-        .filter((line: string) => !/^[─━═┄┈╌╍┅┉]{3,}\s*$/.test(line.trim()))
-        .filter((line: string) => line.trim() !== "")
-        .slice(-50)
-        .join("\n");
-      broadcastText(`Terminal capture (screen locked):\n\n${cleaned}`);
+      // Send to PAILot (skip if the request came from PAILot — ctx.reply handles it)
+      if (ctx.source !== "pailot") {
+        const cleaned = stdout
+          .split("\n")
+          .filter((line: string) => !/^[─━═┄┈╌╍┅┉]{3,}\s*$/.test(line.trim()))
+          .filter((line: string) => line.trim() !== "")
+          .slice(-50)
+          .join("\n");
+        broadcastText(`Terminal capture (screen locked):\n\n${cleaned}`);
+      }
 
       // Send to originating adapter
       const maxLen = 4000;
@@ -145,7 +147,7 @@ export async function handleScreenshot(ctx: CommandContext): Promise<void> {
         .slice(-30)
         .join("\n");
       if (lines) {
-        broadcastText(lines);
+        if (ctx.source !== "pailot") broadcastText(lines);
         await ctx.reply(`*Terminal (unchanged):*\n\n\`\`\`\n${lines}\n\`\`\``);
         log("/ss: content unchanged, sent tail as text");
         return;
@@ -255,12 +257,12 @@ end tell`;
     }
 
     log(`/ss: capturing screen region ${bounds} (iTerm2 window ${windowId})`);
-    execSync(`screencapture -x -R ${bounds} "${filePath}"`, { timeout: 15_000 });
+    execSync(`/usr/sbin/screencapture -x -R ${bounds} "${filePath}"`, { timeout: 15_000 });
 
     const buffer = readFileSync(filePath);
 
-    // Send to PAILot WebSocket clients
-    broadcastImage(buffer, "Screenshot");
+    // Send to PAILot WebSocket clients (skip if request came from PAILot)
+    if (ctx.source !== "pailot") broadcastImage(buffer, "Screenshot");
 
     // Send to originating adapter
     await ctx.replyImage(buffer, "Screenshot");
@@ -268,8 +270,14 @@ end tell`;
     log("/ss: screenshot sent");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log(`/ss: error — ${msg}`);
-    await ctx.reply(`Error taking screenshot: ${msg}`);
+    log(`/ss: screencapture failed — ${msg}`);
+
+    // If screencapture failed (e.g. screen locked but ioreg didn't detect it,
+    // or "could not create image from rect"), fall back to text mode
+    log("/ss: falling back to terminal text capture");
+    try { unlinkSync(filePath); } catch { /* ignore */ }
+    await handleTextScreenshot(ctx);
+    return;
   } finally {
     try { unlinkSync(filePath); } catch { /* ignore */ }
   }

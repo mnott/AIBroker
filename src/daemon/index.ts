@@ -13,7 +13,8 @@ import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
-import { startWsGateway, stopWsGateway } from "../adapters/pailot/gateway.js";
+import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastImage } from "../adapters/pailot/gateway.js";
+import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
 import { HybridSessionManager, setHybridManager } from "../core/hybrid.js";
 import { router } from "../core/router.js";
@@ -21,6 +22,7 @@ import { loadSessionRegistry, loadVoiceConfig } from "../core/persistence.js";
 import { setCommandHandler } from "../core/state.js";
 import { createHubCommandHandler } from "./commands.js";
 import type { CommandContext } from "./command-context.js";
+import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -36,6 +38,29 @@ function getVersion(): string {
 }
 
 export const DAEMON_SOCKET_PATH = "/tmp/aibroker.sock";
+
+const KNOWN_ADAPTERS: { name: string; socketPath: string }[] = [
+  { name: "whazaa", socketPath: "/tmp/whazaa-watcher.sock" },
+  { name: "telex", socketPath: "/tmp/telex-watcher.sock" },
+];
+
+async function discoverRunningAdapters(registry: AdapterRegistry): Promise<void> {
+  for (const { name, socketPath } of KNOWN_ADAPTERS) {
+    if (registry.get(name)) continue; // already registered
+    if (!existsSync(socketPath)) continue;
+    try {
+      const client = new WatcherClient(socketPath);
+      await Promise.race([
+        client.call_raw("health", {}),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 3000)),
+      ]);
+      registry.register({ name, socketPath, registeredAt: Date.now() });
+      log(`[hub] auto-discovered adapter: ${name}`);
+    } catch {
+      // Socket exists but adapter not responding — skip
+    }
+  }
+}
 
 export async function startDaemon(options?: {
   appDir?: string;
@@ -120,9 +145,25 @@ export async function startDaemon(options?: {
   ipcServer.start();
   adapterRegistry.startHealthPolling();
 
+  // Auto-discover adapters that were already running before the hub (re)started.
+  // Probe well-known socket paths and register any that respond to "ping".
+  void discoverRunningAdapters(adapterRegistry);
+
   // PAILot WebSocket gateway
   startWsGateway((text: string, timestamp: number) => {
     adapterRegistry.dispatchIncoming("pailot", text, timestamp);
+  });
+
+  // Wire screenshot handler so PAILot /ss commands work
+  setScreenshotHandler(async (source) => {
+    const ctx: CommandContext = {
+      reply: async (text) => { broadcastText(text); },
+      // no-op: handleScreenshot() already calls broadcastImage() directly
+      replyImage: async () => {},
+      replyVoice: async () => {},
+      source: source ?? "pailot",
+    };
+    await handleScreenshot(ctx);
   });
 
   console.log(`AIBroker daemon v${getVersion()} started`);

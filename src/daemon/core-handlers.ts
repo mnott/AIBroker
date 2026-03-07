@@ -23,7 +23,8 @@ import type { APIBackend } from "../backend/api.js";
 import type { HybridSessionManager } from "../core/hybrid.js";
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
-import { broadcastStatus, broadcastVoice, broadcastImage } from "../adapters/pailot/gateway.js";
+import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
+import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig } from "../core/state.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
@@ -444,6 +445,141 @@ export function registerCoreHandlers(
     } catch (err) {
       return { ok: false, error: `Video analysis failed: ${err instanceof Error ? err.message : String(err)}` };
     }
+  });
+
+  // ── Unified MCP Support ──
+
+  /**
+   * adapter_call — Proxy an IPC call to a named adapter through the hub.
+   * The unified MCP server uses this to reach adapter-specific methods
+   * (send, receive, contacts, history, etc.) without knowing socket paths.
+   */
+  server.on("adapter_call", async (req) => {
+    const { adapter, method, params } = req.params as {
+      adapter: string;
+      method: string;
+      params?: Record<string, unknown>;
+    };
+    if (!adapter) return { ok: false, error: "adapter is required" };
+    if (!method) return { ok: false, error: "method is required" };
+
+    const desc = registry.get(adapter);
+    if (!desc) {
+      return { ok: false, error: `Adapter '${adapter}' not registered. Is the ${adapter} daemon running?` };
+    }
+
+    try {
+      const client = new WatcherClient(desc.socketPath);
+      const forwardParams: Record<string, unknown> = { ...(params ?? {}), sessionId: req.sessionId };
+      if (req.itermSessionId) forwardParams.itermSessionId = req.itermSessionId;
+      const result = await client.call_raw(method, forwardParams);
+      return { ok: true, result };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: `adapter_call to ${adapter}.${method} failed: ${msg}` };
+    }
+  });
+
+  /**
+   * pailot_send — Send text or voice to PAILot app clients via WS gateway.
+   */
+  server.on("pailot_send", async (req) => {
+    const { text, voice, voiceName } = req.params as {
+      text?: string;
+      voice?: boolean;
+      voiceName?: string;
+    };
+    if (!text) return { ok: false, error: "text is required" };
+
+    try {
+      if (voice) {
+        const { textToVoiceNote } = await import("../adapters/kokoro/tts.js");
+        const resolvedVoice = voiceName ?? voiceConfig.defaultVoice;
+        const audioBuffer = await textToVoiceNote(text, resolvedVoice);
+        broadcastVoice(audioBuffer, text.slice(0, 200));
+      } else {
+        broadcastText(text);
+      }
+      return { ok: true, result: { sent: true } };
+    } catch (e) {
+      return { ok: false, error: `pailot_send failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  });
+
+  /**
+   * pailot_receive — Drain the PAILot message queue.
+   * Currently proxied to whazaa adapter's receive with from='pailot'.
+   */
+  server.on("pailot_receive", async (req) => {
+    const adapterName = registry.get("whazaa") ? "whazaa" : "telex";
+    const desc = registry.get(adapterName);
+    if (!desc) return { ok: true, result: { messages: [] } };
+
+    try {
+      const client = new WatcherClient(desc.socketPath);
+      const result = await client.call_raw("receive", {
+        from: "pailot",
+        sessionId: req.sessionId,
+      });
+      return { ok: true, result };
+    } catch {
+      return { ok: true, result: { messages: [] } };
+    }
+  });
+
+  /**
+   * rename — Rename session in hub + forward to all adapters.
+   */
+  server.on("rename", async (req) => {
+    const { name } = req.params as { name: string };
+    if (!name) return { ok: false, error: "name is required" };
+
+    // Update in hub's session manager
+    const session = manager.activeSession;
+    if (session) manager.updateName(session.id, name);
+
+    // Forward to all adapters (best effort)
+    for (const adapter of registry.list()) {
+      try {
+        const client = new WatcherClient(adapter.socketPath);
+        await client.call_raw("rename", { name, sessionId: req.sessionId });
+      } catch { /* best effort */ }
+    }
+    return { ok: true, result: { success: true, name } };
+  });
+
+  /**
+   * discover — Proxy to first available adapter for iTerm2 session scan.
+   */
+  server.on("discover", async (req) => {
+    const adapters = registry.list();
+    if (adapters.length === 0) return { ok: false, error: "No adapters registered" };
+    try {
+      const client = new WatcherClient(adapters[0].socketPath);
+      const result = await client.call_raw("discover", { sessionId: req.sessionId });
+      return { ok: true, result };
+    } catch (e) {
+      return { ok: false, error: `discover failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  });
+
+  /**
+   * command — Execute a slash command through the hub command handler.
+   */
+  server.on("command", async (req) => {
+    const { text } = req.params as { text: string };
+    if (!text) return { ok: false, error: "text is required" };
+
+    // Try the hub's command handler first
+    const adapters = registry.list();
+    if (adapters.length > 0) {
+      try {
+        const client = new WatcherClient(adapters[0].socketPath);
+        const result = await client.call_raw("command", { text, sessionId: req.sessionId });
+        return { ok: true, result };
+      } catch { /* fall through */ }
+    }
+    return { ok: true, result: { executed: true, command: text } };
   });
 
   // ── Phase 2: Message Routing ──

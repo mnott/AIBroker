@@ -303,6 +303,10 @@ export function createHubCommandHandler(): (
     // --- /sessions (aliases: /s) — list sessions ---
     if (trimmedText === "/sessions" || trimmedText === "/s") {
       if (hybridManager) {
+        // Prune dead visual sessions before listing
+        const liveSnapshots = snapshotAllSessions();
+        const liveIds = new Set(liveSnapshots.map(s => s.id));
+        hybridManager.pruneDeadVisualSessions(liveIds);
         const list = hybridManager.formatSessionList();
         ctx.reply(list).catch(() => {});
         return;

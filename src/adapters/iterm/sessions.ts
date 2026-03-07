@@ -54,29 +54,13 @@ export function setItermSessionVar(itermSessionId: string, name: string): void {
 }
 
 export function setItermTabName(itermSessionId: string, name: string): void {
-  // Use xterm escape sequence ESC ]1;title BEL to set the tab title
-  const escapedName = name.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\n\r]/g, " ");
-  const escapedId = itermSessionId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const script = `tell application "iTerm2"
-  repeat with aWindow in windows
-    repeat with aTab in tabs of aWindow
-      repeat with aSession in sessions of aTab
-        if id of aSession is "${escapedId}" then
-          tell aSession to write text ((ASCII character 27) & "]1;${escapedName}" & (ASCII character 7)) newline no
-          return
-        end if
-      end repeat
-    end repeat
-  end repeat
-end tell`;
-  try {
-    execSync(`osascript <<'APPLESCRIPT'\n${script}\nAPPLESCRIPT`, {
-      timeout: 5000,
-      shell: "/bin/bash",
-    });
-  } catch {
-    // silently ignore
-  }
+  // Fire-and-forget: rename the tab via iTerm2's native WebSocket API.
+  // This sets the persistent title override (same as double-click rename).
+  import("./iterm2-api.js").then(({ iterm2SetTabTitle }) =>
+    iterm2SetTabTitle(itermSessionId, name).catch((err) =>
+      log(`Tab rename failed: ${err instanceof Error ? err.message : String(err)}`),
+    ),
+  );
 }
 
 export function getItermSessionVar(itermSessionId: string): string | null {

@@ -30,7 +30,7 @@ import {
   activeItermSessionId,
   setActiveItermSessionId,
 } from "../../core/state.js";
-import { setItermSessionVar, setItermTabName, killSession } from "../iterm/sessions.js";
+import { setItermSessionVar, setItermTabName, killSession, createClaudeSession } from "../iterm/sessions.js";
 import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, pasteTextIntoSession, snapshotAllSessions } from "../iterm/core.js";
 import { hybridManager } from "../../core/hybrid.js";
 
@@ -66,11 +66,40 @@ export function setScreenshotHandler(handler: (source?: "whatsapp" | "pailot") =
 
 // --- Structured command handling ---
 
+/**
+ * Filter: include only Claude-related sessions.
+ * A session qualifies if it has paiName, name contains "claude",
+ * or is not at shell prompt (has a process running — likely Claude).
+ */
+function isClaudeRelated(snap: ReturnType<typeof snapshotAllSessions>[0]): boolean {
+  if (snap.paiName) return true;
+  const name = (snap.tabTitle ?? snap.name).toLowerCase();
+  if (name.includes("claude")) return true;
+  if (!snap.atPrompt) return true;
+  return false;
+}
+
 /** Detect which iTerm2 session is currently focused and sync the hybrid manager to it. */
 function handleSyncCommand(ws: WebSocket): void {
   if (!hybridManager) {
     handleSessionsCommand(ws);
     return;
+  }
+
+  // Auto-discover Claude-related iTerm2 tabs so freshly-started daemons can match
+  const liveSnapshots = snapshotAllSessions();
+  const liveIds = new Set(liveSnapshots.map(s => s.id));
+  hybridManager.pruneDeadVisualSessions(liveIds);
+  const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+  const seenTabs = new Set<string>();
+  for (const snap of liveSnapshots) {
+    if (!isClaudeRelated(snap)) continue;
+    const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+    if (seenTabs.has(displayName)) continue;
+    seenTabs.add(displayName);
+    if (!knownIds.has(snap.id)) {
+      hybridManager.registerVisualSession(displayName, "", snap.id);
+    }
   }
 
   // Ask iTerm2 which session is focused right now
@@ -110,12 +139,21 @@ function handleSessionsCommand(ws: WebSocket): void {
   const liveIds = new Set(liveSnapshots.map(s => s.id));
   hybridManager.pruneDeadVisualSessions(liveIds);
 
-  // Auto-discover new sessions that aren't in the hybrid manager yet
+  // Auto-discover Claude-related iTerm2 tabs not yet in the hybrid manager,
+  // and sync names of existing sessions from live iTerm state.
+  // Deduplicate by tab title — only register first session per tab.
   const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+  const seenTabs = new Set<string>();
   for (const snap of liveSnapshots) {
-    if (!knownIds.has(snap.id) && (snap.paiName || snap.name.toLowerCase().includes("claude"))) {
-      const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+    if (!isClaudeRelated(snap)) continue;
+    const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+    if (seenTabs.has(displayName)) continue; // skip split panes in same tab
+    seenTabs.add(displayName);
+    if (!knownIds.has(snap.id)) {
       hybridManager.registerVisualSession(displayName, "", snap.id);
+    } else {
+      // Sync name from iTerm (handles double-click renames)
+      hybridManager.updateName(snap.id, displayName);
     }
   }
 
@@ -219,6 +257,8 @@ function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void
   }
 
   sendTo(ws, { type: "session_renamed", sessionId, name });
+  // Send updated sessions list so PAILot refreshes the header
+  handleSessionsCommand(ws);
   log(`[PAILot] renamed session ${sessionId} to "${name}"`);
 }
 
@@ -249,6 +289,34 @@ function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void
   }
 
   // Send updated session list
+  handleSessionsCommand(ws);
+}
+
+function handleCreateCommand(ws: WebSocket): void {
+  const sessionId = createClaudeSession();
+  if (!sessionId) {
+    sendTo(ws, { type: "error", message: "Failed to create new session" });
+    return;
+  }
+
+  // Tag it with paiName so it shows up in filtering
+  setItermSessionVar(sessionId, "Claude");
+  setItermTabName(sessionId, "Claude");
+
+  // Register in hybrid manager
+  if (hybridManager) {
+    hybridManager.registerVisualSession("Claude", "", sessionId);
+    // Switch to the new session
+    const sessions = hybridManager.listSessions();
+    const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
+    if (idx >= 0) {
+      hybridManager.switchToIndex(idx + 1);
+      setActiveItermSessionId(sessionId);
+    }
+  }
+
+  log(`[PAILot] created new Claude session (${sessionId.slice(0, 8)}...)`);
+  sendTo(ws, { type: "session_switched", name: "Claude", sessionId });
   handleSessionsCommand(ws);
 }
 
@@ -473,6 +541,9 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
             case "remove":
               handleRemoveCommand(ws, args);
               return;
+            case "create":
+              handleCreateCommand(ws);
+              return;
             case "screenshot":
               // For API sessions, send text status instead of screenshot
               if (hybridManager?.activeSession?.kind === "api") {
@@ -505,13 +576,34 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
           return;
         }
 
+        // Image message — save to temp file, route caption as text
+        // NOTE: Do NOT send the file path to Claude Code — it tries to read .jpg files
+        // as images, which corrupts the conversation context with unprocessable image data.
+        if (msg.type === "image" && msg.imageBase64) {
+          const ext = (msg.mimeType ?? "image/jpeg").includes("png") ? "png" : "jpg";
+          const imgPath = join(tmpdir(), `pailot-img-${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`);
+          const imgBuf = Buffer.from(msg.imageBase64 as string, "base64");
+          writeFileSync(imgPath, imgBuf);
+          log(`[PAILot] Image saved (${imgBuf.length} bytes) → ${imgPath}`);
+          const caption = (msg.caption as string) || "";
+          // Embed the path inside parentheses so Claude Code doesn't auto-attach
+          // the .jpg as an image (which corrupts the session if the API rejects it).
+          // Claude can still use the Read tool to view it.
+          const routeText = caption
+            ? `${caption} (image at ${imgPath})`
+            : `(image at ${imgPath})`;
+          setMessageSource("pailot");
+          onMessage(routeText, Date.now());
+          setMessageSource("whatsapp");
+          return;
+        }
+
         // Plain text message — route through handleMessage
         const text = msg.content ?? "";
         if (!text.trim()) return;
 
         log(`[PAILot] ← ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
 
-        // Set source so commands handler uses [PAILot] prefix
         setMessageSource("pailot");
         onMessage(text, Date.now());
         setMessageSource("whatsapp");

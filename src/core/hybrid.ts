@@ -168,6 +168,15 @@ export class HybridSessionManager {
     return pruned;
   }
 
+  /** Update the name of a session identified by its backend ID. */
+  updateName(backendSessionId: string, newName: string): void {
+    const s = this.sessions.find(s => s.backendSessionId === backendSessionId);
+    if (s && s.name !== newName) {
+      log(`HybridManager: name sync "${s.name}" → "${newName}"`);
+      s.name = newName;
+    }
+  }
+
   /** All sessions in creation order. */
   listSessions(): HybridSession[] {
     return [...this.sessions];

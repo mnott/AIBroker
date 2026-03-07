@@ -13,6 +13,7 @@ import type { BrokerMessage, RouteResult } from "../types/broker.js";
 import type { AdapterHealth } from "../types/adapter.js";
 import { validateAdapterHealth } from "../ipc/validate.js";
 import type { CommandContext } from "./command-context.js";
+import { broadcastText, broadcastImage, broadcastVoice } from "../adapters/pailot/gateway.js";
 
 export interface AdapterDescriptor {
   name: string;       // "whazaa", "telex", "pailot"
@@ -179,9 +180,12 @@ export class AdapterRegistry {
       const handler = this.hubCommandHandler;
       if (handler) {
         const sourceAdapter = this.adapters.get(message.source);
+        const isPailot = message.source === "pailot";
         const ctx: CommandContext = {
           reply: async (text: string) => {
-            if (sourceAdapter) {
+            if (isPailot) {
+              broadcastText(text);
+            } else if (sourceAdapter) {
               const replyMsg = createBrokerMessage("hub", "text", {
                 text,
                 recipient: message.payload.recipient,
@@ -192,7 +196,9 @@ export class AdapterRegistry {
             }
           },
           replyImage: async (buffer: Buffer, caption: string) => {
-            if (sourceAdapter) {
+            if (isPailot) {
+              broadcastImage(buffer, caption);
+            } else if (sourceAdapter) {
               const replyMsg = createBrokerMessage("hub", "image", {
                 text: caption,
                 buffer: buffer.toString("base64"),
@@ -202,7 +208,9 @@ export class AdapterRegistry {
             }
           },
           replyVoice: async (audioBuffer: Buffer, caption: string) => {
-            if (sourceAdapter) {
+            if (isPailot) {
+              broadcastVoice(audioBuffer, caption);
+            } else if (sourceAdapter) {
               const replyMsg = createBrokerMessage("hub", "voice", {
                 buffer: audioBuffer.toString("base64"),
                 text: caption,
