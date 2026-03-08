@@ -53,6 +53,13 @@ interface WsSession {
 
 let wss: WebSocketServer | null = null;
 const clients = new Set<WebSocket>();
+
+/** Maps PAILot session ID → iTerm session ID for explicit reply routing.
+ *  When PAILot sends a message tagged with sessionId, we record it here so
+ *  outbound replies go back tagged with the same sessionId — regardless of
+ *  which iTerm tab happens to be focused on the Mac at response time.
+ */
+const pailotReplyMap = new Map<string, string>();
 /** Track when each client last proved it's alive (pong, message, or connect). */
 const clientLastActive = new Map<WebSocket, number>();
 /** Consider a client "alive" if it responded within this window. */
@@ -604,18 +611,26 @@ const BATCH_WINDOW_MS = 3000;
 let voiceBatchTimer: ReturnType<typeof setTimeout> | null = null;
 let voiceBatchTranscripts: string[] = [];
 let voiceBatchOnMessage: ((text: string, timestamp: number) => void | Promise<void>) | null = null;
+/** iTerm session ID resolved when the first voice chunk of this batch arrived. */
+let voiceBatchSessionId: string = "";
 
 function flushVoiceBatch(): void {
   if (voiceBatchTranscripts.length === 0) return;
   const combined = voiceBatchTranscripts.join(" ");
   const handler = voiceBatchOnMessage;
+  const batchSession = voiceBatchSessionId;
   voiceBatchTranscripts = [];
   voiceBatchOnMessage = null;
+  voiceBatchSessionId = "";
   voiceBatchTimer = null;
 
   if (handler) {
     log(`[PAILot] Flushing voice batch (${combined.length} chars)`);
-    setLastRoutedSessionId(activeItermSessionId);
+    const routeSession = batchSession || activeItermSessionId;
+    if (routeSession) {
+      pailotReplyMap.set(routeSession, routeSession);
+      setLastRoutedSessionId(routeSession);
+    }
     setMessageSource("pailot");
     handler(`[PAILot:voice] ${combined}`, Date.now());
     setMessageSource("whatsapp");
@@ -819,11 +834,38 @@ end tell`)?.trim() ?? "";
           }
         }
 
+        // Extract the session ID that PAILot says this message belongs to.
+        // This is the iTerm session ID the user was viewing when they typed/spoke.
+        // We use it for routing instead of guessing from activeItermSessionId.
+        const pailotSessionId = typeof msg.sessionId === "string" ? msg.sessionId : undefined;
+
+        // Helper: resolve the routing target for this message.
+        // Prefers the explicit PAILot session ID; falls back to active session.
+        const routeTarget = pailotSessionId || activeItermSessionId;
+
+        // If PAILot told us the session, switch iTerm to it (for stdin routing)
+        // and record it in the reply map so outbound replies go to the same session.
+        if (pailotSessionId) {
+          pailotReplyMap.set(pailotSessionId, pailotSessionId);
+          setLastRoutedSessionId(pailotSessionId);
+          // Switch iTerm to the correct session if it differs from the active one
+          if (pailotSessionId !== activeItermSessionId) {
+            setActiveItermSessionId(pailotSessionId);
+            if (hybridManager) {
+              const sessions = hybridManager.listSessions();
+              const idx = sessions.findIndex(s => s.backendSessionId === pailotSessionId);
+              if (idx >= 0) hybridManager.switchToIndex(idx + 1);
+            }
+          }
+        }
+
         // Voice message — transcribe with Whisper then route
         if (msg.type === "voice" && msg.audioBase64) {
           dbg(`Voice message received, audioBase64 length: ${(msg.audioBase64 as string).length}`);
-          broadcast({ type: "typing", typing: true, ...(activeItermSessionId && { sessionId: activeItermSessionId }) });
+          broadcast({ type: "typing", typing: true, ...(routeTarget && { sessionId: routeTarget }) });
           const voiceMsgId = typeof msg.messageId === "string" ? msg.messageId : undefined;
+          // Capture the routing session for this batch (first chunk wins)
+          if (!voiceBatchSessionId && routeTarget) voiceBatchSessionId = routeTarget;
           transcribeAndRoute(msg.audioBase64 as string, onMessage, voiceMsgId).catch((err) => {
             log(`[PAILot] voice transcription error: ${err}`);
           });
@@ -846,7 +888,7 @@ end tell`)?.trim() ?? "";
           const routeText = caption
             ? `${caption} (image at ${imgPath})`
             : `(image at ${imgPath})`;
-          setLastRoutedSessionId(activeItermSessionId);
+          if (!pailotSessionId) setLastRoutedSessionId(activeItermSessionId);
           setMessageSource("pailot");
           onMessage(routeText, Date.now());
           setMessageSource("whatsapp");
@@ -859,8 +901,8 @@ end tell`)?.trim() ?? "";
 
         log(`[PAILot] ← ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
 
-        broadcast({ type: "typing", typing: true, ...(activeItermSessionId && { sessionId: activeItermSessionId }) });
-        setLastRoutedSessionId(activeItermSessionId);
+        broadcast({ type: "typing", typing: true, ...(routeTarget && { sessionId: routeTarget }) });
+        if (!pailotSessionId) setLastRoutedSessionId(activeItermSessionId);
         setMessageSource("pailot");
         onMessage(text, Date.now());
         setMessageSource("whatsapp");
@@ -896,7 +938,14 @@ end tell`)?.trim() ?? "";
  * @param sessionId — iTerm session ID of the originating Claude session
  */
 function resolveSessionId(sessionId?: string): string | undefined {
-  if (sessionId) return sessionId;
+  // If an explicit sessionId was passed (from MCP detectSessionId), check the reply map
+  // first — the reply map records which session the user was actually talking to,
+  // which may differ from whatever iTerm tab is currently focused on the Mac.
+  if (sessionId) {
+    const mapped = pailotReplyMap.get(sessionId);
+    if (mapped) return mapped;
+    return sessionId;
+  }
   // Prefer the session that last received user input from PAILot —
   // this survives session switches that happen while Claude is thinking.
   if (lastRoutedSessionId) return lastRoutedSessionId;
