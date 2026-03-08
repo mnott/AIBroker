@@ -230,8 +230,25 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
 
   // If the client had a session open, try to restore it
   if (clientActiveId) {
-    const sessions = hybridManager.listSessions();
-    const idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
+    // First pass: check if it was already registered (by auto-discovery above or a prior sync)
+    let sessions = hybridManager.listSessions();
+    let idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
+
+    // Second pass: the session may exist in liveSnapshots but wasn't registered because
+    // isClaudeRelated() returned false (e.g. session is at a shell prompt between Claude runs
+    // after a daemon restart). Since the client explicitly asked for this session by ID, register
+    // it unconditionally if it is still alive in iTerm.
+    if (idx < 0 && liveIds.has(clientActiveId)) {
+      const snap = liveSnapshots.find(s => s.id === clientActiveId);
+      if (snap) {
+        const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+        hybridManager.registerVisualSession(displayName, "", clientActiveId);
+        sessions = hybridManager.listSessions();
+        idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
+        log(`[PAILot] sync: force-registered client session "${displayName}" (${clientActiveId.slice(0, 8)}...)`);
+      }
+    }
+
     if (idx >= 0) {
       hybridManager.switchToIndex(idx + 1);
       setActiveItermSessionId(clientActiveId);
@@ -241,10 +258,11 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
       drainOutbox(ws);
       return;
     }
-    // Client's session no longer exists — fall through to iTerm focus
+    // Client's session no longer exists in iTerm — fall through to iTerm focus
+    log(`[PAILot] sync: client session ${clientActiveId.slice(0, 8)}... not found in live iTerm — falling back to focused session`);
   }
 
-  // No client preference — ask iTerm2 which session is focused right now
+  // No client preference (or client's session is gone) — ask iTerm2 which session is focused
   const focusedId = runAppleScript(`tell application "iTerm2"
   try
     return id of current session of current tab of current window
@@ -254,16 +272,38 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
 end tell`)?.trim() ?? "";
 
   if (focusedId) {
-    // Find this session in the hybrid manager and activate it
-    const sessions = hybridManager.listSessions();
-    const idx = sessions.findIndex(s => s.backendSessionId === focusedId);
+    // Find this session in the hybrid manager and activate it.
+    // If it wasn't registered by the Claude-related filter, register it now since the
+    // user is actively looking at it.
+    let sessions = hybridManager.listSessions();
+    let idx = sessions.findIndex(s => s.backendSessionId === focusedId);
+    if (idx < 0 && liveIds.has(focusedId)) {
+      const snap = liveSnapshots.find(s => s.id === focusedId);
+      if (snap) {
+        const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+        hybridManager.registerVisualSession(displayName, "", focusedId);
+        sessions = hybridManager.listSessions();
+        idx = sessions.findIndex(s => s.backendSessionId === focusedId);
+      }
+    }
     if (idx >= 0) {
       hybridManager.switchToIndex(idx + 1);
       setActiveItermSessionId(focusedId);
       setLastRoutedSessionId(focusedId);
       log(`[PAILot] sync: activated focused session "${sessions[idx].name}" (${focusedId.slice(0, 8)}...)`);
     } else {
-      log(`[PAILot] sync: focused session ${focusedId.slice(0, 8)}... not registered`);
+      log(`[PAILot] sync: focused session ${focusedId.slice(0, 8)}... not found in live iTerm`);
+    }
+  }
+
+  // Last resort: if nothing is active yet but we have registered sessions, activate the first one
+  if (!hybridManager.activeSession) {
+    const sessions = hybridManager.listSessions();
+    if (sessions.length > 0) {
+      hybridManager.switchToIndex(1);
+      setActiveItermSessionId(sessions[0].backendSessionId);
+      setLastRoutedSessionId(sessions[0].backendSessionId);
+      log(`[PAILot] sync: no focused session found — defaulting to first session "${sessions[0].name}"`);
     }
   }
 
