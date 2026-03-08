@@ -28,4 +28,7 @@ export interface CommandContext {
 
   /** External recipient identifier (phone JID, chat ID) if known. */
   recipient?: string;
+
+  /** The active iTerm/Claude session ID, if known. Used for image context scoping. */
+  sessionId?: string;
 }

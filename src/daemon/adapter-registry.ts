@@ -15,6 +15,7 @@ import { validateAdapterHealth } from "../ipc/validate.js";
 import type { CommandContext } from "./command-context.js";
 import { broadcastText, broadcastImage, broadcastVoice } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
+import { hybridManager } from "../core/hybrid.js";
 
 export interface AdapterDescriptor {
   name: string;       // "whazaa", "telex", "pailot"
@@ -245,6 +246,7 @@ export class AdapterRegistry {
           },
           source: message.source,
           recipient: message.payload.recipient,
+          sessionId: hybridManager?.activeSession?.backendSessionId,
         };
         await handler(message.payload.text ?? "", message.timestamp, ctx);
         return { ok: true, deliveredTo: "hub" };
