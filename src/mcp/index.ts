@@ -207,6 +207,13 @@ server.tool("aibroker_status", "Hub health: version, adapters, sessions, adapter
   } catch (e) { return err(e); }
 });
 
+server.tool("aibroker_aibp_status", "AIBP protocol status: registered plugins, channels, commands", {}, async () => {
+  try {
+    const r = await hub.call_raw("aibp_status", {});
+    return ok(JSON.stringify(r, null, 2));
+  } catch (e) { return err(e); }
+});
+
 server.tool("aibroker_adapters", "List registered adapters", {}, async () => {
   try {
     const r = await hub.call_raw("adapter_list", {});
