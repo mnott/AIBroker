@@ -23,11 +23,72 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { execSync } from "node:child_process";
 import { WatcherClient } from "../ipc/client.js";
 
 const DAEMON_SOCKET = "/tmp/aibroker.sock";
 
 const hub = new WatcherClient(DAEMON_SOCKET);
+
+// ── Session Identity ──
+// Detect which iTerm session this MCP process belongs to.
+// MCP processes are children of Claude Code, which runs inside an iTerm session.
+// We find our TTY, then ask iTerm which session owns that TTY.
+// This is resolved once at startup and cached for all subsequent tool calls.
+
+let _resolvedSessionId: string | undefined;
+
+function detectSessionId(): string | undefined {
+  // 1. Try ITERM_SESSION_ID from env (works if shell exports it)
+  const envId = process.env.ITERM_SESSION_ID?.split(":")[1];
+  if (envId) return envId;
+
+  // 2. Walk process tree to find the TTY of our ancestor shell
+  try {
+    // Get the TTY of our parent's parent (claude → zsh → tty)
+    let pid = process.ppid;
+    let tty = "";
+    for (let i = 0; i < 5 && pid > 1; i++) {
+      const info = execSync(`ps -o tty=,ppid= -p ${pid} 2>/dev/null`, { encoding: "utf-8" }).trim();
+      const parts = info.split(/\s+/);
+      if (parts[0] && parts[0] !== "??" && parts[0] !== "-") {
+        tty = `/dev/${parts[0]}`;
+        break;
+      }
+      pid = parseInt(parts[1] ?? "1", 10);
+    }
+    if (!tty) return undefined;
+
+    // 3. Ask iTerm which session owns this TTY
+    // Use multiple -e flags since osascript doesn't handle \n in single -e strings
+    const result = execSync(
+      `osascript` +
+      ` -e 'tell application "iTerm2"'` +
+      ` -e '  repeat with w in windows'` +
+      ` -e '    repeat with t in tabs of w'` +
+      ` -e '      repeat with s in sessions of t'` +
+      ` -e '        if tty of s is "${tty}" then'` +
+      ` -e '          return id of s'` +
+      ` -e '        end if'` +
+      ` -e '      end repeat'` +
+      ` -e '    end repeat'` +
+      ` -e '  end repeat'` +
+      ` -e '  return ""'` +
+      ` -e 'end tell'`,
+      { encoding: "utf-8", timeout: 3000 },
+    ).trim();
+    return result || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Resolve once at module load — synchronous is fine for startup
+_resolvedSessionId = detectSessionId();
+
+function getSessionId(): string | undefined {
+  return _resolvedSessionId;
+}
 
 function err(e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
@@ -677,7 +738,7 @@ server.tool(
   { message: z.string().min(1).describe("Message text") },
   async ({ message }) => {
     try {
-      const sessionId = process.env.ITERM_SESSION_ID?.split(":")[1];
+      const sessionId = getSessionId();
       await hub.call_raw("pailot_send", { text: message, sessionId });
       return ok("Sent.");
     } catch (e) { return err(e); }
@@ -693,7 +754,7 @@ server.tool(
   },
   async ({ message, voice }) => {
     try {
-      const sessionId = process.env.ITERM_SESSION_ID?.split(":")[1];
+      const sessionId = getSessionId();
       const r = await hub.call_raw("pailot_send", { text: message, voice: true, voiceName: voice, sessionId }) as any;
       const chunks = r?.chunks ?? 1;
       return ok(chunks > 1 ? `Sent ${chunks} voice notes.` : "Sent.");
