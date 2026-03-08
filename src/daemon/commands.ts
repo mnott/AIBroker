@@ -440,20 +440,23 @@ end tell`;
     const imageMatch = trimmedText.match(/^\/(?:image|img)\s+(.+)$/s);
     if (imageMatch) {
       const prompt = imageMatch[1].trim();
+      ctx.typing(true);
       ctx.reply("On it... generating your image.").catch(() => {});
       (async () => {
         try {
           const { generateImage } = await import("./image-gen/index.js");
           const result = await generateImage({ prompt });
+          ctx.typing(false);
           if (result.images.length > 0) {
             await ctx.replyImage(result.images[0], prompt.slice(0, 200));
           }
         } catch (err) {
+          ctx.typing(false);
           const errMsg = err instanceof Error ? err.message : String(err);
           ctx.reply(`Image generation failed: ${errMsg}`).catch(() => {});
           log(`/image: error — ${errMsg}`);
         }
-      })().catch((err) => log(`/image: unhandled error — ${err}`));
+      })().catch((err) => { ctx.typing(false); log(`/image: unhandled error — ${err}`); });
       return;
     }
 
@@ -713,20 +716,23 @@ end tell`;
     // --- Natural language image generation detection ---
     const imageNlMatch = detectImageRequest(trimmedText);
     if (imageNlMatch) {
+      ctx.typing(true);
       ctx.reply("On it... generating your image.").catch(() => {});
       (async () => {
         try {
           const { generateImage } = await import("./image-gen/index.js");
           const result = await generateImage({ prompt: imageNlMatch });
+          ctx.typing(false);
           if (result.images.length > 0) {
             await ctx.replyImage(result.images[0], imageNlMatch.slice(0, 200));
           }
         } catch (err) {
+          ctx.typing(false);
           const errMsg = err instanceof Error ? err.message : String(err);
           ctx.reply(`Image generation failed: ${errMsg}`).catch(() => {});
           log(`image-gen: error — ${errMsg}`);
         }
-      })().catch((err) => log(`image-gen: unhandled error — ${err}`));
+      })().catch((err) => { ctx.typing(false); log(`image-gen: unhandled error — ${err}`); });
       return;
     }
 

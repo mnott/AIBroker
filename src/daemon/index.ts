@@ -191,6 +191,9 @@ export async function startDaemon(options?: {
           audioBase64: audioBuf.toString("base64"),
         });
       },
+      typing: (active: boolean) => {
+        aibpBridge.sendTyping(sessionId ?? "", active);
+      },
       source: "pailot",
     };
 
@@ -266,6 +269,7 @@ export async function startDaemon(options?: {
       reply: async (msg) => { log(`[hub fallback reply] ${msg.slice(0, 80)}`); },
       replyImage: async () => { log("[hub fallback] image reply not supported in embedded mode"); },
       replyVoice: async () => { log("[hub fallback] voice reply not supported in embedded mode"); },
+      typing: () => {},
       source: "hub",
     };
     return hubCommandHandler(text, timestamp, fallbackCtx);
@@ -301,6 +305,7 @@ export async function startDaemon(options?: {
       reply: async (text) => { broadcastText(text); },
       replyImage: async (buf, caption) => { broadcastImage(buf, caption); },
       replyVoice: async () => {},
+      typing: () => {},
       source: source ?? "pailot",
     };
     await handleScreenshot(ctx);

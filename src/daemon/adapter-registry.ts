@@ -238,6 +238,11 @@ export class AdapterRegistry {
               await this.deliverToAdapter(sourceAdapter, replyMsg);
             }
           },
+          typing: (active: boolean) => {
+            if (isPailot && bridge) {
+              bridge.sendTyping("", active);
+            }
+          },
           source: message.source,
           recipient: message.payload.recipient,
         };
