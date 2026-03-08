@@ -271,10 +271,19 @@ export class PluginRegistry {
   }
 
   private routeToMesh(msg: AibpMessage, hubAddress: string, localDst: string): void {
-    // Find a bridge plugin for this hub
+    // Extract the hub ID from hub address (e.g., "hub:mac-mini" → "mac-mini")
+    const hubId = hubAddress.startsWith("hub:") ? hubAddress.slice(4) : hubAddress;
+
+    // Try to find the specific bridge for this hub first
+    const specificBridge = this.plugins.get(`bridge:${hubId}`);
+    if (specificBridge) {
+      specificBridge.send(msg);
+      return;
+    }
+
+    // Fallback: find any bridge plugin
     for (const [, conn] of this.plugins) {
       if (conn.plugin.spec.type === "bridge") {
-        // Forward with the full mesh address intact
         conn.send(msg);
         return;
       }
@@ -479,6 +488,8 @@ export class PluginRegistry {
         return `bridge:${spec.id}`;
       case "mcp":
         return `mcp:${spec.id}`;
+      case "hub":
+        return `hub:${spec.id}`;
       default:
         return `plugin:${spec.id}`;
     }

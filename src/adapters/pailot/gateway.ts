@@ -31,6 +31,7 @@ import {
   setActiveItermSessionId,
   lastRoutedSessionId,
   setLastRoutedSessionId,
+  getAibpBridge,
 } from "../../core/state.js";
 import { setItermSessionVar, setItermTabName, killSession, createClaudeSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
@@ -630,13 +631,17 @@ function flushVoiceBatch(): void {
   voiceBatchSessionId = "";
   voiceBatchTimer = null;
 
-  if (handler) {
-    log(`[PAILot] Flushing voice batch (${combined.length} chars)`);
-    const routeSession = batchSession || activeItermSessionId;
-    if (routeSession) {
-      pailotReplyMap.set(routeSession, routeSession);
-      setLastRoutedSessionId(routeSession);
-    }
+  log(`[PAILot] Flushing voice batch (${combined.length} chars)`);
+  const routeSession = batchSession || activeItermSessionId;
+  if (routeSession) {
+    pailotReplyMap.set(routeSession, routeSession);
+    setLastRoutedSessionId(routeSession);
+  }
+
+  const bridge = getAibpBridge();
+  if (bridge && routeSession) {
+    bridge.routeFromMobile(routeSession, `[PAILot:voice] ${combined}`);
+  } else if (handler) {
     setMessageSource("pailot");
     handler(`[PAILot:voice] ${combined}`, Date.now());
     setMessageSource("whatsapp");
@@ -895,13 +900,22 @@ end tell`)?.trim() ?? "";
             ? `${caption} (image at ${imgPath})`
             : `(image at ${imgPath})`;
           if (!pailotSessionId) setLastRoutedSessionId(activeItermSessionId);
-          setMessageSource("pailot");
-          onMessage(routeText, Date.now());
-          setMessageSource("whatsapp");
+
+          const imgBridge = getAibpBridge();
+          if (imgBridge && routeTarget) {
+            imgBridge.routeFromMobile(routeTarget, routeText, "IMAGE", {
+              imageBase64: msg.imageBase64 as string,
+              mimeType: msg.mimeType ?? "image/jpeg",
+            });
+          } else {
+            setMessageSource("pailot");
+            onMessage(routeText, Date.now());
+            setMessageSource("whatsapp");
+          }
           return;
         }
 
-        // Plain text message — route through handleMessage
+        // Plain text message — route through AIBP bridge (or legacy fallback)
         const text = msg.content ?? "";
         if (!text.trim()) return;
 
@@ -909,9 +923,16 @@ end tell`)?.trim() ?? "";
 
         broadcast({ type: "typing", typing: true, ...(routeTarget && { sessionId: routeTarget }) });
         if (!pailotSessionId) setLastRoutedSessionId(activeItermSessionId);
-        setMessageSource("pailot");
-        onMessage(text, Date.now());
-        setMessageSource("whatsapp");
+
+        const bridge = getAibpBridge();
+        if (bridge && routeTarget) {
+          bridge.routeFromMobile(routeTarget, text);
+        } else {
+          // Fallback to legacy routing
+          setMessageSource("pailot");
+          onMessage(text, Date.now());
+          setMessageSource("whatsapp");
+        }
       } catch {
         log(`[PAILot] Invalid message from ${addr}`);
       }

@@ -110,7 +110,7 @@ export interface AibpMessage<P extends AibpPayload = AibpPayload> {
 // Plugin types
 // ---------------------------------------------------------------------------
 
-export type PluginType = "transport" | "terminal" | "mobile" | "bridge" | "mcp";
+export type PluginType = "transport" | "terminal" | "mobile" | "bridge" | "mcp" | "hub";
 
 export interface CommandSpec {
   name: string;

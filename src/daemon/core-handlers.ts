@@ -605,6 +605,57 @@ export function registerCoreHandlers(
     };
   });
 
+  /**
+   * aibp_send — Send a message from one session to another via AIBP.
+   * Enables cross-session messaging: session A can send text to session B.
+   */
+  server.on("aibp_send", async (req) => {
+    const { fromSession, toSession, content, type } = req.params as {
+      fromSession?: string;
+      toSession?: string;
+      content?: string;
+      type?: "TEXT" | "COMMAND";
+    };
+    if (!toSession) return { ok: false, error: "toSession is required" };
+    if (!content) return { ok: false, error: "content is required" };
+
+    const bridge = getAibpBridge();
+    if (!bridge) return { ok: false, error: "AIBP bridge not initialized" };
+
+    bridge.routeBetweenSessions(
+      fromSession ?? "unknown",
+      toSession,
+      content,
+      type ?? "TEXT",
+    );
+    return { ok: true, result: {} };
+  });
+
+  /**
+   * aibp_status — Query AIBP registry state (plugins, channels, commands).
+   */
+  server.on("aibp_status", async () => {
+    const bridge = getAibpBridge();
+    if (!bridge) return { ok: false, error: "AIBP bridge not initialized" };
+
+    return {
+      ok: true,
+      result: {
+        plugins: bridge.listPlugins(),
+        channels: bridge.registry.listChannels().map(ch => ({
+          name: ch.channel,
+          members: Array.from(ch.members),
+          outboxSize: ch.outbox.length,
+        })),
+        commands: bridge.listCommands().map(c => ({
+          name: c.name,
+          owner: c.owner,
+          description: c.spec?.description,
+        })),
+      },
+    };
+  });
+
   // ── Unified MCP Support ──
 
   /**

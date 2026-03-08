@@ -25,6 +25,8 @@ import type { CommandContext } from "./command-context.js";
 import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
 import { AibpBridge } from "../aibp/bridge.js";
+import { typeIntoSession, findClaudeSession, isClaudeRunningInSession } from "../adapters/iterm/core.js";
+import { activeItermSessionId, setActiveItermSessionId } from "../core/state.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -162,6 +164,102 @@ export async function startDaemon(options?: {
 
   // Create the hub command handler
   const hubCommandHandler = createHubCommandHandler();
+
+  // Register the hub as an AIBP session handler — receives inbound messages
+  // routed to session channels (e.g., from PAILot via routeFromMobile).
+  aibpBridge.registerSessionHandler((aibpMsg) => {
+    // Extract session ID from destination (session:XYZ) or source
+    const sessionId = aibpMsg.dst.startsWith("session:")
+      ? aibpMsg.dst.slice(8)
+      : aibpMsg.src.startsWith("session:")
+        ? aibpMsg.src.slice(8)
+        : undefined;
+
+    // Build CommandContext with AIBP-routed reply callbacks
+    const ctx: CommandContext = {
+      reply: async (text: string) => {
+        aibpBridge.routeToMobile(sessionId ?? "", text);
+      },
+      replyImage: async (buf: Buffer, caption: string) => {
+        aibpBridge.routeToMobile(sessionId ?? "", caption ?? "", "IMAGE", {
+          imageBase64: buf.toString("base64"),
+          mimeType: "image/png",
+        });
+      },
+      replyVoice: async (audioBuf: Buffer, caption: string) => {
+        aibpBridge.routeToMobile(sessionId ?? "", caption, "VOICE", {
+          audioBase64: audioBuf.toString("base64"),
+        });
+      },
+      source: "pailot",
+    };
+
+    // Dispatch based on message type
+    let text = "";
+    switch (aibpMsg.type) {
+      case "TEXT":
+        text = (aibpMsg.payload as { content: string }).content;
+        break;
+      case "VOICE":
+        text = (aibpMsg.payload as { transcript?: string }).transcript ?? "";
+        break;
+      case "IMAGE":
+        text = (aibpMsg.payload as { caption?: string }).caption ?? "";
+        break;
+      default:
+        log(`[AIBP→Hub] Ignoring ${aibpMsg.type} message`);
+        return;
+    }
+
+    if (text.trim()) {
+      void hubCommandHandler(text, aibpMsg.ts, ctx);
+    }
+  });
+  // Register iTerm2 as a terminal plugin — makes it addressable via AIBP.
+  // Messages sent to terminal:iterm are typed into the active iTerm session.
+  // Keyboard control commands are registered as terminal-owned AIBP commands.
+  const terminalCommands = [
+    { name: "cc", description: "Send Ctrl+C to active session", args: "" },
+    { name: "esc", description: "Send Escape to active session", args: "" },
+    { name: "enter", description: "Send Enter to active session", args: "" },
+    { name: "tab", description: "Send Tab to active session", args: "" },
+    { name: "up", description: "Send Up arrow to active session", args: "" },
+    { name: "down", description: "Send Down arrow to active session", args: "" },
+    { name: "left", description: "Send Left arrow to active session", args: "" },
+    { name: "right", description: "Send Right arrow to active session", args: "" },
+    { name: "pick", description: "Select menu option N", args: "<N> [text]" },
+  ];
+  aibpBridge.registerTerminal("iterm", (aibpMsg) => {
+    if (aibpMsg.type === "TEXT") {
+      const content = (aibpMsg.payload as { content: string }).content;
+      // Determine target session from AIBP message source address
+      const targetSession = aibpMsg.src.startsWith("session:")
+        ? aibpMsg.src.slice(8)
+        : activeItermSessionId;
+
+      if (targetSession) {
+        typeIntoSession(targetSession, content);
+      } else {
+        // Fallback: find any Claude session
+        const found = findClaudeSession();
+        if (found && isClaudeRunningInSession(found)) {
+          setActiveItermSessionId(found);
+          typeIntoSession(found, content);
+        } else {
+          log(`[AIBP→Terminal] No iTerm session available for delivery`);
+        }
+      }
+    } else if (aibpMsg.type === "COMMAND") {
+      const payload = aibpMsg.payload as { command: string; args: Record<string, unknown> };
+      if (payload.command === "type" && payload.args.text) {
+        const sessionId = (payload.args.sessionId as string) || activeItermSessionId;
+        if (sessionId) {
+          typeIntoSession(sessionId, payload.args.text as string);
+        }
+      }
+    }
+  }, terminalCommands);
+
   // Wrap it as a CommandHandler for backward compat (embedded mode fallback)
   setCommandHandler((text, timestamp) => {
     const fallbackCtx: CommandContext = {
