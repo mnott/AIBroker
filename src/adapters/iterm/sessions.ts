@@ -63,6 +63,31 @@ export function setItermTabName(itermSessionId: string, name: string): void {
   );
 }
 
+export function setItermBadge(itermSessionId: string, text: string): void {
+  // Write badge escape sequence to the session's tty device.
+  // Must go to terminal output stream (not stdin via "write text").
+  try {
+    const tty = execSync(
+      `osascript -e 'tell application "iTerm2" to repeat with w in windows
+        repeat with t in tabs of w
+          repeat with s in sessions of t
+            if (unique ID of s) is "${itermSessionId}" then return tty of s
+          end repeat
+        end repeat
+      end repeat'`,
+      { timeout: 5000, encoding: "utf8", shell: "/bin/bash" },
+    ).trim();
+    if (!tty || !tty.startsWith("/dev/ttys")) return;
+    const b64 = Buffer.from(text).toString("base64");
+    execSync(`printf '\\033]1337;SetBadgeFormat=${b64}\\007' > ${tty}`, {
+      timeout: 3000,
+      shell: "/bin/bash",
+    });
+  } catch {
+    // silently ignore — badge is cosmetic
+  }
+}
+
 export function getItermSessionVar(itermSessionId: string): string | null {
   try {
     const script = withSessionAppleScript(

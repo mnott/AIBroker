@@ -41,6 +41,10 @@ Type these in any channel — WhatsApp, Telegram, PAILot, or terminal:
 | `/status` | Show all session statuses |
 | `/image a cat in space` | Generate and deliver an image |
 | `/e 3` | End session 3 |
+| `/aibp` | AIBP protocol status — plugins, channels, commands |
+| `/aibp plugins` | Detailed plugin list with capabilities |
+| `/aibp commands` | All registered commands by owner |
+| `/aibp help` | List all `/aibp` subcommands |
 
 ---
 
@@ -129,6 +133,20 @@ Every plugin declares its type and capabilities:
 | `bridge` | Remote hubs | TEXT, VOICE, IMAGE, COMMAND, FILE |
 
 Messages carry explicit `src` and `dst` addresses — no guessing which session should receive what. Cross-session messaging, mesh networking between machines, and channel fan-out all work through the same protocol.
+
+### Inspecting the Protocol
+
+Use `/aibp` from any channel (WhatsApp, Telegram, PAILot) or the `aibroker_aibp_status` MCP tool from Claude Code to see the live state of the routing infrastructure:
+
+```
+/aibp              → combined overview (sessions, plugins, channels, peers)
+/aibp plugins      → registered plugins with type, status, capabilities
+/aibp channels     → active channels with members and activity
+/aibp commands     → all commands grouped by owning plugin
+/aibp peers        → mesh network peers
+```
+
+`/status` and `/st` are shortcuts for `/aibp status`.
 
 For the full protocol spec, see [docs/protocol.md](docs/protocol.md).
 
@@ -247,6 +265,23 @@ export function createProvider(config: ImageProviderConfig): ImageProvider {
 
 All built-in providers use FLUX.1 Schnell by default. Override with `"model": "your-model-id"` in the config.
 
+### Iterative Refinement
+
+Image generation is conversational. Generate an image, then refine it with follow-up messages:
+
+```
+You:    "Send me an image of a fish sitting on a chair"
+Claude: [image]
+You:    "Put a tie on it"
+Claude: [refined image — fish on chair, now wearing a tie]
+You:    "Make it watercolor style"
+Claude: [refined image — watercolor fish with tie on chair]
+```
+
+AIBroker detects refinement intent from modification verbs ("put", "add", "make"), image references ("it", "the image"), style keywords ("watercolor", "cartoon"), and prepositional modifiers ("with a hat", "without the chair"). Messages that don't reference the image pass through to Claude normally — no manual "stop" needed.
+
+Image context is scoped per source, recipient, and session, so multiple users or devices never interfere. Context expires after 30 minutes of inactivity. Say "new image" or "start over" to reset explicitly.
+
 ---
 
 ## PAILot Companion App
@@ -258,6 +293,7 @@ PAILot is a native iOS app that connects to AIBroker over WebSocket. It provides
 - **Typing indicators** — see when Claude is processing
 - **Message history** — persistent chat with text and voice
 - **Offline queuing** — messages buffer on the server when you're disconnected, drain on reconnect
+- **Session isolation** — the gateway tracks which session each client is viewing and only delivers matching messages, preventing cross-session content bleed
 
 PAILot connects to `ws://your-mac:8765`. See [docs/pailot.md](docs/pailot.md).
 

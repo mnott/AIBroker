@@ -63,18 +63,18 @@ export function pruneStaleContexts(ttlMs = DEFAULT_TTL_MS): number {
 }
 
 /**
- * Classify an incoming text message as either a new image request or a
- * refinement of the current image context.
+ * Classify an incoming text message as a new image request, a refinement
+ * of the current image context, or unrelated to image generation.
  *
- * Conservative bias: when context exists and the message is short or contains
- * known refinement signals, treat it as a refinement. Only start fresh when
- * there is a clear signal ("new image:", "start over") or the message looks
- * like a full standalone description.
+ * Only returns "refine" when there is an actual signal — a pronoun
+ * referencing the image, a modification verb, or a style keyword.
+ * Messages that don't contain any image-related signal fall through
+ * as "unrelated" so they reach normal routing (Claude, slash commands, etc.).
  */
 export function classifyImageRequest(
   text: string,
   context: ImageContext | undefined,
-): { type: "new" | "refine"; prompt: string } {
+): { type: "new" | "refine" | "unrelated"; prompt: string } {
   // No context — always new
   if (!context || context.promptHistory.length === 0) {
     return { type: "new", prompt: text };
@@ -88,8 +88,6 @@ export function classifyImageRequest(
     /^(new image|different image|new picture|start over|forget the image|neues bild|vergiss das bild)$/i.test(text)
   ) {
     const prompt = text.replace(/^[^:]+:\s*/i, "").trim();
-    // If stripping the prefix gives us nothing (the phrase was the whole message),
-    // treat it as a signal-only reset with no new prompt yet.
     return { type: "new", prompt: prompt || text };
   }
 
@@ -105,19 +103,23 @@ export function classifyImageRequest(
 
   // Refinement signals: German
   if (
-    /\b(es|das bild|das foto)\b/i.test(lower) ||
+    /\b(das bild|das foto)\b/i.test(lower) ||
     /^(mach|ändere|füge hinzu|entferne|gib|zeig|setz)\b/i.test(lower)
   ) {
     return { type: "refine", prompt: text };
   }
 
-  // Short messages with existing context default to refinement
-  if (text.split(/\s+/).length <= 8) {
+  // Prepositional phrases that only make sense as image modifications
+  // e.g., "with a hat", "in watercolor", "but bigger", "without the chair"
+  if (/^(with|without|in|but|and|plus|minus)\b/i.test(lower)) {
+    return { type: "refine", prompt: text };
+  }
+  if (/^(mit|ohne|in|aber|und|als)\b/i.test(lower)) {
     return { type: "refine", prompt: text };
   }
 
-  // Long message looks like a new full description
-  return { type: "new", prompt: text };
+  // No image-related signal — this message is not about the image
+  return { type: "unrelated", prompt: text };
 }
 
 /**

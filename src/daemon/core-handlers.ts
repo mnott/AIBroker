@@ -32,6 +32,7 @@ import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
+import { snapshotAllSessions } from "../adapters/iterm/core.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -663,9 +664,27 @@ export function registerCoreHandlers(
       return info;
     });
 
+    // Session snapshots (iTerm sessions with idle/busy status)
+    const snapshots = snapshotAllSessions();
+    const sessions = snapshots.map((snap, i) => {
+      const label = snap.paiName ?? snap.tabTitle ?? snap.name;
+      const isActive = snap.id === activeItermSessionId;
+      const cached = statusCache.get(snap.id);
+      const hasFreshSummary = cached?.summary && Date.now() - cached.timestamp < 5 * 60 * 1000;
+      return {
+        index: i + 1,
+        id: snap.id,
+        name: label,
+        atPrompt: snap.atPrompt,
+        active: isActive,
+        summary: hasFreshSummary ? cached!.summary : undefined,
+      };
+    });
+
     return {
       ok: true,
       result: {
+        sessions,
         plugins,
         channels: bridge.registry.listChannels().map(ch => ({
           name: ch.channel,

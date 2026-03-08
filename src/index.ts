@@ -102,6 +102,7 @@ export type { SessionSnapshot } from "./adapters/iterm/core.js";
 export {
   setItermSessionVar,
   setItermTabName,
+  setItermBadge,
   getItermSessionVar,
   findItermSessionForTermId,
   listClaudeSessions,
