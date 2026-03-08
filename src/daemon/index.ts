@@ -19,11 +19,12 @@ import { APIBackend } from "../backend/api.js";
 import { HybridSessionManager, setHybridManager } from "../core/hybrid.js";
 import { router } from "../core/router.js";
 import { loadSessionRegistry, loadVoiceConfig } from "../core/persistence.js";
-import { setCommandHandler } from "../core/state.js";
+import { setCommandHandler, setAbipBridge } from "../core/state.js";
 import { createHubCommandHandler } from "./commands.js";
 import type { CommandContext } from "./command-context.js";
 import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
+import { AbipBridge } from "../abip/bridge.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -124,6 +125,27 @@ export async function startDaemon(options?: {
   // Adapter registry
   const adapterRegistry = new AdapterRegistry();
 
+  // ABIP bridge — IRC-inspired message routing layer
+  const abipBridge = new AbipBridge();
+  setAbipBridge(abipBridge);
+  // Register PAILot as a mobile plugin. The callback receives ABIP messages
+  // to deliver to connected WebSocket clients (wired after gateway starts).
+  // This is registered early so it's available before the first connection.
+  abipBridge.registerMobile("pailot", (msg) => {
+    // Forward ABIP messages to PAILot gateway broadcast functions
+    const sessionId = msg.src.startsWith("session:")
+      ? msg.src.slice(8)
+      : undefined;
+    if (msg.type === "TEXT") {
+      broadcastText((msg.payload as { content: string }).content, sessionId);
+    } else if (msg.type === "TYPING") {
+      // Typing is handled by existing broadcast path
+    } else if (msg.type === "IMAGE") {
+      const p = msg.payload as { imageBase64: string; caption?: string };
+      broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId);
+    }
+  });
+
   // Create the hub command handler
   const hubCommandHandler = createHubCommandHandler();
   // Wrap it as a CommandHandler for backward compat (embedded mode fallback)
@@ -147,7 +169,14 @@ export async function startDaemon(options?: {
 
   // Auto-discover adapters that were already running before the hub (re)started.
   // Probe well-known socket paths and register any that respond to "ping".
-  void discoverRunningAdapters(adapterRegistry);
+  // Also register them as ABIP transport plugins.
+  void discoverRunningAdapters(adapterRegistry).then(() => {
+    for (const adapter of adapterRegistry.list()) {
+      abipBridge.registerTransport(adapter.name, () => {
+        // Legacy adapters use IPC, not direct ABIP send
+      });
+    }
+  });
 
   // PAILot WebSocket gateway
   startWsGateway((text: string, timestamp: number) => {
@@ -165,9 +194,10 @@ export async function startDaemon(options?: {
     await handleScreenshot(ctx);
   });
 
-  console.log(`AIBroker daemon v${getVersion()} started`);
+  console.log(`AIBroker daemon v${getVersion()} started (ABIP ${abipBridge.registry.listPlugins().length > 0 ? "active" : "standby"})`);
   console.log(`  Socket:  ${socketPath}`);
   console.log(`  AppDir:  ${appDir}`);
+  console.log(`  ABIP:    ${abipBridge.listPlugins().join(", ") || "(no plugins yet)"}`);
 
   // Graceful shutdown — ensure socket cleanup even on abrupt exit
   const shutdown = (signal: string) => {

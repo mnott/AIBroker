@@ -26,7 +26,7 @@ import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig } from "../core/persistence.js";
-import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId } from "../core/state.js";
+import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAbipBridge } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
@@ -561,6 +561,33 @@ export function registerCoreHandlers(
     }
 
     return { ok: true, result: { snapshots: statusCache.getAll() } };
+  });
+
+  // ── ABIP Protocol Support ──
+
+  /**
+   * abip_register — Register an MCP process as an ABIP plugin.
+   * Called once when the MCP server starts. Returns the resolved session
+   * so the MCP doesn't need TTY detection for routing.
+   */
+  server.on("abip_register", async (req) => {
+    const { pluginId, sessionEnvId } = req.params as {
+      pluginId?: string;
+      sessionEnvId?: string;
+    };
+    if (!pluginId) return { ok: false, error: "pluginId is required" };
+
+    const bridge = getAbipBridge();
+    if (!bridge) return { ok: false, error: "ABIP bridge not initialized" };
+
+    const result = bridge.registerMcp(pluginId, sessionEnvId);
+    return {
+      ok: true,
+      result: {
+        address: result.address,
+        resolvedSession: result.resolvedSession,
+      },
+    };
   });
 
   // ── Unified MCP Support ──
