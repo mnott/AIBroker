@@ -33,7 +33,7 @@ import {
   setLastRoutedSessionId,
   getAibpBridge,
 } from "../../core/state.js";
-import { setItermSessionVar, setItermTabName, killSession, createClaudeSession } from "../iterm/sessions.js";
+import { setItermSessionVar, setItermTabName, setItermBadge, killSession, createClaudeSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
 import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, pasteTextIntoSession, snapshotAllSessions } from "../iterm/core.js";
 import { hybridManager } from "../../core/hybrid.js";
@@ -61,6 +61,11 @@ const clients = new Set<WebSocket>();
  *  which iTerm tab happens to be focused on the Mac at response time.
  */
 const pailotReplyMap = new Map<string, string>();
+/** Track which session each WebSocket client is currently viewing.
+ *  Messages tagged with a different sessionId are NOT delivered to that client.
+ *  This prevents cross-session content bleed in multi-session PAILot views.
+ */
+const clientActiveSession = new Map<WebSocket, string>();
 /** Track when each client last proved it's alive (pong, message, or connect). */
 const clientLastActive = new Map<WebSocket, number>();
 /** Consider a client "alive" if it responded within this window. */
@@ -253,6 +258,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
       hybridManager.switchToIndex(idx + 1);
       setActiveItermSessionId(clientActiveId);
       setLastRoutedSessionId(clientActiveId);
+      clientActiveSession.set(ws, clientActiveId);
       log(`[PAILot] sync: restored client session "${sessions[idx].name}" (${clientActiveId.slice(0, 8)}...)`);
       handleSessionsCommand(ws);
       drainOutbox(ws);
@@ -290,6 +296,7 @@ end tell`)?.trim() ?? "";
       hybridManager.switchToIndex(idx + 1);
       setActiveItermSessionId(focusedId);
       setLastRoutedSessionId(focusedId);
+      clientActiveSession.set(ws, focusedId);
       log(`[PAILot] sync: activated focused session "${sessions[idx].name}" (${focusedId.slice(0, 8)}...)`);
     } else {
       log(`[PAILot] sync: focused session ${focusedId.slice(0, 8)}... not found in live iTerm`);
@@ -303,6 +310,7 @@ end tell`)?.trim() ?? "";
       hybridManager.switchToIndex(1);
       setActiveItermSessionId(sessions[0].backendSessionId);
       setLastRoutedSessionId(sessions[0].backendSessionId);
+      clientActiveSession.set(ws, sessions[0].backendSessionId);
       log(`[PAILot] sync: no focused session found — defaulting to first session "${sessions[0].name}"`);
     }
   }
@@ -413,12 +421,14 @@ end tell`);
     if (session.kind === "visual") {
       setItermSessionVar(session.backendSessionId, newName);
       setItermTabName(session.backendSessionId, newName);
+      setItermBadge(session.backendSessionId, newName);
     }
   }
 
   // Record this as the last routed session so outbound replies go here,
   // regardless of which iTerm tab is focused on the Mac.
   setLastRoutedSessionId(session.backendSessionId);
+  clientActiveSession.set(ws, session.backendSessionId);
   sendTo(ws, { type: "session_switched", name: session.name, sessionId: session.backendSessionId });
   log(`[PAILot] switched to ${session.kind} session "${session.name}" (${session.id})`);
 }
@@ -440,6 +450,7 @@ function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void
     if (session.kind === "visual") {
       setItermSessionVar(sessionId, name);
       setItermTabName(sessionId, name);
+      setItermBadge(sessionId, name);
     }
   }
 
@@ -501,6 +512,7 @@ function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}):
 
   setItermSessionVar(sessionId, name);
   setItermTabName(sessionId, name);
+  setItermBadge(sessionId, name);
 
   if (hybridManager) {
     hybridManager.registerVisualSession(name, "", sessionId);
@@ -636,13 +648,21 @@ function broadcast(msg: Record<string, unknown>): void {
   // Only deliver to clients that have proven liveness recently.
   // iOS can keep a WebSocket "open" while the app is backgrounded —
   // ws.send() succeeds but the app never processes the data.
+  //
+  // Session filtering: if the message carries a sessionId, only deliver to
+  // clients viewing that session. This prevents cross-session content bleed.
+  const msgSessionId = msg.sessionId as string | undefined;
   let delivered = false;
   const payload = JSON.stringify(msg);
   for (const ws of clients) {
-    if (isClientAlive(ws)) {
-      ws.send(payload);
-      delivered = true;
+    if (!isClientAlive(ws)) continue;
+    // Session gate: if both the message and client have a session, they must match
+    if (msgSessionId) {
+      const clientSession = clientActiveSession.get(ws);
+      if (clientSession && clientSession !== msgSessionId) continue;
     }
+    ws.send(payload);
+    delivered = true;
   }
   // No live clients — buffer for later
   if (!delivered) {
@@ -982,12 +1002,14 @@ end tell`)?.trim() ?? "";
       log(`PAILot client disconnected from ${addr}`);
       clients.delete(ws);
       clientLastActive.delete(ws);
+      clientActiveSession.delete(ws);
     });
 
     ws.on("error", (err) => {
       log(`[PAILot] WebSocket error: ${err.message}`);
       clients.delete(ws);
       clientLastActive.delete(ws);
+      clientActiveSession.delete(ws);
     });
 
     // Welcome — outbox drains after client sends "sync" command

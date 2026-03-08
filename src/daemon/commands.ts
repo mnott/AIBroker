@@ -26,11 +26,13 @@ import {
   sessionTtyCache,
   updateSessionTtyCache,
   messageSource,
+  getAibpBridge,
 } from "../core/state.js";
 import {
   getSessionList,
   setItermSessionVar,
   setItermTabName,
+  setItermBadge,
   listClaudeSessions,
   createClaudeSession,
   createTerminalTab,
@@ -411,6 +413,7 @@ end tell`;
         if (newName) {
           setItermSessionVar(chosen.id, newName);
           setItermTabName(chosen.id, newName);
+          setItermBadge(chosen.id, newName);
           if (regEntry) regEntry.name = newName;
         }
 
@@ -685,111 +688,247 @@ end tell`;
       return;
     }
 
-    // --- /status, /st — show status of all Claude sessions ---
-    if (trimmedText === "/status" || trimmedText === "/st") {
-      const snapshots = snapshotAllSessions();
-      if (snapshots.length === 0) {
-        ctx.reply("No iTerm2 sessions found.").catch(() => {});
+    // --- /aibp <subcommand> — AIBP protocol inspection ---
+    if (trimmedText === "/aibp" || trimmedText.startsWith("/aibp ")) {
+      const sub = trimmedText.slice(5).trim() || "status";
+      const bridge = getAibpBridge();
+      if (!bridge) {
+        ctx.reply("AIBP bridge not initialized.").catch(() => {});
         return;
       }
 
-      const lines: string[] = ["*Session Status*", ""];
-      for (let i = 0; i < snapshots.length; i++) {
-        const snap = snapshots[i];
-        const label = snap.paiName ?? snap.tabTitle ?? snap.name;
-        const isActive = snap.id === activeItermSessionId;
+      switch (sub) {
+        case "status": {
+          // Combined overview: sessions + plugins + adapters
+          const snapshots = snapshotAllSessions();
+          const lines: string[] = ["*AIBP Status*", ""];
 
-        // Determine status from atPrompt + cached state
-        let statusIcon: string;
-        let statusLabel: string;
-        const cached = statusCache.get(snap.id);
-        if (cached && cached.state !== "idle" && !snap.atPrompt) {
-          // Cache has a non-idle state and iTerm confirms not at prompt
-          statusIcon = "🔴";
-          statusLabel = "busy";
-        } else if (snap.atPrompt) {
-          statusIcon = "🟢";
-          statusLabel = "idle";
-        } else {
-          statusIcon = "🟡";
-          statusLabel = "working";
-        }
-
-        const activeTag = isActive ? " ← active" : "";
-        lines.push(`${i + 1}. ${statusIcon} *${label}* — ${statusLabel}${activeTag}`);
-
-        // Include cached summary if available and recent (< 5 min)
-        if (cached?.summary && Date.now() - cached.timestamp < 5 * 60 * 1000) {
-          lines.push(`   _${cached.summary}_`);
-        }
-      }
-
-      ctx.reply(lines.join("\n")).catch(() => {});
-      return;
-    }
-
-    // --- Natural language image generation detection ---
-    const imageNlMatch = detectImageRequest(trimmedText);
-    if (imageNlMatch) {
-      const imgCtxKey = buildImageContextKey(ctx.source, ctx.recipient, ctx.sessionId);
-      const imageCtx = getImageContext(imgCtxKey);
-      const classification = classifyImageRequest(imageNlMatch, imageCtx);
-
-      if (classification.type === "new") {
-        clearImageContext(imgCtxKey);
-      }
-
-      ctx.typing(true);
-      ctx.reply("On it... generating your image.").catch(() => {});
-
-      (async () => {
-        try {
-          const { generateImage, getConfiguredProvider } = await import("./image-gen/index.js");
-
-          let imgBuf: Buffer;
-          let effectivePrompt: string;
-
-          if (classification.type === "refine" && imageCtx) {
-            const updatedHistory = [...imageCtx.promptHistory, classification.prompt];
-            effectivePrompt = buildChainedPrompt(updatedHistory);
-
-            // Prefer native img2img if the provider supports it and we have a previous image
-            const provider = getConfiguredProvider();
-            if (provider.refine && imageCtx.lastImage) {
-              log(`image-gen: using native img2img (refine) — provider=${provider.name}`);
-              const result = await provider.refine({
-                prompt: classification.prompt,
-                sourceImage: imageCtx.lastImage,
-                sourceMime: imageCtx.lastImageMime,
-                strength: 0.7,
-              });
-              imgBuf = result.images[0];
-            } else {
-              log(`image-gen: refining via prompt chaining — "${effectivePrompt.slice(0, 80)}"`);
-              const result = await generateImage({ prompt: effectivePrompt });
-              imgBuf = result.images[0];
+          // Sessions
+          lines.push(`*Sessions (${snapshots.length})*`);
+          for (let i = 0; i < snapshots.length; i++) {
+            const snap = snapshots[i];
+            const label = snap.paiName ?? snap.tabTitle ?? snap.name;
+            const isActive = snap.id === activeItermSessionId;
+            const icon = snap.atPrompt ? "🟢" : "🟡";
+            const tag = isActive ? " ← active" : "";
+            lines.push(`${i + 1}. ${icon} *${label}*${tag}`);
+            const cached = statusCache.get(snap.id);
+            if (cached?.summary && Date.now() - cached.timestamp < 5 * 60 * 1000) {
+              lines.push(`   _${cached.summary}_`);
             }
+          }
+          lines.push("");
 
-            await ctx.replyImage(imgBuf, classification.prompt.slice(0, 200));
-            setImageContext(imgCtxKey, appendPromptToContext(imageCtx, classification.prompt, imgBuf, "image/png"));
-          } else {
-            // New image
-            effectivePrompt = classification.prompt;
-            const result = await generateImage({ prompt: effectivePrompt });
-            imgBuf = result.images[0];
-            await ctx.replyImage(imgBuf, effectivePrompt.slice(0, 200));
-            setImageContext(imgCtxKey, appendPromptToContext(undefined, effectivePrompt, imgBuf, "image/png"));
+          // Plugins
+          const plugins = bridge.registry.listPlugins();
+          lines.push(`*Plugins (${plugins.length})*`);
+          for (const p of plugins) {
+            const chCount = p.joinedChannels.size;
+            lines.push(`• *${p.spec.name}* [${p.spec.type}] — ${p.status}${chCount > 0 ? ` (${chCount} ch)` : ""}`);
+          }
+          lines.push("");
+
+          // Channels with activity
+          const channels = bridge.registry.listChannels();
+          const activeChannels = channels.filter(ch => ch.members.size > 0);
+          if (activeChannels.length > 0) {
+            lines.push(`*Channels (${activeChannels.length})*`);
+            for (const ch of activeChannels) {
+              const age = ch.lastMessageTs ? `${Math.round((Date.now() - ch.lastMessageTs) / 1000)}s ago` : "no activity";
+              const outbox = ch.outbox.length > 0 ? `, ${ch.outbox.length} buffered` : "";
+              lines.push(`• ${ch.channel} — ${ch.members.size} member(s), ${age}${outbox}`);
+            }
+            lines.push("");
           }
 
-          ctx.typing(false);
-        } catch (err) {
-          ctx.typing(false);
-          const errMsg = err instanceof Error ? err.message : String(err);
-          ctx.reply(`Image generation failed: ${errMsg}`).catch(() => {});
-          log(`image-gen: error — ${errMsg}`);
+          // Peers (mesh)
+          const peers = bridge.listPeers();
+          if (peers.length > 0) {
+            lines.push(`*Peers (${peers.length})*`);
+            for (const p of peers) lines.push(`• ${p}`);
+          }
+
+          ctx.reply(lines.join("\n")).catch(() => {});
+          return;
         }
-      })().catch((err) => { ctx.typing(false); log(`image-gen: unhandled error — ${err}`); });
-      return;
+
+        case "plugins": {
+          const plugins = bridge.registry.listPlugins();
+          const lines: string[] = [`*AIBP Plugins (${plugins.length})*`, ""];
+          for (const p of plugins) {
+            lines.push(`*${p.address}*`);
+            lines.push(`  Type: ${p.spec.type} | Status: ${p.status}`);
+            lines.push(`  Caps: ${p.spec.capabilities.join(", ")}`);
+            if (p.joinedChannels.size > 0) {
+              lines.push(`  Channels: ${Array.from(p.joinedChannels).join(", ")}`);
+            }
+            if (p.spec.commands?.length) {
+              lines.push(`  Commands: ${p.spec.commands.map(c => c.name).join(", ")}`);
+            }
+            lines.push("");
+          }
+          ctx.reply(lines.join("\n")).catch(() => {});
+          return;
+        }
+
+        case "channels": {
+          const channels = bridge.registry.listChannels();
+          const lines: string[] = [`*AIBP Channels (${channels.length})*`, ""];
+          for (const ch of channels) {
+            const members = Array.from(ch.members).join(", ") || "(empty)";
+            const age = ch.lastMessageTs ? `last: ${Math.round((Date.now() - ch.lastMessageTs) / 1000)}s ago` : "no activity";
+            lines.push(`*${ch.channel}*`);
+            lines.push(`  Members: ${members}`);
+            lines.push(`  ${age}${ch.outbox.length > 0 ? ` | outbox: ${ch.outbox.length}` : ""}`);
+            lines.push("");
+          }
+          ctx.reply(lines.join("\n")).catch(() => {});
+          return;
+        }
+
+        case "commands": {
+          const commands = bridge.listCommands();
+          const lines: string[] = [`*AIBP Commands (${commands.length})*`, ""];
+          // Group by owner
+          const byOwner = new Map<string, typeof commands>();
+          for (const cmd of commands) {
+            const group = byOwner.get(cmd.owner) ?? [];
+            group.push(cmd);
+            byOwner.set(cmd.owner, group);
+          }
+          for (const [owner, cmds] of byOwner) {
+            lines.push(`*${owner}*`);
+            for (const c of cmds) {
+              const desc = c.spec?.description ? ` — ${c.spec.description}` : "";
+              const args = c.spec?.args ? ` ${c.spec.args}` : "";
+              lines.push(`  /${c.name}${args}${desc}`);
+            }
+            lines.push("");
+          }
+          ctx.reply(lines.join("\n")).catch(() => {});
+          return;
+        }
+
+        case "peers": {
+          const peers = bridge.listPeers();
+          if (peers.length === 0) {
+            ctx.reply("No mesh peers connected.").catch(() => {});
+          } else {
+            const lines = [`*AIBP Mesh Peers (${peers.length})*`, ""];
+            for (const p of peers) lines.push(`• ${p}`);
+            ctx.reply(lines.join("\n")).catch(() => {});
+          }
+          return;
+        }
+
+        case "help": {
+          ctx.reply([
+            "*AIBP Commands*",
+            "",
+            "/aibp status — Overview (sessions, plugins, channels)",
+            "/aibp plugins — Registered plugins with capabilities",
+            "/aibp channels — Active channels with members",
+            "/aibp commands — All registered commands by owner",
+            "/aibp peers — Mesh network peers",
+            "/aibp help — This help",
+          ].join("\n")).catch(() => {});
+          return;
+        }
+
+        default:
+          ctx.reply(`Unknown subcommand: ${sub}. Try /aibp help`).catch(() => {});
+          return;
+      }
+    }
+
+    // --- /status, /st — alias for /aibp status ---
+    if (trimmedText === "/status" || trimmedText === "/st") {
+      return handleMessage("/aibp status", timestamp, ctx);
+    }
+
+    // --- Image refinement pre-check ---
+    // If the user has an active image context, short messages like "with a tie"
+    // or "make it watercolor" should be caught as refinements even if they don't
+    // match IMAGE_REQUEST_PATTERNS (which require "send/show/make me an image...").
+    const imgCtxKey = buildImageContextKey(ctx.source, ctx.recipient, ctx.sessionId);
+    const existingImageCtx = getImageContext(imgCtxKey);
+    const imageNlMatch = detectImageRequest(trimmedText);
+
+    // Refinement shortcut: if image context exists and no NL match, try classifying
+    // the raw message. If it classifies as "refine", intercept it.
+    let forceRefinement = false;
+    if (!imageNlMatch && existingImageCtx && existingImageCtx.promptHistory.length > 0) {
+      const preCheck = classifyImageRequest(trimmedText, existingImageCtx);
+      if (preCheck.type === "refine") {
+        forceRefinement = true;
+      }
+    }
+
+    if (imageNlMatch || forceRefinement) {
+      const imageCtx = existingImageCtx;
+      const classification = imageNlMatch
+        ? classifyImageRequest(imageNlMatch, imageCtx)
+        : classifyImageRequest(trimmedText, imageCtx);
+
+      // Only intercept if the classifier found an actual image signal.
+      // "unrelated" falls through to normal routing (Claude, slash commands, etc.).
+      if (classification.type !== "unrelated") {
+        if (classification.type === "new") {
+          clearImageContext(imgCtxKey);
+        }
+
+        ctx.typing(true);
+        ctx.reply("On it... generating your image.").catch(() => {});
+
+        (async () => {
+          try {
+            const { generateImage, getConfiguredProvider } = await import("./image-gen/index.js");
+
+            let imgBuf: Buffer;
+            let effectivePrompt: string;
+
+            if (classification.type === "refine" && imageCtx) {
+              const updatedHistory = [...imageCtx.promptHistory, classification.prompt];
+              effectivePrompt = buildChainedPrompt(updatedHistory);
+
+              // Prefer native img2img if the provider supports it and we have a previous image
+              const provider = getConfiguredProvider();
+              if (provider.refine && imageCtx.lastImage) {
+                log(`image-gen: using native img2img (refine) — provider=${provider.name}`);
+                const result = await provider.refine({
+                  prompt: classification.prompt,
+                  sourceImage: imageCtx.lastImage,
+                  sourceMime: imageCtx.lastImageMime,
+                  strength: 0.7,
+                });
+                imgBuf = result.images[0];
+              } else {
+                log(`image-gen: refining via prompt chaining — "${effectivePrompt.slice(0, 80)}"`);
+                const result = await generateImage({ prompt: effectivePrompt });
+                imgBuf = result.images[0];
+              }
+
+              await ctx.replyImage(imgBuf, classification.prompt.slice(0, 200));
+              setImageContext(imgCtxKey, appendPromptToContext(imageCtx, classification.prompt, imgBuf, "image/png"));
+            } else {
+              // New image
+              effectivePrompt = classification.prompt;
+              const result = await generateImage({ prompt: effectivePrompt });
+              imgBuf = result.images[0];
+              await ctx.replyImage(imgBuf, effectivePrompt.slice(0, 200));
+              setImageContext(imgCtxKey, appendPromptToContext(undefined, effectivePrompt, imgBuf, "image/png"));
+            }
+
+            ctx.typing(false);
+          } catch (err) {
+            ctx.typing(false);
+            const errMsg = err instanceof Error ? err.message : String(err);
+            ctx.reply(`Image generation failed: ${errMsg}`).catch(() => {});
+            log(`image-gen: error — ${errMsg}`);
+          }
+        })().catch((err) => { ctx.typing(false); log(`image-gen: unhandled error — ${err}`); });
+        return;
+      }
     }
 
     // --- Plain text / unrecognized commands → dispatch to iTerm2 ---
