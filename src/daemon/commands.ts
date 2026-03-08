@@ -58,6 +58,15 @@ import { deliverViaApi } from "../core/transport.js";
 import { hybridManager } from "../core/hybrid.js";
 import type { CommandContext } from "./command-context.js";
 import { handleScreenshot } from "./screenshot.js";
+import {
+  buildImageContextKey,
+  getImageContext,
+  setImageContext,
+  clearImageContext,
+  classifyImageRequest,
+  buildChainedPrompt,
+  appendPromptToContext,
+} from "./image-context.js";
 
 /**
  * Detect natural language image generation requests.
@@ -436,10 +445,13 @@ end tell`;
       return;
     }
 
-    // --- /image, /img <prompt> — generate an image ---
+    // --- /image, /img <prompt> — generate an image (always fresh, clears context) ---
     const imageMatch = trimmedText.match(/^\/(?:image|img)\s+(.+)$/s);
     if (imageMatch) {
       const prompt = imageMatch[1].trim();
+      const imgCtxKey = buildImageContextKey(ctx.source, ctx.recipient, ctx.sessionId);
+      // Explicit /image command always starts fresh
+      clearImageContext(imgCtxKey);
       ctx.typing(true);
       ctx.reply("On it... generating your image.").catch(() => {});
       (async () => {
@@ -448,7 +460,10 @@ end tell`;
           const result = await generateImage({ prompt });
           ctx.typing(false);
           if (result.images.length > 0) {
-            await ctx.replyImage(result.images[0], prompt.slice(0, 200));
+            const imgBuf = result.images[0];
+            await ctx.replyImage(imgBuf, prompt.slice(0, 200));
+            // Store prompt + image in context for future refinements
+            setImageContext(imgCtxKey, appendPromptToContext(undefined, prompt, imgBuf, "image/png"));
           }
         } catch (err) {
           ctx.typing(false);
@@ -716,16 +731,57 @@ end tell`;
     // --- Natural language image generation detection ---
     const imageNlMatch = detectImageRequest(trimmedText);
     if (imageNlMatch) {
+      const imgCtxKey = buildImageContextKey(ctx.source, ctx.recipient, ctx.sessionId);
+      const imageCtx = getImageContext(imgCtxKey);
+      const classification = classifyImageRequest(imageNlMatch, imageCtx);
+
+      if (classification.type === "new") {
+        clearImageContext(imgCtxKey);
+      }
+
       ctx.typing(true);
       ctx.reply("On it... generating your image.").catch(() => {});
+
       (async () => {
         try {
-          const { generateImage } = await import("./image-gen/index.js");
-          const result = await generateImage({ prompt: imageNlMatch });
-          ctx.typing(false);
-          if (result.images.length > 0) {
-            await ctx.replyImage(result.images[0], imageNlMatch.slice(0, 200));
+          const { generateImage, getConfiguredProvider } = await import("./image-gen/index.js");
+
+          let imgBuf: Buffer;
+          let effectivePrompt: string;
+
+          if (classification.type === "refine" && imageCtx) {
+            const updatedHistory = [...imageCtx.promptHistory, classification.prompt];
+            effectivePrompt = buildChainedPrompt(updatedHistory);
+
+            // Prefer native img2img if the provider supports it and we have a previous image
+            const provider = getConfiguredProvider();
+            if (provider.refine && imageCtx.lastImage) {
+              log(`image-gen: using native img2img (refine) — provider=${provider.name}`);
+              const result = await provider.refine({
+                prompt: classification.prompt,
+                sourceImage: imageCtx.lastImage,
+                sourceMime: imageCtx.lastImageMime,
+                strength: 0.7,
+              });
+              imgBuf = result.images[0];
+            } else {
+              log(`image-gen: refining via prompt chaining — "${effectivePrompt.slice(0, 80)}"`);
+              const result = await generateImage({ prompt: effectivePrompt });
+              imgBuf = result.images[0];
+            }
+
+            await ctx.replyImage(imgBuf, classification.prompt.slice(0, 200));
+            setImageContext(imgCtxKey, appendPromptToContext(imageCtx, classification.prompt, imgBuf, "image/png"));
+          } else {
+            // New image
+            effectivePrompt = classification.prompt;
+            const result = await generateImage({ prompt: effectivePrompt });
+            imgBuf = result.images[0];
+            await ctx.replyImage(imgBuf, effectivePrompt.slice(0, 200));
+            setImageContext(imgCtxKey, appendPromptToContext(undefined, effectivePrompt, imgBuf, "image/png"));
           }
+
+          ctx.typing(false);
         } catch (err) {
           ctx.typing(false);
           const errMsg = err instanceof Error ? err.message : String(err);

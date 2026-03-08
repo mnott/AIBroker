@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { AibpBridge } from "../aibp/bridge.js";
 import { typeIntoSession, findClaudeSession, isClaudeRunningInSession } from "../adapters/iterm/core.js";
 import { activeItermSessionId, setActiveItermSessionId } from "../core/state.js";
+import { pruneStaleContexts } from "./image-context.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -195,6 +196,7 @@ export async function startDaemon(options?: {
         aibpBridge.sendTyping(sessionId ?? "", active);
       },
       source: "pailot",
+      sessionId,
     };
 
     // Dispatch based on message type
@@ -271,6 +273,7 @@ export async function startDaemon(options?: {
       replyVoice: async () => { log("[hub fallback] voice reply not supported in embedded mode"); },
       typing: () => {},
       source: "hub",
+      // sessionId intentionally omitted — fallback/embedded mode has no session
     };
     return hubCommandHandler(text, timestamp, fallbackCtx);
   });
@@ -282,6 +285,12 @@ export async function startDaemon(options?: {
   registerCoreHandlers(ipcServer, adapterRegistry, apiBackend, manager);
   ipcServer.start();
   adapterRegistry.startHealthPolling();
+
+  // Prune stale image contexts every 5 minutes (30-minute TTL enforced inside)
+  setInterval(() => {
+    const evicted = pruneStaleContexts();
+    if (evicted > 0) log(`[hub] pruned ${evicted} stale image context(s)`);
+  }, 5 * 60 * 1000).unref();
 
   // Auto-discover adapters that were already running before the hub (re)started.
   // Probe well-known socket paths and register any that respond to "ping".
@@ -307,6 +316,7 @@ export async function startDaemon(options?: {
       replyVoice: async () => {},
       typing: () => {},
       source: source ?? "pailot",
+      sessionId: manager.activeSession?.backendSessionId,
     };
     await handleScreenshot(ctx);
   });

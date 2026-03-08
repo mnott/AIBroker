@@ -35,7 +35,7 @@ export async function generateImage(opts: GenerateImageOptions): Promise<Generat
   return provider.generate(opts);
 }
 
-function getConfiguredProvider(): ImageProvider {
+export function getConfiguredProvider(): ImageProvider {
   // 1. Explicit config file
   const config = loadConfig();
   if (config) {

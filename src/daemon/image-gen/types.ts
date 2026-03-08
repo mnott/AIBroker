@@ -16,9 +16,22 @@ export interface GenerateImageResult {
   durationMs: number;
 }
 
+export interface RefineImageOptions {
+  /** The modification instruction (what to change). */
+  prompt: string;
+  /** The image to modify. */
+  sourceImage: Buffer;
+  /** MIME type of sourceImage ("image/webp" | "image/png"). */
+  sourceMime: string;
+  /** How much to deviate from the source image. 0.0 = minimal change, 1.0 = ignore source. Default 0.7. */
+  strength?: number;
+}
+
 export interface ImageProvider {
   name: string;
   generate(opts: GenerateImageOptions): Promise<GenerateImageResult>;
+  /** Optional: native img2img refinement. Falls back to prompt chaining if absent. */
+  refine?(opts: RefineImageOptions): Promise<GenerateImageResult>;
 }
 
 export interface ImageProviderConfig {
