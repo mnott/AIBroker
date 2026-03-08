@@ -1,75 +1,75 @@
-# aibroker
+# AIBroker
 
-Platform-agnostic AI message broker — shared infrastructure for messaging
-bridges that connect WhatsApp, Telegram, and other channels to Claude Code.
+Claude Code is locked inside your terminal. You can only talk to it by typing. AIBroker breaks it out — send a WhatsApp voice note from the train, text from Telegram on your phone, or use the PAILot iOS app with full session management. Claude hears you, works on it, and replies in the same channel. Voice in, voice out.
 
----
-
-## Architecture
-
-```
-  Messaging Services           AIBroker Hub             AI Backends
-  ─────────────────           ────────────             ───────────
-  WhatsApp (Whazaa)  ──────>                ──────>  Anthropic Claude
-  Telegram (Telex)   ──────>   Hub Daemon   ──────>  OpenAI
-  iOS App (PAILot)   ──────>                ──────>  Ollama (local)
-  Your Adapter       ──────>                ──────>  Custom Backend
-```
-
-Each adapter is a standalone npm package. The hub daemon routes messages between adapters and AI backends. Everything communicates over Unix Domain Sockets.
+Install AIBroker and your Claude Code sessions become reachable from anywhere. Ask Claude to check on your build while you're away from the desk. Send a screenshot request from WhatsApp. Switch between Claude sessions from your phone. It all routes through one daemon that owns the plumbing — TTS, transcription, image generation, screenshots, session management — so the adapters stay thin and the experience stays consistent.
 
 ---
 
-## Supported Adapters
+## What You Can Do
 
-| Package | Channel | Repo |
-|---------|---------|------|
-| **whazaa** | WhatsApp | [github.com/mnott/Whazaa](https://github.com/mnott/Whazaa) |
-| **telex** | Telegram | [github.com/mnott/Telex](https://github.com/mnott/Telex) |
-| **pailot** | iOS companion app | Built into aibroker (`adapters/pailot/`) |
+### Talk to Claude from Your Phone
 
-Want to connect a different service? See [docs/CREATE_ADAPTER.md](docs/CREATE_ADAPTER.md).
+- **WhatsApp** — Send a text or voice note. Claude gets it, processes it, replies back. Voice in → voice out.
+- **Telegram** — Same experience, different app. Text and voice both work.
+- **PAILot** (iOS app) — Native companion app with session switching, voice messages, typing indicators, and message history.
 
----
+### Manage Sessions Remotely
 
-## Supported AI Backends
+- "Show me all sessions" — see every running Claude Code session
+- "Switch to session 2" — route your messages to a different session
+- "Start a new session for ~/projects/api" — launch a fresh Claude session from your phone
+- "Screenshot" — capture what Claude is showing in iTerm right now
+- "What's the status?" — see which sessions are busy, idle, or waiting
 
-| Provider | Model Access | Tool Use | Conversation History |
-|----------|-------------|----------|---------------------|
-| **Anthropic Claude** | Claude Agent SDK subprocess | Yes (full tool access) | Yes (session resume) |
-| **OpenAI** | Chat Completions API | No | No (stateless) |
-| **Ollama** | Local Ollama HTTP API | No | No (stateless) |
-| **Custom** | Your implementation | Optional | Optional |
+### Voice and Media
 
-Want to connect a different AI provider? See [docs/BACKEND_GUIDE.md](docs/BACKEND_GUIDE.md).
+- **Voice notes** — Send a voice note from WhatsApp or Telegram. Whisper transcribes it, Claude processes it, Kokoro speaks the reply back as a voice note.
+- **Image generation** — "Send me an image of a sunset over mountains" — Flux generates it, delivers it to your chat.
+- **Screenshots** — Capture any iTerm session and receive the image on your phone.
+- **Video analysis** — Send a video, Gemini analyzes it, Claude discusses the results.
+
+### Slash Commands from Anywhere
+
+Type these in any channel — WhatsApp, Telegram, PAILot, or terminal:
+
+| Command | What it does |
+|---------|-------------|
+| `/s` | List all sessions |
+| `/n ~/project` | Start a new visual session |
+| `/ss` | Screenshot the active session |
+| `/status` | Show all session statuses |
+| `/image a cat in space` | Generate and deliver an image |
+| `/e 3` | End session 3 |
 
 ---
 
 ## Quick Start
 
+Tell Claude Code:
+
+> Clone https://github.com/mnott/AIBroker and set it up for me
+
+Or manually:
+
 ### 1. Install
 
 ```bash
-npm install -g aibroker
+git clone https://github.com/mnott/AIBroker
+cd AIBroker
+npm install
+npm run build
 ```
 
-### 2. Configure
+### 2. Configure the MCP server
 
-Create `~/.aibroker/config.json`:
+Add to `~/.claude.json` under `mcpServers`:
 
 ```json
-{
-  "adapters": [
-    {
-      "name": "whazaa",
-      "socketPath": "/tmp/whazaa-watcher.sock"
-    }
-  ],
-  "backend": {
-    "type": "api",
-    "provider": "anthropic",
-    "model": "claude-opus-4-5"
-  }
+"aibroker": {
+  "type": "stdio",
+  "command": "node",
+  "args": ["/path/to/AIBroker/dist/mcp/index.js"]
 }
 ```
 
@@ -79,121 +79,189 @@ Create `~/.aibroker/config.json`:
 aibroker start
 ```
 
-Check status:
+The daemon runs as a macOS launchd service (`com.aibroker.daemon`). It owns the IPC socket at `/tmp/aibroker.sock` and the PAILot WebSocket gateway on port 8765.
+
+### 4. Connect an adapter
 
 ```bash
-aibroker status
-```
-
-### 4. Install and start an adapter
-
-```bash
+# WhatsApp
 npm install -g whazaa
 whazaa watch
+
+# Telegram
+npm install -g telex
+telex watch
 ```
 
-Once the adapter watcher is running, messages from your messaging service are routed to the configured AI backend and replies are sent back automatically.
+Once connected, messages from your phone route to Claude and replies come back automatically.
+
+---
+
+## Architecture
+
+```
+  Your Phone                   AIBroker Daemon                   Claude Code
+  ──────────                   ───────────────                   ──────────
+  WhatsApp  ───► Whazaa  ──┐                                ┌──► Session 1 (iTerm)
+  Telegram  ───► Telex   ──┤   Hub (IPC + AIBP routing)    ├──► Session 2 (iTerm)
+  PAILot    ───► WS:8765 ──┤   TTS · STT · Screenshots     ├──► Session 3 (iTerm)
+  Your App  ───► Adapter ──┘   Image Gen · Session Mgmt    └──► Headless (API)
+```
+
+**AIBroker is the runtime.** Adapters are thin transport plugins — they handle the network connection and nothing else. All intelligence lives in the hub: command parsing, message routing, media pipelines, session orchestration.
+
+### AIBP Protocol
+
+Internally, all messages flow through AIBP (AIBroker Protocol) — an IRC-inspired routing layer with explicit source/destination addressing, typed channels, and plugin registration.
+
+```
+Plugin A ──message──► #session:abc ──fan-out──► Plugin B, Plugin C, Plugin D
+```
+
+Every plugin declares its type and capabilities:
+
+| Plugin Type | Examples | Capabilities |
+|------------|----------|-------------|
+| `transport` | Whazaa, Telex | TEXT, VOICE, IMAGE, FILE |
+| `terminal` | iTerm2 | TEXT, COMMAND |
+| `mobile` | PAILot | TEXT, VOICE, IMAGE, TYPING, STATUS |
+| `mcp` | Claude Code sessions | TEXT, VOICE, IMAGE, COMMAND |
+| `bridge` | Remote hubs | TEXT, VOICE, IMAGE, COMMAND, FILE |
+
+Messages carry explicit `src` and `dst` addresses — no guessing which session should receive what. Cross-session messaging, mesh networking between machines, and channel fan-out all work through the same protocol.
+
+For the full protocol spec, see [docs/protocol.md](docs/protocol.md).
+
+---
+
+## MCP Tools
+
+AIBroker exposes 42 MCP tools through a single unified server. Claude uses these automatically based on message routing rules — you don't need to call them manually.
+
+### Message Routing
+
+When a message arrives with a prefix, Claude knows where it came from and replies through the matching channel:
+
+| Prefix | Source | Claude replies with |
+|--------|--------|-------------------|
+| `[Whazaa]` | WhatsApp text | `whatsapp_send` |
+| `[Whazaa:voice]` | WhatsApp voice note | `whatsapp_tts` |
+| `[Telex]` | Telegram text | `telegram_send` |
+| `[Telex:voice]` | Telegram voice note | `telegram_tts` |
+| `[PAILot]` | PAILot app text | `pailot_send` |
+| `[PAILot:voice]` | PAILot app voice | `pailot_tts` |
+| _(no prefix)_ | Terminal keyboard | Terminal only |
+
+### Tool Categories
+
+| Category | Tools | What they do |
+|----------|-------|-------------|
+| `whatsapp_*` | send, tts, contacts, chats, history, login, status | WhatsApp messaging and management |
+| `telegram_*` | send, tts, contacts, chats, history, login, status | Telegram messaging and management |
+| `pailot_*` | send, tts, receive | PAILot app communication |
+| `aibroker_*` | status, sessions, switch, discover, speak, dictate, generate_image, ... | Hub-level operations |
+
+For the complete reference, see [docs/mcp-tools.md](docs/mcp-tools.md).
 
 ---
 
 ## Bring Your Own Messenger
 
-AIBroker adapters are standalone npm packages. The scaffold takes care of all IPC wiring, MCP tool registration, and hub integration. You only implement two functions: `connectWatcher()` (connect to the service) and `sendText()` / `sendVoice()` / `sendFile()` (deliver outbound messages).
+AIBroker adapters are standalone npm packages. A scaffold generator handles all the IPC wiring, MCP registration, and hub integration. You implement two things: how to connect and how to send.
 
 ```bash
 aibroker create-adapter my-signal
 cd my-signal
-claude  # paste the onboarding prompt and answer 5 questions
+npm install
 ```
 
-Full guide: [docs/CREATE_ADAPTER.md](docs/CREATE_ADAPTER.md)
+Full guide: [docs/adapters.md](docs/adapters.md)
 
 ---
 
-## Bring Your Own AI
+## Media Pipelines
 
-Configure a built-in provider (Anthropic, OpenAI, Ollama) or implement the `Backend` interface in any Node.js module:
+All media processing is centralized in the hub — adapters never touch TTS, transcription, or image generation directly.
 
-```json
-{
-  "backend": {
-    "type": "api",
-    "provider": "ollama",
-    "model": "llama3.2"
-  }
-}
-```
-
-```json
-{
-  "backend": {
-    "type": "custom",
-    "modulePath": "/path/to/my-backend.js",
-    "options": { "model": "my-model" }
-  }
-}
-```
-
-Full guide: [docs/BACKEND_GUIDE.md](docs/BACKEND_GUIDE.md)
+| Pipeline | Technology | What happens |
+|----------|-----------|-------------|
+| **Text-to-Speech** | Kokoro (local) | Text → WAV → OGG Opus → delivered as voice note |
+| **Speech-to-Text** | Whisper (local) | Voice note → transcription → delivered as text to Claude |
+| **Image Generation** | Replicate Flux Schnell | Prompt → image → delivered to chat ($0.003/image, 2-4s) |
+| **Image Analysis** | Claude Vision | Image → description → text response (no extra API cost on Max plan) |
+| **Video Analysis** | Gemini 2.0 Flash | Video → analysis → text response (free tier: 15 RPM) |
+| **Screenshots** | iTerm2 AppleScript | Capture terminal → PNG → delivered to chat |
 
 ---
 
-## What's Inside
+## PAILot Companion App
 
-- Logging with configurable prefix (`setLogPrefix`)
-- Session state management and message queuing
-- File persistence with configurable data dir (`setAppDir`)
-- Unix Domain Socket IPC (server + client)
-- macOS iTerm2 adapter (AppleScript session management)
-- Kokoro TTS (local speech synthesis + Whisper transcription)
-- PAILot WebSocket gateway (iOS companion app support)
+PAILot is a native iOS app that connects to AIBroker over WebSocket. It provides:
+
+- **Session management** — switch between Claude sessions, start new ones, end old ones
+- **Voice messages** — record and send, receive voice replies with chain playback
+- **Typing indicators** — see when Claude is processing
+- **Message history** — persistent chat with text and voice
+- **Offline queuing** — messages buffer on the server when you're disconnected, drain on reconnect
+
+PAILot connects to `ws://your-mac:8765`. See [docs/pailot.md](docs/pailot.md).
 
 ---
 
-## Usage as a Library
+## Mesh Networking
 
-```typescript
-import { setLogPrefix, setAppDir, log } from "aibroker";
+Two AIBroker instances on different machines can exchange messages through AIBP bridge plugins. A message from PAILot on Machine A can reach a Claude session on Machine B:
 
-setLogPrefix("my-app");
-setAppDir("/path/to/data");
-
-log("my-app started");
+```
+Machine A                          Machine B
+─────────                          ─────────
+PAILot ──► Hub A ──bridge──► Hub B ──► Claude Session
 ```
 
-The IPC client:
+Addressing is explicit: `hub:machine-b/session:abc` routes through the bridge to the remote hub. See [docs/mesh.md](docs/mesh.md).
 
-```typescript
-import { WatcherClient } from "aibroker";
+---
 
-const client = new WatcherClient("/tmp/my-adapter-watcher.sock");
-const result = await client.call_raw("health", {});
-console.log(result);
-```
+## Documentation
+
+| Document | What it covers |
+|----------|---------------|
+| [architecture.md](docs/architecture.md) | System design, component interactions, data flow |
+| [protocol.md](docs/protocol.md) | AIBP protocol specification |
+| [plugins.md](docs/plugins.md) | Plugin types, registration, capabilities |
+| [routing.md](docs/routing.md) | Message routing logic and channel system |
+| [sessions.md](docs/sessions.md) | Session management and lifecycle |
+| [commands.md](docs/commands.md) | Slash command reference |
+| [mcp-tools.md](docs/mcp-tools.md) | All 42 MCP tools with parameters |
+| [adapters.md](docs/adapters.md) | Adapter development guide |
+| [pailot.md](docs/pailot.md) | PAILot iOS app integration |
+| [mesh.md](docs/mesh.md) | Multi-machine mesh networking |
+| [ipc.md](docs/ipc.md) | IPC protocol and message format |
+| [tts-stt.md](docs/tts-stt.md) | Voice pipeline details |
+| [use-cases.md](docs/use-cases.md) | End-to-end message flow diagrams |
+| [protocol-landscape.md](docs/protocol-landscape.md) | How AIBP relates to A2A, MCP, and other standards |
+| [configuration.md](docs/configuration.md) | Configuration reference |
+| [development.md](docs/development.md) | Development setup and testing |
 
 ---
 
 ## Hard Rule
 
-aibroker never imports `@whiskeysockets/baileys`, `telegram`/`gramjs`,
-`better-sqlite3`, `qrcode`, or any transport SDK. Those belong in
-the per-channel packages.
+AIBroker never imports `@whiskeysockets/baileys`, `telegram`/`gramjs`, `better-sqlite3`, `qrcode`, or any transport-specific SDK. Platform-specific dependencies belong in the adapter packages.
 
 ---
 
-## Family
+## Companion Projects
 
-| Package | Channel | Repo |
-|---------|---------|------|
-| **aibroker** | Shared core | [github.com/mnott/AIBroker](https://github.com/mnott/AIBroker) |
-| **whazaa** | WhatsApp | [github.com/mnott/Whazaa](https://github.com/mnott/Whazaa) |
-| **telex** | Telegram | [github.com/mnott/Telex](https://github.com/mnott/Telex) |
+| Package | What it does | Repo |
+|---------|-------------|------|
+| **[PAI](https://github.com/mnott/PAI)** | Knowledge OS — persistent memory, session continuity, semantic search for Claude Code | [github.com/mnott/PAI](https://github.com/mnott/PAI) |
+| **[Whazaa](https://github.com/mnott/Whazaa)** | WhatsApp adapter — voice notes, media, contact management | [github.com/mnott/Whazaa](https://github.com/mnott/Whazaa) |
+| **[Telex](https://github.com/mnott/Telex)** | Telegram adapter — text and voice messaging | [github.com/mnott/Telex](https://github.com/mnott/Telex) |
+| **[Coogle](https://github.com/mnott/Coogle)** | Google Workspace MCP — Gmail, Calendar, Drive multiplexing | [github.com/mnott/Coogle](https://github.com/mnott/Coogle) |
+| **[DEVONthink MCP](https://github.com/mnott/devonthink-mcp)** | DEVONthink integration — document search and archival | [github.com/mnott/devonthink-mcp](https://github.com/mnott/devonthink-mcp) |
 
 ---
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
