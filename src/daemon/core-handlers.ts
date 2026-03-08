@@ -652,6 +652,7 @@ export function registerCoreHandlers(
     // MCP server may not have ITERM_SESSION_ID — fall back to session that last
     // received user input from PAILot (survives session switches during processing)
     const sessionId = callerSessionId || lastRoutedSessionId || activeItermSessionId || undefined;
+    log(`[pailot_send] callerSession=${callerSessionId?.slice(0, 8) ?? "none"} lastRouted=${lastRoutedSessionId?.slice(0, 8) ?? "none"} activeIterm=${activeItermSessionId?.slice(0, 8) ?? "none"} → resolved=${sessionId?.slice(0, 8) ?? "none"}`);
 
     try {
       const bridge = getAibpBridge();
