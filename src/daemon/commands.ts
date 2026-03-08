@@ -443,7 +443,7 @@ end tell`;
       ctx.reply("On it... generating your image.").catch(() => {});
       (async () => {
         try {
-          const { generateImage } = await import("./image-gen.js");
+          const { generateImage } = await import("./image-gen/index.js");
           const result = await generateImage({ prompt });
           if (result.images.length > 0) {
             await ctx.replyImage(result.images[0], prompt.slice(0, 200));
@@ -716,7 +716,7 @@ end tell`;
       ctx.reply("On it... generating your image.").catch(() => {});
       (async () => {
         try {
-          const { generateImage } = await import("./image-gen.js");
+          const { generateImage } = await import("./image-gen/index.js");
           const result = await generateImage({ prompt: imageNlMatch });
           if (result.images.length > 0) {
             await ctx.replyImage(result.images[0], imageNlMatch.slice(0, 200));
