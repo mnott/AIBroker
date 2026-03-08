@@ -73,10 +73,62 @@ function buildProvider(config: ImageProviderConfig): ImageProvider {
       return createHuggingFaceProvider(config);
     case "pollinations":
       return createPollinationsProvider();
+    case "custom":
+      return loadCustomProvider(config);
     default:
       log(`Image gen: unknown provider "${config.provider}", falling back to pollinations`);
       return createPollinationsProvider();
   }
+}
+
+/**
+ * Load a custom image provider from a user-supplied module.
+ *
+ * The module must export a `createProvider` function:
+ *   export function createProvider(config: ImageProviderConfig): ImageProvider
+ *
+ * Example module (my-provider.js):
+ *   export function createProvider(config) {
+ *     return {
+ *       name: "my-provider",
+ *       async generate(opts) {
+ *         const res = await fetch("https://my-api.com/generate", { ... });
+ *         return { images: [Buffer.from(await res.arrayBuffer())], model: "my-model", durationMs: 0 };
+ *       }
+ *     };
+ *   }
+ *
+ * Config (~/.aibroker/image-gen.json):
+ *   { "provider": "custom", "modulePath": "/path/to/my-provider.js", "options": { "apiKey": "..." } }
+ */
+function loadCustomProvider(config: ImageProviderConfig): ImageProvider {
+  if (!config.modulePath) {
+    throw new Error('Image gen: custom provider requires "modulePath" in ~/.aibroker/image-gen.json');
+  }
+
+  log(`Image gen: loading custom provider from ${config.modulePath}`);
+
+  // Dynamic import is async, so we return a lazy wrapper that loads on first call
+  let cached: ImageProvider | null = null;
+
+  return {
+    name: `custom (${config.modulePath})`,
+    async generate(opts: GenerateImageOptions): Promise<GenerateImageResult> {
+      if (!cached) {
+        const mod = await import(config.modulePath!) as {
+          createProvider?: (cfg: ImageProviderConfig) => ImageProvider;
+        };
+        if (typeof mod.createProvider !== "function") {
+          throw new Error(
+            `Image gen: custom module ${config.modulePath} must export createProvider(config): ImageProvider`
+          );
+        }
+        cached = mod.createProvider(config);
+        log(`Image gen: custom provider "${cached.name}" loaded`);
+      }
+      return cached.generate(opts);
+    },
+  };
 }
 
 function loadConfig(): ImageProviderConfig | null {
