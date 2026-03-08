@@ -192,31 +192,30 @@ All media processing is centralized in the hub — adapters never touch TTS, tra
 | **Video Analysis** | Gemini 2.0 Flash | Video → analysis → text response (free tier: 15 RPM) |
 | **Screenshots** | iTerm2 AppleScript | Capture terminal → PNG → delivered to chat |
 
-### Bring Your Own Image Provider
+### Image Generation — Works Out of the Box
 
-Image generation is pluggable — pick the provider that fits your budget and privacy needs:
+Image generation uses [Pollinations.ai](https://pollinations.ai) by default — free, unlimited, no API key, no signup. Just ask Claude to generate an image and it works.
 
-| Provider | Token needed? | Free tier | Speed |
-|----------|--------------|-----------|-------|
-| **Replicate** | `REPLICATE_API_TOKEN` | No (~$0.003/image) | 2-4s |
-| **Cloudflare Workers AI** | `CLOUDFLARE_AI_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Yes (~100 images/day) | 3-5s |
-| **Hugging Face** | `HF_API_TOKEN` | Yes (rate-limited) | 5-15s |
-| **Pollinations** | None | Yes (unlimited, no account) | 5-10s |
+Want faster results? Upgrade to a paid provider by setting a single environment variable in `~/.aibroker/env`:
 
-**Zero-config default:** If no tokens are set, AIBroker falls back to Pollinations — free, no signup, works immediately.
+| Provider | Setup | Speed | Cost |
+|----------|-------|-------|------|
+| **Pollinations** _(default)_ | Nothing — works immediately | ~20s | Free |
+| **Replicate** | `REPLICATE_API_TOKEN=r8_...` | 2-4s | ~$0.003/image |
+| **Cloudflare Workers AI** | `CLOUDFLARE_AI_TOKEN=...` + `CLOUDFLARE_ACCOUNT_ID=...` | 3-5s | Free (~100/day) |
+| **Hugging Face** | `HF_API_TOKEN=hf_...` | 5-15s | Free (rate-limited) |
 
-**Auto-detection:** Set an API token in `~/.aibroker/env` and the provider is detected automatically. Priority: Replicate → Cloudflare → Hugging Face → Pollinations.
+AIBroker auto-detects which token is set and uses that provider. No config file needed.
 
-**Explicit config:** Create `~/.aibroker/image-gen.json` to pin a specific provider:
+**Pin a specific provider** with `~/.aibroker/image-gen.json`:
 
 ```json
 {
-  "provider": "cloudflare",
-  "accountId": "your-account-id"
+  "provider": "replicate"
 }
 ```
 
-**Bring your own provider:** Point to any Node.js module that exports a `createProvider` function:
+**Bring your own provider** — point to any Node.js module that implements the `ImageProvider` interface:
 
 ```json
 {
@@ -226,7 +225,7 @@ Image generation is pluggable — pick the provider that fits your budget and pr
 }
 ```
 
-Your module implements one function:
+Your module exports one function:
 
 ```typescript
 import type { ImageProvider, ImageProviderConfig } from "aibroker";
