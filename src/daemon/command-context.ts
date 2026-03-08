@@ -20,6 +20,9 @@ export interface CommandContext {
   /** Send a voice note reply back through the originating adapter. */
   replyVoice: (audioBuffer: Buffer, caption: string) => Promise<void>;
 
+  /** Send a typing/busy indicator to the originating client. */
+  typing: (active: boolean) => void;
+
   /** The adapter that originated the message ("whazaa", "telex", "pailot"). */
   source: string;
 
