@@ -192,6 +192,8 @@ export class AibpBridge {
         { name: "image", description: "Generate an image", args: "<prompt>" },
         { name: "img", description: "Generate an image (alias)", args: "<prompt>" },
         { name: "restart", description: "Restart the adapter", args: "" },
+        { name: "status", description: "Show status of all Claude sessions", args: "" },
+        { name: "st", description: "Show status of all Claude sessions (alias)", args: "" },
       ],
     };
     this.registry.register(spec, sendFn);

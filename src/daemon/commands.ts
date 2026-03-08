@@ -52,6 +52,7 @@ import {
   snapshotAllSessions,
 } from "../adapters/iterm/core.js";
 import { log } from "../core/log.js";
+import { statusCache } from "../core/status-cache.js";
 import { router } from "../core/router.js";
 import { deliverViaApi } from "../core/transport.js";
 import { hybridManager } from "../core/hybrid.js";
@@ -247,6 +248,7 @@ export function createHubCommandHandler(): (
         "/c — Send /clear + go to Claude",
         "/p — Send \"pause session\" to Claude",
         "/ss — Screenshot",
+        "/st — Session status (busy/idle)",
         "",
         "*Media*",
         "/image <prompt> — Generate an image",
@@ -662,6 +664,49 @@ end tell`;
       const target = sessions[num - 1];
       handleEndSessionVisual(target).catch((err) => log(`/e: error — ${err}`));
       ctx.reply(`Ended session *${target.paiName ?? target.name}*.`).catch(() => {});
+      return;
+    }
+
+    // --- /status, /st — show status of all Claude sessions ---
+    if (trimmedText === "/status" || trimmedText === "/st") {
+      const snapshots = snapshotAllSessions();
+      if (snapshots.length === 0) {
+        ctx.reply("No iTerm2 sessions found.").catch(() => {});
+        return;
+      }
+
+      const lines: string[] = ["*Session Status*", ""];
+      for (let i = 0; i < snapshots.length; i++) {
+        const snap = snapshots[i];
+        const label = snap.paiName ?? snap.tabTitle ?? snap.name;
+        const isActive = snap.id === activeItermSessionId;
+
+        // Determine status from atPrompt + cached state
+        let statusIcon: string;
+        let statusLabel: string;
+        const cached = statusCache.get(snap.id);
+        if (cached && cached.state !== "idle" && !snap.atPrompt) {
+          // Cache has a non-idle state and iTerm confirms not at prompt
+          statusIcon = "🔴";
+          statusLabel = "busy";
+        } else if (snap.atPrompt) {
+          statusIcon = "🟢";
+          statusLabel = "idle";
+        } else {
+          statusIcon = "🟡";
+          statusLabel = "working";
+        }
+
+        const activeTag = isActive ? " ← active" : "";
+        lines.push(`${i + 1}. ${statusIcon} *${label}* — ${statusLabel}${activeTag}`);
+
+        // Include cached summary if available and recent (< 5 min)
+        if (cached?.summary && Date.now() - cached.timestamp < 5 * 60 * 1000) {
+          lines.push(`   _${cached.summary}_`);
+        }
+      }
+
+      ctx.reply(lines.join("\n")).catch(() => {});
       return;
     }
 
