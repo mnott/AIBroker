@@ -1,22 +1,22 @@
 /**
- * ABIP IPC Bridge — translates legacy IPC requests into ABIP messages
+ * AIBP IPC Bridge — translates legacy IPC requests into AIBP messages
  * and routes them through the PluginRegistry.
  *
  * This is the Phase 2 integration layer. Existing adapters (Whazaa, Telex)
  * continue using the old IPC protocol. The bridge translates their calls
- * to ABIP messages so the PluginRegistry handles routing.
+ * to AIBP messages so the PluginRegistry handles routing.
  *
- * New plugins (PAILot, MCP) register directly via ABIP handshake.
+ * New plugins (PAILot, MCP) register directly via AIBP handshake.
  */
 
 import { log } from "../core/log.js";
 import * as msg from "./envelope.js";
 import { PluginRegistry, type SendFn } from "./registry.js";
-import type { AbipMessage, PluginSpec } from "./types.js";
+import type { AibpMessage, PluginSpec } from "./types.js";
 
-export class AbipBridge {
+export class AibpBridge {
   readonly registry: PluginRegistry;
-  private mobileCallbacks = new Map<string, (msg: AbipMessage) => void>();
+  private mobileCallbacks = new Map<string, (msg: AibpMessage) => void>();
 
   constructor() {
     this.registry = new PluginRegistry();
@@ -28,11 +28,11 @@ export class AbipBridge {
 
   /**
    * Register the PAILot mobile gateway as a plugin.
-   * The callback receives ABIP messages to deliver to connected WebSocket clients.
+   * The callback receives AIBP messages to deliver to connected WebSocket clients.
    */
   registerMobile(
     id: string,
-    callback: (msg: AbipMessage) => void,
+    callback: (msg: AibpMessage) => void,
   ): void {
     const spec: PluginSpec = {
       id,
@@ -43,7 +43,7 @@ export class AbipBridge {
     };
     const ack = this.registry.register(spec, callback);
     this.mobileCallbacks.set(`mobile:${id}`, callback);
-    log(`[ABIP Bridge] Mobile plugin registered: ${id}`);
+    log(`[AIBP Bridge] Mobile plugin registered: ${id}`);
   }
 
   /**
@@ -64,7 +64,7 @@ export class AbipBridge {
       commands,
     };
     this.registry.register(spec, sendFn);
-    log(`[ABIP Bridge] Transport plugin registered: ${id}`);
+    log(`[AIBP Bridge] Transport plugin registered: ${id}`);
   }
 
   /**
@@ -82,7 +82,7 @@ export class AbipBridge {
       channels: [],
     };
     this.registry.register(spec, sendFn);
-    log(`[ABIP Bridge] Terminal plugin registered: ${id}`);
+    log(`[AIBP Bridge] Terminal plugin registered: ${id}`);
   }
 
   /**
@@ -121,7 +121,7 @@ export class AbipBridge {
       this.registry.join(address, resolvedSession);
     }
 
-    log(`[ABIP Bridge] MCP plugin registered: ${mcpId} → session: ${resolvedSession ?? "unresolved"}`);
+    log(`[AIBP Bridge] MCP plugin registered: ${mcpId} → session: ${resolvedSession ?? "unresolved"}`);
     return { address, resolvedSession };
   }
 
@@ -138,7 +138,7 @@ export class AbipBridge {
     type: "TEXT" | "VOICE" | "IMAGE" = "TEXT",
     extra?: Record<string, unknown>,
   ): void {
-    let message: AbipMessage;
+    let message: AibpMessage;
     const dst = `session:${sessionId}`;
 
     switch (type) {
@@ -180,7 +180,7 @@ export class AbipBridge {
     const src = sessionId ? `session:${sessionId}` : "hub:local";
     const dst = "mobile:pailot";
 
-    let message: AbipMessage;
+    let message: AibpMessage;
     switch (type) {
       case "VOICE":
         message = msg.voice(

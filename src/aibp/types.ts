@@ -1,7 +1,7 @@
 /**
- * ABIP — AIBroker Interchange Protocol
+ * AIBP — AIBroker Interchange Protocol
  *
- * Canonical types for the protocol. Source of truth is SPEC-abip-protocol.md.
+ * Canonical types for the protocol. Source of truth is SPEC-aibp-protocol.md.
  * Every message has explicit src/dst addressing — no guessing.
  */
 
@@ -82,7 +82,7 @@ export interface FilePayload {
   sizeBytes?: number;
 }
 
-export type AbipPayload =
+export type AibpPayload =
   | TextPayload
   | VoicePayload
   | ImagePayload
@@ -93,11 +93,11 @@ export type AbipPayload =
   | FilePayload;
 
 // ---------------------------------------------------------------------------
-// The envelope — every ABIP message has this shape
+// The envelope — every AIBP message has this shape
 // ---------------------------------------------------------------------------
 
-export interface AbipMessage<P extends AbipPayload = AbipPayload> {
-  abip: "0.1";
+export interface AibpMessage<P extends AibpPayload = AibpPayload> {
+  aibp: "0.1";
   id: string;
   ts: number;
   src: string;
@@ -142,7 +142,7 @@ export interface ChannelMembership {
   members: Set<string>;
   lastMessageId?: string;
   lastMessageTs?: number;
-  outbox: AbipMessage[];
+  outbox: AibpMessage[];
 }
 
 // ---------------------------------------------------------------------------

@@ -84,15 +84,15 @@ function detectSessionId(): string | undefined {
 }
 
 // Resolve session identity:
-// 1. Try ABIP registration with hub (preferred — hub resolves identity)
+// 1. Try AIBP registration with hub (preferred — hub resolves identity)
 // 2. Fall back to TTY detection (legacy — fragile but works on macOS)
 _resolvedSessionId = detectSessionId();
 
-async function registerWithAbip(): Promise<void> {
+async function registerWithAibp(): Promise<void> {
   try {
     const pluginId = _resolvedSessionId ?? `mcp-${process.pid}`;
     const sessionEnvId = process.env.ITERM_SESSION_ID?.split(":")[1] ?? _resolvedSessionId;
-    const result = await hub.call_raw("abip_register", {
+    const result = await hub.call_raw("aibp_register", {
       pluginId,
       sessionEnvId,
     });
@@ -103,12 +103,12 @@ async function registerWithAbip(): Promise<void> {
       }
     }
   } catch {
-    // Hub may not support ABIP yet — fall back to TTY detection silently
+    // Hub may not support AIBP yet — fall back to TTY detection silently
   }
 }
 
 // Fire and forget — don't block MCP startup
-void registerWithAbip();
+void registerWithAibp();
 
 function getSessionId(): string | undefined {
   return _resolvedSessionId;

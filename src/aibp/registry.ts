@@ -1,5 +1,5 @@
 /**
- * ABIP Plugin Registry — manages plugin connections, channels, and routing.
+ * AIBP Plugin Registry — manages plugin connections, channels, and routing.
  *
  * This is the hub's brain. It knows:
  * - Which plugins are registered and their capabilities
@@ -11,7 +11,7 @@
 import { log } from "../core/log.js";
 import * as envelope from "./envelope.js";
 import type {
-  AbipMessage,
+  AibpMessage,
   ChannelMembership,
   CommandSpec,
   PluginSpec,
@@ -23,7 +23,7 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_MISS_DEGRADED = 3;
 const HEARTBEAT_MISS_DEAD = 5;
 
-export type SendFn = (msg: AbipMessage) => void;
+export type SendFn = (msg: AibpMessage) => void;
 
 interface PluginConnection {
   plugin: RegisteredPlugin;
@@ -46,12 +46,12 @@ export class PluginRegistry {
    * Register a plugin. Returns the REGISTER_ACK message to send back,
    * or an ERROR message if registration fails.
    */
-  register(spec: PluginSpec, send: SendFn): AbipMessage {
+  register(spec: PluginSpec, send: SendFn): AibpMessage {
     const address = this.resolveAddress(spec);
 
     // Reject duplicate
     if (this.plugins.has(address)) {
-      log(`[ABIP] REGISTER rejected: ${address} already registered`);
+      log(`[AIBP] REGISTER rejected: ${address} already registered`);
       return envelope.system("hub:local", address, "ERROR", {
         code: "REGISTER_REJECTED",
         reason: `Plugin address ${address} already registered`,
@@ -81,7 +81,7 @@ export class PluginRegistry {
       this.join(address, ch);
     }
 
-    log(`[ABIP] REGISTER ${spec.type}:${spec.id} → ${address}`);
+    log(`[AIBP] REGISTER ${spec.type}:${spec.id} → ${address}`);
 
     const peers = Array.from(this.plugins.keys()).filter((a) => a !== address);
     return envelope.system("hub:local", address, "REGISTER_ACK", {
@@ -113,7 +113,7 @@ export class PluginRegistry {
     }
 
     this.plugins.delete(address);
-    log(`[ABIP] UNREGISTER ${address} (${reason})`);
+    log(`[AIBP] UNREGISTER ${address} (${reason})`);
 
     // Notify all remaining plugins
     for (const [, other] of this.plugins) {
@@ -133,7 +133,7 @@ export class PluginRegistry {
   /**
    * Join a channel. Creates the channel if it doesn't exist.
    */
-  join(address: string, channel: string): AbipMessage {
+  join(address: string, channel: string): AibpMessage {
     let membership = this.channels.get(channel);
     if (!membership) {
       membership = { channel, members: new Set(), outbox: [] };
@@ -147,7 +147,7 @@ export class PluginRegistry {
       conn.plugin.joinedChannels.add(channel);
     }
 
-    log(`[ABIP] JOIN ${address} → ${channel} (${membership.members.size} members)`);
+    log(`[AIBP] JOIN ${address} → ${channel} (${membership.members.size} members)`);
 
     // Drain outbox for this member
     const buffered = membership.outbox.length;
@@ -165,7 +165,7 @@ export class PluginRegistry {
   /**
    * Part a channel.
    */
-  part(address: string, channel: string, reason = "left"): AbipMessage {
+  part(address: string, channel: string, reason = "left"): AibpMessage {
     const membership = this.channels.get(channel);
     if (membership) {
       membership.members.delete(address);
@@ -180,7 +180,7 @@ export class PluginRegistry {
       conn.plugin.joinedChannels.delete(channel);
     }
 
-    log(`[ABIP] PART ${address} ← ${channel} (${reason})`);
+    log(`[AIBP] PART ${address} ← ${channel} (${reason})`);
 
     return envelope.system("hub:local", address, "PART_ACK", {
       channel,
@@ -189,7 +189,7 @@ export class PluginRegistry {
   }
 
   // -------------------------------------------------------------------------
-  // Message routing — the core of ABIP
+  // Message routing — the core of AIBP
   // -------------------------------------------------------------------------
 
   /**
@@ -202,7 +202,7 @@ export class PluginRegistry {
    * 4. If dst contains "/" (mesh), forward to bridge plugin
    * 5. If recipient is offline, buffer in outbox
    */
-  route(msg: AbipMessage): void {
+  route(msg: AibpMessage): void {
     const { dst } = msg;
 
     // Mesh routing — forward to the appropriate bridge
@@ -245,10 +245,10 @@ export class PluginRegistry {
       return;
     }
 
-    log(`[ABIP] ROUTE FAIL: no destination for ${dst} (from ${msg.src})`);
+    log(`[AIBP] ROUTE FAIL: no destination for ${dst} (from ${msg.src})`);
   }
 
-  private fanOut(msg: AbipMessage, membership: ChannelMembership): void {
+  private fanOut(msg: AibpMessage, membership: ChannelMembership): void {
     membership.lastMessageId = msg.id;
     membership.lastMessageTs = msg.ts;
 
@@ -270,7 +270,7 @@ export class PluginRegistry {
     }
   }
 
-  private routeToMesh(msg: AbipMessage, hubAddress: string, localDst: string): void {
+  private routeToMesh(msg: AibpMessage, hubAddress: string, localDst: string): void {
     // Find a bridge plugin for this hub
     for (const [, conn] of this.plugins) {
       if (conn.plugin.spec.type === "bridge") {
@@ -279,10 +279,10 @@ export class PluginRegistry {
         return;
       }
     }
-    log(`[ABIP] MESH FAIL: no bridge plugin for ${hubAddress}`);
+    log(`[AIBP] MESH FAIL: no bridge plugin for ${hubAddress}`);
   }
 
-  private handleHubMessage(msg: AbipMessage): void {
+  private handleHubMessage(msg: AibpMessage): void {
     if (msg.type === "COMMAND") {
       const payload = msg.payload as { command: string; args: Record<string, unknown> };
       const cmdOwner = this.commands.get(payload.command);
@@ -313,7 +313,7 @@ export class PluginRegistry {
   }
 
   private handleBuiltinCommand(
-    msg: AbipMessage,
+    msg: AibpMessage,
     cmd: string,
     args: Record<string, unknown>,
   ): void {
@@ -346,7 +346,7 @@ export class PluginRegistry {
       }
 
       default:
-        log(`[ABIP] Unknown hub command: ${cmd}`);
+        log(`[AIBP] Unknown hub command: ${cmd}`);
         this.sendTo(
           src,
           envelope.system("hub:local", src, "ERROR", {
@@ -361,7 +361,7 @@ export class PluginRegistry {
   // Outbox
   // -------------------------------------------------------------------------
 
-  private bufferMessage(membership: ChannelMembership, msg: AbipMessage): void {
+  private bufferMessage(membership: ChannelMembership, msg: AibpMessage): void {
     // Don't buffer typing indicators or pings
     if (msg.type === "TYPING" || msg.type === "SYSTEM") return;
 
@@ -369,7 +369,7 @@ export class PluginRegistry {
       membership.outbox.shift(); // Drop oldest
     }
     membership.outbox.push(msg);
-    log(`[ABIP] OUTBOX ${msg.dst}: ${membership.outbox.length} buffered`);
+    log(`[AIBP] OUTBOX ${msg.dst}: ${membership.outbox.length} buffered`);
   }
 
   private drainOutbox(address: string, channel: string): void {
@@ -396,7 +396,7 @@ export class PluginRegistry {
     }
 
     membership.outbox = [];
-    log(`[ABIP] OUTBOX DRAIN ${channel} → ${address}: ${count} messages`);
+    log(`[AIBP] OUTBOX DRAIN ${channel} → ${address}: ${count} messages`);
   }
 
   // -------------------------------------------------------------------------
@@ -411,11 +411,11 @@ export class PluginRegistry {
       conn.plugin.missedPings++;
 
       if (conn.plugin.missedPings >= HEARTBEAT_MISS_DEAD) {
-        log(`[ABIP] Plugin dead: ${address} (${conn.plugin.missedPings} missed pings)`);
+        log(`[AIBP] Plugin dead: ${address} (${conn.plugin.missedPings} missed pings)`);
         this.unregister(address, "heartbeat timeout");
       } else if (conn.plugin.missedPings >= HEARTBEAT_MISS_DEGRADED) {
         conn.plugin.status = "degraded";
-        log(`[ABIP] Plugin degraded: ${address}`);
+        log(`[AIBP] Plugin degraded: ${address}`);
       }
     }
   }
@@ -462,7 +462,7 @@ export class PluginRegistry {
   // Internal helpers
   // -------------------------------------------------------------------------
 
-  private sendTo(address: string, msg: AbipMessage): void {
+  private sendTo(address: string, msg: AibpMessage): void {
     const conn = this.plugins.get(address);
     if (conn) conn.send(msg);
   }
