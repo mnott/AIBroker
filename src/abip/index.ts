@@ -8,3 +8,4 @@ export * from "./types.js";
 export * as msg from "./envelope.js";
 export { PluginRegistry } from "./registry.js";
 export type { SendFn } from "./registry.js";
+export { AbipBridge } from "./bridge.js";
