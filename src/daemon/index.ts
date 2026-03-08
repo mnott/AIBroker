@@ -136,6 +136,7 @@ export async function startDaemon(options?: {
     const sessionId = aibpMsg.src.startsWith("session:")
       ? aibpMsg.src.slice(8)
       : undefined;
+    log(`[AIBP→PAILot] type=${aibpMsg.type} src=${aibpMsg.src} → sessionId=${sessionId?.slice(0, 8) ?? "none"}`);
     switch (aibpMsg.type) {
       case "TEXT": {
         const p = aibpMsg.payload as { content: string };

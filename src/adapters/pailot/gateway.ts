@@ -234,6 +234,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
     if (idx >= 0) {
       hybridManager.switchToIndex(idx + 1);
       setActiveItermSessionId(clientActiveId);
+      setLastRoutedSessionId(clientActiveId);
       log(`[PAILot] sync: restored client session "${sessions[idx].name}" (${clientActiveId.slice(0, 8)}...)`);
       handleSessionsCommand(ws);
       drainOutbox(ws);
@@ -258,6 +259,7 @@ end tell`)?.trim() ?? "";
     if (idx >= 0) {
       hybridManager.switchToIndex(idx + 1);
       setActiveItermSessionId(focusedId);
+      setLastRoutedSessionId(focusedId);
       log(`[PAILot] sync: activated focused session "${sessions[idx].name}" (${focusedId.slice(0, 8)}...)`);
     } else {
       log(`[PAILot] sync: focused session ${focusedId.slice(0, 8)}... not registered`);
@@ -373,6 +375,9 @@ end tell`);
     }
   }
 
+  // Record this as the last routed session so outbound replies go here,
+  // regardless of which iTerm tab is focused on the Mac.
+  setLastRoutedSessionId(session.backendSessionId);
   sendTo(ws, { type: "session_switched", name: session.name, sessionId: session.backendSessionId });
   log(`[PAILot] switched to ${session.kind} session "${session.name}" (${session.id})`);
 }
@@ -463,6 +468,7 @@ function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}):
     if (idx >= 0) {
       hybridManager.switchToIndex(idx + 1);
       setActiveItermSessionId(sessionId);
+      setLastRoutedSessionId(sessionId);
     }
   }
 
