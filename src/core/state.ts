@@ -90,6 +90,20 @@ export function setVoiceConfig(cfg: VoiceConfig): void {
   voiceConfig = cfg;
 }
 
+// ── ABIP Bridge (singleton, set by daemon at startup) ──
+
+import type { AbipBridge } from "../abip/bridge.js";
+
+let _abipBridge: AbipBridge | null = null;
+
+export function setAbipBridge(bridge: AbipBridge): void {
+  _abipBridge = bridge;
+}
+
+export function getAbipBridge(): AbipBridge | null {
+  return _abipBridge;
+}
+
 // ── Command Handler ──
 
 export type CommandHandler = (text: string, timestamp: number) => void | Promise<void>;
