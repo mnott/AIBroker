@@ -638,10 +638,35 @@ export function registerCoreHandlers(
     const bridge = getAibpBridge();
     if (!bridge) return { ok: false, error: "AIBP bridge not initialized" };
 
+    // Build iTerm session ID → name lookup from HybridSessionManager
+    const sessionNames = new Map<string, string>();
+    for (const s of manager.listSessions()) {
+      sessionNames.set(s.backendSessionId, s.name);
+    }
+
+    // Enrich plugin list with session names for MCP plugins
+    const plugins = bridge.registry.listPlugins().map(p => {
+      const info: Record<string, unknown> = {
+        address: p.address,
+        type: p.spec.type,
+        name: p.spec.name,
+      };
+      // For MCP plugins, resolve the session name from the iTerm UUID
+      if (p.spec.type === "mcp") {
+        const sessionChannel = Array.from(p.joinedChannels).find(ch => ch.startsWith("session:"));
+        if (sessionChannel) {
+          const itermId = sessionChannel.slice(8);
+          const sessionName = sessionNames.get(itermId);
+          if (sessionName) info.sessionName = sessionName;
+        }
+      }
+      return info;
+    });
+
     return {
       ok: true,
       result: {
-        plugins: bridge.listPlugins(),
+        plugins,
         channels: bridge.registry.listChannels().map(ch => ({
           name: ch.channel,
           members: Array.from(ch.members),
