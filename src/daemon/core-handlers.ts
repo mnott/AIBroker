@@ -329,7 +329,7 @@ export function registerCoreHandlers(
     }
 
     try {
-      const { generateImage } = await import("./image-gen.js");
+      const { generateImage } = await import("./image-gen/index.js");
       const result = await generateImage({ prompt, width, height });
 
       // Deliver image to requesting adapter

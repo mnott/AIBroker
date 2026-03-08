@@ -187,10 +187,36 @@ All media processing is centralized in the hub — adapters never touch TTS, tra
 |----------|-----------|-------------|
 | **Text-to-Speech** | Kokoro (local) | Text → WAV → OGG Opus → delivered as voice note |
 | **Speech-to-Text** | Whisper (local) | Voice note → transcription → delivered as text to Claude |
-| **Image Generation** | Replicate Flux Schnell | Prompt → image → delivered to chat ($0.003/image, 2-4s) |
+| **Image Generation** | Pluggable (see below) | Prompt → image → delivered to chat |
 | **Image Analysis** | Claude Vision | Image → description → text response (no extra API cost on Max plan) |
 | **Video Analysis** | Gemini 2.0 Flash | Video → analysis → text response (free tier: 15 RPM) |
 | **Screenshots** | iTerm2 AppleScript | Capture terminal → PNG → delivered to chat |
+
+### Bring Your Own Image Provider
+
+Image generation is pluggable — pick the provider that fits your budget and privacy needs:
+
+| Provider | Token needed? | Free tier | Speed |
+|----------|--------------|-----------|-------|
+| **Replicate** | `REPLICATE_API_TOKEN` | No (~$0.003/image) | 2-4s |
+| **Cloudflare Workers AI** | `CLOUDFLARE_AI_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Yes (~100 images/day) | 3-5s |
+| **Hugging Face** | `HF_API_TOKEN` | Yes (rate-limited) | 5-15s |
+| **Pollinations** | None | Yes (unlimited, no account) | 5-10s |
+
+**Zero-config default:** If no tokens are set, AIBroker falls back to Pollinations — free, no signup, works immediately.
+
+**Auto-detection:** Set an API token in `~/.aibroker/env` and the provider is detected automatically. Priority: Replicate → Cloudflare → Hugging Face → Pollinations.
+
+**Explicit config:** Create `~/.aibroker/image-gen.json` to pin a specific provider:
+
+```json
+{
+  "provider": "cloudflare",
+  "accountId": "your-account-id"
+}
+```
+
+All providers use FLUX.1 Schnell by default. Override with `"model": "your-model-id"` in the config.
 
 ---
 
