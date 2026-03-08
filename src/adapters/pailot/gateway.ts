@@ -822,7 +822,7 @@ end tell`)?.trim() ?? "";
         // Voice message — transcribe with Whisper then route
         if (msg.type === "voice" && msg.audioBase64) {
           dbg(`Voice message received, audioBase64 length: ${(msg.audioBase64 as string).length}`);
-          broadcast({ type: "typing", typing: true });
+          broadcast({ type: "typing", typing: true, ...(activeItermSessionId && { sessionId: activeItermSessionId }) });
           const voiceMsgId = typeof msg.messageId === "string" ? msg.messageId : undefined;
           transcribeAndRoute(msg.audioBase64 as string, onMessage, voiceMsgId).catch((err) => {
             log(`[PAILot] voice transcription error: ${err}`);
@@ -859,7 +859,7 @@ end tell`)?.trim() ?? "";
 
         log(`[PAILot] ← ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
 
-        broadcast({ type: "typing", typing: true });
+        broadcast({ type: "typing", typing: true, ...(activeItermSessionId && { sessionId: activeItermSessionId }) });
         setLastRoutedSessionId(activeItermSessionId);
         setMessageSource("pailot");
         onMessage(text, Date.now());
@@ -907,7 +907,7 @@ function resolveSessionId(sessionId?: string): string | undefined {
 
 export function broadcastText(text: string, sessionId?: string): void {
   const resolvedSession = resolveSessionId(sessionId);
-  broadcast({ type: "typing", typing: false });
+  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) });
   broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) });
 }
 
@@ -918,7 +918,7 @@ export function broadcastText(text: string, sessionId?: string): void {
  */
 export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string): Promise<void> {
   const resolvedSession = resolveSessionId(sessionId);
-  broadcast({ type: "typing", typing: false });
+  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) });
   let sendBuffer = audioBuffer;
 
   // Convert OGG Opus → M4A for iOS compatibility
