@@ -216,7 +216,37 @@ Image generation is pluggable — pick the provider that fits your budget and pr
 }
 ```
 
-All providers use FLUX.1 Schnell by default. Override with `"model": "your-model-id"` in the config.
+**Bring your own provider:** Point to any Node.js module that exports a `createProvider` function:
+
+```json
+{
+  "provider": "custom",
+  "modulePath": "/path/to/my-provider.js",
+  "options": { "apiKey": "...", "endpoint": "https://my-api.com" }
+}
+```
+
+Your module implements one function:
+
+```typescript
+import type { ImageProvider, ImageProviderConfig } from "aibroker";
+
+export function createProvider(config: ImageProviderConfig): ImageProvider {
+  return {
+    name: "my-provider",
+    async generate(opts) {
+      const res = await fetch(config.options.endpoint, { /* ... */ });
+      return {
+        images: [Buffer.from(await res.arrayBuffer())],
+        model: "my-model",
+        durationMs: 0,
+      };
+    },
+  };
+}
+```
+
+All built-in providers use FLUX.1 Schnell by default. Override with `"model": "your-model-id"` in the config.
 
 ---
 
