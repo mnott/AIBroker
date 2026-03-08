@@ -1,4 +1,4 @@
-# ABIP — AIBroker Interchange Protocol
+# AIBP — AIBroker Interchange Protocol
 
 **Version:** 0.1 (draft)
 **Date:** 2026-03-08
@@ -8,10 +8,10 @@
 
 ## 1. Overview
 
-ABIP is the internal message protocol that structures all communication inside
+AIBP is the internal message protocol that structures all communication inside
 an AIBroker hub. Today the hub speaks an ad-hoc mix of NDJSON over Unix Domain
 Sockets (IPC), JSON over WebSocket (PAILot gateway), and AppleScript side
-effects (iTerm). ABIP replaces this with a single, coherent addressing model
+effects (iTerm). AIBP replaces this with a single, coherent addressing model
 that borrows the discipline of IRC without copying its wire format.
 
 ### What IRC Gets Right
@@ -23,16 +23,16 @@ IRC has survived 35 years because of four principles:
 3. Plugins (services, bots) register with the server and declare capabilities.
 4. Server-to-server linking lets networks span multiple physical hosts.
 
-ABIP applies these principles to a personal AI infrastructure hub where the
+AIBP applies these principles to a personal AI infrastructure hub where the
 "users" are human-operated apps (PAILot), AI agents (Claude Code sessions),
 and platform transports (WhatsApp, Telegram).
 
 ### What We Don't Copy from IRC
 
-- IRC is newline-delimited text. ABIP is newline-delimited JSON (NDJSON).
-- IRC channel names are flat (`#channel`). ABIP channels are namespaced
+- IRC is newline-delimited text. AIBP is newline-delimited JSON (NDJSON).
+- IRC channel names are flat (`#channel`). AIBP channels are namespaced
   (`session:<id>`, `transport:<name>`, `hub:<machine>`).
-- IRC authentication is a bolt-on. ABIP authentication is first-class for
+- IRC authentication is a bolt-on. AIBP authentication is first-class for
   plugin registration and hub-to-hub links.
 
 ---
@@ -66,7 +66,7 @@ Plugin types:
 | `bridge` | Remote AIBroker hub | WebSocket |
 | `mcp` | Claude Code MCP process | Unix socket (IPC) |
 
-All plugins use the same ABIP message format regardless of transport.
+All plugins use the same AIBP message format regardless of transport.
 
 ### Channel
 
@@ -113,11 +113,11 @@ This matches the existing IPC protocol and WebSocket framing.
 
 ### Envelope
 
-Every ABIP message has this envelope:
+Every AIBP message has this envelope:
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "<uuid>",
   "ts": 1709900000000,
   "src": "<address>",
@@ -129,7 +129,7 @@ Every ABIP message has this envelope:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `abip` | string | yes | Protocol version for forward compat |
+| `aibp` | string | yes | Protocol version for forward compat |
 | `id` | string | yes | UUID, unique per message |
 | `ts` | number | yes | Unix epoch milliseconds |
 | `src` | string | yes | Sender address |
@@ -154,7 +154,7 @@ FILE       — Binary file transfer (path or base64)
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "ts": 1709900000000,
   "src": "mobile:pailot",
@@ -170,7 +170,7 @@ FILE       — Binary file transfer (path or base64)
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "550e8400-e29b-41d4-a716-446655440001",
   "ts": 1709900000000,
   "src": "mobile:pailot",
@@ -189,7 +189,7 @@ FILE       — Binary file transfer (path or base64)
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "550e8400-e29b-41d4-a716-446655440002",
   "ts": 1709900000000,
   "src": "mobile:pailot",
@@ -207,7 +207,7 @@ FILE       — Binary file transfer (path or base64)
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "550e8400-e29b-41d4-a716-446655440003",
   "ts": 1709900000000,
   "src": "session:ABC123",
@@ -224,7 +224,7 @@ FILE       — Binary file transfer (path or base64)
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "550e8400-e29b-41d4-a716-446655440004",
   "ts": 1709900000000,
   "src": "hub:local",
@@ -245,7 +245,7 @@ System events: `JOIN`, `JOIN_ACK`, `PART`, `PART_ACK`, `REGISTER`, `REGISTER_ACK
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "550e8400-e29b-41d4-a716-446655440005",
   "ts": 1709900000000,
   "src": "session:ABC123",
@@ -261,7 +261,7 @@ System events: `JOIN`, `JOIN_ACK`, `PART`, `PART_ACK`, `REGISTER`, `REGISTER_ACK
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "550e8400-e29b-41d4-a716-446655440006",
   "ts": 1709900000000,
   "src": "hub:local",
@@ -288,7 +288,7 @@ When a plugin connects (Unix socket or WebSocket), it must register within
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "<uuid>",
   "ts": 1709900000000,
   "src": "plugin:whazaa",
@@ -322,7 +322,7 @@ When a plugin connects (Unix socket or WebSocket), it must register within
 
 ```json
 {
-  "abip": "0.1",
+  "aibp": "0.1",
   "id": "<uuid>",
   "ts": 1709900000000,
   "src": "hub:local",
@@ -627,8 +627,8 @@ Pre-shared token only (no certificate exchange in v0.1). Token is configured
 in `~/.aibroker/env` on both machines:
 
 ```
-ABIP_MESH_TOKEN=<shared-secret>
-ABIP_MESH_PEERS=ws://mac-mini.local:8766
+AIBP_MESH_TOKEN=<shared-secret>
+AIBP_MESH_PEERS=ws://mac-mini.local:8766
 ```
 
 Bridge connections use wss:// for remote WAN links; ws:// is acceptable on
@@ -649,7 +649,7 @@ Remote hubs do NOT share:
 
 ## 8. Terminal Plugin
 
-The current iTerm2 integration is hardcoded in `src/adapters/iterm/`. ABIP
+The current iTerm2 integration is hardcoded in `src/adapters/iterm/`. AIBP
 formalizes it as a pluggable terminal plugin.
 
 ### Terminal Plugin Contract
@@ -677,7 +677,7 @@ A terminal plugin is responsible for:
 
 The iTerm2 concrete implementation uses AppleScript (as today). Future
 terminals (Terminal.app, Ghostty, VS Code integrated terminal) would provide
-their own plugin implementations without changing the ABIP protocol.
+their own plugin implementations without changing the AIBP protocol.
 
 The current hardcoded `runAppleScript` calls in gateway.ts become private
 implementation details of the iTerm2 terminal plugin. The hub calls
@@ -702,13 +702,13 @@ When a session closes:
 ### MCP as a Plugin Type
 
 Each Claude Code process spawns an MCP server process (`dist/mcp/index.js`).
-Under ABIP, this MCP process registers as a `mcp` type plugin.
+Under AIBP, this MCP process registers as a `mcp` type plugin.
 
 **Current identity problem:** The MCP process uses TTY detection and AppleScript
 to figure out which iTerm session it belongs to (`detectSessionId()` in
 mcp/index.ts). This is fragile and macOS-specific.
 
-**ABIP solution:** The hub knows which session spawned which MCP process.
+**AIBP solution:** The hub knows which session spawned which MCP process.
 When an MCP plugin registers, it passes its `TERM_SESSION_ID` environment
 variable. The hub cross-references this against the terminal plugin's session
 registry to assign the correct `session:<id>` address. No TTY detection needed.
@@ -745,7 +745,7 @@ Hub responds with the resolved session address:
 ### MCP Tool Calls as COMMAND Messages
 
 When Claude calls an MCP tool like `pailot_send`, the MCP plugin translates it
-to an ABIP COMMAND message:
+to an AIBP COMMAND message:
 
 ```json
 {
@@ -772,24 +772,24 @@ and wraps it as an MCP tool response.
 | `telegram_*` | transport:telegram |
 | `pailot_*` | mobile:pailot |
 
-This replaces the current `adapter_call` IPC pattern with direct ABIP routing.
+This replaces the current `adapter_call` IPC pattern with direct AIBP routing.
 
 ---
 
 ## 10. Migration Path
 
-### Phase 1: ABIP Envelope (non-breaking, additive)
+### Phase 1: AIBP Envelope (non-breaking, additive)
 
-**Goal:** Add ABIP envelope to all existing messages without changing behavior.
+**Goal:** Add AIBP envelope to all existing messages without changing behavior.
 This establishes the addressing discipline while the underlying transports stay
 the same.
 
 Changes:
-- `IpcRequest` and `IpcResponse` in `src/types/ipc.ts` grow optional `abip`,
+- `IpcRequest` and `IpcResponse` in `src/types/ipc.ts` grow optional `aibp`,
   `src`, `dst` fields
 - `IpcServer.dispatch()` logs unaddressed messages as warnings
-- Gateway messages get `abip`, `src`, `dst` fields (ignored by clients initially)
-- New `src/abip/envelope.ts` utility to wrap/unwrap the envelope
+- Gateway messages get `aibp`, `src`, `dst` fields (ignored by clients initially)
+- New `src/aibp/envelope.ts` utility to wrap/unwrap the envelope
 
 No behavior changes. No migration risk.
 
@@ -799,7 +799,7 @@ No behavior changes. No migration risk.
 registry that understands capabilities and channels.
 
 Changes:
-- `src/abip/registry.ts` — PluginRegistry class
+- `src/aibp/registry.ts` — PluginRegistry class
 - REGISTER/REGISTER_ACK handshake replaces implicit connection accept
 - Channel JOIN/PART replaces `setMessageSource()` + `activeClientId` heuristics
 - Outbox moves from `gateway.ts` into the hub's channel layer
@@ -821,7 +821,7 @@ Changes:
 - TTY detection code removed from `mcp/index.ts`
 
 Risk: High. This changes the plugin boundary significantly. Implement behind a
-feature flag (`ABIP_PHASE3=1`). iTerm plugin runs as a separate process or
+feature flag (`AIBP_PHASE3=1`). iTerm plugin runs as a separate process or
 in-process with the hub (start in-process for simplicity).
 
 ### What Does Not Change
@@ -952,7 +952,7 @@ These are the canonical types for implementation. Source of truth is this spec
 until the code is written.
 
 ```typescript
-// src/abip/types.ts
+// src/aibp/types.ts
 
 export type MessageType =
   | "TEXT" | "VOICE" | "IMAGE" | "COMMAND" | "SYSTEM" | "TYPING" | "STATUS" | "FILE";
@@ -961,14 +961,14 @@ export type SystemEvent =
   | "REGISTER" | "REGISTER_ACK" | "JOIN" | "JOIN_ACK" | "PART" | "PART_ACK"
   | "PING" | "PONG" | "ERROR" | "SHUTDOWN" | "OUTBOX_DRAIN" | "PLUGIN_OFFLINE";
 
-export interface AbipMessage {
-  abip: "0.1";
+export interface AibpMessage {
+  aibp: "0.1";
   id: string;          // UUID
   ts: number;          // Unix ms
   src: string;         // sender address
   dst: string;         // destination address or channel
   type: MessageType;
-  payload: AbipPayload;
+  payload: AibpPayload;
 }
 
 export interface TextPayload { content: string }
@@ -979,7 +979,7 @@ export interface StatusPayload { subject: string; state: "idle"|"busy"|"error"|"
 export interface CommandPayload { command: string; args: Record<string, unknown> }
 export interface SystemPayload { event: SystemEvent; [key: string]: unknown }
 
-export type AbipPayload =
+export type AibpPayload =
   | TextPayload | VoicePayload | ImagePayload | TypingPayload
   | StatusPayload | CommandPayload | SystemPayload;
 
@@ -1007,7 +1007,7 @@ export interface ChannelMembership {
   members: string[];      // plugin addresses
   lastMessageId?: string;
   lastMessageTs?: number;
-  outbox: AbipMessage[];  // buffered for offline members, max 50
+  outbox: AibpMessage[];  // buffered for offline members, max 50
 }
 ```
 

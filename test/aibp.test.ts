@@ -1,17 +1,17 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import * as envelope from "../src/abip/envelope.js";
-import { PluginRegistry } from "../src/abip/registry.js";
-import type { AbipMessage, PluginSpec } from "../src/abip/types.js";
+import * as envelope from "../src/aibp/envelope.js";
+import { PluginRegistry } from "../src/aibp/registry.js";
+import type { AibpMessage, PluginSpec } from "../src/aibp/types.js";
 
 // ---------------------------------------------------------------------------
 // Envelope tests
 // ---------------------------------------------------------------------------
 
-describe("ABIP Envelope", () => {
+describe("AIBP Envelope", () => {
   it("creates a TEXT message with correct envelope fields", () => {
     const msg = envelope.text("mobile:pailot", "session:ABC123", "Hello");
-    assert.equal(msg.abip, "0.1");
+    assert.equal(msg.aibp, "0.1");
     assert.equal(msg.src, "mobile:pailot");
     assert.equal(msg.dst, "session:ABC123");
     assert.equal(msg.type, "TEXT");
@@ -62,7 +62,7 @@ describe("ABIP Envelope", () => {
     assert.equal(parsed.payload.content, "test");
   });
 
-  it("parses valid ABIP JSON", () => {
+  it("parses valid AIBP JSON", () => {
     const msg = envelope.text("a", "b", "test");
     const json = JSON.stringify(msg);
     const parsed = envelope.parse(json);
@@ -76,16 +76,16 @@ describe("ABIP Envelope", () => {
     assert.equal(envelope.parse('{"foo": "bar"}'), null);
   });
 
-  it("validates with isAbipMessage", () => {
+  it("validates with isAibpMessage", () => {
     const msg = envelope.text("a", "b", "test");
-    assert.ok(envelope.isAbipMessage(msg));
-    assert.ok(!envelope.isAbipMessage({ foo: "bar" }));
-    assert.ok(!envelope.isAbipMessage(null));
-    assert.ok(!envelope.isAbipMessage("string"));
+    assert.ok(envelope.isAibpMessage(msg));
+    assert.ok(!envelope.isAibpMessage({ foo: "bar" }));
+    assert.ok(!envelope.isAibpMessage(null));
+    assert.ok(!envelope.isAibpMessage("string"));
   });
 });
 
-describe("ABIP Address Helpers", () => {
+describe("AIBP Address Helpers", () => {
   it("extracts address type", () => {
     assert.equal(envelope.addressType("session:ABC123"), "session");
     assert.equal(envelope.addressType("transport:whatsapp"), "transport");
@@ -129,7 +129,7 @@ describe("PluginRegistry", () => {
 
   it("registers a plugin and returns REGISTER_ACK", () => {
     const reg = new PluginRegistry();
-    const sent: AbipMessage[] = [];
+    const sent: AibpMessage[] = [];
     const ack = reg.register(makeSpec({ id: "whazaa" }), (m) => sent.push(m));
     assert.equal((ack.payload as any).event, "REGISTER_ACK");
     assert.equal((ack.payload as any).assignedAddress, "transport:whazaa");
@@ -165,7 +165,7 @@ describe("PluginRegistry", () => {
 
   it("routes TEXT to direct plugin address", () => {
     const reg = new PluginRegistry();
-    const received: AbipMessage[] = [];
+    const received: AibpMessage[] = [];
     reg.register(makeSpec({ id: "pailot", type: "mobile" }), (m) => received.push(m));
     const msg = envelope.text("session:ABC", "mobile:pailot", "Hello from Claude");
     reg.route(msg);
@@ -175,8 +175,8 @@ describe("PluginRegistry", () => {
 
   it("fans out channel messages to all members except sender", () => {
     const reg = new PluginRegistry();
-    const received1: AbipMessage[] = [];
-    const received2: AbipMessage[] = [];
+    const received1: AibpMessage[] = [];
+    const received2: AibpMessage[] = [];
     reg.register(makeSpec({ id: "p1", type: "mobile" }), (m) => received1.push(m));
     reg.register(makeSpec({ id: "p2", type: "transport" }), (m) => received2.push(m));
     reg.join("mobile:p1", "session:ABC");
@@ -207,7 +207,7 @@ describe("PluginRegistry", () => {
     reg.route(envelope.text("mcp:ABC", "session:ABC", "Buffered msg"));
 
     // Now join — should receive OUTBOX_DRAIN + buffered message
-    const received: AbipMessage[] = [];
+    const received: AibpMessage[] = [];
     reg.register(makeSpec({ id: "pailot", type: "mobile" }), (m) => received.push(m));
     reg.join("mobile:pailot", "session:ABC");
 
@@ -227,7 +227,7 @@ describe("PluginRegistry", () => {
 
   it("unregisters plugin and notifies others", () => {
     const reg = new PluginRegistry();
-    const notifications: AbipMessage[] = [];
+    const notifications: AibpMessage[] = [];
     reg.register(makeSpec({ id: "p1", type: "mobile" }), () => {});
     reg.register(makeSpec({ id: "p2", type: "transport" }), (m) => notifications.push(m));
 
@@ -250,7 +250,7 @@ describe("PluginRegistry", () => {
 
   it("handles hub commands", () => {
     const reg = new PluginRegistry();
-    const received: AbipMessage[] = [];
+    const received: AibpMessage[] = [];
     reg.register(makeSpec({ id: "cli", type: "terminal" }), (m) => received.push(m));
 
     // Route a list_plugins command
@@ -261,7 +261,7 @@ describe("PluginRegistry", () => {
 
   it("routes commands to owning plugin", () => {
     const reg = new PluginRegistry();
-    const waReceived: AbipMessage[] = [];
+    const waReceived: AibpMessage[] = [];
     reg.register(
       makeSpec({
         id: "whazaa",

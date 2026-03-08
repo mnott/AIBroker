@@ -1,12 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { AbipBridge } from "../src/abip/bridge.js";
-import type { AbipMessage } from "../src/abip/types.js";
+import { AibpBridge } from "../src/aibp/bridge.js";
+import type { AibpMessage } from "../src/aibp/types.js";
 
-describe("AbipBridge", () => {
+describe("AibpBridge", () => {
   it("registers PAILot as a mobile plugin", () => {
-    const bridge = new AbipBridge();
-    const received: AbipMessage[] = [];
+    const bridge = new AibpBridge();
+    const received: AibpMessage[] = [];
     bridge.registerMobile("pailot", (m) => received.push(m));
 
     const plugins = bridge.listPlugins();
@@ -14,7 +14,7 @@ describe("AbipBridge", () => {
   });
 
   it("registers a transport adapter", () => {
-    const bridge = new AbipBridge();
+    const bridge = new AibpBridge();
     bridge.registerTransport("whazaa", () => {});
 
     const plugins = bridge.listPlugins();
@@ -22,7 +22,7 @@ describe("AbipBridge", () => {
   });
 
   it("registers an MCP process and resolves session", () => {
-    const bridge = new AbipBridge();
+    const bridge = new AibpBridge();
     const result = bridge.registerMcp("ABC123", "ABC123");
 
     assert.equal(result.address, "mcp:ABC123");
@@ -33,8 +33,8 @@ describe("AbipBridge", () => {
   });
 
   it("routes text from mobile to session channel", () => {
-    const bridge = new AbipBridge();
-    const received: AbipMessage[] = [];
+    const bridge = new AibpBridge();
+    const received: AibpMessage[] = [];
 
     // Register a mock session listener
     bridge.registry.register(
@@ -60,8 +60,8 @@ describe("AbipBridge", () => {
   });
 
   it("routes text from session to mobile plugin", () => {
-    const bridge = new AbipBridge();
-    const received: AbipMessage[] = [];
+    const bridge = new AibpBridge();
+    const received: AibpMessage[] = [];
 
     bridge.registerMobile("pailot", (m) => received.push(m));
 
@@ -75,8 +75,8 @@ describe("AbipBridge", () => {
   });
 
   it("routes typing indicator to mobile", () => {
-    const bridge = new AbipBridge();
-    const received: AbipMessage[] = [];
+    const bridge = new AibpBridge();
+    const received: AibpMessage[] = [];
 
     bridge.registerMobile("pailot", (m) => received.push(m));
     bridge.sendTyping("ABC123", true);
@@ -87,7 +87,7 @@ describe("AbipBridge", () => {
   });
 
   it("joins and parts session channels", () => {
-    const bridge = new AbipBridge();
+    const bridge = new AibpBridge();
     bridge.registerMobile("pailot", () => {});
 
     bridge.joinSession("ABC123");
@@ -103,8 +103,8 @@ describe("AbipBridge", () => {
   });
 
   it("buffers messages when mobile is not joined and drains on join", () => {
-    const bridge = new AbipBridge();
-    const received: AbipMessage[] = [];
+    const bridge = new AibpBridge();
+    const received: AibpMessage[] = [];
 
     bridge.registerMobile("pailot", (m) => received.push(m));
 
@@ -117,9 +117,9 @@ describe("AbipBridge", () => {
   });
 
   it("handles multiple transport registrations", () => {
-    const bridge = new AbipBridge();
-    const waReceived: AbipMessage[] = [];
-    const tgReceived: AbipMessage[] = [];
+    const bridge = new AibpBridge();
+    const waReceived: AibpMessage[] = [];
+    const tgReceived: AibpMessage[] = [];
 
     bridge.registerTransport("whazaa", (m) => waReceived.push(m));
     bridge.registerTransport("telex", (m) => tgReceived.push(m));

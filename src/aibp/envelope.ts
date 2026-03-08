@@ -1,11 +1,11 @@
 /**
- * ABIP envelope utilities — create, parse, and validate ABIP messages.
+ * AIBP envelope utilities — create, parse, and validate AIBP messages.
  */
 
 import { randomUUID } from "node:crypto";
 import type {
-  AbipMessage,
-  AbipPayload,
+  AibpMessage,
+  AibpPayload,
   CommandPayload,
   ImagePayload,
   MessageType,
@@ -17,20 +17,20 @@ import type {
   VoicePayload,
 } from "./types.js";
 
-const ABIP_VERSION = "0.1" as const;
+const AIBP_VERSION = "0.1" as const;
 
 // ---------------------------------------------------------------------------
 // Factory — create typed messages with automatic envelope fields
 // ---------------------------------------------------------------------------
 
-function envelope<P extends AbipPayload>(
+function envelope<P extends AibpPayload>(
   src: string,
   dst: string,
   type: MessageType,
   payload: P,
-): AbipMessage<P> {
+): AibpMessage<P> {
   return {
-    abip: ABIP_VERSION,
+    aibp: AIBP_VERSION,
     id: randomUUID(),
     ts: Date.now(),
     src,
@@ -40,7 +40,7 @@ function envelope<P extends AbipPayload>(
   };
 }
 
-export function text(src: string, dst: string, content: string): AbipMessage<TextPayload> {
+export function text(src: string, dst: string, content: string): AibpMessage<TextPayload> {
   return envelope(src, dst, "TEXT", { content });
 }
 
@@ -50,7 +50,7 @@ export function voice(
   audioBase64: string,
   transcript: string,
   durationMs?: number,
-): AbipMessage<VoicePayload> {
+): AibpMessage<VoicePayload> {
   return envelope(src, dst, "VOICE", { audioBase64, transcript, durationMs });
 }
 
@@ -60,11 +60,11 @@ export function image(
   imageBase64: string,
   mimeType: string,
   caption?: string,
-): AbipMessage<ImagePayload> {
+): AibpMessage<ImagePayload> {
   return envelope(src, dst, "IMAGE", { imageBase64, mimeType, caption });
 }
 
-export function typing(src: string, dst: string, active: boolean): AbipMessage<TypingPayload> {
+export function typing(src: string, dst: string, active: boolean): AibpMessage<TypingPayload> {
   return envelope(src, dst, "TYPING", { active });
 }
 
@@ -74,7 +74,7 @@ export function status(
   subject: string,
   state: StatusPayload["state"],
   summary?: string,
-): AbipMessage<StatusPayload> {
+): AibpMessage<StatusPayload> {
   return envelope(src, dst, "STATUS", { subject, state, summary });
 }
 
@@ -83,7 +83,7 @@ export function command(
   dst: string,
   cmd: string,
   args: Record<string, unknown> = {},
-): AbipMessage<CommandPayload> {
+): AibpMessage<CommandPayload> {
   return envelope(src, dst, "COMMAND", { command: cmd, args });
 }
 
@@ -92,7 +92,7 @@ export function system(
   dst: string,
   event: SystemEvent,
   data: Record<string, unknown> = {},
-): AbipMessage<SystemPayload> {
+): AibpMessage<SystemPayload> {
   return envelope(src, dst, "SYSTEM", { event, ...data });
 }
 
@@ -100,21 +100,21 @@ export function system(
 // Parsing — validate incoming JSON
 // ---------------------------------------------------------------------------
 
-export function parse(raw: string): AbipMessage | null {
+export function parse(raw: string): AibpMessage | null {
   try {
     const obj = JSON.parse(raw);
-    if (!isAbipMessage(obj)) return null;
+    if (!isAibpMessage(obj)) return null;
     return obj;
   } catch {
     return null;
   }
 }
 
-export function isAbipMessage(obj: unknown): obj is AbipMessage {
+export function isAibpMessage(obj: unknown): obj is AibpMessage {
   if (typeof obj !== "object" || obj === null) return false;
   const m = obj as Record<string, unknown>;
   return (
-    typeof m.abip === "string" &&
+    typeof m.aibp === "string" &&
     typeof m.id === "string" &&
     typeof m.ts === "number" &&
     typeof m.src === "string" &&
@@ -129,7 +129,7 @@ export function isAbipMessage(obj: unknown): obj is AbipMessage {
 // Serialize — NDJSON line
 // ---------------------------------------------------------------------------
 
-export function serialize(msg: AbipMessage): string {
+export function serialize(msg: AibpMessage): string {
   return JSON.stringify(msg) + "\n";
 }
 

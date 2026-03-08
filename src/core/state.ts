@@ -90,18 +90,18 @@ export function setVoiceConfig(cfg: VoiceConfig): void {
   voiceConfig = cfg;
 }
 
-// ── ABIP Bridge (singleton, set by daemon at startup) ──
+// ── AIBP Bridge (singleton, set by daemon at startup) ──
 
-import type { AbipBridge } from "../abip/bridge.js";
+import type { AibpBridge } from "../aibp/bridge.js";
 
-let _abipBridge: AbipBridge | null = null;
+let _aibpBridge: AibpBridge | null = null;
 
-export function setAbipBridge(bridge: AbipBridge): void {
-  _abipBridge = bridge;
+export function setAibpBridge(bridge: AibpBridge): void {
+  _aibpBridge = bridge;
 }
 
-export function getAbipBridge(): AbipBridge | null {
-  return _abipBridge;
+export function getAibpBridge(): AibpBridge | null {
+  return _aibpBridge;
 }
 
 // ── Command Handler ──

@@ -26,7 +26,7 @@ import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig } from "../core/persistence.js";
-import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAbipBridge } from "../core/state.js";
+import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
@@ -181,7 +181,14 @@ export function registerCoreHandlers(
       }
 
       // Also broadcast to PAILot clients
-      broadcastVoice(audioBuffer, text.slice(0, 200));
+      const bridge = getAibpBridge();
+      if (bridge) {
+        bridge.routeToMobile("", text.slice(0, 200), "VOICE", {
+          audioBase64: audioBuffer.toString("base64"),
+        });
+      } else {
+        broadcastVoice(audioBuffer, text.slice(0, 200));
+      }
 
       return { ok: true, result: { generated: true, voice: resolvedVoice, bytes: audioBuffer.length } };
     } catch (err) {
@@ -341,7 +348,15 @@ export function registerCoreHandlers(
 
       // Also broadcast to PAILot clients
       if (result.images.length > 0) {
-        broadcastImage(result.images[0], prompt.slice(0, 200));
+        const bridge = getAibpBridge();
+        if (bridge) {
+          bridge.routeToMobile("", prompt.slice(0, 200), "IMAGE", {
+            imageBase64: result.images[0].toString("base64"),
+            mimeType: "image/png",
+          });
+        } else {
+          broadcastImage(result.images[0], prompt.slice(0, 200));
+        }
       }
 
       return {
@@ -563,22 +578,22 @@ export function registerCoreHandlers(
     return { ok: true, result: { snapshots: statusCache.getAll() } };
   });
 
-  // ── ABIP Protocol Support ──
+  // ── AIBP Protocol Support ──
 
   /**
-   * abip_register — Register an MCP process as an ABIP plugin.
+   * aibp_register — Register an MCP process as an AIBP plugin.
    * Called once when the MCP server starts. Returns the resolved session
    * so the MCP doesn't need TTY detection for routing.
    */
-  server.on("abip_register", async (req) => {
+  server.on("aibp_register", async (req) => {
     const { pluginId, sessionEnvId } = req.params as {
       pluginId?: string;
       sessionEnvId?: string;
     };
     if (!pluginId) return { ok: false, error: "pluginId is required" };
 
-    const bridge = getAbipBridge();
-    if (!bridge) return { ok: false, error: "ABIP bridge not initialized" };
+    const bridge = getAibpBridge();
+    if (!bridge) return { ok: false, error: "AIBP bridge not initialized" };
 
     const result = bridge.registerMcp(pluginId, sessionEnvId);
     return {
@@ -639,6 +654,7 @@ export function registerCoreHandlers(
     const sessionId = callerSessionId || lastRoutedSessionId || activeItermSessionId || undefined;
 
     try {
+      const bridge = getAibpBridge();
       if (voice) {
         const { textToVoiceNote } = await import("../adapters/kokoro/tts.js");
         const resolvedVoice = voiceName ?? voiceConfig.defaultVoice;
@@ -647,14 +663,22 @@ export function registerCoreHandlers(
         for (let i = 0; i < chunks.length; i++) {
           if (i > 0) await new Promise((r) => setTimeout(r, 1000));
           const audioBuffer = await textToVoiceNote(chunks[i], resolvedVoice);
-          // First chunk gets the full original text as transcript;
-          // subsequent chunks get empty transcript (audio only)
           const transcript = i === 0 ? plainText : "";
-          await broadcastVoice(audioBuffer, transcript, sessionId);
+          if (bridge) {
+            bridge.routeToMobile(sessionId ?? "", transcript, "VOICE", {
+              audioBase64: audioBuffer.toString("base64"),
+            });
+          } else {
+            await broadcastVoice(audioBuffer, transcript, sessionId);
+          }
         }
         return { ok: true, result: { sent: true, chunks: chunks.length } };
       } else {
-        broadcastText(text, sessionId);
+        if (bridge) {
+          bridge.routeToMobile(sessionId ?? "", text);
+        } else {
+          broadcastText(text, sessionId);
+        }
       }
       return { ok: true, result: { sent: true } };
     } catch (e) {

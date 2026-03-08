@@ -14,6 +14,7 @@ import type { AdapterHealth } from "../types/adapter.js";
 import { validateAdapterHealth } from "../ipc/validate.js";
 import type { CommandContext } from "./command-context.js";
 import { broadcastText, broadcastImage, broadcastVoice } from "../adapters/pailot/gateway.js";
+import { getAibpBridge } from "../core/state.js";
 
 export interface AdapterDescriptor {
   name: string;       // "whazaa", "telex", "pailot"
@@ -181,10 +182,15 @@ export class AdapterRegistry {
       if (handler) {
         const sourceAdapter = this.adapters.get(message.source);
         const isPailot = message.source === "pailot";
+        const bridge = getAibpBridge();
         const ctx: CommandContext = {
           reply: async (text: string) => {
             if (isPailot) {
-              broadcastText(text);
+              if (bridge) {
+                bridge.routeToMobile("", text);
+              } else {
+                broadcastText(text);
+              }
             } else if (sourceAdapter) {
               const replyMsg = createBrokerMessage("hub", "text", {
                 text,
@@ -197,7 +203,14 @@ export class AdapterRegistry {
           },
           replyImage: async (buffer: Buffer, caption: string) => {
             if (isPailot) {
-              broadcastImage(buffer, caption);
+              if (bridge) {
+                bridge.routeToMobile("", caption, "IMAGE", {
+                  imageBase64: buffer.toString("base64"),
+                  mimeType: "image/png",
+                });
+              } else {
+                broadcastImage(buffer, caption);
+              }
             } else if (sourceAdapter) {
               const replyMsg = createBrokerMessage("hub", "image", {
                 text: caption,
@@ -209,7 +222,13 @@ export class AdapterRegistry {
           },
           replyVoice: async (audioBuffer: Buffer, caption: string) => {
             if (isPailot) {
-              broadcastVoice(audioBuffer, caption);
+              if (bridge) {
+                bridge.routeToMobile("", caption, "VOICE", {
+                  audioBase64: audioBuffer.toString("base64"),
+                });
+              } else {
+                broadcastVoice(audioBuffer, caption);
+              }
             } else if (sourceAdapter) {
               const replyMsg = createBrokerMessage("hub", "voice", {
                 buffer: audioBuffer.toString("base64"),

@@ -13,18 +13,18 @@ import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
-import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastImage } from "../adapters/pailot/gateway.js";
+import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage } from "../adapters/pailot/gateway.js";
 import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
 import { HybridSessionManager, setHybridManager } from "../core/hybrid.js";
 import { router } from "../core/router.js";
 import { loadSessionRegistry, loadVoiceConfig } from "../core/persistence.js";
-import { setCommandHandler, setAbipBridge } from "../core/state.js";
+import { setCommandHandler, setAibpBridge } from "../core/state.js";
 import { createHubCommandHandler } from "./commands.js";
 import type { CommandContext } from "./command-context.js";
 import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
-import { AbipBridge } from "../abip/bridge.js";
+import { AibpBridge } from "../aibp/bridge.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -125,24 +125,37 @@ export async function startDaemon(options?: {
   // Adapter registry
   const adapterRegistry = new AdapterRegistry();
 
-  // ABIP bridge — IRC-inspired message routing layer
-  const abipBridge = new AbipBridge();
-  setAbipBridge(abipBridge);
-  // Register PAILot as a mobile plugin. The callback receives ABIP messages
+  // AIBP bridge — IRC-inspired message routing layer
+  const aibpBridge = new AibpBridge();
+  setAibpBridge(aibpBridge);
+  // Register PAILot as a mobile plugin. The callback receives AIBP messages
   // to deliver to connected WebSocket clients (wired after gateway starts).
   // This is registered early so it's available before the first connection.
-  abipBridge.registerMobile("pailot", (msg) => {
-    // Forward ABIP messages to PAILot gateway broadcast functions
-    const sessionId = msg.src.startsWith("session:")
-      ? msg.src.slice(8)
+  aibpBridge.registerMobile("pailot", (aibpMsg) => {
+    // Forward AIBP messages to PAILot gateway broadcast functions
+    const sessionId = aibpMsg.src.startsWith("session:")
+      ? aibpMsg.src.slice(8)
       : undefined;
-    if (msg.type === "TEXT") {
-      broadcastText((msg.payload as { content: string }).content, sessionId);
-    } else if (msg.type === "TYPING") {
-      // Typing is handled by existing broadcast path
-    } else if (msg.type === "IMAGE") {
-      const p = msg.payload as { imageBase64: string; caption?: string };
-      broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId);
+    switch (aibpMsg.type) {
+      case "TEXT": {
+        const p = aibpMsg.payload as { content: string };
+        broadcastText(p.content, sessionId);
+        break;
+      }
+      case "VOICE": {
+        const p = aibpMsg.payload as { audioBase64: string; transcript?: string };
+        void broadcastVoice(Buffer.from(p.audioBase64, "base64"), p.transcript ?? "", sessionId);
+        break;
+      }
+      case "IMAGE": {
+        const p = aibpMsg.payload as { imageBase64: string; caption?: string };
+        broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId);
+        break;
+      }
+      case "TYPING": {
+        // Typing broadcast handled directly by gateway — no AIBP routing needed yet
+        break;
+      }
     }
   });
 
@@ -169,11 +182,11 @@ export async function startDaemon(options?: {
 
   // Auto-discover adapters that were already running before the hub (re)started.
   // Probe well-known socket paths and register any that respond to "ping".
-  // Also register them as ABIP transport plugins.
+  // Also register them as AIBP transport plugins.
   void discoverRunningAdapters(adapterRegistry).then(() => {
     for (const adapter of adapterRegistry.list()) {
-      abipBridge.registerTransport(adapter.name, () => {
-        // Legacy adapters use IPC, not direct ABIP send
+      aibpBridge.registerTransport(adapter.name, () => {
+        // Legacy adapters use IPC, not direct AIBP send
       });
     }
   });
@@ -194,10 +207,10 @@ export async function startDaemon(options?: {
     await handleScreenshot(ctx);
   });
 
-  console.log(`AIBroker daemon v${getVersion()} started (ABIP ${abipBridge.registry.listPlugins().length > 0 ? "active" : "standby"})`);
+  console.log(`AIBroker daemon v${getVersion()} started (AIBP ${aibpBridge.registry.listPlugins().length > 0 ? "active" : "standby"})`);
   console.log(`  Socket:  ${socketPath}`);
   console.log(`  AppDir:  ${appDir}`);
-  console.log(`  ABIP:    ${abipBridge.listPlugins().join(", ") || "(no plugins yet)"}`);
+  console.log(`  AIBP:    ${aibpBridge.listPlugins().join(", ") || "(no plugins yet)"}`);
 
   // Graceful shutdown — ensure socket cleanup even on abrupt exit
   const shutdown = (signal: string) => {
