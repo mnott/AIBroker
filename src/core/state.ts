@@ -23,6 +23,15 @@ export const sessionTtyCache = new Map<string, string>();
 export let activeClientId: string | null = null;
 export let activeItermSessionId = "";
 
+// Track the session that last received user input from PAILot.
+// Used to tag responses correctly even if the user switches sessions
+// before the response arrives (race condition prevention).
+export let lastRoutedSessionId = "";
+
+export function setLastRoutedSessionId(id: string): void {
+  lastRoutedSessionId = id;
+}
+
 export function setActiveClientId(id: string | null): void {
   activeClientId = id;
 }

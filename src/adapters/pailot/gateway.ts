@@ -29,6 +29,8 @@ import {
   setMessageSource,
   activeItermSessionId,
   setActiveItermSessionId,
+  lastRoutedSessionId,
+  setLastRoutedSessionId,
 } from "../../core/state.js";
 import { setItermSessionVar, setItermTabName, killSession, createClaudeSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
@@ -554,6 +556,7 @@ function flushVoiceBatch(): void {
 
   if (handler) {
     log(`[PAILot] Flushing voice batch (${combined.length} chars)`);
+    setLastRoutedSessionId(activeItermSessionId);
     setMessageSource("pailot");
     handler(`[PAILot:voice] ${combined}`, Date.now());
     setMessageSource("whatsapp");
@@ -778,6 +781,7 @@ end tell`)?.trim() ?? "";
           const routeText = caption
             ? `${caption} (image at ${imgPath})`
             : `(image at ${imgPath})`;
+          setLastRoutedSessionId(activeItermSessionId);
           setMessageSource("pailot");
           onMessage(routeText, Date.now());
           setMessageSource("whatsapp");
@@ -791,6 +795,7 @@ end tell`)?.trim() ?? "";
         log(`[PAILot] ← ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
 
         broadcast({ type: "typing", typing: true });
+        setLastRoutedSessionId(activeItermSessionId);
         setMessageSource("pailot");
         onMessage(text, Date.now());
         setMessageSource("whatsapp");
@@ -825,6 +830,9 @@ end tell`)?.trim() ?? "";
  */
 function resolveSessionId(sessionId?: string): string | undefined {
   if (sessionId) return sessionId;
+  // Prefer the session that last received user input from PAILot —
+  // this survives session switches that happen while Claude is thinking.
+  if (lastRoutedSessionId) return lastRoutedSessionId;
   if (activeItermSessionId) return activeItermSessionId;
   // Last resort: ask hybrid manager for the active session's backend ID
   return hybridManager?.activeSession?.backendSessionId || undefined;

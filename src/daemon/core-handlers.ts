@@ -26,7 +26,7 @@ import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig } from "../core/persistence.js";
-import { voiceConfig, setVoiceConfig, activeItermSessionId } from "../core/state.js";
+import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
@@ -607,8 +607,9 @@ export function registerCoreHandlers(
       sessionId?: string;
     };
     if (!text) return { ok: false, error: "text is required" };
-    // MCP server may not have ITERM_SESSION_ID — fall back to daemon's active session
-    const sessionId = callerSessionId || activeItermSessionId || undefined;
+    // MCP server may not have ITERM_SESSION_ID — fall back to session that last
+    // received user input from PAILot (survives session switches during processing)
+    const sessionId = callerSessionId || lastRoutedSessionId || activeItermSessionId || undefined;
 
     try {
       if (voice) {
