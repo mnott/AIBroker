@@ -14,7 +14,7 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { join } from "node:path";
 import { writeFileSync, readFileSync, existsSync, unlinkSync, appendFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 
 const DEBUG_LOG = process.env.PAILOT_DEBUG ? "/tmp/pailot-ws-debug.log" : null;
 function dbg(msg: string): void {
@@ -53,37 +53,55 @@ interface WsSession {
 
 let wss: WebSocketServer | null = null;
 const clients = new Set<WebSocket>();
+/** Track when each client last proved it's alive (pong, message, or connect). */
+const clientLastActive = new Map<WebSocket, number>();
+/** Consider a client "alive" if it responded within this window. */
+const CLIENT_ALIVE_THRESHOLD = 90_000; // 90s (3x the 30s heartbeat)
 
-// --- Message outbox for offline clients ---
-// Buffers messages when no client is connected so they can be replayed on reconnect.
-// Only text messages are buffered fully; voice/image are counted but not stored (too large).
-const MAX_OUTBOX = 50;
+// --- Per-session message outbox for offline/backgrounded clients ---
+// Buffers messages when no live client can receive them.
+// Stored per-session so drain delivers to the correct session.
+const MAX_OUTBOX_PER_SESSION = 50;
+const OUTBOX_DIR = join(homedir(), ".aibroker", "outbox");
+
 interface OutboxEntry {
   msg: Record<string, unknown>;
   timestamp: number;
 }
-const outbox: OutboxEntry[] = [];
-let missedVoiceCount = 0;
+const outboxMap = new Map<string, OutboxEntry[]>();  // sessionId → entries
 let missedImageCount = 0;
 
 function addToOutbox(msg: Record<string, unknown>): void {
   const type = msg.type as string;
-  // Skip typing indicators — not useful to replay
   if (type === "typing") return;
-  // Count but don't buffer screenshots (very large, less important)
   if (type === "image") { missedImageCount++; return; }
-  // Buffer text, voice, sessions, errors, etc.
-  outbox.push({ msg, timestamp: Date.now() });
-  if (outbox.length > MAX_OUTBOX) outbox.shift();
+
+  const sessionId = (msg.sessionId as string) || "_global";
+  let queue = outboxMap.get(sessionId);
+  if (!queue) { queue = []; outboxMap.set(sessionId, queue); }
+  queue.push({ msg, timestamp: Date.now() });
+  if (queue.length > MAX_OUTBOX_PER_SESSION) queue.shift();
+
+  // Persist to disk (best-effort, async)
+  persistOutbox();
 }
 
 function drainOutbox(ws: WebSocket): void {
-  if (outbox.length === 0 && missedVoiceCount === 0 && missedImageCount === 0) return;
+  // Collect all entries across all sessions
+  let totalEntries = 0;
+  let textCount = 0;
+  let voiceCount = 0;
+  for (const entries of outboxMap.values()) {
+    totalEntries += entries.length;
+    for (const e of entries) {
+      const t = e.msg.type as string;
+      if (t === "text") textCount++;
+      else if (t === "voice") voiceCount++;
+    }
+  }
+  if (totalEntries === 0 && missedImageCount === 0) return;
 
-  // Send a summary of what was missed
-  const textCount = outbox.filter(e => (e.msg.type as string) === "text").length;
-  const voiceCount = outbox.filter(e => (e.msg.type as string) === "voice").length;
-  const otherCount = outbox.length - textCount - voiceCount;
+  const otherCount = totalEntries - textCount - voiceCount;
   const parts: string[] = [];
   if (textCount > 0) parts.push(`${textCount} text message(s)`);
   if (voiceCount > 0) parts.push(`${voiceCount} voice note(s)`);
@@ -95,15 +113,54 @@ function drainOutbox(ws: WebSocket): void {
     content: `📬 While you were away: ${parts.join(", ")}`,
   });
 
-  // Replay buffered messages
-  for (const entry of outbox) {
+  // Replay all buffered messages (sorted by timestamp across sessions)
+  const allEntries: OutboxEntry[] = [];
+  for (const entries of outboxMap.values()) allEntries.push(...entries);
+  allEntries.sort((a, b) => a.timestamp - b.timestamp);
+  for (const entry of allEntries) {
     sendTo(ws, entry.msg);
   }
 
   // Clear outbox
-  outbox.length = 0;
-  missedVoiceCount = 0;
+  outboxMap.clear();
   missedImageCount = 0;
+  persistOutbox();
+}
+
+/** Persist outbox to disk so daemon restarts don't lose messages. */
+function persistOutbox(): void {
+  try {
+    const { mkdirSync, writeFileSync: writeSync } = require("node:fs");
+    mkdirSync(OUTBOX_DIR, { recursive: true });
+    const data: Record<string, OutboxEntry[]> = {};
+    for (const [k, v] of outboxMap) data[k] = v;
+    writeSync(join(OUTBOX_DIR, "pending.json"), JSON.stringify({ messages: data, missedImageCount }));
+  } catch { /* best-effort */ }
+}
+
+/** Restore outbox from disk on startup. */
+function restoreOutbox(): void {
+  try {
+    const path = join(OUTBOX_DIR, "pending.json");
+    if (!existsSync(path)) return;
+    const raw = readFileSync(path, "utf-8");
+    const data = JSON.parse(raw);
+    if (data.messages) {
+      for (const [k, v] of Object.entries(data.messages)) {
+        outboxMap.set(k, v as OutboxEntry[]);
+      }
+    }
+    if (data.missedImageCount) missedImageCount = data.missedImageCount;
+    log(`[PAILot] Restored ${outboxMap.size} outbox queue(s) from disk`);
+    // Clean up the file after restoring
+    unlinkSync(path);
+  } catch { /* ignore */ }
+}
+
+function isClientAlive(ws: WebSocket): boolean {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  const lastActive = clientLastActive.get(ws) ?? 0;
+  return (Date.now() - lastActive) < CLIENT_ALIVE_THRESHOLD;
 }
 
 // Reference to the screenshot handler — set via setScreenshotHandler()
@@ -522,16 +579,18 @@ function sendTo(ws: WebSocket, msg: Record<string, unknown>): void {
 }
 
 function broadcast(msg: Record<string, unknown>): void {
-  // Check if any client is actually ready to receive
+  // Only deliver to clients that have proven liveness recently.
+  // iOS can keep a WebSocket "open" while the app is backgrounded —
+  // ws.send() succeeds but the app never processes the data.
   let delivered = false;
   const payload = JSON.stringify(msg);
   for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (isClientAlive(ws)) {
       ws.send(payload);
       delivered = true;
     }
   }
-  // No connected clients — buffer for later
+  // No live clients — buffer for later
   if (!delivered) {
     addToOutbox(msg);
   }
@@ -644,6 +703,9 @@ async function transcribeAndRoute(
 export function startWsGateway(onMessage: (text: string, timestamp: number) => void | Promise<void>): void {
   wss = new WebSocketServer({ port: WS_PORT });
 
+  // Restore any buffered messages from a previous daemon run
+  restoreOutbox();
+
   wss.on("listening", () => {
     log(`WebSocket gateway listening on ws://0.0.0.0:${WS_PORT}`);
 
@@ -690,14 +752,17 @@ end tell`)?.trim() ?? "";
     const addr = req.socket.remoteAddress ?? "unknown";
     log(`PAILot client connected from ${addr}`);
     clients.add(ws);
+    clientLastActive.set(ws, Date.now());
 
     ws.on("message", (raw) => {
+      clientLastActive.set(ws, Date.now());
       try {
         const rawStr = raw.toString();
         const msg = JSON.parse(rawStr);
         dbg(`RAW msg (${rawStr.length} chars): type=${msg.type}, hasAudio=${!!msg.audioBase64}, content=${(msg.content ?? "").slice(0, 50)}`);
 
-        // Heartbeat ping — reply with pong immediately
+        // Heartbeat ping — reply with pong immediately.
+        // The clientLastActive update above already covers liveness.
         if (msg.type === "ping") {
           sendTo(ws, { type: "pong" });
           return;
@@ -807,11 +872,13 @@ end tell`)?.trim() ?? "";
     ws.on("close", () => {
       log(`PAILot client disconnected from ${addr}`);
       clients.delete(ws);
+      clientLastActive.delete(ws);
     });
 
     ws.on("error", (err) => {
       log(`[PAILot] WebSocket error: ${err.message}`);
       clients.delete(ws);
+      clientLastActive.delete(ws);
     });
 
     // Welcome — outbox drains after client sends "sync" command
