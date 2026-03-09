@@ -163,7 +163,7 @@ const server = new McpServer(
       "- **Text formatting**: use **bold** and *italic* only for whatsapp_send/telegram_send. No markdown headers or code blocks.",
       "- **Voice formatting**: NEVER use asterisks or any markdown in _tts messages. TTS reads them literally as 'asterisk'. Write plain conversational text only.",
       "- **Acknowledge long tasks**: if a prefixed task will take more than a few seconds, immediately send a brief ack via the matching channel BEFORE starting work. Never leave the client silent.",
-      "- **Session messages**: `[Session:NAME]` messages come from another Claude Code session. Process the request, then send your full response back via `aibroker_send_to_session(target=NAME, message=YOUR_RESPONSE)`. Do NOT just answer in the terminal — the sender is waiting via `aibroker_receive`.",
+      "- **Session messages**: `[Session:NAME]` messages come from another Claude Code session. Process the request, then send your full response back via `aibroker_send_to_session(target=NAME, message=YOUR_RESPONSE)`. Do NOT just answer in the terminal — the sender is waiting via `aibroker_receive`. IMPORTANT: When calling `aibroker_send_to_session`, do NOT include a `[Session:...]` prefix in your message — the hub auto-prepends it.",
       "- **Per-message toggle**: this switches automatically with every message. No manual on/off needed.",
       "",
       "### Companion App Message Detection",
@@ -426,10 +426,10 @@ server.tool(
 
 server.tool(
   "aibroker_send_to_session",
-  "Send a message to another iTerm2 session by typing it into the session's terminal AND depositing it into that session's AIBP mailbox. The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can read structured messages via aibroker_receive.",
+  "Send a message to another iTerm2 session by typing it into the session's terminal AND depositing it into that session's AIBP mailbox. The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can read structured messages via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message.",
   {
     target: z.string().min(1).describe("Session to send to: index (1-based), name substring, or iTerm2 session UUID"),
-    message: z.string().min(1).describe("Message to type into the target session"),
+    message: z.string().min(1).describe("The raw message content. Do NOT include a [Session:...] prefix — the hub auto-prepends [Session:SENDER_NAME] for routing."),
   },
   async ({ target, message }) => {
     try {
