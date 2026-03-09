@@ -776,8 +776,12 @@ export function registerCoreHandlers(
     // Deposit into the target session's mailbox (structured receive)
     depositToSessionMailbox(itermSessionId, senderLabel, message);
 
+    // Prefix with session routing tag so the receiving Claude knows to route the response back
+    // This is analogous to [Whazaa], [PAILot], [Telex] prefixes for other channels
+    const prefixedMessage = `[Session:${senderLabel}] ${message}`;
+
     // Also type into the terminal (ensures text appears even if target isn't polling mailbox)
-    const success = typeIntoSession(itermSessionId, message);
+    const success = typeIntoSession(itermSessionId, prefixedMessage);
     if (!success) {
       return { ok: false, error: `Failed to type into session "${resolvedName}" (${itermSessionId})` };
     }
