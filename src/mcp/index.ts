@@ -422,6 +422,37 @@ server.tool(
   },
 );
 
+server.tool(
+  "aibroker_send_to_session",
+  "Send a message to another iTerm2 session by typing it into the session's terminal AND depositing it into that session's AIBP mailbox. The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can read structured messages via aibroker_receive.",
+  {
+    target: z.string().min(1).describe("Session to send to: index (1-based), name substring, or iTerm2 session UUID"),
+    message: z.string().min(1).describe("Message to type into the target session"),
+  },
+  async ({ target, message }) => {
+    try {
+      const r = await hub.call_raw("send_to_session", { target, message }) as any;
+      return ok(`Sent to session "${r.name ?? target}".`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_receive",
+  "Drain messages sent to this session via aibroker_send_to_session. Returns structured messages with sender, content, and timestamp. Returns empty array if no messages. Use this to receive inter-session messages from other Claude Code sessions.",
+  {},
+  async () => {
+    try {
+      const sessionId = getSessionId();
+      const r = await hub.call_raw("session_mailbox_receive", { sessionId }) as any;
+      const msgs: Array<{ from: string; content: string; timestamp: number }> = r?.messages ?? [];
+      if (msgs.length === 0) return ok("No new messages.");
+      const lines = msgs.map((m) => `[${new Date(m.timestamp).toISOString()}] From ${m.from}: ${m.content}`);
+      return ok(lines.join("\n"));
+    } catch (e) { return err(e); }
+  },
+);
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WhatsApp Tools (whatsapp_*) — proxied to whazaa adapter
 // ═══════════════════════════════════════════════════════════════════════════
