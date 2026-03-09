@@ -26,13 +26,13 @@ import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig } from "../core/persistence.js";
-import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge } from "../core/state.js";
+import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
-import { snapshotAllSessions } from "../adapters/iterm/core.js";
+import { snapshotAllSessions, typeIntoSession } from "../adapters/iterm/core.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -698,6 +698,115 @@ export function registerCoreHandlers(
         })),
       },
     };
+  });
+
+  // ── Inter-Session Communication ──
+
+  /**
+   * send_to_session — Type a message into a target iTerm2 session.
+   *
+   * Resolves the target by:
+   *   1. Number → session index (1-based) from snapshotAllSessions
+   *   2. iTerm UUID (contains hyphens and matches length) → used directly
+   *   3. String → case-insensitive match against paiName or session name
+   *
+   * Calls typeIntoSession which writes text + Enter into the session's stdin.
+   */
+  server.on("send_to_session", async (req) => {
+    const { target, message } = req.params as { target?: string; message?: string };
+    if (!target) return { ok: false, error: "target is required" };
+    if (!message) return { ok: false, error: "message is required" };
+
+    const snapshots = snapshotAllSessions();
+
+    let itermSessionId: string | null = null;
+    let resolvedName: string | null = null;
+
+    const asNumber = parseInt(target, 10);
+    if (!Number.isNaN(asNumber) && String(asNumber) === target.trim()) {
+      // Numeric index (1-based)
+      const snap = snapshots[asNumber - 1];
+      if (snap) {
+        itermSessionId = snap.id;
+        resolvedName = snap.paiName ?? snap.name;
+      }
+    } else if (/^[0-9A-Fa-f-]{20,}$/.test(target)) {
+      // Looks like an iTerm UUID — use directly if it exists
+      const snap = snapshots.find((s) => s.id === target);
+      if (snap) {
+        itermSessionId = snap.id;
+        resolvedName = snap.paiName ?? snap.name;
+      } else {
+        // Trust the caller — they may have a valid ID not yet in the snapshot
+        itermSessionId = target;
+        resolvedName = target;
+      }
+    } else {
+      // Name match (case-insensitive, prefers paiName, falls back to session name)
+      const lower = target.toLowerCase();
+      const snap = snapshots.find(
+        (s) => (s.paiName ?? s.name).toLowerCase().includes(lower),
+      );
+      if (snap) {
+        itermSessionId = snap.id;
+        resolvedName = snap.paiName ?? snap.name;
+      }
+    }
+
+    if (!itermSessionId) {
+      return {
+        ok: false,
+        error: `Session "${target}" not found. Available sessions: ${snapshots.map((s, i) => `${i + 1}:${s.paiName ?? s.name}`).join(", ")}`,
+      };
+    }
+
+    // Resolve the sender's name for the mailbox "from" label.
+    // Normalize "w0t0p0:UUID" → "UUID" before snapshot lookup.
+    const rawSenderId = req.itermSessionId;
+    const senderItermId = rawSenderId
+      ? (rawSenderId.includes(":") ? rawSenderId.split(":").pop()! : rawSenderId)
+      : undefined;
+    const senderSnap = senderItermId
+      ? snapshots.find((s) => s.id === senderItermId)
+      : undefined;
+    const senderLabel = senderSnap
+      ? (senderSnap.paiName ?? senderSnap.name)
+      : (senderItermId ?? req.sessionId ?? "unknown");
+
+    // Deposit into the target session's mailbox (structured receive)
+    depositToSessionMailbox(itermSessionId, senderLabel, message);
+
+    // Also type into the terminal (ensures text appears even if target isn't polling mailbox)
+    const success = typeIntoSession(itermSessionId, message);
+    if (!success) {
+      return { ok: false, error: `Failed to type into session "${resolvedName}" (${itermSessionId})` };
+    }
+
+    return { ok: true, result: { sent: true, sessionId: itermSessionId, name: resolvedName } };
+  });
+
+  /**
+   * session_mailbox_receive — Drain the calling session's message mailbox.
+   *
+   * Returns all pending messages deposited by send_to_session from other sessions.
+   * The queue is cleared on read (drain semantics). Returns empty array if no messages.
+   *
+   * The caller's iTerm session ID is taken from req.itermSessionId (set by IPC server
+   * from the session context) or from the explicit sessionId param as a fallback.
+   *
+   * iTerm2 session IDs in env vars have the form "w0t0p0:UUID". We normalize to just
+   * the UUID so mailbox keys match snapshot IDs.
+   */
+  server.on("session_mailbox_receive", async (req) => {
+    const { sessionId: explicitSessionId } = req.params as { sessionId?: string };
+    const rawId = req.itermSessionId ?? explicitSessionId ?? req.sessionId;
+    if (!rawId) {
+      return { ok: false, error: "Cannot determine session ID — pass sessionId param or run inside an iTerm session" };
+    }
+    // Normalize "w0t0p0:UUID" → "UUID"
+    const itermSessionId = rawId.includes(":") ? rawId.split(":").pop()! : rawId;
+    const messages = drainSessionMailbox(itermSessionId);
+    return { ok: true, result: { messages, sessionId: itermSessionId } };
   });
 
   // ── Unified MCP Support ──

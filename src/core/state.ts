@@ -127,6 +127,44 @@ export function setMessageSource(src: MessageSource): void {
 
 export const sentMessageIds = new Set<string | number>();
 
+// ── Session Mailboxes ──
+// Per-session message queues for structured inter-session messaging.
+// A session's mailbox is keyed by its iTerm2 session ID.
+// Messages are deposited by send_to_session and drained by aibroker_receive.
+
+export interface MailboxMessage {
+  from: string;       // sender label (session name or "hub")
+  content: string;    // message text
+  timestamp: number;  // Unix ms
+}
+
+const sessionMailboxes = new Map<string, MailboxMessage[]>();
+
+const MAX_MAILBOX = 100;
+
+export function depositToSessionMailbox(
+  itermSessionId: string,
+  from: string,
+  content: string,
+): void {
+  let queue = sessionMailboxes.get(itermSessionId);
+  if (!queue) {
+    queue = [];
+    sessionMailboxes.set(itermSessionId, queue);
+  }
+  if (queue.length >= MAX_MAILBOX) {
+    queue.shift(); // drop oldest
+  }
+  queue.push({ from, content, timestamp: Date.now() });
+}
+
+export function drainSessionMailbox(itermSessionId: string): MailboxMessage[] {
+  const queue = sessionMailboxes.get(itermSessionId);
+  if (!queue || queue.length === 0) return [];
+  const messages = queue.splice(0);
+  return messages;
+}
+
 // ── Message Dispatch ──
 
 export function dispatchIncomingMessage(body: string, timestamp: number): void {
