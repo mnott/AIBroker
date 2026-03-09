@@ -439,14 +439,31 @@ server.tool(
 
 server.tool(
   "aibroker_receive",
-  "Drain messages sent to this session via aibroker_send_to_session. Returns structured messages with sender, content, and timestamp. Returns empty array if no messages. Use this to receive inter-session messages from other Claude Code sessions.",
-  {},
-  async () => {
+  "Drain messages sent to this session via aibroker_send_to_session. Returns structured messages with sender, content, and timestamp. If timeout is set, polls until a message arrives or timeout expires (max 120s). Without timeout, returns immediately.",
+  {
+    timeout: z.number().optional().describe("Seconds to wait for a message (max 120). Omit for immediate drain."),
+  },
+  async ({ timeout }) => {
     try {
       const sessionId = getSessionId();
+      const maxWait = Math.min(timeout ?? 0, 120) * 1000;
+      const pollInterval = 2000;
+      const deadline = Date.now() + maxWait;
+
+      let msgs: Array<{ from: string; content: string; timestamp: number }> = [];
+
+      // First immediate check
       const r = await hub.call_raw("session_mailbox_receive", { sessionId }) as any;
-      const msgs: Array<{ from: string; content: string; timestamp: number }> = r?.messages ?? [];
-      if (msgs.length === 0) return ok("No new messages.");
+      msgs = r?.messages ?? [];
+
+      // If no messages and timeout requested, poll
+      while (msgs.length === 0 && maxWait > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+        const r2 = await hub.call_raw("session_mailbox_receive", { sessionId }) as any;
+        msgs = r2?.messages ?? [];
+      }
+
+      if (msgs.length === 0) return ok("No messages received.");
       const lines = msgs.map((m) => `[${new Date(m.timestamp).toISOString()}] From ${m.from}: ${m.content}`);
       return ok(lines.join("\n"));
     } catch (e) { return err(e); }
