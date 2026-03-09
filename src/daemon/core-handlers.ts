@@ -33,6 +33,7 @@ import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-project
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { snapshotAllSessions, typeIntoSession } from "../adapters/iterm/core.js";
+import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -917,17 +918,39 @@ export function registerCoreHandlers(
   });
 
   /**
-   * rename — Rename session in hub + forward to all adapters.
+   * rename — Rename session: update registry, tab title, badge, and session variable.
+   *
+   * Resolves the caller's iTerm2 session from req.itermSessionId (set by IPC client
+   * from ITERM_SESSION_ID env var). This works for both MCP callers (Claude Code sessions)
+   * and adapter-forwarded renames.
    */
   server.on("rename", async (req) => {
     const { name } = req.params as { name: string };
     if (!name) return { ok: false, error: "name is required" };
 
-    // Update in hub's session manager
-    const session = manager.activeSession;
-    if (session) manager.updateName(session.id, name);
+    // Resolve caller's iTerm2 session UUID from "w0t0p0:UUID" format
+    const rawItermId = req.itermSessionId;
+    const itermSessionId = rawItermId
+      ? (rawItermId.includes(":") ? rawItermId.split(":").pop()! : rawItermId)
+      : undefined;
 
-    // Forward to all adapters (best effort)
+    // Update in hub's session manager
+    if (itermSessionId) {
+      // updateName searches by backendSessionId (iTerm2 UUID)
+      manager.updateName(itermSessionId, name);
+    } else {
+      const session = manager.activeSession;
+      if (session) manager.updateName(session.id, name);
+    }
+
+    // Set iTerm2 visuals directly if we know the session
+    if (itermSessionId) {
+      setItermSessionVar(itermSessionId, name);
+      setItermTabName(itermSessionId, name);
+      setItermBadge(itermSessionId, name);
+    }
+
+    // Forward to all adapters (best effort — for PAILot session list sync)
     for (const adapter of registry.list()) {
       try {
         const client = new WatcherClient(adapter.socketPath);
