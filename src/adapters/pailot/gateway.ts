@@ -449,6 +449,7 @@ end tell`);
   clientActiveSession.set(ws, session.backendSessionId);
   sendTo(ws, { type: "session_switched", name: session.name, sessionId: session.backendSessionId });
   log(`[PAILot] switched to ${session.kind} session "${session.name}" (${session.id})`);
+  drainOutbox(ws);
 }
 
 function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void {
@@ -662,35 +663,49 @@ function sendTo(ws: WebSocket, msg: Record<string, unknown>): void {
   }
 }
 
-function broadcast(msg: Record<string, unknown>, opts?: { skipSessionGate?: boolean }): void {
+function broadcast(msg: Record<string, unknown>): void {
   // Only deliver to clients that have proven liveness recently.
   // iOS can keep a WebSocket "open" while the app is backgrounded —
   // ws.send() succeeds but the app never processes the data.
   //
   // Session filtering: if the message carries a sessionId, only deliver to
   // clients viewing that session. This prevents cross-session content bleed.
-  // Exception: direct replies (pailot_send) skip the session gate — the user
-  // must see replies regardless of which session they're viewing.
+  // When a message is gated, notify live clients so they can show an unread badge.
   const msgSessionId = msg.sessionId as string | undefined;
-  const applySessionGate = !opts?.skipSessionGate;
   let delivered = false;
   let skippedDead = 0;
   let skippedSession = 0;
+  const gatedClients: WebSocket[] = [];
   const payload = JSON.stringify(msg);
   for (const ws of clients) {
     if (!isClientAlive(ws)) { skippedDead++; continue; }
     // Session gate: if both the message and client have a session, they must match
-    if (applySessionGate && msgSessionId) {
+    if (msgSessionId) {
       const clientSession = clientActiveSession.get(ws);
-      if (clientSession && clientSession !== msgSessionId) { skippedSession++; continue; }
+      if (clientSession && clientSession !== msgSessionId) {
+        skippedSession++;
+        gatedClients.push(ws);
+        continue;
+      }
     }
     ws.send(payload);
     delivered = true;
   }
-  log(`[PAILot] broadcast type=${msg.type} session=${msgSessionId ?? "none"}: delivered=${delivered ? 1 : 0} skippedDead=${skippedDead} skippedSession=${skippedSession} outboxed=${!delivered}${opts?.skipSessionGate ? " (gate-bypass)" : ""}`);
+  log(`[PAILot] broadcast type=${msg.type} session=${msgSessionId ?? "none"}: delivered=${delivered ? 1 : 0} skippedDead=${skippedDead} skippedSession=${skippedSession} outboxed=${!delivered}`);
   // No live clients received the message — buffer for later
   if (!delivered) {
     addToOutbox(msg);
+  }
+  // Notify live clients viewing other sessions about unread messages,
+  // so the app can show a badge/indicator on that session in the drawer.
+  if (!delivered && gatedClients.length > 0 && msg.type !== "typing") {
+    const unreadNotification = JSON.stringify({
+      type: "unread",
+      sessionId: msgSessionId,
+    });
+    for (const ws of gatedClients) {
+      ws.send(unreadNotification);
+    }
   }
 }
 
@@ -1086,10 +1101,10 @@ function resolveSessionId(sessionId?: string): string | undefined {
   return hybridManager?.activeSession?.backendSessionId || undefined;
 }
 
-export function broadcastText(text: string, sessionId?: string, opts?: { skipSessionGate?: boolean }): void {
+export function broadcastText(text: string, sessionId?: string): void {
   const resolvedSession = resolveSessionId(sessionId);
-  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, opts);
-  broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) }, opts);
+  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) });
+  broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) });
 }
 
 /**
@@ -1097,9 +1112,9 @@ export function broadcastText(text: string, sessionId?: string, opts?: { skipSes
  * Converts OGG Opus to M4A (AAC) since iOS can't play OGG natively.
  * @param sessionId — iTerm session ID of the originating Claude session
  */
-export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string, opts?: { skipSessionGate?: boolean }): Promise<void> {
+export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string): Promise<void> {
   const resolvedSession = resolveSessionId(sessionId);
-  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, opts);
+  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) });
   let sendBuffer = audioBuffer;
 
   // Convert OGG Opus → M4A for iOS compatibility
@@ -1124,7 +1139,7 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
     content: transcript,
     audioBase64: sendBuffer.toString("base64"),
     ...(resolvedSession && { sessionId: resolvedSession }),
-  }, opts);
+  });
 }
 
 /**

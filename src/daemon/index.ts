@@ -140,18 +140,15 @@ export async function startDaemon(options?: {
       ? aibpMsg.src.slice(8)
       : undefined;
     log(`[AIBP→PAILot] type=${aibpMsg.type} src=${aibpMsg.src} → sessionId=${sessionId?.slice(0, 8) ?? "none"}`);
-    // Direct replies (TEXT, VOICE) bypass the session gate — the user must see
-    // replies regardless of which session they're viewing in the app.
-    // Screenshots/images keep the gate since they're session-specific content.
     switch (aibpMsg.type) {
       case "TEXT": {
         const p = aibpMsg.payload as { content: string };
-        broadcastText(p.content, sessionId, { skipSessionGate: true });
+        broadcastText(p.content, sessionId);
         break;
       }
       case "VOICE": {
         const p = aibpMsg.payload as { audioBase64: string; transcript?: string };
-        void broadcastVoice(Buffer.from(p.audioBase64, "base64"), p.transcript ?? "", sessionId, { skipSessionGate: true });
+        void broadcastVoice(Buffer.from(p.audioBase64, "base64"), p.transcript ?? "", sessionId);
         break;
       }
       case "IMAGE": {
