@@ -100,21 +100,40 @@ function addToOutbox(msg: Record<string, unknown>): void {
 }
 
 function drainOutbox(ws: WebSocket): void {
-  // Collect all entries across all sessions
-  let totalEntries = 0;
+  // Determine which session this client is currently viewing.
+  // Only drain messages that match the client's session or have no session ID.
+  const clientSession = clientActiveSession.get(ws);
+
+  // Collect entries eligible for this client, leaving non-matching entries in place.
+  const eligibleEntries: OutboxEntry[] = [];
+  const remainingMap = new Map<string, OutboxEntry[]>();
+
+  for (const [sessionKey, entries] of outboxMap.entries()) {
+    const eligible: OutboxEntry[] = [];
+    const remaining: OutboxEntry[] = [];
+    for (const e of entries) {
+      const msgSession = e.msg.sessionId as string | undefined;
+      // Drain if: message has no session, client has no session, or sessions match
+      if (!msgSession || !clientSession || msgSession === clientSession) {
+        eligible.push(e);
+      } else {
+        remaining.push(e);
+      }
+    }
+    eligibleEntries.push(...eligible);
+    if (remaining.length > 0) remainingMap.set(sessionKey, remaining);
+  }
+
+  if (eligibleEntries.length === 0 && missedImageCount === 0) return;
+
   let textCount = 0;
   let voiceCount = 0;
-  for (const entries of outboxMap.values()) {
-    totalEntries += entries.length;
-    for (const e of entries) {
-      const t = e.msg.type as string;
-      if (t === "text") textCount++;
-      else if (t === "voice") voiceCount++;
-    }
+  for (const e of eligibleEntries) {
+    const t = e.msg.type as string;
+    if (t === "text") textCount++;
+    else if (t === "voice") voiceCount++;
   }
-  if (totalEntries === 0 && missedImageCount === 0) return;
-
-  const otherCount = totalEntries - textCount - voiceCount;
+  const otherCount = eligibleEntries.length - textCount - voiceCount;
   const parts: string[] = [];
   if (textCount > 0) parts.push(`${textCount} text message(s)`);
   if (voiceCount > 0) parts.push(`${voiceCount} voice note(s)`);
@@ -126,16 +145,15 @@ function drainOutbox(ws: WebSocket): void {
     content: `📬 While you were away: ${parts.join(", ")}`,
   });
 
-  // Replay all buffered messages (sorted by timestamp across sessions)
-  const allEntries: OutboxEntry[] = [];
-  for (const entries of outboxMap.values()) allEntries.push(...entries);
-  allEntries.sort((a, b) => a.timestamp - b.timestamp);
-  for (const entry of allEntries) {
+  // Replay eligible buffered messages sorted by timestamp
+  eligibleEntries.sort((a, b) => a.timestamp - b.timestamp);
+  for (const entry of eligibleEntries) {
     sendTo(ws, entry.msg);
   }
 
-  // Clear outbox
+  // Replace outbox with only the non-drained (session-mismatched) entries
   outboxMap.clear();
+  for (const [k, v] of remainingMap) outboxMap.set(k, v);
   missedImageCount = 0;
   persistOutbox();
 }
@@ -653,18 +671,21 @@ function broadcast(msg: Record<string, unknown>): void {
   // clients viewing that session. This prevents cross-session content bleed.
   const msgSessionId = msg.sessionId as string | undefined;
   let delivered = false;
+  let skippedDead = 0;
+  let skippedSession = 0;
   const payload = JSON.stringify(msg);
   for (const ws of clients) {
-    if (!isClientAlive(ws)) continue;
+    if (!isClientAlive(ws)) { skippedDead++; continue; }
     // Session gate: if both the message and client have a session, they must match
     if (msgSessionId) {
       const clientSession = clientActiveSession.get(ws);
-      if (clientSession && clientSession !== msgSessionId) continue;
+      if (clientSession && clientSession !== msgSessionId) { skippedSession++; continue; }
     }
     ws.send(payload);
     delivered = true;
   }
-  // No live clients — buffer for later
+  log(`[PAILot] broadcast type=${msg.type} session=${msgSessionId ?? "none"}: delivered=${delivered ? 1 : 0} skippedDead=${skippedDead} skippedSession=${skippedSession} outboxed=${!delivered}`);
+  // No live clients received the message — buffer for later
   if (!delivered) {
     addToOutbox(msg);
   }
@@ -792,6 +813,21 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
   // Restore any buffered messages from a previous daemon run
   restoreOutbox();
 
+  // Server-side ping: keep connections alive and detect dead iOS clients.
+  // iOS suspends backgrounded apps but keeps the TCP socket "open" — without
+  // server pings, ws.readyState stays OPEN indefinitely even though the app is gone.
+  const pingInterval = setInterval(() => {
+    for (const ws of clients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      }
+    }
+  }, 30_000);
+
+  wss.on("close", () => {
+    clearInterval(pingInterval);
+  });
+
   wss.on("listening", () => {
     log(`WebSocket gateway listening on ws://0.0.0.0:${WS_PORT}`);
 
@@ -839,6 +875,10 @@ end tell`)?.trim() ?? "";
     log(`PAILot client connected from ${addr}`);
     clients.add(ws);
     clientLastActive.set(ws, Date.now());
+
+    ws.on("pong", () => {
+      clientLastActive.set(ws, Date.now());
+    });
 
     ws.on("message", (raw) => {
       clientLastActive.set(ws, Date.now());
