@@ -13,7 +13,8 @@
 
 import { WebSocketServer, WebSocket } from "ws";
 import { join } from "node:path";
-import { writeFileSync, readFileSync, existsSync, unlinkSync, appendFileSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, unlinkSync, appendFileSync, mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir, homedir } from "node:os";
 
 const DEBUG_LOG = process.env.PAILOT_DEBUG ? "/tmp/pailot-ws-debug.log" : null;
@@ -71,121 +72,63 @@ const clientLastActive = new Map<WebSocket, number>();
 /** Consider a client "alive" if it responded within this window. */
 const CLIENT_ALIVE_THRESHOLD = 90_000; // 90s (3x the 30s heartbeat)
 
-// --- Per-session message outbox for offline/backgrounded clients ---
-// Buffers messages when no live client can receive them.
-// Stored per-session so drain delivers to the correct session.
-const MAX_OUTBOX_PER_SESSION = 50;
-const OUTBOX_DIR = join(homedir(), ".aibroker", "outbox");
+// --- Sequence-based message log ---
+// Every broadcast message gets a monotonic sequence number. The log is a circular
+// buffer of the last N messages. Clients track their lastSeq and request catch_up
+// on connect or foreground resume. This replaces the old outbox system entirely —
+// no per-client state, fully idempotent, works regardless of reconnection path.
+const MESSAGE_LOG_SIZE = 200;
+let nextSeq = 1;
 
-interface OutboxEntry {
+interface LogEntry {
+  seq: number;
   msg: Record<string, unknown>;
   timestamp: number;
 }
-const outboxMap = new Map<string, OutboxEntry[]>();  // sessionId → entries
-let missedImageCount = 0;
+const messageLog: LogEntry[] = [];
 
-function addToOutbox(msg: Record<string, unknown>): void {
+/** Append a message to the log with a sequence number. Returns the seq (0 for ephemeral). */
+function appendToLog(msg: Record<string, unknown>): number {
   const type = msg.type as string;
-  if (type === "typing") return;
-  if (type === "image") { missedImageCount++; return; }
-
-  const sessionId = (msg.sessionId as string) || "_global";
-  let queue = outboxMap.get(sessionId);
-  if (!queue) { queue = []; outboxMap.set(sessionId, queue); }
-  queue.push({ msg, timestamp: Date.now() });
-  if (queue.length > MAX_OUTBOX_PER_SESSION) queue.shift();
-
-  // Persist to disk (best-effort, async)
-  persistOutbox();
+  // Don't log ephemeral/meta messages
+  if (type === "typing" || type === "pong" || type === "sessions"
+    || type === "session_switched" || type === "unread" || type === "status") return 0;
+  const seq = nextSeq++;
+  messageLog.push({ seq, msg: { ...msg, seq }, timestamp: Date.now() });
+  if (messageLog.length > MESSAGE_LOG_SIZE) messageLog.shift();
+  return seq;
 }
 
-function drainOutbox(ws: WebSocket): void {
-  // Determine which session this client is currently viewing.
-  // Only drain messages that match the client's session or have no session ID.
-  const clientSession = clientActiveSession.get(ws);
-
-  // Collect entries eligible for this client, leaving non-matching entries in place.
-  const eligibleEntries: OutboxEntry[] = [];
-  const remainingMap = new Map<string, OutboxEntry[]>();
-
-  for (const [sessionKey, entries] of outboxMap.entries()) {
-    const eligible: OutboxEntry[] = [];
-    const remaining: OutboxEntry[] = [];
-    for (const e of entries) {
-      const msgSession = e.msg.sessionId as string | undefined;
-      // Drain if: message has no session, client has no session, or sessions match
-      if (!msgSession || !clientSession || msgSession === clientSession) {
-        eligible.push(e);
-      } else {
-        remaining.push(e);
-      }
-    }
-    eligibleEntries.push(...eligible);
-    if (remaining.length > 0) remainingMap.set(sessionKey, remaining);
-  }
-
-  if (eligibleEntries.length === 0 && missedImageCount === 0) return;
-
-  let textCount = 0;
-  let voiceCount = 0;
-  for (const e of eligibleEntries) {
-    const t = e.msg.type as string;
-    if (t === "text") textCount++;
-    else if (t === "voice") voiceCount++;
-  }
-  const otherCount = eligibleEntries.length - textCount - voiceCount;
-  const parts: string[] = [];
-  if (textCount > 0) parts.push(`${textCount} text message(s)`);
-  if (voiceCount > 0) parts.push(`${voiceCount} voice note(s)`);
-  if (missedImageCount > 0) parts.push(`${missedImageCount} image(s)`);
-  if (otherCount > 0) parts.push(`${otherCount} other`);
-
-  sendTo(ws, {
-    type: "text",
-    content: `📬 While you were away: ${parts.join(", ")}`,
+/** Return all log entries with seq > afterSeq, optionally filtered by session. */
+function getMessagesAfter(afterSeq: number, sessionId?: string): LogEntry[] {
+  return messageLog.filter(e => {
+    if (e.seq <= afterSeq) return false;
+    // Session filter: if client has a session and message has a different one, skip
+    const msgSession = e.msg.sessionId as string | undefined;
+    if (sessionId && msgSession && msgSession !== sessionId) return false;
+    return true;
   });
+}
 
-  // Replay eligible buffered messages sorted by timestamp
-  eligibleEntries.sort((a, b) => a.timestamp - b.timestamp);
-  for (const entry of eligibleEntries) {
-    sendTo(ws, entry.msg);
+/** Handle catch_up command: replay missed messages to the client. */
+function handleCatchUp(ws: WebSocket, args?: Record<string, unknown>): void {
+  const lastSeq = typeof args?.lastSeq === "number" ? args.lastSeq : 0;
+  const clientSession = clientActiveSession.get(ws);
+  const missed = getMessagesAfter(lastSeq, clientSession);
+  const currentSeq = nextSeq - 1;
+
+  if (missed.length === 0) {
+    // Still send response so client can update its epoch/seq tracking
+    sendTo(ws, { type: "catch_up", messages: [], serverSeq: currentSeq });
+    return;
   }
 
-  // Replace outbox with only the non-drained (session-mismatched) entries
-  outboxMap.clear();
-  for (const [k, v] of remainingMap) outboxMap.set(k, v);
-  missedImageCount = 0;
-  persistOutbox();
-}
-
-/** Persist outbox to disk so daemon restarts don't lose messages. */
-function persistOutbox(): void {
-  try {
-    const { mkdirSync, writeFileSync: writeSync } = require("node:fs");
-    mkdirSync(OUTBOX_DIR, { recursive: true });
-    const data: Record<string, OutboxEntry[]> = {};
-    for (const [k, v] of outboxMap) data[k] = v;
-    writeSync(join(OUTBOX_DIR, "pending.json"), JSON.stringify({ messages: data, missedImageCount }));
-  } catch { /* best-effort */ }
-}
-
-/** Restore outbox from disk on startup. */
-function restoreOutbox(): void {
-  try {
-    const path = join(OUTBOX_DIR, "pending.json");
-    if (!existsSync(path)) return;
-    const raw = readFileSync(path, "utf-8");
-    const data = JSON.parse(raw);
-    if (data.messages) {
-      for (const [k, v] of Object.entries(data.messages)) {
-        outboxMap.set(k, v as OutboxEntry[]);
-      }
-    }
-    if (data.missedImageCount) missedImageCount = data.missedImageCount;
-    log(`[PAILot] Restored ${outboxMap.size} outbox queue(s) from disk`);
-    // Clean up the file after restoring
-    unlinkSync(path);
-  } catch { /* ignore */ }
+  log(`[PAILot] catch_up: replaying ${missed.length} messages (client lastSeq=${lastSeq}, server seq=${currentSeq})`);
+  sendTo(ws, {
+    type: "catch_up",
+    messages: missed.map(e => e.msg),
+    serverSeq: currentSeq,
+  });
 }
 
 function isClientAlive(ws: WebSocket): boolean {
@@ -229,7 +172,6 @@ function isClaudeRelated(snap: ReturnType<typeof snapshotAllSessions>[0]): boole
 function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void {
   if (!hybridManager) {
     handleSessionsCommand(ws);
-    drainOutbox(ws);
     return;
   }
 
@@ -279,7 +221,6 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
       clientActiveSession.set(ws, clientActiveId);
       log(`[PAILot] sync: restored client session "${sessions[idx].name}" (${clientActiveId.slice(0, 8)}...)`);
       handleSessionsCommand(ws);
-      drainOutbox(ws);
       return;
     }
     // Client's session no longer exists in iTerm — fall through to iTerm focus
@@ -333,9 +274,8 @@ end tell`)?.trim() ?? "";
     }
   }
 
-  // Return sessions with updated active state, then drain buffered messages
+  // Return sessions with updated active state
   handleSessionsCommand(ws);
-  drainOutbox(ws);
 }
 
 function handleSessionsCommand(ws: WebSocket): void {
@@ -449,7 +389,6 @@ end tell`);
   clientActiveSession.set(ws, session.backendSessionId);
   sendTo(ws, { type: "session_switched", name: session.name, sessionId: session.backendSessionId });
   log(`[PAILot] switched to ${session.kind} session "${session.name}" (${session.id})`);
-  drainOutbox(ws);
 }
 
 function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void {
@@ -664,22 +603,22 @@ function sendTo(ws: WebSocket, msg: Record<string, unknown>): void {
 }
 
 function broadcast(msg: Record<string, unknown>): void {
-  // Only deliver to clients that have proven liveness recently.
-  // iOS can keep a WebSocket "open" while the app is backgrounded —
-  // ws.send() succeeds but the app never processes the data.
-  //
+  // Append to message log FIRST — every non-ephemeral message gets a seq number.
+  // Clients that miss it will catch up via the catch_up command.
+  const seq = appendToLog(msg);
+  if (seq > 0) msg = { ...msg, seq };
+
   // Session filtering: if the message carries a sessionId, only deliver to
   // clients viewing that session. This prevents cross-session content bleed.
   // When a message is gated, notify live clients so they can show an unread badge.
   const msgSessionId = msg.sessionId as string | undefined;
-  let delivered = false;
+  let delivered = 0;
   let skippedDead = 0;
   let skippedSession = 0;
   const gatedClients: WebSocket[] = [];
   const payload = JSON.stringify(msg);
   for (const ws of clients) {
     if (!isClientAlive(ws)) { skippedDead++; continue; }
-    // Session gate: if both the message and client have a session, they must match
     if (msgSessionId) {
       const clientSession = clientActiveSession.get(ws);
       if (clientSession && clientSession !== msgSessionId) {
@@ -689,16 +628,12 @@ function broadcast(msg: Record<string, unknown>): void {
       }
     }
     ws.send(payload);
-    delivered = true;
+    delivered++;
   }
-  log(`[PAILot] broadcast type=${msg.type} session=${msgSessionId ?? "none"}: delivered=${delivered ? 1 : 0} skippedDead=${skippedDead} skippedSession=${skippedSession} outboxed=${!delivered}`);
-  // No live clients received the message — buffer for later
-  if (!delivered) {
-    addToOutbox(msg);
-  }
-  // Notify live clients viewing other sessions about unread messages,
-  // so the app can show a badge/indicator on that session in the drawer.
-  if (!delivered && gatedClients.length > 0 && msg.type !== "typing") {
+  log(`[PAILot] broadcast type=${msg.type} seq=${seq} session=${msgSessionId ?? "none"}: delivered=${delivered} skippedDead=${skippedDead} skippedSession=${skippedSession}`);
+
+  // Notify live clients viewing other sessions about unread messages
+  if (delivered === 0 && gatedClients.length > 0 && msg.type !== "typing") {
     const unreadNotification = JSON.stringify({
       type: "unread",
       sessionId: msgSessionId,
@@ -828,9 +763,6 @@ async function transcribeAndRoute(
 export function startWsGateway(onMessage: (text: string, timestamp: number) => void | Promise<void>): void {
   wss = new WebSocketServer({ port: WS_PORT });
 
-  // Restore any buffered messages from a previous daemon run
-  restoreOutbox();
-
   // Server-side ping: keep connections alive and detect dead iOS clients.
   // iOS suspends backgrounded apps but keeps the TCP socket "open" — without
   // server pings, ws.readyState stays OPEN indefinitely even though the app is gone.
@@ -925,6 +857,9 @@ end tell`)?.trim() ?? "";
             case "sync":
               handleSyncCommand(ws, args);
               return;
+            case "catch_up":
+              handleCatchUp(ws, args);
+              return;
             case "switch":
               handleSwitchCommand(ws, args);
               return;
@@ -1001,15 +936,31 @@ end tell`)?.trim() ?? "";
           return;
         }
 
-        // Image message — save to temp file, route caption as text
-        // NOTE: Do NOT send the file path to Claude Code — it tries to read .jpg files
-        // as images, which corrupts the conversation context with unprocessable image data.
+        // Image message — save to temp file, convert HEIC→JPEG if needed, route caption as text
         if (msg.type === "image" && msg.imageBase64) {
-          const ext = (msg.mimeType ?? "image/jpeg").includes("png") ? "png" : "jpg";
-          const imgPath = join(tmpdir(), `pailot-img-${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`);
+          const mime = (msg.mimeType ?? "image/jpeg").toLowerCase();
           const imgBuf = Buffer.from(msg.imageBase64 as string, "base64");
-          writeFileSync(imgPath, imgBuf);
-          log(`[PAILot] Image saved (${imgBuf.length} bytes) → ${imgPath}`);
+          let imgPath: string;
+
+          if (mime.includes("heic") || mime.includes("heif")) {
+            // HEIC/HEIF: save with real extension, convert to JPEG via macOS sips
+            const heicPath = join(tmpdir(), `pailot-img-${Date.now()}-${randomUUID().slice(0, 8)}.heic`);
+            imgPath = heicPath.replace(/\.heic$/, ".jpg");
+            writeFileSync(heicPath, imgBuf);
+            try {
+              execFileSync("sips", ["-s", "format", "jpeg", heicPath, "--out", imgPath], { timeout: 10000 });
+              unlinkSync(heicPath);
+              log(`[PAILot] HEIC→JPEG converted (${imgBuf.length} bytes) → ${imgPath}`);
+            } catch (err) {
+              log(`[PAILot] HEIC conversion failed: ${err}, keeping original`);
+              imgPath = heicPath;
+            }
+          } else {
+            const ext = mime.includes("png") ? "png" : "jpg";
+            imgPath = join(tmpdir(), `pailot-img-${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`);
+            writeFileSync(imgPath, imgBuf);
+            log(`[PAILot] Image saved (${imgBuf.length} bytes) → ${imgPath}`);
+          }
           const caption = (msg.caption as string) || "";
           // Embed the path inside parentheses so Claude Code doesn't auto-attach
           // the .jpg as an image (which corrupts the session if the API rejects it).
@@ -1070,9 +1021,8 @@ end tell`)?.trim() ?? "";
       clientActiveSession.delete(ws);
     });
 
-    // Welcome — outbox drains after client sends "sync" command
+    // Outbox drains after client sends "sync" command or next ping
     // (so activeSessionId is set before messages arrive)
-    sendTo(ws, { type: "text", content: "Connected to PAILot gateway." });
   });
 
   wss.on("error", (err) => {
