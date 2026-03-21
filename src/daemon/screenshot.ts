@@ -140,6 +140,11 @@ export async function handleScreenshot(ctx: CommandContext): Promise<void> {
   if (currentContent && lastScreenshotContent) {
     const tail = (s: string) => s.split("\n").slice(-100).join("\n").trim();
     if (tail(currentContent) === tail(lastScreenshotContent)) {
+      if (ctx.source === "pailot") {
+        // PAILot already has the screenshot in Navigate — don't spam text
+        log("/ss: content unchanged, skipping (pailot)");
+        return;
+      }
       const lines = currentContent
         .split("\n")
         .filter((l: string) => !/^[─━═┄┈╌╍┅┉]{3,}\s*$/.test(l.trim()))
@@ -147,7 +152,7 @@ export async function handleScreenshot(ctx: CommandContext): Promise<void> {
         .slice(-30)
         .join("\n");
       if (lines) {
-        if (ctx.source !== "pailot") broadcastText(lines);
+        broadcastText(lines);
         await ctx.reply(`*Terminal (unchanged):*\n\n\`\`\`\n${lines}\n\`\`\``);
         log("/ss: content unchanged, sent tail as text");
         return;
@@ -237,27 +242,10 @@ end tell`;
 
     await new Promise((r) => setTimeout(r, 1500));
 
-    const boundsScript = `tell application "iTerm2"
-  repeat with w in windows
-    if (id of w as text) is "${windowId}" then
-      set wBounds to bounds of w
-      set wx to item 1 of wBounds
-      set wy to item 2 of wBounds
-      set wx2 to item 3 of wBounds
-      set wy2 to item 4 of wBounds
-      return (wx as text) & "," & (wy as text) & "," & ((wx2 - wx) as text) & "," & ((wy2 - wy) as text)
-    end if
-  end repeat
-  return ""
-end tell`;
-    const boundsResult = runAppleScript(boundsScript) ?? "";
-    const bounds = boundsResult.trim();
-    if (!bounds || !bounds.includes(",")) {
-      throw new Error("Could not get window bounds from iTerm2");
-    }
-
-    log(`/ss: capturing screen region ${bounds} (iTerm2 window ${windowId})`);
-    execSync(`/usr/sbin/screencapture -x -R ${bounds} "${filePath}"`, { timeout: 15_000 });
+    // Use window ID capture (-l) instead of region (-R) — region fails on
+    // multi-display setups where the window coordinates exceed a single screen.
+    log(`/ss: capturing window ${windowId}`);
+    execSync(`/usr/sbin/screencapture -x -l ${windowId} "${filePath}"`, { timeout: 15_000 });
 
     const buffer = readFileSync(filePath);
 

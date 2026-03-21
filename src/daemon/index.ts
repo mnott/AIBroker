@@ -143,17 +143,18 @@ export async function startDaemon(options?: {
     switch (aibpMsg.type) {
       case "TEXT": {
         const p = aibpMsg.payload as { content: string };
-        broadcastText(p.content, sessionId);
+        // direct=true: explicit pailot_send replies bypass session gate
+        broadcastText(p.content, sessionId, true);
         break;
       }
       case "VOICE": {
         const p = aibpMsg.payload as { audioBase64: string; transcript?: string };
-        void broadcastVoice(Buffer.from(p.audioBase64, "base64"), p.transcript ?? "", sessionId);
+        void broadcastVoice(Buffer.from(p.audioBase64, "base64"), p.transcript ?? "", sessionId, true);
         break;
       }
       case "IMAGE": {
         const p = aibpMsg.payload as { imageBase64: string; caption?: string };
-        broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId);
+        broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId, true);
         break;
       }
       case "TYPING": {

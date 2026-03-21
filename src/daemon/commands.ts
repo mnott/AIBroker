@@ -140,7 +140,13 @@ export function createHubCommandHandler(): (
 
   // ── Message delivery to iTerm2 ──
 
-  function deliverMessage(text: string): boolean {
+  function deliverMessage(text: string, targetSessionId?: string): boolean {
+    // If a specific target session is given (e.g., from AIBP routing), use it first
+    if (targetSessionId) {
+      const bareTarget = stripItermPrefix(targetSessionId) ?? targetSessionId;
+      if (typeIntoSession(bareTarget, text)) return true;
+    }
+
     const bareSessionId = stripItermPrefix(activeItermSessionId) ?? activeItermSessionId;
     if (bareSessionId && managedSessions.has(bareSessionId)) {
       if (typeIntoSession(bareSessionId, text)) return true;
@@ -947,6 +953,9 @@ end tell`;
       textToDeliver = text.replace(/^!/, "");
     } else if (trimmedText.startsWith("/")) {
       textToDeliver = text;
+    } else if (/^\[(?:PAILot|Whazaa|Telex)(?::voice)?\]/.test(trimmedText)) {
+      // Already prefixed (e.g. voice batch adds [PAILot:voice] before routing) — pass through
+      textToDeliver = text;
     } else if (/^\[(?:Voice note|Audio)\]:/.test(trimmedText)) {
       textToDeliver = `[${tag}:voice] ${text}`;
     } else {
@@ -964,6 +973,6 @@ end tell`;
     }
 
     // Visual session — deliver to iTerm2
-    deliverMessage(textToDeliver);
+    deliverMessage(textToDeliver, ctx.sessionId);
   };
 }

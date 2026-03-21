@@ -196,7 +196,7 @@ export class HybridSessionManager {
       const isActive = i === this._activeIndex;
       const tag = s.kind === "api" ? "[api]" : "[visual]";
       const marker = isActive ? "*" : " ";
-      return `${marker}${i + 1}. ${s.name} ${tag} (${s.cwd})`;
+      return `${marker}${i + 1}. ${s.name} ${tag}${s.cwd ? ` (${s.cwd})` : ""}`;
     }).join("\n");
   }
 

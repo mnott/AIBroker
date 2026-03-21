@@ -389,6 +389,12 @@ end tell`);
   clientActiveSession.set(ws, session.backendSessionId);
   sendTo(ws, { type: "session_switched", name: session.name, sessionId: session.backendSessionId });
   log(`[PAILot] switched to ${session.kind} session "${session.name}" (${session.id})`);
+
+  // Auto-drain: replay any messages for the new session that were skipped while
+  // the client was viewing a different session. Uses lastSeq=0 which is safe
+  // because getMessagesAfter filters by sessionId — only messages for this
+  // session are returned. The client deduplicates via seenSeqsRef.
+  handleCatchUp(ws, { lastSeq: 0 });
 }
 
 function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void {
@@ -548,15 +554,39 @@ async function handleNavCommand(ws: WebSocket, args: Record<string, unknown>): P
   // sendKeystrokeToSession takes ASCII code: 13=enter, 9=tab, 27=escape
   // sendEscapeSequenceToSession takes ANSI direction char: A=up, B=down, C=right, D=left
   const keyMap: Record<string, () => void> = {
+    // Arrow keys (descriptive names)
     up: () => sendEscapeSequenceToSession(targetSession, "A"),
     down: () => sendEscapeSequenceToSession(targetSession, "B"),
     left: () => sendEscapeSequenceToSession(targetSession, "D"),
     right: () => sendEscapeSequenceToSession(targetSession, "C"),
+    // Vim-style arrow keys (Flutter nav screen sends these)
+    k: () => sendEscapeSequenceToSession(targetSession, "A"),
+    j: () => sendEscapeSequenceToSession(targetSession, "B"),
+    h: () => sendEscapeSequenceToSession(targetSession, "D"),
+    l: () => sendEscapeSequenceToSession(targetSession, "C"),
+    // Action keys
     enter: () => sendKeystrokeToSession(targetSession, 13),
+    Return: () => sendKeystrokeToSession(targetSession, 13),
     tab: () => sendKeystrokeToSession(targetSession, 9),
+    Tab: () => sendKeystrokeToSession(targetSession, 9),
     escape: () => sendKeystrokeToSession(targetSession, 27),
+    Escape: () => sendKeystrokeToSession(targetSession, 27),
     "ctrl-c": () => {
       // Send Ctrl+C (ETX, ASCII 3)
+      runAppleScript(`tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if id of s is "${targetSession}" then
+          tell s to write text (ASCII character 3)
+          return
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell`);
+    },
+    "ctrl+c": () => {
       runAppleScript(`tell application "iTerm2"
   repeat with w in windows
     repeat with t in tabs of w
@@ -602,7 +632,7 @@ function sendTo(ws: WebSocket, msg: Record<string, unknown>): void {
   }
 }
 
-function broadcast(msg: Record<string, unknown>): void {
+function broadcast(msg: Record<string, unknown>, direct?: boolean): void {
   // Append to message log FIRST — every non-ephemeral message gets a seq number.
   // Clients that miss it will catch up via the catch_up command.
   const seq = appendToLog(msg);
@@ -611,6 +641,8 @@ function broadcast(msg: Record<string, unknown>): void {
   // Session filtering: if the message carries a sessionId, only deliver to
   // clients viewing that session. This prevents cross-session content bleed.
   // When a message is gated, notify live clients so they can show an unread badge.
+  // Exception: "direct" messages (explicit pailot_send replies) bypass the gate —
+  // the user expects to see responses from any session they interact with.
   const msgSessionId = msg.sessionId as string | undefined;
   let delivered = 0;
   let skippedDead = 0;
@@ -619,7 +651,7 @@ function broadcast(msg: Record<string, unknown>): void {
   const payload = JSON.stringify(msg);
   for (const ws of clients) {
     if (!isClientAlive(ws)) { skippedDead++; continue; }
-    if (msgSessionId) {
+    if (msgSessionId && !direct) {
       const clientSession = clientActiveSession.get(ws);
       if (clientSession && clientSession !== msgSessionId) {
         skippedSession++;
@@ -630,7 +662,11 @@ function broadcast(msg: Record<string, unknown>): void {
     ws.send(payload);
     delivered++;
   }
-  log(`[PAILot] broadcast type=${msg.type} seq=${seq} session=${msgSessionId ?? "none"}: delivered=${delivered} skippedDead=${skippedDead} skippedSession=${skippedSession}`);
+  log(`[PAILot] broadcast type=${msg.type} seq=${seq} session=${msgSessionId ?? "none"}: delivered=${delivered} skippedDead=${skippedDead} skippedSession=${skippedSession}${direct ? " DIRECT" : ""}`);
+  // Debug: log payload for text messages to diagnose app-side rendering issues
+  if (msg.type === "text" && delivered > 0) {
+    log(`[PAILot] DEBUG payload: ${payload.slice(0, 200)}`);
+  }
 
   // Notify live clients viewing other sessions about unread messages
   if (delivered === 0 && gatedClients.length > 0 && msg.type !== "typing") {
@@ -665,8 +701,8 @@ function flushVoiceBatch(): void {
   voiceBatchSessionId = "";
   voiceBatchTimer = null;
 
-  log(`[PAILot] Flushing voice batch (${combined.length} chars)`);
   const routeSession = batchSession || activeItermSessionId;
+  log(`[PAILot] Flushing voice batch (${combined.length} chars) → session=${routeSession?.slice(0, 8) ?? "none"} (batch=${batchSession?.slice(0, 8) ?? "none"}, active=${activeItermSessionId?.slice(0, 8) ?? "none"})`);
   if (routeSession) {
     pailotReplyMap.set(routeSession, routeSession);
     setLastRoutedSessionId(routeSession);
@@ -1002,8 +1038,8 @@ end tell`)?.trim() ?? "";
           onMessage(text, Date.now());
           setMessageSource("whatsapp");
         }
-      } catch {
-        log(`[PAILot] Invalid message from ${addr}`);
+      } catch (parseErr) {
+        log(`[PAILot] Invalid message from ${addr}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)} — raw: ${String(raw).slice(0, 300)}`);
       }
     });
 
@@ -1051,10 +1087,10 @@ function resolveSessionId(sessionId?: string): string | undefined {
   return hybridManager?.activeSession?.backendSessionId || undefined;
 }
 
-export function broadcastText(text: string, sessionId?: string): void {
+export function broadcastText(text: string, sessionId?: string, direct?: boolean): void {
   const resolvedSession = resolveSessionId(sessionId);
-  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) });
-  broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) });
+  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
+  broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
 }
 
 /**
@@ -1062,9 +1098,9 @@ export function broadcastText(text: string, sessionId?: string): void {
  * Converts OGG Opus to M4A (AAC) since iOS can't play OGG natively.
  * @param sessionId — iTerm session ID of the originating Claude session
  */
-export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string): Promise<void> {
+export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string, direct?: boolean): Promise<void> {
   const resolvedSession = resolveSessionId(sessionId);
-  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) });
+  broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
   let sendBuffer = audioBuffer;
 
   // Convert OGG Opus → M4A for iOS compatibility
@@ -1089,21 +1125,21 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
     content: transcript,
     audioBase64: sendBuffer.toString("base64"),
     ...(resolvedSession && { sessionId: resolvedSession }),
-  });
+  }, direct);
 }
 
 /**
  * Broadcast a screenshot/image to all connected PAILot clients.
  * @param sessionId — iTerm session ID of the originating Claude session
  */
-export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string): void {
+export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean): void {
   const resolvedSession = resolveSessionId(sessionId);
   broadcast({
     type: "image",
     imageBase64: imageBuffer.toString("base64"),
     caption: caption ?? "Screenshot",
     ...(resolvedSession && { sessionId: resolvedSession }),
-  });
+  }, direct);
 }
 
 /**
