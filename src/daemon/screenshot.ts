@@ -239,7 +239,6 @@ end tell`;
       windowId = findResult?.trim() ?? "";
       // Brief delay for tab to render
       if (windowId) {
-        const { spawnSync } = require("node:child_process");
         spawnSync("sleep", ["0.3"]);
       }
     }
