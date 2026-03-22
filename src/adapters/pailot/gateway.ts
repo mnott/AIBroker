@@ -755,7 +755,7 @@ function flushVoiceBatch(): void {
 
 const execFileAsync = promisify(execFile);
 
-async function transcribeAndRoute(
+export async function transcribeAndRoute(
   audioBase64: string,
   onMessage: (text: string, timestamp: number) => void | Promise<void>,
   messageId?: string,
