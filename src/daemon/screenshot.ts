@@ -219,14 +219,15 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
       }
     }
 
-    // Find the window ID for the target session — no need to raise/activate
-    // since screencapture -l captures by window ID regardless of focus
+    // Find the window and SELECT the tab containing the target session
+    // screencapture -l captures the visible tab, so we must switch to it
     if (itermSessionId) {
-      const findScript = `tell application "iTerm2"
+      const findAndSelectScript = `tell application "iTerm2"
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
         if id of s is "${itermSessionId}" then
+          select t
           return (id of w as text)
         end if
       end repeat
@@ -234,8 +235,13 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
   end repeat
   return ""
 end tell`;
-      const findResult = runAppleScript(findScript);
+      const findResult = runAppleScript(findAndSelectScript);
       windowId = findResult?.trim() ?? "";
+      // Brief delay for tab to render
+      if (windowId) {
+        const { spawnSync } = require("node:child_process");
+        spawnSync("sleep", ["0.3"]);
+      }
     }
 
     if (!windowId) {
