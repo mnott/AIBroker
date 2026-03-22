@@ -1124,14 +1124,14 @@ function resolveSessionId(sessionId?: string): string | undefined {
 }
 
 export function broadcastText(text: string, sessionId?: string, direct?: boolean): void {
-  const resolvedSession = resolveSessionId(sessionId);
+  const resolvedSession = sessionId || resolveSessionId(sessionId);
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
   broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
 
-  // MQTT dual-publish (Phase 1)
-  if (isMqttRunning() && resolvedSession) {
-    mqttPublishTyping(resolvedSession, false);
-    mqttPublishText(resolvedSession, text);
+  // MQTT publish — always publish when broker is running
+  if (isMqttRunning()) {
+    if (resolvedSession) mqttPublishTyping(resolvedSession, false);
+    mqttPublishText(resolvedSession ?? "global", text);
   }
 }
 
@@ -1141,7 +1141,7 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
  * @param sessionId — iTerm session ID of the originating Claude session
  */
 export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string, direct?: boolean): Promise<void> {
-  const resolvedSession = resolveSessionId(sessionId);
+  const resolvedSession = sessionId || resolveSessionId(sessionId);
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
   let sendBuffer = audioBuffer;
 
@@ -1170,10 +1170,9 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
     ...(resolvedSession && { sessionId: resolvedSession }),
   }, direct);
 
-  // MQTT dual-publish (Phase 1)
-  if (isMqttRunning() && resolvedSession) {
-    mqttPublishTyping(resolvedSession, false);
-    mqttPublishVoice(resolvedSession, voiceBase64, transcript);
+  if (isMqttRunning()) {
+    if (resolvedSession) mqttPublishTyping(resolvedSession, false);
+    mqttPublishVoice(resolvedSession ?? "global", voiceBase64, transcript);
   }
 }
 
@@ -1182,7 +1181,7 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
  * @param sessionId — iTerm session ID of the originating Claude session
  */
 export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean): void {
-  const resolvedSession = resolveSessionId(sessionId);
+  const resolvedSession = sessionId || resolveSessionId(sessionId);
   const imgBase64 = imageBuffer.toString("base64");
   broadcast({
     type: "image",
@@ -1191,12 +1190,11 @@ export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?
     ...(resolvedSession && { sessionId: resolvedSession }),
   }, direct);
 
-  // MQTT dual-publish (Phase 1)
-  if (isMqttRunning() && resolvedSession) {
-    mqttPublishImage(resolvedSession, imgBase64, caption ?? "Screenshot");
-    // Also publish to retained screenshot topic if this looks like a screenshot
+  if (isMqttRunning()) {
+    const target = resolvedSession ?? "global";
+    mqttPublishImage(target, imgBase64, caption ?? "Screenshot");
     if ((caption ?? "Screenshot").toLowerCase().includes("screenshot")) {
-      mqttPublishScreenshot(resolvedSession, imgBase64);
+      mqttPublishScreenshot(target, imgBase64);
     }
   }
 }

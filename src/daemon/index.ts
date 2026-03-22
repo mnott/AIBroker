@@ -6,8 +6,9 @@
  */
 
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
-import { unlinkSync, readFileSync, existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { unlinkSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { setLogPrefix, log } from "../core/log.js";
 import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
@@ -346,13 +347,17 @@ export async function startDaemon(options?: {
         (_text: string, _ts: number) => { /* onMessage not needed for MQTT path */ },
         msgId,
       ).catch((err) => log(`[MQTT→Hub] voice transcription error: ${err}`));
-    } else if (type === "image") {
+    } else if (type === "image" && payload.imageBase64) {
       const caption = (payload.caption as string) ?? "";
-      log(`[MQTT→Hub] image from session ${routeSession.slice(0, 8)}...`);
-      bridge.routeFromMobile(routeSession, caption || "(image)", "IMAGE", {
-        imageBase64: payload.imageBase64 as string,
-        mimeType: (payload.mimeType as string) ?? "image/jpeg",
-      });
+      const mime = ((payload.mimeType as string) ?? "image/jpeg").toLowerCase();
+      const imgBuf = Buffer.from(payload.imageBase64 as string, "base64");
+      const ext = mime.includes("png") ? "png" : "jpg";
+      const imgPath = join(tmpdir(), `pailot-img-${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`);
+      writeFileSync(imgPath, imgBuf);
+      log(`[MQTT→Hub] image saved (${imgBuf.length} bytes) → ${imgPath}`);
+      const routeText = caption ? `${caption} (image at ${imgPath})` : `(image at ${imgPath})`;
+      setLastRoutedSessionId(routeSession!);
+      bridge.routeFromMobile(routeSession, routeText);
     }
   });
   startMqttBroker(getVersion());
