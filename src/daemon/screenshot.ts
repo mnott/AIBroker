@@ -135,16 +135,12 @@ end tell`;
 }
 
 export async function handleScreenshot(ctx: CommandContext): Promise<void> {
-  // Check if content is unchanged
+  // Content-unchanged optimization: skip text fallback for non-PAILot sources
+  // PAILot always gets a real screenshot (window capture is fast)
   const currentContent = getActiveSessionContent();
-  if (currentContent && lastScreenshotContent) {
+  if (ctx.source !== "pailot" && currentContent && lastScreenshotContent) {
     const tail = (s: string) => s.split("\n").slice(-100).join("\n").trim();
     if (tail(currentContent) === tail(lastScreenshotContent)) {
-      if (ctx.source === "pailot") {
-        // PAILot already has the screenshot in Navigate — don't spam text
-        log("/ss: content unchanged, skipping (pailot)");
-        return;
-      }
       const lines = currentContent
         .split("\n")
         .filter((l: string) => !/^[─━═┄┈╌╍┅┉]{3,}\s*$/.test(l.trim()))
