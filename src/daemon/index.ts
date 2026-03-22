@@ -356,14 +356,15 @@ export async function startDaemon(options?: {
   startMqttBroker(getVersion());
 
   // Wire screenshot handler so PAILot /ss commands work
-  setScreenshotHandler(async (source) => {
+  setScreenshotHandler(async (source, targetSessionId) => {
+    const sessionId = targetSessionId ?? manager.activeSession?.backendSessionId;
     const ctx: CommandContext = {
-      reply: async (text) => { broadcastText(text); },
-      replyImage: async (buf, caption) => { broadcastImage(buf, caption); },
+      reply: async (text) => { broadcastText(text, sessionId); },
+      replyImage: async (buf, caption) => { broadcastImage(buf, caption, sessionId); },
       replyVoice: async () => {},
       typing: () => {},
       source: source ?? "pailot",
-      sessionId: manager.activeSession?.backendSessionId,
+      sessionId,
     };
     await handleScreenshot(ctx);
   });
