@@ -148,25 +148,29 @@ export function createHubCommandHandler(): (
     if (resolvedId) {
       log(`[deliver] target=${resolvedId.slice(0, 8)}...`);
 
-      // Check if session is responsive before trying to type
-      const sessionState = runAppleScript(`tell application "iTerm2"
+      // Try AppleScript paste first (works when session accepts input)
+      if (typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok`); return true; }
+
+      // Paste failed — session might be frozen. Try to wake it by selecting
+      // its tab and sending a no-op keystroke, then retry.
+      log(`[deliver] paste failed for ${resolvedId.slice(0, 8)}, attempting wake...`);
+      runAppleScript(`tell application "iTerm2"
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
         if id of s is "${resolvedId}" then
-          return (is at shell prompt of s as text) & ":" & (is processing of s as text)
+          select t
+          return "selected"
         end if
       end repeat
     end repeat
   end repeat
-  return "missing"
-end tell`)?.trim() ?? "unknown";
-      if (sessionState === "false:false") {
-        log(`[deliver] WARNING: session ${resolvedId.slice(0, 8)} is frozen (not at prompt, not processing)`);
-      }
-
-      // Try AppleScript paste first (works when session accepts input)
-      if (typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok`); return true; }
+end tell`);
+      // Brief delay for iTerm to process the tab selection
+      const { execSync: execSyncWake } = require("child_process");
+      try { execSyncWake("sleep 0.3"); } catch {}
+      // Retry paste after wake
+      if (typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok after wake`); return true; }
 
       // Fallback: direct TTY write (works even when AppleScript paste is blocked)
       const ttyPath = sessionTtyCache.get(resolvedId);
