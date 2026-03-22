@@ -315,8 +315,10 @@ export async function startDaemon(options?: {
     const bridge = aibpBridge;
     if (type === "command") {
       const command = (payload.command as string) ?? "";
-      const args = (payload.args as Record<string, unknown>) ?? {};
-      log(`[MQTT→Hub] command: ${command}`);
+      // Args may be nested under 'args' key or spread at top level
+      const nested = payload.args as Record<string, unknown> | undefined;
+      const args = nested ?? payload;
+      log(`[MQTT→Hub] command: ${command} args=${JSON.stringify(args).slice(0, 100)}`);
       handleMqttCommand(command, args);
       return;
     }
