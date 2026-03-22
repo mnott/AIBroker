@@ -141,19 +141,60 @@ export function createHubCommandHandler(): (
   // ── Message delivery to iTerm2 ──
 
   function deliverMessage(text: string, targetSessionId?: string): boolean {
-    // If a specific target session is given (e.g., from AIBP routing), use it first
-    if (targetSessionId) {
-      const bareTarget = stripItermPrefix(targetSessionId) ?? targetSessionId;
-      if (typeIntoSession(bareTarget, text)) return true;
+    const resolvedId = targetSessionId
+      ? (stripItermPrefix(targetSessionId) ?? targetSessionId)
+      : (stripItermPrefix(activeItermSessionId) ?? activeItermSessionId);
+
+    if (resolvedId) {
+      log(`[deliver] target=${resolvedId.slice(0, 8)}...`);
+
+      // Check if session is responsive before trying to type
+      const sessionState = runAppleScript(`tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if id of s is "${resolvedId}" then
+          return (is at shell prompt of s as text) & ":" & (is processing of s as text)
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "missing"
+end tell`)?.trim() ?? "unknown";
+      if (sessionState === "false:false") {
+        log(`[deliver] WARNING: session ${resolvedId.slice(0, 8)} is frozen (not at prompt, not processing)`);
+      }
+
+      // Try AppleScript paste first (works when session accepts input)
+      if (typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok`); return true; }
+
+      // Fallback: direct TTY write (works even when AppleScript paste is blocked)
+      const ttyPath = sessionTtyCache.get(resolvedId);
+      if (ttyPath) {
+        log(`[deliver] paste failed, trying TTY ${ttyPath}`);
+        if (writeToTty(ttyPath, text)) { log(`[deliver] tty ok`); return true; }
+      }
+
+      // Refresh TTY cache and retry
+      const fresh = snapshotAllSessions();
+      updateSessionTtyCache(fresh);
+      const freshTty = sessionTtyCache.get(resolvedId);
+      if (freshTty) {
+        log(`[deliver] retrying with fresh TTY ${freshTty}`);
+        if (writeToTty(freshTty, text)) { log(`[deliver] tty ok`); return true; }
+      }
+
+      log(`[deliver] all methods failed for ${resolvedId.slice(0, 8)}`);
     }
 
+    // Legacy fallbacks
     const bareSessionId = stripItermPrefix(activeItermSessionId) ?? activeItermSessionId;
-    if (bareSessionId && managedSessions.has(bareSessionId)) {
+    if (bareSessionId && bareSessionId !== resolvedId && managedSessions.has(bareSessionId)) {
       if (typeIntoSession(bareSessionId, text)) return true;
       managedSessions.delete(bareSessionId);
     }
 
-    if (activeItermSessionId) {
+    if (activeItermSessionId && activeItermSessionId !== resolvedId) {
       if (typeIntoSession(activeItermSessionId, text)) return true;
     }
 
