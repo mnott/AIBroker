@@ -1312,6 +1312,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
     }
     case "screenshot": {
       const ssSessionId = args.sessionId as string | undefined;
+      log(`[MQTT] screenshot command: requested session=${ssSessionId?.slice(0, 8) ?? "none"}`);
       if (ssSessionId) {
         setActiveItermSessionId(ssSessionId);
         setLastRoutedSessionId(ssSessionId);
