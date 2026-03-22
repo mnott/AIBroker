@@ -14,7 +14,7 @@ import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
-import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute } from "../adapters/pailot/gateway.js";
+import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession } from "../adapters/pailot/gateway.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler } from "../adapters/pailot/mqtt-broker.js";
 import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
@@ -339,9 +339,10 @@ export async function startDaemon(options?: {
     } else if (type === "voice" && payload.audioBase64) {
       log(`[MQTT→Hub] voice from session ${routeSession.slice(0, 8)}...`);
       const msgId = typeof payload.messageId === "string" ? payload.messageId : undefined;
-      // Set routing session before transcription
+      // Set routing session before transcription — capture for batch flush
       setLastRoutedSessionId(routeSession!);
       setActiveItermSessionId(routeSession!);
+      setVoiceBatchSession(routeSession!);
       transcribeAndRoute(
         payload.audioBase64 as string,
         (_text: string, _ts: number) => { /* onMessage not needed for MQTT path */ },
