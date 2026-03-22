@@ -13,7 +13,7 @@ import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
-import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand } from "../adapters/pailot/gateway.js";
+import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute } from "../adapters/pailot/gateway.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler } from "../adapters/pailot/mqtt-broker.js";
 import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
@@ -334,9 +334,17 @@ export async function startDaemon(options?: {
       log(`[MQTT→Hub] text from session ${routeSession.slice(0, 8)}...`);
       bridge.routeFromMobile(routeSession, content);
     } else if (type === "voice" && payload.audioBase64) {
-      // Voice messages need transcription — route through the same path as WS
-      log(`[MQTT→Hub] voice from session ${routeSession.slice(0, 8)}... (transcription via WS path)`);
-      bridge.routeFromMobile(routeSession, `[PAILot:voice] ${(payload.audioBase64 as string).slice(0, 20)}...`);
+      log(`[MQTT→Hub] voice from session ${routeSession.slice(0, 8)}...`);
+      const msgId = typeof payload.messageId === "string" ? payload.messageId : undefined;
+      // Set the voice batch session before transcription
+      import("../core/state.js").then(({ setLastRoutedSessionId }) => {
+        setLastRoutedSessionId(routeSession!);
+      });
+      transcribeAndRoute(
+        payload.audioBase64 as string,
+        (_text: string, _ts: number) => { /* onMessage not needed for MQTT path */ },
+        msgId,
+      ).catch((err) => log(`[MQTT→Hub] voice transcription error: ${err}`));
     } else if (type === "image") {
       const caption = (payload.caption as string) ?? "";
       log(`[MQTT→Hub] image from session ${routeSession.slice(0, 8)}...`);
