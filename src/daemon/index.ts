@@ -14,6 +14,7 @@ import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
 import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage } from "../adapters/pailot/gateway.js";
+import { startMqttBroker, stopMqttBroker, setMqttInboundHandler } from "../adapters/pailot/mqtt-broker.js";
 import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
 import { HybridSessionManager, setHybridManager } from "../core/hybrid.js";
@@ -309,6 +310,46 @@ export async function startDaemon(options?: {
     adapterRegistry.dispatchIncoming("pailot", text, timestamp);
   });
 
+  // PAILot MQTT broker (Phase 1: dual-publish alongside WebSocket)
+  setMqttInboundHandler((sessionId, type, payload) => {
+    const bridge = aibpBridge;
+    if (type === "command") {
+      // Control commands from MQTT — route same as WS command handling
+      const command = (payload.command as string) ?? "";
+      log(`[MQTT→Hub] command: ${command}`);
+      // Commands are handled by the WS gateway's command dispatcher.
+      // For Phase 1, MQTT clients send commands but the WS gateway handles them.
+      // Full MQTT command handling will be wired in Phase 2.
+      return;
+    }
+
+    // Text/voice/image from app — route through AIBP bridge (same as WS path)
+    const routeSession = sessionId || undefined;
+    if (!routeSession) {
+      log(`[MQTT→Hub] no sessionId in inbound ${type} message — dropping`);
+      return;
+    }
+
+    if (type === "text") {
+      const content = (payload.content as string) ?? "";
+      if (!content.trim()) return;
+      log(`[MQTT→Hub] text from session ${routeSession.slice(0, 8)}...`);
+      bridge.routeFromMobile(routeSession, content);
+    } else if (type === "voice" && payload.audioBase64) {
+      // Voice messages need transcription — route through the same path as WS
+      log(`[MQTT→Hub] voice from session ${routeSession.slice(0, 8)}... (transcription via WS path)`);
+      bridge.routeFromMobile(routeSession, `[PAILot:voice] ${(payload.audioBase64 as string).slice(0, 20)}...`);
+    } else if (type === "image") {
+      const caption = (payload.caption as string) ?? "";
+      log(`[MQTT→Hub] image from session ${routeSession.slice(0, 8)}...`);
+      bridge.routeFromMobile(routeSession, caption || "(image)", "IMAGE", {
+        imageBase64: payload.imageBase64 as string,
+        mimeType: (payload.mimeType as string) ?? "image/jpeg",
+      });
+    }
+  });
+  startMqttBroker(getVersion());
+
   // Wire screenshot handler so PAILot /ss commands work
   setScreenshotHandler(async (source) => {
     const ctx: CommandContext = {
@@ -331,6 +372,7 @@ export async function startDaemon(options?: {
   const shutdown = (signal: string) => {
     console.log(`\n[aibroker] ${signal} received. Stopping.`);
     adapterRegistry.stopHealthPolling();
+    stopMqttBroker();
     stopWsGateway();
     ipcServer.stop();
     // Belt-and-suspenders: remove socket in case ipcServer.stop() didn't

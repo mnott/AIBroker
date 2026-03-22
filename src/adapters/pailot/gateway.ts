@@ -38,6 +38,18 @@ import { setItermSessionVar, setItermTabName, setItermBadge, killSession, create
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
 import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, pasteTextIntoSession, snapshotAllSessions } from "../iterm/core.js";
 import { hybridManager } from "../../core/hybrid.js";
+import {
+  mqttPublishText,
+  mqttPublishVoice,
+  mqttPublishImage,
+  mqttPublishTyping,
+  mqttPublishScreenshot,
+  mqttPublishSessions,
+  mqttPublishTranscript,
+  mqttPublishStatus as mqttPubStatus,
+  mqttPublishControl,
+  isMqttRunning,
+} from "./mqtt-broker.js";
 
 const WS_PORT = parseInt(process.env.PAILOT_PORT ?? "8765", 10);
 
@@ -323,6 +335,11 @@ function handleSessionsCommand(ws: WebSocket): void {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(payload);
   }
+
+  // MQTT dual-publish session list (retained) — Phase 1
+  if (isMqttRunning()) {
+    mqttPublishSessions(sessions);
+  }
 }
 
 function handleSwitchCommand(ws: WebSocket, args: Record<string, unknown>): void {
@@ -390,6 +407,11 @@ end tell`);
   sendTo(ws, { type: "session_switched", name: session.name, sessionId: session.backendSessionId });
   log(`[PAILot] switched to ${session.kind} session "${session.name}" (${session.id})`);
 
+  // MQTT dual-publish control response (Phase 1)
+  if (isMqttRunning()) {
+    mqttPublishControl({ type: "session_switched", sessionId: session.backendSessionId, name: session.name });
+  }
+
   // Auto-drain: replay any messages for the new session that were skipped while
   // the client was viewing a different session. Uses lastSeq=0 which is safe
   // because getMessagesAfter filters by sessionId — only messages for this
@@ -419,6 +441,10 @@ function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void
   }
 
   sendTo(ws, { type: "session_renamed", sessionId, name });
+  // MQTT dual-publish control response (Phase 1)
+  if (isMqttRunning()) {
+    mqttPublishControl({ type: "session_renamed", sessionId, name });
+  }
   // Send updated sessions list so PAILot refreshes the header
   handleSessionsCommand(ws);
   log(`[PAILot] renamed session ${sessionId} to "${name}"`);
@@ -633,6 +659,13 @@ function sendTo(ws: WebSocket, msg: Record<string, unknown>): void {
 }
 
 function broadcast(msg: Record<string, unknown>, direct?: boolean): void {
+  // MQTT dual-publish typing indicators (Phase 1)
+  // Other message types are published by their specific broadcast* functions.
+  if (isMqttRunning() && msg.type === "typing") {
+    const sid = msg.sessionId as string | undefined;
+    if (sid) mqttPublishTyping(sid, !!msg.typing);
+  }
+
   // Append to message log FIRST — every non-ephemeral message gets a seq number.
   // Clients that miss it will catch up via the catch_up command.
   const seq = appendToLog(msg);
@@ -774,6 +807,10 @@ async function transcribeAndRoute(
     // Reflect transcript back to the app so the voice bubble shows text
     if (messageId) {
       broadcast({ type: "transcript", messageId, content: transcript });
+      // MQTT dual-publish (Phase 1)
+      if (isMqttRunning()) {
+        mqttPublishTranscript(messageId, transcript);
+      }
     }
 
     // Batch: accumulate transcripts and reset the timer
@@ -1091,6 +1128,12 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
   const resolvedSession = resolveSessionId(sessionId);
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
   broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
+
+  // MQTT dual-publish (Phase 1)
+  if (isMqttRunning() && resolvedSession) {
+    mqttPublishTyping(resolvedSession, false);
+    mqttPublishText(resolvedSession, text);
+  }
 }
 
 /**
@@ -1120,12 +1163,19 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
     log(`[PAILot] OGG→M4A conversion failed, sending raw: ${err}`);
   }
 
+  const voiceBase64 = sendBuffer.toString("base64");
   broadcast({
     type: "voice",
     content: transcript,
-    audioBase64: sendBuffer.toString("base64"),
+    audioBase64: voiceBase64,
     ...(resolvedSession && { sessionId: resolvedSession }),
   }, direct);
+
+  // MQTT dual-publish (Phase 1)
+  if (isMqttRunning() && resolvedSession) {
+    mqttPublishTyping(resolvedSession, false);
+    mqttPublishVoice(resolvedSession, voiceBase64, transcript);
+  }
 }
 
 /**
@@ -1134,12 +1184,22 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
  */
 export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean): void {
   const resolvedSession = resolveSessionId(sessionId);
+  const imgBase64 = imageBuffer.toString("base64");
   broadcast({
     type: "image",
-    imageBase64: imageBuffer.toString("base64"),
+    imageBase64: imgBase64,
     caption: caption ?? "Screenshot",
     ...(resolvedSession && { sessionId: resolvedSession }),
   }, direct);
+
+  // MQTT dual-publish (Phase 1)
+  if (isMqttRunning() && resolvedSession) {
+    mqttPublishImage(resolvedSession, imgBase64, caption ?? "Screenshot");
+    // Also publish to retained screenshot topic if this looks like a screenshot
+    if ((caption ?? "Screenshot").toLowerCase().includes("screenshot")) {
+      mqttPublishScreenshot(resolvedSession, imgBase64);
+    }
+  }
 }
 
 /**
@@ -1148,6 +1208,11 @@ export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?
  */
 export function broadcastStatus(status: string): void {
   broadcast({ type: "status", status });
+
+  // MQTT dual-publish (Phase 1)
+  if (isMqttRunning()) {
+    mqttPubStatus(status);
+  }
 }
 
 /**
