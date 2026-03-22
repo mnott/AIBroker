@@ -206,7 +206,7 @@ export async function startMqttBroker(version?: string): Promise<void> {
     return;
   }
 
-  const MQTT_PORT = parseInt(process.env.MQTT_PORT ?? "1883", 10);
+  const MQTT_PORT = parseInt(process.env.MQTT_PORT ?? process.env.PAILOT_PORT ?? "8765", 10);
   const MQTT_TOKEN = process.env.MQTT_TOKEN;
 
   // Build aedes options

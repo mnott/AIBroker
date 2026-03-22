@@ -1233,3 +1233,160 @@ export function stopWsGateway(): void {
     wss = null;
   }
 }
+
+/**
+ * Handle a command from MQTT (no WebSocket needed).
+ * Replicates the WS command dispatcher for MQTT-only clients.
+ */
+export function handleMqttCommand(command: string, args: Record<string, unknown> = {}): void {
+  if (!hybridManager) {
+    log(`[MQTT] command ${command} — no hybridManager`);
+    return;
+  }
+
+  switch (command) {
+    case "sessions": {
+      // Prune dead sessions and publish current list via MQTT
+      const liveSnapshots = snapshotAllSessions();
+      const liveIds = new Set(liveSnapshots.map(s => s.id));
+      hybridManager.pruneDeadVisualSessions(liveIds);
+      const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+      const seenTabs = new Set<string>();
+      for (const snap of liveSnapshots) {
+        if (!isClaudeRelated(snap)) continue;
+        const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+        if (seenTabs.has(displayName)) continue;
+        seenTabs.add(displayName);
+        if (!knownIds.has(snap.id)) {
+          hybridManager.registerVisualSession(displayName, "", snap.id);
+        } else {
+          const existing = hybridManager.listSessions().find(s => s.backendSessionId === snap.id);
+          if (existing && existing.name !== displayName) existing.name = displayName;
+        }
+      }
+      const active = hybridManager.activeSession;
+      const sessions = hybridManager.listSessions().map((s, i) => ({
+        index: i + 1,
+        name: s.name,
+        type: "claude" as const,
+        kind: s.kind,
+        isActive: active ? s.id === active.id : false,
+        id: s.backendSessionId,
+      }));
+      mqttPublishSessions(sessions);
+      break;
+    }
+    case "sync": {
+      // Sync is sessions + set active from client preference
+      const clientActiveId = args.activeSessionId as string | undefined;
+      if (clientActiveId) {
+        const sessions = hybridManager.listSessions();
+        const idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
+        if (idx >= 0) {
+          hybridManager.switchToIndex(idx + 1);
+          setActiveItermSessionId(clientActiveId);
+          setLastRoutedSessionId(clientActiveId);
+        }
+      }
+      handleMqttCommand("sessions");
+      break;
+    }
+    case "switch": {
+      const sessionId = args.sessionId as string | undefined;
+      const sessionIndex = args.index as number | undefined;
+      let targetIndex: number | undefined;
+      if (sessionIndex) {
+        targetIndex = sessionIndex;
+      } else if (sessionId) {
+        const sessions = hybridManager.listSessions();
+        const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
+        if (idx >= 0) targetIndex = idx + 1;
+      }
+      if (targetIndex) {
+        const session = hybridManager.switchToIndex(targetIndex);
+        if (session?.kind === "visual") {
+          setActiveItermSessionId(session.backendSessionId);
+        }
+        setLastRoutedSessionId(session?.backendSessionId ?? "");
+        mqttPublishControl({ type: "session_switched", sessionId: session?.backendSessionId, name: session?.name });
+        handleMqttCommand("sessions");
+      }
+      break;
+    }
+    case "screenshot": {
+      triggerScreenshotForPailot().catch((err) => {
+        log(`[MQTT] screenshot error: ${err}`);
+      });
+      break;
+    }
+    case "nav": {
+      handleNavCommand(null as any, args).catch((err) => {
+        log(`[MQTT] nav error: ${err}`);
+      });
+      break;
+    }
+    case "rename": {
+      const sessionId = args.sessionId as string | undefined;
+      const name = args.name as string | undefined;
+      if (sessionId && name) {
+        const sessions = hybridManager.listSessions();
+        const session = sessions.find(s => s.backendSessionId === sessionId);
+        if (session) {
+          session.name = name;
+          if (session.kind === "visual") {
+            setItermSessionVar(sessionId, name);
+            setItermTabName(sessionId, name);
+            setItermBadge(sessionId, name);
+          }
+        }
+        mqttPublishControl({ type: "session_renamed", sessionId, name });
+        handleMqttCommand("sessions");
+      }
+      break;
+    }
+    case "remove": {
+      const sessionId = args.sessionId as string | undefined;
+      if (sessionId) {
+        const sessions = hybridManager.listSessions();
+        const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
+        if (idx >= 0) {
+          const target = sessions[idx];
+          if (target.kind === "visual" && target.backendSessionId) {
+            killSession(target.backendSessionId);
+          }
+          hybridManager.removeByIndex(idx + 1);
+        }
+        handleMqttCommand("sessions");
+      }
+      break;
+    }
+    case "create": {
+      const path = args.path as string | undefined;
+      const command = path ? `cd ${path.replace(/"/g, '\\"')} && claude` : "claude";
+      const name = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
+      const sessionId = createClaudeSession(command);
+      if (!sessionId) { log("[MQTT] create: failed to create session"); break; }
+      setItermSessionVar(sessionId, name);
+      setItermTabName(sessionId, name);
+      setItermBadge(sessionId, name);
+      hybridManager.registerVisualSession(name, "", sessionId);
+      const sessions = hybridManager.listSessions();
+      const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
+      if (idx >= 0) {
+        hybridManager.switchToIndex(idx + 1);
+        setActiveItermSessionId(sessionId);
+        setLastRoutedSessionId(sessionId);
+      }
+      mqttPublishControl({ type: "session_switched", name, sessionId });
+      handleMqttCommand("sessions");
+      break;
+    }
+    case "catch_up": {
+      // MQTT handles delivery natively — just update the session list
+      handleMqttCommand("sessions");
+      break;
+    }
+    default:
+      log(`[MQTT] unknown command: ${command}`);
+  }
+}

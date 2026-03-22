@@ -13,7 +13,7 @@ import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
-import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage } from "../adapters/pailot/gateway.js";
+import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand } from "../adapters/pailot/gateway.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler } from "../adapters/pailot/mqtt-broker.js";
 import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
@@ -305,21 +305,19 @@ export async function startDaemon(options?: {
     }
   });
 
-  // PAILot WebSocket gateway
-  startWsGateway((text: string, timestamp: number) => {
-    adapterRegistry.dispatchIncoming("pailot", text, timestamp);
-  });
+  // PAILot WebSocket gateway — disabled, replaced by MQTT
+  // startWsGateway((text: string, timestamp: number) => {
+  //   adapterRegistry.dispatchIncoming("pailot", text, timestamp);
+  // });
 
-  // PAILot MQTT broker (Phase 1: dual-publish alongside WebSocket)
+  // PAILot MQTT broker — takes over port 8765
   setMqttInboundHandler((sessionId, type, payload) => {
     const bridge = aibpBridge;
     if (type === "command") {
-      // Control commands from MQTT — route same as WS command handling
       const command = (payload.command as string) ?? "";
+      const args = (payload.args as Record<string, unknown>) ?? {};
       log(`[MQTT→Hub] command: ${command}`);
-      // Commands are handled by the WS gateway's command dispatcher.
-      // For Phase 1, MQTT clients send commands but the WS gateway handles them.
-      // Full MQTT command handling will be wired in Phase 2.
+      handleMqttCommand(command, args);
       return;
     }
 
@@ -373,7 +371,6 @@ export async function startDaemon(options?: {
     console.log(`\n[aibroker] ${signal} received. Stopping.`);
     adapterRegistry.stopHealthPolling();
     stopMqttBroker();
-    stopWsGateway();
     ipcServer.stop();
     // Belt-and-suspenders: remove socket in case ipcServer.stop() didn't
     try { unlinkSync(socketPath); } catch { /* already gone */ }
