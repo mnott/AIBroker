@@ -134,7 +134,23 @@ end tell`;
   }
 }
 
+let _screenshotInFlight = false;
+
 export async function handleScreenshot(ctx: CommandContext): Promise<void> {
+  // Debounce: if a screenshot is already in progress, skip
+  if (_screenshotInFlight) {
+    log("/ss: already in progress, skipping");
+    return;
+  }
+  _screenshotInFlight = true;
+  try {
+    await _handleScreenshotImpl(ctx);
+  } finally {
+    _screenshotInFlight = false;
+  }
+}
+
+async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
   // Content-unchanged optimization: skip text fallback for non-PAILot sources
   // PAILot always gets a real screenshot (window capture is fast)
   const currentContent = getActiveSessionContent();
@@ -177,9 +193,13 @@ export async function handleScreenshot(ctx: CommandContext): Promise<void> {
 
   try {
     // Resolve the window
-    let windowId: string;
+    let windowId: string = "";
     const activeEntry = activeClientId ? sessionRegistry.get(activeClientId) : undefined;
-    let itermSessionId = stripItermPrefix((activeItermSessionId || undefined) ?? activeEntry?.itermSessionId);
+    // Prefer the session from the command context (PAILot's active session)
+    // over the global activeItermSessionId (which may be a different tab)
+    let itermSessionId = stripItermPrefix(
+      ctx.sessionId ?? (activeItermSessionId || undefined) ?? activeEntry?.itermSessionId
+    );
 
     if (!itermSessionId) {
       const registryEntries = [...sessionRegistry.values()]
@@ -199,17 +219,14 @@ export async function handleScreenshot(ctx: CommandContext): Promise<void> {
       }
     }
 
+    // Find the window ID for the target session — no need to raise/activate
+    // since screencapture -l captures by window ID regardless of focus
     if (itermSessionId) {
-      const findAndRaiseScript = `tell application "iTerm2"
+      const findScript = `tell application "iTerm2"
   repeat with w in windows
-    set tabCount to count of tabs of w
-    repeat with tabIdx from 1 to tabCount
-      set t to tab tabIdx of w
+    repeat with t in tabs of w
       repeat with s in sessions of t
         if id of s is "${itermSessionId}" then
-          select t
-          set index of w to 1
-          activate
           return (id of w as text)
         end if
       end repeat
@@ -217,17 +234,13 @@ export async function handleScreenshot(ctx: CommandContext): Promise<void> {
   end repeat
   return ""
 end tell`;
-      const findResult = runAppleScript(findAndRaiseScript);
-      if (findResult && findResult !== "") {
-        windowId = findResult.trim();
-      } else {
-        runAppleScript('tell application "iTerm2" to activate');
-        const fb = runAppleScript(`tell application "iTerm2"\n  set w to window 1\n  activate\n  return (id of w as text)\nend tell`) ?? "";
-        windowId = fb.trim();
-      }
-    } else {
-      runAppleScript('tell application "iTerm2" to activate');
-      const fb = runAppleScript(`tell application "iTerm2"\n  set w to window 1\n  activate\n  return (id of w as text)\nend tell`) ?? "";
+      const findResult = runAppleScript(findScript);
+      windowId = findResult?.trim() ?? "";
+    }
+
+    if (!windowId) {
+      // Fallback: use frontmost window
+      const fb = runAppleScript(`tell application "iTerm2" to return (id of window 1 as text)`) ?? "";
       windowId = fb.trim();
     }
 
@@ -236,10 +249,6 @@ end tell`;
       return;
     }
 
-    await new Promise((r) => setTimeout(r, 1500));
-
-    // Use window ID capture (-l) instead of region (-R) — region fails on
-    // multi-display setups where the window coordinates exceed a single screen.
     log(`/ss: capturing window ${windowId}`);
     execSync(`/usr/sbin/screencapture -x -l ${windowId} "${filePath}"`, { timeout: 15_000 });
 
