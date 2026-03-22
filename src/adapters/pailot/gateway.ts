@@ -632,8 +632,10 @@ end tell`);
   if (action) {
     action();
   } else {
-    // Fallback: send as literal text (vi keys like "dd", "0", "G", etc.)
-    pasteTextIntoSession(targetSession, key);
+    // Send each character individually (vi keys like "dd" need separate keystrokes)
+    for (const ch of key) {
+      pasteTextIntoSession(targetSession, ch);
+    }
   }
   log(`[PAILot] nav: sent ${key} to session ${targetSession.slice(0, 8)}...`);
 
