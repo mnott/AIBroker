@@ -66,7 +66,8 @@ function evictOldIds(): void {
 // --- MQTT publish helpers ---
 
 function mqttPublish(topic: string, payload: Record<string, unknown>, opts?: { qos?: number; retain?: boolean }): void {
-  if (!broker) return;
+  if (!broker) { log(`[MQTT] publish skipped (no broker): ${topic}`); return; }
+  log(`[MQTT] → ${topic} (${JSON.stringify(payload).length} bytes)`);
   const qos = opts?.qos ?? 1;
   const retain = opts?.retain ?? false;
   const buf = Buffer.from(JSON.stringify(payload));
