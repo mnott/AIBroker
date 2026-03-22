@@ -27,7 +27,7 @@ import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
 import { AibpBridge } from "../aibp/bridge.js";
 import { typeIntoSession, findClaudeSession, isClaudeRunningInSession } from "../adapters/iterm/core.js";
-import { activeItermSessionId, setActiveItermSessionId } from "../core/state.js";
+import { activeItermSessionId, setActiveItermSessionId, setLastRoutedSessionId } from "../core/state.js";
 import { pruneStaleContexts } from "./image-context.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -336,10 +336,9 @@ export async function startDaemon(options?: {
     } else if (type === "voice" && payload.audioBase64) {
       log(`[MQTT→Hub] voice from session ${routeSession.slice(0, 8)}...`);
       const msgId = typeof payload.messageId === "string" ? payload.messageId : undefined;
-      // Set the voice batch session before transcription
-      import("../core/state.js").then(({ setLastRoutedSessionId }) => {
-        setLastRoutedSessionId(routeSession!);
-      });
+      // Set routing session before transcription
+      setLastRoutedSessionId(routeSession!);
+      setActiveItermSessionId(routeSession!);
       transcribeAndRoute(
         payload.audioBase64 as string,
         (_text: string, _ts: number) => { /* onMessage not needed for MQTT path */ },

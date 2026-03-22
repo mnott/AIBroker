@@ -1314,6 +1314,12 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "screenshot": {
+      // Switch to the requested session before capturing
+      const ssSessionId = args.sessionId as string | undefined;
+      if (ssSessionId) {
+        setActiveItermSessionId(ssSessionId);
+        setLastRoutedSessionId(ssSessionId);
+      }
       triggerScreenshotForPailot().catch((err) => {
         log(`[MQTT] screenshot error: ${err}`);
       });
