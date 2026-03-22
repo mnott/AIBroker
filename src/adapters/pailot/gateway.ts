@@ -725,6 +725,11 @@ let voiceBatchOnMessage: ((text: string, timestamp: number) => void | Promise<vo
 /** iTerm session ID resolved when the first voice chunk of this batch arrived. */
 let voiceBatchSessionId: string = "";
 
+/** Set the voice batch session from external callers (MQTT path). */
+export function setVoiceBatchSession(sessionId: string): void {
+  if (!voiceBatchSessionId) voiceBatchSessionId = sessionId;
+}
+
 function flushVoiceBatch(): void {
   if (voiceBatchTranscripts.length === 0) return;
   const combined = voiceBatchTranscripts.join(" ");
