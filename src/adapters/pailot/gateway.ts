@@ -152,13 +152,13 @@ function isClientAlive(ws: WebSocket): boolean {
 // Reference to the screenshot handler — set via setScreenshotHandler()
 // to avoid circular imports (screenshot.ts imports from state.ts which
 // would create a cycle if we imported it here directly).
-let screenshotHandler: ((source?: "whatsapp" | "pailot") => Promise<void>) | null = null;
+let screenshotHandler: ((source?: "whatsapp" | "pailot", sessionId?: string) => Promise<void>) | null = null;
 
 /**
  * Provide the screenshot handler so ws-gateway can trigger screenshots
  * for navigation commands without a circular import.
  */
-export function setScreenshotHandler(handler: (source?: "whatsapp" | "pailot") => Promise<void>): void {
+export function setScreenshotHandler(handler: (source?: "whatsapp" | "pailot", sessionId?: string) => Promise<void>): void {
   screenshotHandler = handler;
 }
 
@@ -644,10 +644,9 @@ end tell`);
   }
 }
 
-async function triggerScreenshotForPailot(): Promise<void> {
+async function triggerScreenshotForPailot(sessionId?: string): Promise<void> {
   if (!screenshotHandler) return;
-  // Only send to PAILot — this is triggered by PAILot commands
-  await screenshotHandler("pailot");
+  await screenshotHandler("pailot", sessionId);
 }
 
 // --- Helpers ---
@@ -1314,13 +1313,12 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "screenshot": {
-      // Switch to the requested session before capturing
       const ssSessionId = args.sessionId as string | undefined;
       if (ssSessionId) {
         setActiveItermSessionId(ssSessionId);
         setLastRoutedSessionId(ssSessionId);
       }
-      triggerScreenshotForPailot().catch((err) => {
+      triggerScreenshotForPailot(ssSessionId).catch((err) => {
         log(`[MQTT] screenshot error: ${err}`);
       });
       break;
