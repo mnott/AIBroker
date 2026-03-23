@@ -373,10 +373,16 @@ export async function startDaemon(options?: {
       bridge.routeFromMobile(routeSession, `${fileName} (file at ${filePath})`);
     } else if (type === "bundle") {
       // Atomic multi-attachment message: save all files, compose single text
-      const caption = (payload.caption as string) ?? "";
+      let caption = (payload.caption as string) ?? "";
+      const audioBase64 = payload.audioBase64 as string | undefined;
       const attachments = (payload.attachments as Array<{ data: string; mimeType: string; fileName?: string }>) ?? [];
-      const paths: string[] = [];
 
+      mqttPublishTyping(routeSession!, true);
+      setLastRoutedSessionId(routeSession!);
+      setActiveItermSessionId(routeSession!);
+
+      // Save all attachments to temp files
+      const paths: string[] = [];
       for (let i = 0; i < attachments.length; i++) {
         const att = attachments[i];
         const buf = Buffer.from(att.data, "base64");
@@ -389,13 +395,30 @@ export async function startDaemon(options?: {
         log(`[MQTT→Hub] bundle attachment ${i + 1}/${attachments.length}: ${name} (${buf.length} bytes) → ${filePath}`);
       }
 
-      // Compose single message: caption + all file paths
-      const fileParts = paths.map(p => `(image at ${p})`).join(" ");
-      const routeText = caption ? `${caption} ${fileParts}` : fileParts;
-
-      mqttPublishTyping(routeSession!, true);
-      setLastRoutedSessionId(routeSession!);
-      bridge.routeFromMobile(routeSession, routeText);
+      // If voice caption, transcribe first then deliver bundle with transcript
+      if (audioBase64) {
+        const voiceMessageId = payload.voiceMessageId as string | undefined;
+        log(`[MQTT→Hub] bundle has voice — transcribing before delivery (msgId=${voiceMessageId?.slice(0, 8) ?? "none"})`);
+        setVoiceBatchSession(routeSession!);
+        const fileParts = paths.map(p => `(file at ${p})`).join(" ");
+        transcribeAndRoute(
+          audioBase64,
+          (text: string, _ts: number) => {
+            const routeText = `[PAILot:voice] ${text} ${fileParts}`;
+            bridge.routeFromMobile(routeSession!, routeText);
+          },
+          voiceMessageId,
+        ).catch((err) => {
+          log(`[MQTT→Hub] bundle voice transcription error: ${err}`);
+          // Fallback: deliver files without transcript
+          bridge.routeFromMobile(routeSession!, fileParts);
+        });
+      } else {
+        // Text caption only — deliver immediately
+        const fileParts = paths.map(p => `(file at ${p})`).join(" ");
+        const routeText = caption ? `${caption} ${fileParts}` : fileParts;
+        bridge.routeFromMobile(routeSession!, routeText);
+      }
     }
   });
   startMqttBroker(getVersion());
