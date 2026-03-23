@@ -853,6 +853,45 @@ server.tool(
 );
 
 server.tool(
+  "pailot_send_file",
+  "Send a file (image, PDF, document) to the PAILot mobile app. Reads the file from disk, encodes it, and delivers via MQTT.",
+  {
+    filePath: z.string().min(1).describe("Absolute path to the file"),
+    caption: z.string().optional().describe("Caption or description for the file"),
+  },
+  async ({ filePath, caption }) => {
+    try {
+      const { readFileSync, existsSync } = await import("node:fs");
+      const { extname } = await import("node:path");
+      if (!existsSync(filePath)) return err(new Error(`File not found: ${filePath}`));
+      const buf = readFileSync(filePath);
+      const b64 = buf.toString("base64");
+      const ext = extname(filePath).toLowerCase();
+      // Determine if it's an image or a generic file
+      const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"];
+      const mimeMap: Record<string, string> = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+        ".svg": "image/svg+xml", ".pdf": "application/pdf",
+        ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".txt": "text/plain", ".csv": "text/csv", ".json": "application/json",
+      };
+      const mimeType = mimeMap[ext] ?? "application/octet-stream";
+      const sessionId = getSessionId();
+      if (imageExts.includes(ext)) {
+        await hub.call_raw("pailot_send", { imageBase64: b64, caption: caption ?? filePath.split("/").pop(), mimeType, sessionId });
+      } else {
+        // For non-image files, send as text with file info (app doesn't render arbitrary files yet)
+        await hub.call_raw("pailot_send", { imageBase64: b64, caption: caption ?? filePath.split("/").pop(), mimeType, sessionId });
+      }
+      const sizeKB = Math.round(buf.length / 1024);
+      return ok(`Sent ${filePath.split("/").pop()} (${sizeKB} KB).`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
   "pailot_receive",
   "Drain queued incoming PAILot messages",
   {},

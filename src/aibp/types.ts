@@ -46,6 +46,9 @@ export interface VoicePayload {
   transcript: string;
   transcriptConfidence?: number;
   durationMs?: number;
+  groupId?: string;
+  chunkIndex?: number;
+  totalChunks?: number;
 }
 
 export interface ImagePayload {

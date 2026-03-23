@@ -275,15 +275,20 @@ export class AibpBridge {
 
     let message: AibpMessage;
     switch (type) {
-      case "VOICE":
+      case "VOICE": {
+        const chunkMeta = extra?.groupId
+          ? { groupId: extra.groupId as string, chunkIndex: extra.chunkIndex as number, totalChunks: extra.totalChunks as number }
+          : undefined;
         message = msg.voice(
           src,
           dst,
           (extra?.audioBase64 as string) ?? "",
           content,
           extra?.durationMs as number | undefined,
+          chunkMeta,
         );
         break;
+      }
       case "IMAGE":
         message = msg.image(
           src,

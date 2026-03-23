@@ -15,6 +15,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { log } from "../../core/log.js";
+import { enqueue } from "./message-queue.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -81,38 +82,61 @@ function mqttPublish(topic: string, payload: Record<string, unknown>, opts?: { q
 
 /** Publish a text message to a session output topic. */
 export function mqttPublishText(sessionId: string, content: string, messageId?: string): void {
-  mqttPublish(`pailot/${sessionId}/out`, {
-    msgId: messageId ?? randomUUID(),
+  const msgId = messageId ?? randomUUID();
+  const payload: Record<string, unknown> = {
+    msgId,
     type: "text",
     sessionId,
     content,
     ts: Date.now(),
-  });
+  };
+  const seq = enqueue(sessionId, "text", payload);
+  if (seq > 0) payload.seq = seq;
+  mqttPublish(`pailot/${sessionId}/out`, payload);
 }
 
 /** Publish a voice message to a session output topic. */
-export function mqttPublishVoice(sessionId: string, audioBase64: string, transcript: string, messageId?: string): void {
-  mqttPublish(`pailot/${sessionId}/out`, {
-    msgId: messageId ?? randomUUID(),
+export function mqttPublishVoice(
+  sessionId: string,
+  audioBase64: string,
+  transcript: string,
+  messageId?: string,
+  chunkMeta?: { groupId: string; chunkIndex: number; totalChunks: number },
+): void {
+  const msgId = messageId ?? randomUUID();
+  const payload: Record<string, unknown> = {
+    msgId,
     type: "voice",
     sessionId,
     audioBase64,
     transcript,
     ts: Date.now(),
-  });
+  };
+  if (chunkMeta) {
+    payload.groupId = chunkMeta.groupId;
+    payload.chunkIndex = chunkMeta.chunkIndex;
+    payload.totalChunks = chunkMeta.totalChunks;
+  }
+  const seq = enqueue(sessionId, "voice", payload);
+  if (seq > 0) payload.seq = seq;
+  mqttPublish(`pailot/${sessionId}/out`, payload);
 }
 
 /** Publish an image message to a session output topic. */
 export function mqttPublishImage(sessionId: string, imageBase64: string, caption?: string, messageId?: string): void {
-  mqttPublish(`pailot/${sessionId}/out`, {
-    msgId: messageId ?? randomUUID(),
+  const msgId = messageId ?? randomUUID();
+  const payload: Record<string, unknown> = {
+    msgId,
     type: "image",
     sessionId,
     imageBase64,
     mimeType: "image/png",
     caption: caption ?? "",
     ts: Date.now(),
-  });
+  };
+  const seq = enqueue(sessionId, "image", payload);
+  if (seq > 0) payload.seq = seq;
+  mqttPublish(`pailot/${sessionId}/out`, payload);
 }
 
 /** Publish a typing indicator (QoS 0, no msgId — ephemeral). */
