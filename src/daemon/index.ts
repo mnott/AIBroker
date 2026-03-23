@@ -15,7 +15,7 @@ import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
 import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession } from "../adapters/pailot/gateway.js";
-import { startMqttBroker, stopMqttBroker, setMqttInboundHandler } from "../adapters/pailot/mqtt-broker.js";
+import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping } from "../adapters/pailot/mqtt-broker.js";
 import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
 import { HybridSessionManager, setHybridManager } from "../core/hybrid.js";
@@ -335,9 +335,13 @@ export async function startDaemon(options?: {
       const content = (payload.content as string) ?? "";
       if (!content.trim()) return;
       log(`[MQTT→Hub] text from session ${routeSession.slice(0, 8)}...`);
+      // Publish typing indicator so the app shows 3 dots while waiting for response
+      mqttPublishTyping(routeSession, true);
       bridge.routeFromMobile(routeSession, content);
     } else if (type === "voice" && payload.audioBase64) {
       log(`[MQTT→Hub] voice from session ${routeSession.slice(0, 8)}...`);
+      // Publish typing indicator so the app shows 3 dots while waiting for response
+      mqttPublishTyping(routeSession, true);
       const msgId = typeof payload.messageId === "string" ? payload.messageId : undefined;
       // Set routing session before transcription — capture for batch flush
       setLastRoutedSessionId(routeSession!);
