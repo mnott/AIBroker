@@ -363,6 +363,14 @@ export async function startDaemon(options?: {
       const routeText = caption ? `${caption} (image at ${imgPath})` : `(image at ${imgPath})`;
       setLastRoutedSessionId(routeSession!);
       bridge.routeFromMobile(routeSession, routeText);
+    } else if (type === "file" && payload.fileBase64) {
+      const fileName = (payload.fileName as string) ?? "file";
+      const fileBuf = Buffer.from(payload.fileBase64 as string, "base64");
+      const filePath = join(tmpdir(), `pailot-file-${Date.now()}-${fileName}`);
+      writeFileSync(filePath, fileBuf);
+      log(`[MQTT→Hub] file saved (${fileBuf.length} bytes) → ${filePath}`);
+      setLastRoutedSessionId(routeSession!);
+      bridge.routeFromMobile(routeSession, `${fileName} (file at ${filePath})`);
     }
   });
   startMqttBroker(getVersion());
