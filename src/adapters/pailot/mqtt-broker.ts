@@ -211,7 +211,10 @@ export async function startMqttBroker(version?: string): Promise<void> {
   const MQTT_TOKEN = process.env.MQTT_TOKEN;
 
   // Build aedes options
-  const aedesOpts: Record<string, unknown> = {};
+  const aedesOpts: Record<string, unknown> = {
+    // Allow large payloads (files, images) — 50MB max
+    maxPayload: 50 * 1024 * 1024,
+  };
 
   // Authentication: only enforce if MQTT_TOKEN is set
   if (MQTT_TOKEN) {

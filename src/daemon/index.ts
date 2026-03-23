@@ -371,6 +371,31 @@ export async function startDaemon(options?: {
       log(`[MQTT→Hub] file saved (${fileBuf.length} bytes) → ${filePath}`);
       setLastRoutedSessionId(routeSession!);
       bridge.routeFromMobile(routeSession, `${fileName} (file at ${filePath})`);
+    } else if (type === "bundle") {
+      // Atomic multi-attachment message: save all files, compose single text
+      const caption = (payload.caption as string) ?? "";
+      const attachments = (payload.attachments as Array<{ data: string; mimeType: string; fileName?: string }>) ?? [];
+      const paths: string[] = [];
+
+      for (let i = 0; i < attachments.length; i++) {
+        const att = attachments[i];
+        const buf = Buffer.from(att.data, "base64");
+        const mime = (att.mimeType ?? "application/octet-stream").toLowerCase();
+        const ext = mime.includes("png") ? "png" : mime.includes("pdf") ? "pdf" : mime.includes("image") ? "jpg" : "bin";
+        const name = att.fileName ?? `attachment_${i + 1}.${ext}`;
+        const filePath = join(tmpdir(), `pailot-${Date.now()}-${randomUUID().slice(0, 8)}-${name}`);
+        writeFileSync(filePath, buf);
+        paths.push(filePath);
+        log(`[MQTT→Hub] bundle attachment ${i + 1}/${attachments.length}: ${name} (${buf.length} bytes) → ${filePath}`);
+      }
+
+      // Compose single message: caption + all file paths
+      const fileParts = paths.map(p => `(image at ${p})`).join(" ");
+      const routeText = caption ? `${caption} ${fileParts}` : fileParts;
+
+      mqttPublishTyping(routeSession!, true);
+      setLastRoutedSessionId(routeSession!);
+      bridge.routeFromMobile(routeSession, routeText);
     }
   });
   startMqttBroker(getVersion());
