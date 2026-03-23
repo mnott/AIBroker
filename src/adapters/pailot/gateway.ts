@@ -1,14 +1,17 @@
 /**
- * adapters/pailot/gateway.ts — WebSocket gateway for PAILot app connections.
+ * adapters/pailot/gateway.ts — Gateway for PAILot app connections (MQTT + legacy WS).
  *
  * Runs alongside any transport's watcher (Whazaa, Telex, etc.). When the
- * PAILot iOS app connects via WebSocket, incoming messages are routed through
+ * PAILot iOS app connects via MQTT, incoming messages are routed through
  * the same handleMessage() path as the transport's native messages. Outbound
  * messages from Claude are broadcast to all connected clients.
  *
  * The gateway also supports structured commands (sessions, screenshot,
  * navigation keys) so the app can interact with the watcher without
  * going through text-based slash commands.
+ *
+ * Messages are persisted to disk via message-queue.ts so they survive daemon
+ * restarts. The app requests catch_up with its lastSeq on reconnect.
  */
 
 import { WebSocketServer, WebSocket } from "ws";
@@ -50,6 +53,7 @@ import {
   mqttPublishControl,
   isMqttRunning,
 } from "./mqtt-broker.js";
+import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 
 const WS_PORT = parseInt(process.env.PAILOT_PORT ?? "8765", 10);
 
@@ -90,7 +94,9 @@ const CLIENT_ALIVE_THRESHOLD = 90_000; // 90s (3x the 30s heartbeat)
 // on connect or foreground resume. This replaces the old outbox system entirely —
 // no per-client state, fully idempotent, works regardless of reconnection path.
 const MESSAGE_LOG_SIZE = 200;
+// nextSeq for in-memory log is lazily synced from persistent queue on first use
 let nextSeq = 1;
+let nextSeqSynced = false;
 
 interface LogEntry {
   seq: number;
@@ -99,12 +105,37 @@ interface LogEntry {
 }
 const messageLog: LogEntry[] = [];
 
-/** Append a message to the log with a sequence number. Returns the seq (0 for ephemeral). */
+/** Append a message to the in-memory log with a sequence number. Returns the seq (0 for ephemeral).
+ *  Content messages (text, voice, image) are persisted to the disk queue via mqtt-broker's enqueue.
+ *  The in-memory log handles non-content messages (catch_up responses, screenshots, transcripts)
+ *  that don't survive restarts but are useful during the current daemon lifetime.
+ */
 function appendToLog(msg: Record<string, unknown>): number {
+  // Sync in-memory nextSeq from persistent queue on first call
+  if (!nextSeqSynced) {
+    nextSeqSynced = true;
+    const latestPersisted = mqGetLatestSeq();
+    if (latestPersisted >= nextSeq) {
+      nextSeq = latestPersisted + 1;
+    }
+  }
+
   const type = msg.type as string;
   // Don't log ephemeral/meta messages
   if (type === "typing" || type === "pong" || type === "sessions"
     || type === "session_switched" || type === "unread" || type === "status") return 0;
+
+  // Content messages already have a seq from the persistent queue (assigned in mqttPublish*)
+  // Just add them to the in-memory log for WS catch_up during this daemon lifetime
+  if (msg.seq && typeof msg.seq === "number") {
+    const seq = msg.seq as number;
+    messageLog.push({ seq, msg, timestamp: Date.now() });
+    if (messageLog.length > MESSAGE_LOG_SIZE) messageLog.shift();
+    if (seq >= nextSeq) nextSeq = seq + 1;
+    return seq;
+  }
+
+  // Non-content messages get an in-memory seq (not persisted)
   const seq = nextSeq++;
   messageLog.push({ seq, msg: { ...msg, seq }, timestamp: Date.now() });
   if (messageLog.length > MESSAGE_LOG_SIZE) messageLog.shift();
@@ -122,12 +153,16 @@ function getMessagesAfter(afterSeq: number, sessionId?: string): LogEntry[] {
   });
 }
 
-/** Handle catch_up command: replay missed messages to the client. */
+/** Handle catch_up command: replay missed messages to the client.
+ *  Uses the persistent disk queue so messages survive daemon restarts.
+ */
 function handleCatchUp(ws: WebSocket, args?: Record<string, unknown>): void {
   const lastSeq = typeof args?.lastSeq === "number" ? args.lastSeq : 0;
   const clientSession = clientActiveSession.get(ws);
-  const missed = getMessagesAfter(lastSeq, clientSession);
-  const currentSeq = nextSeq - 1;
+  const currentSeq = mqGetLatestSeq();
+
+  // Use persistent queue for content messages (survives restarts)
+  const missed = mqGetAfter(lastSeq, clientSession);
 
   if (missed.length === 0) {
     // Still send response so client can update its epoch/seq tracking
@@ -138,7 +173,7 @@ function handleCatchUp(ws: WebSocket, args?: Record<string, unknown>): void {
   log(`[PAILot] catch_up: replaying ${missed.length} messages (client lastSeq=${lastSeq}, server seq=${currentSeq})`);
   sendTo(ws, {
     type: "catch_up",
-    messages: missed.map(e => e.msg),
+    messages: missed.map(e => e.payload),
     serverSeq: currentSeq,
   });
 }
@@ -1147,7 +1182,13 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
  * Converts OGG Opus to M4A (AAC) since iOS can't play OGG natively.
  * @param sessionId — iTerm session ID of the originating Claude session
  */
-export async function broadcastVoice(audioBuffer: Buffer, transcript: string, sessionId?: string, direct?: boolean): Promise<void> {
+export async function broadcastVoice(
+  audioBuffer: Buffer,
+  transcript: string,
+  sessionId?: string,
+  direct?: boolean,
+  chunkMeta?: { groupId: string; chunkIndex: number; totalChunks: number },
+): Promise<void> {
   const resolvedSession = sessionId || resolveSessionId(sessionId);
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
   let sendBuffer = audioBuffer;
@@ -1175,11 +1216,12 @@ export async function broadcastVoice(audioBuffer: Buffer, transcript: string, se
     content: transcript,
     audioBase64: voiceBase64,
     ...(resolvedSession && { sessionId: resolvedSession }),
+    ...(chunkMeta && { groupId: chunkMeta.groupId, chunkIndex: chunkMeta.chunkIndex, totalChunks: chunkMeta.totalChunks }),
   }, direct);
 
   if (isMqttRunning()) {
     if (resolvedSession) mqttPublishTyping(resolvedSession, false);
-    mqttPublishVoice(resolvedSession ?? "global", voiceBase64, transcript);
+    mqttPublishVoice(resolvedSession ?? "global", voiceBase64, transcript, undefined, chunkMeta);
   }
 }
 
@@ -1392,7 +1434,39 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "catch_up": {
-      // MQTT handles delivery natively — just update the session list
+      let lastSeq = typeof args.lastSeq === "number" ? args.lastSeq : 0;
+      const currentSeq = mqGetLatestSeq();
+
+      // If client's lastSeq is ahead of server (server restarted with fresh queue),
+      // replay all queued messages and let the client sync to the new seq
+      if (lastSeq > currentSeq) {
+        log(`[MQTT] catch_up: client lastSeq=${lastSeq} > server seq=${currentSeq} — replaying all`);
+        lastSeq = 0;
+      }
+
+      const missed = mqGetAfter(lastSeq);
+      log(`[MQTT] catch_up: lastSeq=${lastSeq} currentSeq=${currentSeq} missed=${missed.length}`);
+
+      // Strip audioBase64 from voice messages to avoid sending megabytes of
+      // audio data that would overwhelm the MQTT connection. Voice messages
+      // become text transcripts. Images are kept intact (typically <500KB).
+      const lightPayloads = missed.map(m => {
+        const p = { ...m.payload };
+        if (p.type === "voice" && p.audioBase64) {
+          delete p.audioBase64;
+          // Promote transcript to content so app shows it as text
+          if (!p.content && p.transcript) p.content = p.transcript;
+          p.type = "text";  // Downgrade to text — audio is not recoverable offline
+        }
+        return p;
+      });
+
+      mqttPublishControl({
+        type: "catch_up",
+        messages: lightPayloads,
+        serverSeq: currentSeq,
+      });
+
       handleMqttCommand("sessions");
       break;
     }

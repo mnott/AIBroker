@@ -21,6 +21,7 @@ import type { IpcServer } from "../ipc/server.js";
 import type { AdapterRegistry } from "./adapter-registry.js";
 import type { APIBackend } from "../backend/api.js";
 import type { HybridSessionManager } from "../core/hybrid.js";
+import { randomUUID } from "node:crypto";
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
@@ -851,13 +852,17 @@ export function registerCoreHandlers(
    * pailot_send — Send text or voice to PAILot app clients via WS gateway.
    */
   server.on("pailot_send", async (req) => {
-    const { text, voice, voiceName, sessionId: callerSessionId } = req.params as {
+    const { text, voice, voiceName, sessionId: callerSessionId, imageBase64, caption, mimeType, image } = req.params as {
       text?: string;
       voice?: boolean;
       voiceName?: string;
       sessionId?: string;
+      imageBase64?: string;
+      caption?: string;
+      mimeType?: string;
+      image?: boolean;
     };
-    if (!text) return { ok: false, error: "text is required" };
+    if (!text && !imageBase64) return { ok: false, error: "text or imageBase64 is required" };
     // MCP server may not have ITERM_SESSION_ID — fall back to session that last
     // received user input from PAILot (survives session switches during processing)
     const sessionId = callerSessionId || lastRoutedSessionId || activeItermSessionId || undefined;
@@ -865,29 +870,45 @@ export function registerCoreHandlers(
 
     try {
       const bridge = getAibpBridge();
+      if (imageBase64) {
+        const imgBuffer = Buffer.from(imageBase64, "base64");
+        if (bridge) {
+          bridge.routeToMobile(sessionId ?? "", caption ?? "", "IMAGE", {
+            imageBase64,
+            mimeType: mimeType ?? "image/png",
+          });
+        } else {
+          broadcastImage(imgBuffer, caption, sessionId);
+        }
+        return { ok: true, result: { sent: true, type: "image" } };
+      }
       if (voice) {
         const { textToVoiceNote } = await import("../adapters/kokoro/tts.js");
         const resolvedVoice = voiceName ?? voiceConfig.defaultVoice;
-        const plainText = stripMarkdown(text);
+        const plainText = stripMarkdown(text!);
         const chunks = splitIntoChunks(plainText);
+        const groupId = chunks.length > 1 ? randomUUID().slice(0, 12) : undefined;
         for (let i = 0; i < chunks.length; i++) {
-          if (i > 0) await new Promise((r) => setTimeout(r, 1000));
+          if (i > 0) await new Promise((r) => setTimeout(r, 1500));
           const audioBuffer = await textToVoiceNote(chunks[i], resolvedVoice);
-          const transcript = i === 0 ? plainText : "";
+          // Only first chunk carries transcript (truncated to avoid payload bloat)
+          const transcript = i === 0 ? plainText.slice(0, 200) : "";
+          const chunkMeta = groupId ? { groupId, chunkIndex: i, totalChunks: chunks.length } : undefined;
           if (bridge) {
             bridge.routeToMobile(sessionId ?? "", transcript, "VOICE", {
               audioBase64: audioBuffer.toString("base64"),
+              ...(chunkMeta && { groupId: chunkMeta.groupId, chunkIndex: chunkMeta.chunkIndex, totalChunks: chunkMeta.totalChunks }),
             });
           } else {
-            await broadcastVoice(audioBuffer, transcript, sessionId);
+            await broadcastVoice(audioBuffer, transcript, sessionId, undefined, chunkMeta);
           }
         }
         return { ok: true, result: { sent: true, chunks: chunks.length } };
       } else {
         if (bridge) {
-          bridge.routeToMobile(sessionId ?? "", text);
+          bridge.routeToMobile(sessionId ?? "", text!);
         } else {
-          broadcastText(text, sessionId);
+          broadcastText(text!, sessionId);
         }
       }
       return { ok: true, result: { sent: true } };

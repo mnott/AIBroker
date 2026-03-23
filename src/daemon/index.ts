@@ -16,6 +16,7 @@ import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
 import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession } from "../adapters/pailot/gateway.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping } from "../adapters/pailot/mqtt-broker.js";
+import { loadQueue, flushQueue } from "../adapters/pailot/message-queue.js";
 import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
 import { HybridSessionManager, setHybridManager } from "../core/hybrid.js";
@@ -150,8 +151,9 @@ export async function startDaemon(options?: {
         break;
       }
       case "VOICE": {
-        const p = aibpMsg.payload as { audioBase64: string; transcript?: string };
-        void broadcastVoice(Buffer.from(p.audioBase64, "base64"), p.transcript ?? "", sessionId, true);
+        const p = aibpMsg.payload as { audioBase64: string; transcript?: string; groupId?: string; chunkIndex?: number; totalChunks?: number };
+        const chunkMeta = p.groupId ? { groupId: p.groupId, chunkIndex: p.chunkIndex!, totalChunks: p.totalChunks! } : undefined;
+        void broadcastVoice(Buffer.from(p.audioBase64, "base64"), p.transcript ?? "", sessionId, true, chunkMeta);
         break;
       }
       case "IMAGE": {
@@ -421,6 +423,7 @@ export async function startDaemon(options?: {
       }
     }
   });
+  loadQueue();
   startMqttBroker(getVersion());
 
   // Wire screenshot handler so PAILot /ss commands work
@@ -446,6 +449,7 @@ export async function startDaemon(options?: {
   const shutdown = (signal: string) => {
     console.log(`\n[aibroker] ${signal} received. Stopping.`);
     adapterRegistry.stopHealthPolling();
+    flushQueue();
     stopMqttBroker();
     ipcServer.stop();
     // Belt-and-suspenders: remove socket in case ipcServer.stop() didn't

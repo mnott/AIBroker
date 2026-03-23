@@ -50,8 +50,14 @@ export function voice(
   audioBase64: string,
   transcript: string,
   durationMs?: number,
+  chunkMeta?: { groupId: string; chunkIndex: number; totalChunks: number },
 ): AibpMessage<VoicePayload> {
-  return envelope(src, dst, "VOICE", { audioBase64, transcript, durationMs });
+  return envelope(src, dst, "VOICE", {
+    audioBase64,
+    transcript,
+    durationMs,
+    ...(chunkMeta && { groupId: chunkMeta.groupId, chunkIndex: chunkMeta.chunkIndex, totalChunks: chunkMeta.totalChunks }),
+  });
 }
 
 export function image(
