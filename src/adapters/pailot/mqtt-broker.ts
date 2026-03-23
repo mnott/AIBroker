@@ -267,7 +267,10 @@ export async function startMqttBroker(version?: string): Promise<void> {
     const sessionInMatch = topic.match(/^pailot\/([^/]+)\/in$/);
     if (sessionInMatch) {
       try {
-        const payload = JSON.parse(packet.payload.toString()) as Record<string, unknown>;
+        // Strip control characters (0x00-0x1F) except \t \n \r before parsing
+        const raw = packet.payload.toString();
+        const sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+        const payload = JSON.parse(sanitized) as Record<string, unknown>;
         const msgId = payload.msgId as string | undefined;
 
         // Dedup
@@ -282,7 +285,8 @@ export async function startMqttBroker(version?: string): Promise<void> {
         log(`[MQTT] <- ${type} from session ${sessionId.slice(0, 8)}...`);
         inboundHandler?.(sessionId, type, payload);
       } catch (err) {
-        log(`[MQTT] invalid inbound message on ${topic}: ${err}`);
+        const raw = packet.payload.toString();
+        log(`[MQTT] invalid inbound message on ${topic}: ${err} — payload: ${raw.slice(0, 200)}`);
       }
       return;
     }
@@ -290,7 +294,10 @@ export async function startMqttBroker(version?: string): Promise<void> {
     // Match pailot/control/in — commands from app
     if (topic === "pailot/control/in") {
       try {
-        const payload = JSON.parse(packet.payload.toString()) as Record<string, unknown>;
+        // Strip control characters (0x00-0x1F) except \t \n \r before parsing
+        const raw = packet.payload.toString();
+        const sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+        const payload = JSON.parse(sanitized) as Record<string, unknown>;
         const msgId = payload.msgId as string | undefined;
 
         // Dedup
@@ -304,7 +311,8 @@ export async function startMqttBroker(version?: string): Promise<void> {
         log(`[MQTT] <- command: ${command}`);
         inboundHandler?.(undefined, "command", payload);
       } catch (err) {
-        log(`[MQTT] invalid control message: ${err}`);
+        const raw = packet.payload.toString();
+        log(`[MQTT] invalid control message: ${err} — payload: ${raw.slice(0, 200)}`);
       }
       return;
     }
