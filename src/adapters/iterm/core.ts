@@ -61,6 +61,10 @@ export function sendEscapeSequenceToSession(sessionId: string, dirChar: string):
 }
 
 export function typeIntoSession(sessionId: string, text: string): boolean {
+  // Claude Code terminal can get stuck in vi normal mode.
+  // Send 'i' (insert) then backspace to ensure we're in editing mode.
+  sendKeystrokeToSession(sessionId, 105); // 'i'
+  sendKeystrokeToSession(sessionId, 127); // backspace (DEL)
   if (!pasteTextIntoSession(sessionId, text)) return false;
   sendKeystrokeToSession(sessionId, 13);
   return true;
