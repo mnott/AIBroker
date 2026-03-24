@@ -891,8 +891,8 @@ export function registerCoreHandlers(
         for (let i = 0; i < chunks.length; i++) {
           if (i > 0) await new Promise((r) => setTimeout(r, 1500));
           const audioBuffer = await textToVoiceNote(chunks[i], resolvedVoice);
-          // Only first chunk carries transcript (truncated to avoid payload bloat)
-          const transcript = i === 0 ? plainText.slice(0, 200) : "";
+          // Each chunk carries its own text segment as transcript
+          const transcript = chunks[i];
           const chunkMeta = groupId ? { groupId, chunkIndex: i, totalChunks: chunks.length } : undefined;
           if (bridge) {
             bridge.routeToMobile(sessionId ?? "", transcript, "VOICE", {
