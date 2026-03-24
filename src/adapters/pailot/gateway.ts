@@ -227,7 +227,9 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
   // Auto-discover Claude-related iTerm2 tabs so freshly-started daemons can match
   const liveSnapshots = snapshotAllSessions();
   const liveIds = new Set(liveSnapshots.map(s => s.id));
-  hybridManager.pruneDeadVisualSessions(liveIds);
+  if (liveSnapshots.length > 0) {
+    hybridManager.pruneDeadVisualSessions(liveIds);
+  }
   const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
   const seenTabs = new Set<string>();
   for (const snap of liveSnapshots) {
@@ -331,10 +333,14 @@ function handleSessionsCommand(ws: WebSocket): void {
     return;
   }
 
-  // Prune visual sessions whose iTerm2 tabs have been closed
+  // Prune visual sessions whose iTerm2 tabs have been closed.
+  // ONLY prune if snapshotAllSessions returns results — an empty result
+  // likely means AppleScript failed, not that all sessions are gone.
   const liveSnapshots = snapshotAllSessions();
-  const liveIds = new Set(liveSnapshots.map(s => s.id));
-  hybridManager.pruneDeadVisualSessions(liveIds);
+  if (liveSnapshots.length > 0) {
+    const liveIds = new Set(liveSnapshots.map(s => s.id));
+    hybridManager.pruneDeadVisualSessions(liveIds);
+  }
 
   // Auto-discover Claude-related iTerm2 tabs not yet in the hybrid manager,
   // and sync names of existing sessions from live iTerm state.
@@ -1295,7 +1301,9 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       // Prune dead sessions and publish current list via MQTT
       const liveSnapshots = snapshotAllSessions();
       const liveIds = new Set(liveSnapshots.map(s => s.id));
-      hybridManager.pruneDeadVisualSessions(liveIds);
+      if (liveSnapshots.length > 0) {
+        hybridManager.pruneDeadVisualSessions(liveIds);
+      }
       const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
       const seenTabs = new Set<string>();
       for (const snap of liveSnapshots) {
