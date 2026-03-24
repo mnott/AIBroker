@@ -397,24 +397,33 @@ export async function startDaemon(options?: {
         log(`[MQTT→Hub] bundle attachment ${i + 1}/${attachments.length}: ${name} (${buf.length} bytes) → ${filePath}`);
       }
 
-      // If voice caption, transcribe first then deliver bundle with transcript
+      // If voice caption, transcribe directly (bypass voice batch to keep file paths)
       if (audioBase64) {
         const voiceMessageId = payload.voiceMessageId as string | undefined;
         log(`[MQTT→Hub] bundle has voice — transcribing before delivery (msgId=${voiceMessageId?.slice(0, 8) ?? "none"})`);
-        setVoiceBatchSession(routeSession!);
+        setLastRoutedSessionId(routeSession!);
+        setActiveItermSessionId(routeSession!);
         const fileParts = paths.map(p => `(file at ${p})`).join(" ");
-        transcribeAndRoute(
-          audioBase64,
-          (text: string, _ts: number) => {
-            const routeText = `[PAILot:voice] ${text} ${fileParts}`;
+        void (async () => {
+          try {
+            const { transcribeAudio } = await import("../adapters/kokoro/media.js");
+            const audioPath = join(tmpdir(), `pailot-bundle-voice-${Date.now()}.m4a`);
+            writeFileSync(audioPath, Buffer.from(audioBase64, "base64"));
+            const transcript = await transcribeAudio(audioPath, "");
+            const text = transcript?.replace(/^\[.*?\]\s*:?\s*/, "") ?? "";
+            // Reflect transcript to app
+            if (voiceMessageId) {
+              const { mqttPublishTranscript } = await import("../adapters/pailot/mqtt-broker.js");
+              mqttPublishTranscript(voiceMessageId, text, routeSession);
+            }
+            const routeText = text ? `[PAILot:voice] ${text} ${fileParts}` : fileParts;
+            log(`[MQTT→Hub] bundle delivering: ${routeText.slice(0, 100)}`);
             bridge.routeFromMobile(routeSession!, routeText);
-          },
-          voiceMessageId,
-        ).catch((err) => {
-          log(`[MQTT→Hub] bundle voice transcription error: ${err}`);
-          // Fallback: deliver files without transcript
-          bridge.routeFromMobile(routeSession!, fileParts);
-        });
+          } catch (err) {
+            log(`[MQTT→Hub] bundle voice transcription error: ${err}`);
+            bridge.routeFromMobile(routeSession!, fileParts);
+          }
+        })();
       } else {
         // Text caption only — deliver immediately
         const fileParts = paths.map(p => `(file at ${p})`).join(" ");
