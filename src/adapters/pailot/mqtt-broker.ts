@@ -46,6 +46,8 @@ async function loadAedes(): Promise<boolean> {
 
 let broker: any = null;
 let mqttServer: Server | null = null;
+let bonjourInstance: any = null;
+let bonjourService: any = null;
 
 /** Dedup set for inbound messages from app clients. */
 const seenInboundIds = new Set<string>();
@@ -370,6 +372,20 @@ export async function startMqttBroker(version?: string): Promise<void> {
 
     // Publish initial "ready" status (overwrites any stale LWT from previous crash)
     mqttPublishStatus("ready", version);
+
+    // Advertise via Bonjour/mDNS so PAILot app can auto-discover on LAN
+    try {
+      const { Bonjour } = require("bonjour-service");
+      bonjourInstance = new Bonjour();
+      bonjourService = bonjourInstance.publish({
+        name: "AIBroker",
+        type: "mqtt",
+        port: MQTT_PORT,
+      });
+      log(`[MQTT] Bonjour advertising _mqtt._tcp on port ${MQTT_PORT}`);
+    } catch (err) {
+      log(`[MQTT] Bonjour advertising failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+    }
   });
 }
 
@@ -377,6 +393,14 @@ export async function startMqttBroker(version?: string): Promise<void> {
  * Stop the MQTT broker and TCP server.
  */
 export function stopMqttBroker(): void {
+  if (bonjourService) {
+    try { bonjourService.stop(); } catch { /* ignore */ }
+    bonjourService = null;
+  }
+  if (bonjourInstance) {
+    try { bonjourInstance.destroy(); } catch { /* ignore */ }
+    bonjourInstance = null;
+  }
   if (broker) {
     // Publish shutting_down before closing
     mqttPublishStatus("shutting_down");
