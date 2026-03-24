@@ -1206,7 +1206,9 @@ export async function broadcastVoice(
     const m4aPath = join(tmpdir(), `pailot-conv-${uid}.m4a`);
     writeFileSync(oggPath, audioBuffer);
     await execFileAsync("/opt/homebrew/bin/ffmpeg", [
-      "-y", "-i", oggPath, "-c:a", "aac", "-b:a", "128k", m4aPath,
+      "-y", "-i", oggPath, "-c:a", "aac", "-b:a", "128k",
+      "-af", "apad=pad_dur=0.3", // Pad 300ms silence to prevent truncation
+      m4aPath,
     ]);
     if (existsSync(m4aPath)) {
       sendBuffer = readFileSync(m4aPath);

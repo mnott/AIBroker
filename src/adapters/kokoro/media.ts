@@ -119,7 +119,7 @@ export async function transcribeAudio(
  * Splits at paragraph breaks, then sentence boundaries, then commas,
  * then word boundaries. Guarantees no chunk exceeds maxChars.
  */
-export function splitIntoChunks(text: string, maxChars = 500): string[] {
+export function splitIntoChunks(text: string, maxChars = 400): string[] {
   if (text.length <= maxChars) return [text];
 
   const paragraphs = text.split(/\n\n+/);
