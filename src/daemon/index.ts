@@ -409,8 +409,8 @@ export async function startDaemon(options?: {
             const { transcribeAudio } = await import("../adapters/kokoro/media.js");
             const audioPath = join(tmpdir(), `pailot-bundle-voice-${Date.now()}.m4a`);
             writeFileSync(audioPath, Buffer.from(audioBase64, "base64"));
-            const transcript = await transcribeAudio(audioPath, "");
-            const text = transcript?.replace(/^\[.*?\]\s*:?\s*/, "") ?? "";
+            const rawTranscript = await transcribeAudio(audioPath, "");
+            const text = rawTranscript?.replace(/^[\s:]+/, "").trim() ?? "";
             // Reflect transcript to app
             if (voiceMessageId) {
               const { mqttPublishTranscript } = await import("../adapters/pailot/mqtt-broker.js");
