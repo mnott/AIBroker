@@ -142,21 +142,17 @@ export async function sendPushToToken(token: string, payload: PushPayload): Prom
   if (!client) return false;
 
   try {
-    const { Notification, Priority } = require("apns2");
+    const { Notification } = require("apns2");
 
     const notification = new Notification(token, {
-      aps: {
-        alert: {
-          title: payload.title,
-          body: payload.body,
-        },
-        badge: payload.badge ?? 1,
-        sound: "default",
-        "content-available": 1,
+      alert: {
+        title: payload.title,
+        body: payload.body,
       },
-      ...payload.data,
+      badge: payload.badge ?? 1,
+      sound: "default",
+      data: payload.data ?? {},
     });
-    notification.priority = Priority.immediate;
 
     await client.send(notification);
     log(`[APNs] push sent to ${token.slice(0, 16)}... — "${payload.title}: ${payload.body.slice(0, 40)}"`);
