@@ -9,11 +9,14 @@
  * See Notes/SPEC-mqtt-pailot.md for the full protocol specification.
  */
 
-import { createServer, type Server } from "node:net";
+import { createServer as createTlsServer } from "node:tls";
+import { type Server } from "node:net";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { log } from "../../core/log.js";
 import { enqueue } from "./message-queue.js";
 
@@ -42,12 +45,64 @@ async function loadAedes(): Promise<boolean> {
   }
 }
 
+// --- TLS certificate management ---
+
+const TLS_DIR = join(process.env.HOME ?? "/tmp", ".aibroker", "tls");
+const TLS_CERT = join(TLS_DIR, "cert.pem");
+const TLS_KEY = join(TLS_DIR, "key.pem");
+
+/**
+ * Ensure a self-signed TLS certificate exists at ~/.aibroker/tls/.
+ * Generates one using openssl if missing. Returns { key, cert } buffers.
+ */
+function ensureTlsCert(): { key: Buffer; cert: Buffer } | null {
+  try {
+    if (!existsSync(TLS_CERT) || !existsSync(TLS_KEY)) {
+      log("[MQTT] TLS: generating self-signed certificate...");
+      mkdirSync(TLS_DIR, { recursive: true });
+
+      // Generate a 2048-bit RSA key and a self-signed cert valid for 10 years
+      execFileSync("openssl", [
+        "req",
+        "-x509",
+        "-newkey", "rsa:2048",
+        "-keyout", TLS_KEY,
+        "-out", TLS_CERT,
+        "-days", "3650",
+        "-nodes",
+        "-subj", "/CN=aibroker.local/O=AIBroker/C=CH",
+        "-addext", "subjectAltName=DNS:aibroker.local,DNS:localhost,IP:127.0.0.1",
+      ], { stdio: "pipe" });
+
+      log(`[MQTT] TLS: certificate generated at ${TLS_DIR}`);
+    } else {
+      log("[MQTT] TLS: using existing certificate");
+    }
+
+    return {
+      key: readFileSync(TLS_KEY),
+      cert: readFileSync(TLS_CERT),
+    };
+  } catch (err) {
+    log(`[MQTT] TLS: certificate setup failed: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
 // --- State ---
 
 let broker: any = null;
 let mqttServer: Server | null = null;
 let bonjourInstance: any = null;
 let bonjourService: any = null;
+
+/** Number of currently connected MQTT clients. */
+let mqttClientCount = 0;
+
+/** Returns the number of currently connected MQTT clients. */
+export function getMqttClientCount(): number {
+  return mqttClientCount;
+}
 
 /** Dedup set for inbound messages from app clients. */
 const seenInboundIds = new Set<string>();
@@ -264,6 +319,7 @@ export async function startMqttBroker(version?: string): Promise<void> {
     packet: any,
     callback: (error: Error | null) => void,
   ) => {
+    // Allow pailot/ topics and the device token registration topic
     if (packet.topic.startsWith("pailot/")) {
       callback(null);
     } else {
@@ -320,6 +376,22 @@ export async function startMqttBroker(version?: string): Promise<void> {
       return;
     }
 
+    // Match pailot/device/token — APNs device token registration from app
+    if (topic === "pailot/device/token") {
+      try {
+        const raw = packet.payload.toString();
+        const sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+        const payload = JSON.parse(sanitized) as Record<string, unknown>;
+        const token = payload.token as string | undefined;
+        if (token) {
+          inboundHandler?.(undefined, "apns_token", { token });
+        }
+      } catch (err) {
+        log(`[MQTT] invalid device token message: ${err}`);
+      }
+      return;
+    }
+
     // Match pailot/control/in — commands from app
     if (topic === "pailot/control/in") {
       try {
@@ -349,26 +421,37 @@ export async function startMqttBroker(version?: string): Promise<void> {
 
   // --- Connection events ---
   broker.on("client", (client: any) => {
-    log(`[MQTT] client connected: ${client?.id ?? "unknown"}`);
+    mqttClientCount++;
+    log(`[MQTT] client connected: ${client?.id ?? "unknown"} (total: ${mqttClientCount})`);
   });
 
   broker.on("clientDisconnect", (client: any) => {
-    log(`[MQTT] client disconnected: ${client?.id ?? "unknown"}`);
+    mqttClientCount = Math.max(0, mqttClientCount - 1);
+    log(`[MQTT] client disconnected: ${client?.id ?? "unknown"} (total: ${mqttClientCount})`);
   });
 
   broker.on("clientError", (client: any, err: Error) => {
     log(`[MQTT] client error (${client?.id ?? "unknown"}): ${err.message}`);
   });
 
-  // --- Start TCP server ---
-  mqttServer = createServer(broker.handle);
+  // --- Start TLS server ---
+  const tlsCreds = ensureTlsCert();
+  if (tlsCreds) {
+    mqttServer = createTlsServer({ key: tlsCreds.key, cert: tlsCreds.cert }, broker.handle) as unknown as Server;
+    log("[MQTT] TLS enabled");
+  } else {
+    // Fallback: plain TCP if TLS setup fails (openssl not available, etc.)
+    log("[MQTT] WARNING: TLS setup failed — falling back to plain TCP (not recommended)");
+    const { createServer: createTcpServer } = await import("node:net");
+    mqttServer = createTcpServer(broker.handle);
+  }
 
   mqttServer.on("error", (err: Error) => {
     log(`[MQTT] server error: ${err.message}`);
   });
 
   mqttServer.listen(MQTT_PORT, () => {
-    log(`[MQTT] broker listening on port ${MQTT_PORT}${MQTT_TOKEN ? " (auth enabled)" : " (no auth)"}`);
+    log(`[MQTT] broker listening on port ${MQTT_PORT}${MQTT_TOKEN ? " (auth enabled)" : " (no auth)"}${tlsCreds ? " [TLS]" : " [PLAIN TCP]"}`);
 
     // Publish initial "ready" status (overwrites any stale LWT from previous crash)
     mqttPublishStatus("ready", version);

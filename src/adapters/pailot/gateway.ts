@@ -52,7 +52,9 @@ import {
   mqttPublishStatus as mqttPubStatus,
   mqttPublishControl,
   isMqttRunning,
+  getMqttClientCount,
 } from "./mqtt-broker.js";
+import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 
 const WS_PORT = parseInt(process.env.PAILOT_PORT ?? "8765", 10);
@@ -1181,6 +1183,13 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
     if (resolvedSession) mqttPublishTyping(resolvedSession, false);
     mqttPublishText(resolvedSession ?? "global", text);
   }
+
+  // APNs push — fire when no MQTT clients are connected (app is in background / offline)
+  if (getMqttClientCount() === 0) {
+    const sessionName = resolvedSession ? resolvedSession.slice(0, 8) : "PAI";
+    const preview = text.replace(/\s+/g, " ").trim().slice(0, 100);
+    void apnsSendPush("PAI", preview || "(no content)", { sessionId: resolvedSession }).catch(() => {});
+  }
 }
 
 /**
@@ -1230,6 +1239,12 @@ export async function broadcastVoice(
   if (isMqttRunning()) {
     if (resolvedSession) mqttPublishTyping(resolvedSession, false);
     mqttPublishVoice(resolvedSession ?? "global", voiceBase64, transcript, undefined, chunkMeta);
+  }
+
+  // APNs push for voice — use transcript as body when no clients connected
+  if (getMqttClientCount() === 0 && transcript) {
+    const preview = transcript.replace(/\s+/g, " ").trim().slice(0, 100);
+    void apnsSendPush("PAI (voice)", preview, { sessionId: resolvedSession, type: "voice" }).catch(() => {});
   }
 }
 
