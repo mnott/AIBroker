@@ -124,6 +124,16 @@ export function getTokens(): string[] {
   return loadTokens();
 }
 
+// --- Badge counter ---
+// Tracks pending (unseen) push count. Incremented with each push,
+// reset to 0 when an MQTT client connects (app is opened).
+let pendingBadge = 0;
+
+/** Reset badge counter — call when the app connects via MQTT. */
+export function resetBadge(): void {
+  pendingBadge = 0;
+}
+
 // --- Push sending ---
 
 export interface PushPayload {
@@ -177,7 +187,7 @@ export async function sendPush(
   title: string,
   body: string,
   data?: Record<string, unknown>,
-  badge = 1,
+  badge?: number,
 ): Promise<number> {
   const tokens = getTokens();
   if (tokens.length === 0) {
@@ -188,10 +198,14 @@ export async function sendPush(
   const client = getApnsClient();
   if (!client) return 0;
 
-  log(`[APNs] sending push to ${tokens.length} token(s): "${title}"`);
+  // Increment pending badge counter
+  pendingBadge++;
+  const actualBadge = badge ?? pendingBadge;
+
+  log(`[APNs] sending push to ${tokens.length} token(s): "${title}" (badge=${actualBadge})`);
 
   const results = await Promise.allSettled(
-    tokens.map((token) => sendPushToToken(token, { title, body, badge, data })),
+    tokens.map((token) => sendPushToToken(token, { title, body, badge: actualBadge, data })),
   );
 
   const succeeded = results.filter((r) => r.status === "fulfilled" && r.value === true).length;

@@ -1186,9 +1186,21 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
 
   // APNs push — fire when no MQTT clients are connected (app is in background / offline)
   if (getMqttClientCount() === 0) {
-    const sessionName = resolvedSession ? resolvedSession.slice(0, 8) : "PAI";
+    let sessionName = "PAI";
+    if (resolvedSession) {
+      // Try hybrid manager first; if empty, scan iTerm directly for session name
+      if (hybridManager && hybridManager.listSessions().length > 0) {
+        const match = hybridManager.listSessions().find(s => s.backendSessionId.startsWith(resolvedSession) || resolvedSession.startsWith(s.backendSessionId));
+        if (match) sessionName = match.name;
+      } else {
+        // Fallback: scan iTerm tabs for the session name
+        const snaps = snapshotAllSessions();
+        const snap = snaps.find(s => s.id.startsWith(resolvedSession) || resolvedSession.startsWith(s.id));
+        if (snap) sessionName = snap.tabTitle ?? snap.paiName ?? snap.name;
+      }
+    }
     const preview = text.replace(/\s+/g, " ").trim().slice(0, 100);
-    void apnsSendPush("PAI", preview || "(no content)", { sessionId: resolvedSession }).catch(() => {});
+    void apnsSendPush(sessionName, preview || "(no content)", { sessionId: resolvedSession }).catch(() => {});
   }
 }
 
@@ -1243,8 +1255,19 @@ export async function broadcastVoice(
 
   // APNs push for voice — use transcript as body when no clients connected
   if (getMqttClientCount() === 0 && transcript) {
+    let voiceSessionName = "PAI";
+    if (resolvedSession) {
+      if (hybridManager && hybridManager.listSessions().length > 0) {
+        const match = hybridManager.listSessions().find(s => s.backendSessionId.startsWith(resolvedSession) || resolvedSession.startsWith(s.backendSessionId));
+        if (match) voiceSessionName = match.name;
+      } else {
+        const snaps = snapshotAllSessions();
+        const snap = snaps.find(s => s.id.startsWith(resolvedSession) || resolvedSession.startsWith(s.id));
+        if (snap) voiceSessionName = snap.tabTitle ?? snap.paiName ?? snap.name;
+      }
+    }
     const preview = transcript.replace(/\s+/g, " ").trim().slice(0, 100);
-    void apnsSendPush("PAI (voice)", preview, { sessionId: resolvedSession, type: "voice" }).catch(() => {});
+    void apnsSendPush(`${voiceSessionName} (voice)`, preview, { sessionId: resolvedSession, type: "voice" }).catch(() => {});
   }
 }
 
