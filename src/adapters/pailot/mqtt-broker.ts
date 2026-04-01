@@ -423,6 +423,8 @@ export async function startMqttBroker(version?: string): Promise<void> {
   broker.on("client", (client: any) => {
     mqttClientCount++;
     log(`[MQTT] client connected: ${client?.id ?? "unknown"} (total: ${mqttClientCount})`);
+    // Reset APNs badge counter when app connects
+    import("../../apns/client.js").then(m => m.resetBadge()).catch(() => {});
   });
 
   broker.on("clientDisconnect", (client: any) => {
