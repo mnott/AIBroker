@@ -15,7 +15,8 @@ import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
 import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession } from "../adapters/pailot/gateway.js";
-import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping } from "../adapters/pailot/mqtt-broker.js";
+import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping, getMqttClientCount } from "../adapters/pailot/mqtt-broker.js";
+import { registerToken as apnsRegisterToken, sendPush as apnsSendPush } from "../apns/client.js";
 import { loadQueue, flushQueue } from "../adapters/pailot/message-queue.js";
 import { handleScreenshot } from "./screenshot.js";
 import { APIBackend } from "../backend/api.js";
@@ -316,6 +317,16 @@ export async function startDaemon(options?: {
   // PAILot MQTT broker — takes over port 8765
   setMqttInboundHandler((sessionId, type, payload) => {
     const bridge = aibpBridge;
+
+    // APNs device token registration — app publishes on pailot/device/token
+    if (type === "apns_token") {
+      const token = payload.token as string | undefined;
+      if (token) {
+        apnsRegisterToken(token);
+      }
+      return;
+    }
+
     if (type === "command") {
       const command = (payload.command as string) ?? "";
       // Args may be nested under 'args' key or spread at top level

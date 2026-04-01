@@ -22,6 +22,7 @@ import type { AdapterRegistry } from "./adapter-registry.js";
 import type { APIBackend } from "../backend/api.js";
 import type { HybridSessionManager } from "../core/hybrid.js";
 import { randomUUID } from "node:crypto";
+import { registerToken as apnsRegisterToken, getTokens as apnsGetTokens } from "../apns/client.js";
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
@@ -1033,5 +1034,15 @@ export function registerCoreHandlers(
       return { ok: true, result: result as unknown as Record<string, unknown> };
     }
     return { ok: false, error: result.error ?? "Routing failed" };
+  });
+
+  // APNs device token registration (from MCP or direct IPC callers)
+  server.on("apns_register_token", async (req) => {
+    const { token } = req.params as { token?: string };
+    if (!token || typeof token !== "string") {
+      return { ok: false, error: "token is required" };
+    }
+    apnsRegisterToken(token);
+    return { ok: true, result: { tokens: apnsGetTokens().length } };
   });
 }
