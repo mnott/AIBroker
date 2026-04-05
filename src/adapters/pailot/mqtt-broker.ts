@@ -96,12 +96,12 @@ let mqttServer: Server | null = null;
 let bonjourInstance: any = null;
 let bonjourService: any = null;
 
-/** Number of currently connected MQTT clients. */
-let mqttClientCount = 0;
+/** Set of currently connected MQTT client IDs. */
+const connectedClients = new Set<string>();
 
 /** Returns the number of currently connected MQTT clients. */
 export function getMqttClientCount(): number {
-  return mqttClientCount;
+  return connectedClients.size;
 }
 
 /** Dedup set for inbound messages from app clients. */
@@ -421,15 +421,19 @@ export async function startMqttBroker(version?: string): Promise<void> {
 
   // --- Connection events ---
   broker.on("client", (client: any) => {
-    mqttClientCount++;
-    log(`[MQTT] client connected: ${client?.id ?? "unknown"} (total: ${mqttClientCount})`);
-    // Reset APNs badge counter when app connects
-    import("../../apns/client.js").then(m => m.resetBadge()).catch(() => {});
+    const id = client?.id ?? "unknown";
+    connectedClients.add(id);
+    log(`[MQTT] client connected: ${id} (total: ${connectedClients.size})`);
+    // Reset APNs badge counter when a real PAILot app connects
+    if (id.startsWith("pailot")) {
+      import("../../apns/client.js").then(m => m.resetBadge()).catch(() => {});
+    }
   });
 
   broker.on("clientDisconnect", (client: any) => {
-    mqttClientCount = Math.max(0, mqttClientCount - 1);
-    log(`[MQTT] client disconnected: ${client?.id ?? "unknown"} (total: ${mqttClientCount})`);
+    const id = client?.id ?? "unknown";
+    connectedClients.delete(id);
+    log(`[MQTT] client disconnected: ${id} (total: ${connectedClients.size})`);
   });
 
   broker.on("clientError", (client: any, err: Error) => {
