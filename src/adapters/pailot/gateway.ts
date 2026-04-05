@@ -56,6 +56,7 @@ import {
 } from "./mqtt-broker.js";
 import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
+import { addTrace } from "../../daemon/trace-log.js";
 
 const WS_PORT = parseInt(process.env.PAILOT_PORT ?? "8765", 10);
 
@@ -1175,13 +1176,31 @@ function resolveSessionId(sessionId?: string): string | undefined {
 
 export function broadcastText(text: string, sessionId?: string, direct?: boolean): void {
   const resolvedSession = sessionId || resolveSessionId(sessionId);
+  const traceId = randomUUID().slice(0, 8);
+  const contentPreview = text.replace(/\s+/g, " ").trim().slice(0, 80);
+
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
   broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
 
   // MQTT publish — always publish when broker is running
   if (isMqttRunning()) {
     if (resolvedSession) mqttPublishTyping(resolvedSession, false);
+    const payloadBytes = Buffer.byteLength(text, "utf8");
     mqttPublishText(resolvedSession ?? "global", text);
+    log(`[TRACE ${traceId}] published to pailot/${resolvedSession ?? "global"}/out (${payloadBytes} bytes)`);
+    addTrace({ traceId, event: "published_text", sessionId: resolvedSession, content_preview: contentPreview });
+
+    const clientCount = getMqttClientCount();
+    if (clientCount > 0) {
+      log(`[TRACE ${traceId}] APNs push sent (clientCount=${clientCount})`);
+      addTrace({ traceId, event: "apns_push_sent", sessionId: resolvedSession, details: { clientCount } });
+    } else {
+      log(`[TRACE ${traceId}] APNs push sent (clientCount=0)`);
+      addTrace({ traceId, event: "apns_push_sent_no_clients", sessionId: resolvedSession, details: { clientCount: 0 } });
+    }
+  } else {
+    log(`[TRACE ${traceId}] MQTT not running — text not published`);
+    addTrace({ traceId, event: "mqtt_not_running_text", sessionId: resolvedSession, content_preview: contentPreview });
   }
 
   // APNs push — always send. iOS suppresses the notification if the app is in foreground.
@@ -1219,6 +1238,8 @@ export async function broadcastVoice(
   chunkMeta?: { groupId: string; chunkIndex: number; totalChunks: number },
 ): Promise<void> {
   const resolvedSession = sessionId || resolveSessionId(sessionId);
+  const traceId = randomUUID().slice(0, 8);
+  const contentPreview = transcript.replace(/\s+/g, " ").trim().slice(0, 80);
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
   let sendBuffer = audioBuffer;
 
@@ -1252,7 +1273,23 @@ export async function broadcastVoice(
 
   if (isMqttRunning()) {
     if (resolvedSession) mqttPublishTyping(resolvedSession, false);
+    const voiceBytes = Buffer.byteLength(voiceBase64, "utf8");
     mqttPublishVoice(resolvedSession ?? "global", voiceBase64, transcript, undefined, chunkMeta);
+    const chunkInfo = chunkMeta ? ` chunk=${chunkMeta.chunkIndex + 1}/${chunkMeta.totalChunks}` : "";
+    log(`[TRACE ${traceId}] published voice to pailot/${resolvedSession ?? "global"}/out (${voiceBytes} bytes${chunkInfo})`);
+    addTrace({ traceId, event: "published_voice", sessionId: resolvedSession, content_preview: contentPreview, details: chunkMeta ? { chunkIndex: chunkMeta.chunkIndex, totalChunks: chunkMeta.totalChunks } : undefined });
+
+    const clientCount = getMqttClientCount();
+    if (clientCount > 0) {
+      log(`[TRACE ${traceId}] APNs push sent (clientCount=${clientCount})`);
+      addTrace({ traceId, event: "apns_push_sent_voice", sessionId: resolvedSession, details: { clientCount } });
+    } else {
+      log(`[TRACE ${traceId}] APNs push sent (clientCount=0)`);
+      addTrace({ traceId, event: "apns_push_sent_voice_no_clients", sessionId: resolvedSession, details: { clientCount: 0 } });
+    }
+  } else {
+    log(`[TRACE ${traceId}] MQTT not running — voice not published`);
+    addTrace({ traceId, event: "mqtt_not_running_voice", sessionId: resolvedSession, content_preview: contentPreview });
   }
 
   // APNs push for voice — always send (iOS suppresses if app is in foreground)
