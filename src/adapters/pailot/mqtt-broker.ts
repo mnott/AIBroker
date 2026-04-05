@@ -419,6 +419,13 @@ export async function startMqttBroker(version?: string): Promise<void> {
     }
   });
 
+  // --- Delivery confirmation: log when broker delivers to a subscriber ---
+  broker.on("delivered", (packet: any, client: any) => {
+    const clientId = client?.id ?? "unknown";
+    const topic = packet?.topic ?? "?";
+    log(`[TRACE] delivered to ${clientId} on ${topic}`);
+  });
+
   // --- Connection events ---
   broker.on("client", (client: any) => {
     const id = client?.id ?? "unknown";

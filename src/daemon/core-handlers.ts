@@ -1045,4 +1045,11 @@ export function registerCoreHandlers(
     apnsRegisterToken(token);
     return { ok: true, result: { tokens: apnsGetTokens().length } };
   });
+
+  // trace_log — return the last 100 message delivery trace entries
+  server.on("trace_log", async (_req) => {
+    const { getTraces } = await import("./trace-log.js");
+    const traces = getTraces();
+    return { ok: true, result: { traces, count: traces.length } };
+  });
 }
