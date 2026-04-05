@@ -1184,8 +1184,10 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
     mqttPublishText(resolvedSession ?? "global", text);
   }
 
-  // APNs push — fire when no MQTT clients are connected (app is in background / offline)
-  if (getMqttClientCount() === 0) {
+  // APNs push — always send. iOS suppresses the notification if the app is in foreground.
+  // We can't reliably detect background state because iOS suspends the TCP socket
+  // but the MQTT keepalive timeout (30s) hasn't fired yet.
+  {
     let sessionName = "PAI";
     if (resolvedSession) {
       // Try hybrid manager first; if empty, scan iTerm directly for session name
@@ -1253,8 +1255,8 @@ export async function broadcastVoice(
     mqttPublishVoice(resolvedSession ?? "global", voiceBase64, transcript, undefined, chunkMeta);
   }
 
-  // APNs push for voice — use transcript as body when no clients connected
-  if (getMqttClientCount() === 0 && transcript) {
+  // APNs push for voice — always send (iOS suppresses if app is in foreground)
+  if (transcript) {
     let voiceSessionName = "PAI";
     if (resolvedSession) {
       if (hybridManager && hybridManager.listSessions().length > 0) {
