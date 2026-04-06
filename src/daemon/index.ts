@@ -329,6 +329,15 @@ export async function startDaemon(options?: {
 
     if (type === "command") {
       const command = (payload.command as string) ?? "";
+
+      // App trace log — stream to daemon log for remote debugging
+      if (command === "app_trace") {
+        const event = (payload.event as string) ?? "?";
+        const details = (payload.details as string) ?? "";
+        log(`[APP] ${event}: ${details}`);
+        return;
+      }
+
       // Args may be nested under 'args' key or spread at top level
       const nested = payload.args as Record<string, unknown> | undefined;
       const args = nested ?? payload;
