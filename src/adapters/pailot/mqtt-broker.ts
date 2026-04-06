@@ -89,6 +89,10 @@ function ensureTlsCert(): { key: Buffer; cert: Buffer } | null {
   }
 }
 
+// --- Loopback MQTT client for server-side publishing ---
+let loopbackClient: any = null;
+let loopbackReady = false;
+
 // --- State ---
 
 let broker: any = null;
@@ -125,10 +129,19 @@ function evictOldIds(): void {
 
 function mqttPublish(topic: string, payload: Record<string, unknown>, opts?: { qos?: number; retain?: boolean }): void {
   if (!broker) { log(`[MQTT] publish skipped (no broker): ${topic}`); return; }
-  log(`[MQTT] → ${topic} (${JSON.stringify(payload).length} bytes)`);
+  const json = JSON.stringify(payload);
+  log(`[MQTT] → ${topic} (${json.length} bytes)`);
   const qos = opts?.qos ?? 1;
   const retain = opts?.retain ?? false;
-  const buf = Buffer.from(JSON.stringify(payload));
+
+  if (loopbackClient && loopbackReady) {
+    loopbackClient.publish(topic, json, { qos, retain }, (err: Error | null) => {
+      if (err) log(`[MQTT] loopback publish error on ${topic}: ${err.message}`);
+    });
+    return;
+  }
+
+  const buf = Buffer.from(json);
   broker.publish(
     { topic, payload: buf, qos, retain, cmd: "publish" },
     (err: Error | null) => {
@@ -463,11 +476,37 @@ export async function startMqttBroker(version?: string): Promise<void> {
     log(`[MQTT] server error: ${err.message}`);
   });
 
-  mqttServer.listen(MQTT_PORT, () => {
+  mqttServer.listen(MQTT_PORT, async () => {
     log(`[MQTT] broker listening on port ${MQTT_PORT}${MQTT_TOKEN ? " (auth enabled)" : " (no auth)"}${tlsCreds ? " [TLS]" : " [PLAIN TCP]"}`);
 
-    // Publish initial "ready" status (overwrites any stale LWT from previous crash)
-    mqttPublishStatus("ready", version);
+    // Start loopback MQTT client for server-side publishing.
+    // broker.publish() doesn't deliver to MQTT protocol clients in aedes 1.0.x.
+    try {
+      const mqtt = await import("mqtt");
+      const connectOpts: Record<string, unknown> = {
+        clientId: "aibroker-loopback",
+        clean: true,
+        connectTimeout: 3000,
+      };
+      if (MQTT_TOKEN) {
+        connectOpts.username = "pailot";
+        connectOpts.password = MQTT_TOKEN;
+      }
+      const protocol = tlsCreds ? "mqtts" : "mqtt";
+      if (tlsCreds) connectOpts.rejectUnauthorized = false;
+      loopbackClient = mqtt.connect(`${protocol}://localhost:${MQTT_PORT}`, connectOpts);
+      loopbackClient.on("connect", () => {
+        loopbackReady = true;
+        log("[MQTT] loopback client connected");
+      });
+      loopbackClient.on("error", (err: Error) => log(`[MQTT] loopback error: ${err.message}`));
+      loopbackClient.on("close", () => { loopbackReady = false; });
+    } catch (err) {
+      log(`[MQTT] loopback client failed: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // Publish initial "ready" status — delay for loopback to connect
+    setTimeout(() => mqttPublishStatus("ready", version), 500);
 
     // Advertise via Bonjour/mDNS so PAILot app can auto-discover on LAN
     try {
@@ -489,6 +528,11 @@ export async function startMqttBroker(version?: string): Promise<void> {
  * Stop the MQTT broker and TCP server.
  */
 export function stopMqttBroker(): void {
+  if (loopbackClient) {
+    try { loopbackClient.end(true); } catch { /* ignore */ }
+    loopbackClient = null;
+    loopbackReady = false;
+  }
   if (bonjourService) {
     try { bonjourService.stop(); } catch { /* ignore */ }
     bonjourService = null;
