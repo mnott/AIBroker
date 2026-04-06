@@ -162,7 +162,7 @@ export function mqttPublishText(sessionId: string, content: string, messageId?: 
   };
   const seq = enqueue(sessionId, "text", payload);
   if (seq > 0) payload.seq = seq;
-  mqttPublish(`pailot/${sessionId}/out`, payload);
+  mqttPublish("pailot/out", payload);
 }
 
 /** Publish a voice message to a session output topic. */
@@ -189,7 +189,7 @@ export function mqttPublishVoice(
   }
   const seq = enqueue(sessionId, "voice", payload);
   if (seq > 0) payload.seq = seq;
-  mqttPublish(`pailot/${sessionId}/out`, payload);
+  mqttPublish("pailot/out", payload);
 }
 
 /** Publish an image message to a session output topic. */
@@ -206,12 +206,12 @@ export function mqttPublishImage(sessionId: string, imageBase64: string, caption
   };
   const seq = enqueue(sessionId, "image", payload);
   if (seq > 0) payload.seq = seq;
-  mqttPublish(`pailot/${sessionId}/out`, payload);
+  mqttPublish("pailot/out", payload);
 }
 
 /** Publish a typing indicator (QoS 0, no msgId — ephemeral). */
 export function mqttPublishTyping(sessionId: string, active: boolean): void {
-  mqttPublish(`pailot/${sessionId}/typing`, {
+  mqttPublish("pailot/out", {
     type: "typing",
     sessionId,
     active,
@@ -231,7 +231,7 @@ export function mqttPublishSessions(sessions: unknown[]): void {
 
 /** Publish a screenshot for a session (retained). */
 export function mqttPublishScreenshot(sessionId: string, imageBase64: string): void {
-  mqttPublish(`pailot/${sessionId}/screenshot`, {
+  mqttPublish("pailot/out", {
     msgId: randomUUID(),
     type: "screenshot",
     sessionId,
@@ -243,7 +243,7 @@ export function mqttPublishScreenshot(sessionId: string, imageBase64: string): v
 
 /** Publish a voice transcript reflection. */
 export function mqttPublishTranscript(messageId: string, content: string, sessionId?: string): void {
-  mqttPublish("pailot/voice/transcript", {
+  mqttPublish("pailot/out", {
     msgId: randomUUID(),
     type: "transcript",
     messageId,
