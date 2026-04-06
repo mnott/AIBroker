@@ -84,9 +84,10 @@ function detectSessionId(): string | undefined {
 }
 
 // Resolve session identity:
-// 1. Try AIBP registration with hub (preferred — hub resolves identity)
-// 2. Fall back to TTY detection (legacy — fragile but works on macOS)
-_resolvedSessionId = detectSessionId();
+// 1. ITERM_SESSION_ID env var (most reliable — set by iTerm per tab)
+// 2. Try AIBP registration with hub (preferred — hub resolves identity)
+// 3. Fall back to TTY detection (legacy — fragile but works on macOS)
+_resolvedSessionId = process.env.ITERM_SESSION_ID?.split(":")[1] ?? detectSessionId();
 
 async function registerWithAibp(): Promise<void> {
   try {
@@ -111,7 +112,11 @@ async function registerWithAibp(): Promise<void> {
 void registerWithAibp();
 
 function getSessionId(): string | undefined {
-  return _resolvedSessionId;
+  // Prefer AIBP-resolved session, fall back to iTerm env var
+  if (_resolvedSessionId) return _resolvedSessionId;
+  const envId = process.env.ITERM_SESSION_ID?.split(":")[1];
+  if (envId) return envId;
+  return undefined;
 }
 
 function err(e: unknown) {
