@@ -881,6 +881,11 @@ server.tool(
         ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ".txt": "text/plain", ".csv": "text/csv", ".json": "application/json",
+        ".md": "text/markdown", ".html": "text/html", ".htm": "text/html",
+        ".xml": "application/xml", ".yaml": "text/yaml", ".yml": "text/yaml",
+        ".ts": "text/plain", ".js": "text/plain", ".py": "text/plain",
+        ".sh": "text/plain", ".dart": "text/plain", ".swift": "text/plain",
+        ".zip": "application/zip", ".gz": "application/gzip",
       };
       const mimeType = mimeMap[ext] ?? "application/octet-stream";
       const sessionId = getSessionId();
