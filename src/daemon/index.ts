@@ -158,8 +158,8 @@ export async function startDaemon(options?: {
         break;
       }
       case "IMAGE": {
-        const p = aibpMsg.payload as { imageBase64: string; caption?: string };
-        broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId, true);
+        const p = aibpMsg.payload as { imageBase64: string; caption?: string; mimeType?: string };
+        broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId, true, p.mimeType);
         break;
       }
       case "TYPING": {

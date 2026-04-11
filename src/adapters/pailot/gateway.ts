@@ -1314,19 +1314,20 @@ export async function broadcastVoice(
  * Broadcast a screenshot/image to all connected PAILot clients.
  * @param sessionId — iTerm session ID of the originating Claude session
  */
-export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean): void {
+export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean, mimeType?: string): void {
   const resolvedSession = sessionId || resolveSessionId(sessionId);
   const imgBase64 = imageBuffer.toString("base64");
   broadcast({
     type: "image",
     imageBase64: imgBase64,
     caption: caption ?? "Screenshot",
+    mimeType: mimeType ?? "image/png",
     ...(resolvedSession && { sessionId: resolvedSession }),
   }, direct);
 
   if (isMqttRunning()) {
     const target = resolvedSession ?? "global";
-    mqttPublishImage(target, imgBase64, caption ?? "Screenshot");
+    mqttPublishImage(target, imgBase64, caption ?? "Screenshot", undefined, mimeType);
     if ((caption ?? "Screenshot").toLowerCase().includes("screenshot")) {
       mqttPublishScreenshot(target, imgBase64);
     }
