@@ -229,7 +229,11 @@ export function mqttPublishSessions(sessions: unknown[]): void {
   }, { retain: true });
 }
 
-/** Publish a screenshot for a session (retained). */
+/** Publish a screenshot for a session.
+ * NOT retained — screenshots are large (often MB) and dumping them on every
+ * subscribe overwhelms the TLS buffer, causing iOS clients to drop the
+ * connection ~28ms after subscribing. Use the offline queue for delivery.
+ */
 export function mqttPublishScreenshot(sessionId: string, imageBase64: string): void {
   mqttPublish("pailot/out", {
     msgId: randomUUID(),
@@ -238,7 +242,7 @@ export function mqttPublishScreenshot(sessionId: string, imageBase64: string): v
     imageBase64,
     mimeType: "image/png",
     ts: Date.now(),
-  }, { retain: true });
+  });
 }
 
 /** Publish a voice transcript reflection. */
@@ -439,9 +443,21 @@ export async function startMqttBroker(version?: string): Promise<void> {
     log(`[TRACE] delivered to ${clientId} on ${topic}`);
   });
 
+  // --- Connection throttle: reject rapid reconnects from same client ---
+  const lastConnectTime = new Map<string, number>();
+  const CONNECT_THROTTLE_MS = 2000; // min 2s between connects from same client
+
   // --- Connection events ---
   broker.on("client", (client: any) => {
     const id = client?.id ?? "unknown";
+    const now = Date.now();
+    const last = lastConnectTime.get(id) ?? 0;
+    if (now - last < CONNECT_THROTTLE_MS && id !== "aibroker-loopback") {
+      log(`[MQTT] throttled rapid reconnect from ${id} (${now - last}ms since last)`);
+      client.close();
+      return;
+    }
+    lastConnectTime.set(id, now);
     connectedClients.add(id);
     log(`[MQTT] client connected: ${id} (total: ${connectedClients.size})`);
     // Reset APNs badge counter when a real PAILot app connects
@@ -507,6 +523,16 @@ export async function startMqttBroker(version?: string): Promise<void> {
 
     // Publish initial "ready" status — delay for loopback to connect
     setTimeout(() => mqttPublishStatus("ready", version), 500);
+
+    // Clear any stale retained screenshot from previous versions.
+    // Retained screenshots cause iOS clients to drop the TLS connection
+    // immediately on subscribe due to the large payload.
+    setTimeout(() => {
+      if (loopbackClient && loopbackReady) {
+        loopbackClient.publish("pailot/out", "", { qos: 0, retain: true });
+        log("[MQTT] cleared retained pailot/out (screenshot purge)");
+      }
+    }, 700);
 
     // Advertise via Bonjour/mDNS so PAILot app can auto-discover on LAN
     try {
