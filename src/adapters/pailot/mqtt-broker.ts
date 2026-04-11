@@ -193,14 +193,14 @@ export function mqttPublishVoice(
 }
 
 /** Publish an image message to a session output topic. */
-export function mqttPublishImage(sessionId: string, imageBase64: string, caption?: string, messageId?: string): void {
+export function mqttPublishImage(sessionId: string, imageBase64: string, caption?: string, messageId?: string, mimeType?: string): void {
   const msgId = messageId ?? randomUUID();
   const payload: Record<string, unknown> = {
     msgId,
     type: "image",
     sessionId,
     imageBase64,
-    mimeType: "image/png",
+    mimeType: mimeType ?? "image/png",
     caption: caption ?? "",
     ts: Date.now(),
   };
