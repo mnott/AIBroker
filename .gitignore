@@ -38,3 +38,4 @@ test_noise.*
 
 # Obsidian vault metadata (wikilink index files)
 _index.md
+.playwright-mcp
