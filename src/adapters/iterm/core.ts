@@ -71,7 +71,14 @@ export function typeIntoSession(sessionId: string, text: string): boolean {
 }
 
 export function pasteTextIntoSession(sessionId: string, text: string): boolean {
-  const escaped = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // Escape for AppleScript string literal. Newlines must use concatenation with
+  // AppleScript's `linefeed` constant since \n isn't a valid escape in AppleScript.
+  const escaped = text
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r\n/g, '" & return & "')
+    .replace(/\n/g, '" & linefeed & "')
+    .replace(/\r/g, '" & return & "');
   const textScript = withSessionAppleScript(
     sessionId,
     `          tell aSession to write text "${escaped}" newline no\n          return "ok"`,
