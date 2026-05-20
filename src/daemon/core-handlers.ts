@@ -80,11 +80,18 @@ export function registerCoreHandlers(
   });
 
   server.on("sessions", async (_req) => {
-    const sessions = manager.listSessions().map((s, i) => ({
+    // Use snapshotAllSessions() — the same iTerm2 source that session_content uses —
+    // to enumerate live sessions without pulling scrollback content.
+    // manager.listSessions() is always empty (nothing populates the internal registry).
+    const snapshots = snapshotAllSessions();
+    const sessions = snapshots.map((s, i) => ({
       index: i + 1,
+      sessionId: s.id,
       name: s.name,
-      kind: s.kind,
-      active: manager.activeSession?.id === s.id,
+      paiName: s.paiName ?? null,
+      atPrompt: s.atPrompt,
+      kind: s.paiName ? "claude" : "shell",
+      active: s.id === activeItermSessionId,
     }));
     return { ok: true, result: { sessions } };
   });
