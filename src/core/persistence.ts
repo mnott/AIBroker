@@ -132,3 +132,61 @@ export function saveSessionRegistry(): void {
   };
   safeWriteJson("sessions.json", data);
 }
+
+// ── Persistent Session Names ──
+// Maps iTerm2 session UUID → user-chosen name (set via /Name command).
+// Survives daemon restarts. Used to re-assert tab titles after Claude Code
+// overwrites them with its auto-generated ai-title.
+
+const SESSION_NAMES_FILE = "session-names.json";
+
+type SessionNamesStore = Record<string, string>;
+
+/** In-memory cache for the persistent name store. */
+let _sessionNamesCache: SessionNamesStore | null = null;
+
+function loadSessionNames(): SessionNamesStore {
+  if (_sessionNamesCache !== null) return _sessionNamesCache;
+  _sessionNamesCache = safeReadJson<SessionNamesStore>(SESSION_NAMES_FILE) ?? {};
+  return _sessionNamesCache;
+}
+
+function saveSessionNames(): void {
+  if (_sessionNamesCache !== null) {
+    safeWriteJson(SESSION_NAMES_FILE, _sessionNamesCache);
+  }
+}
+
+/**
+ * Persist a user-chosen name for an iTerm2 session.
+ * @param itermSessionId - the raw iTerm2 session UUID (e.g. "942A4044-...")
+ * @param name - the user-set name
+ */
+export function setPersistentSessionName(itermSessionId: string, name: string): void {
+  const store = loadSessionNames();
+  store[itermSessionId] = name;
+  saveSessionNames();
+}
+
+/**
+ * Get the user-chosen persistent name for an iTerm2 session, or undefined.
+ */
+export function getPersistentSessionName(itermSessionId: string): string | undefined {
+  return loadSessionNames()[itermSessionId];
+}
+
+/**
+ * Get all persistent session names (for re-assert on rescan).
+ */
+export function getAllPersistentSessionNames(): SessionNamesStore {
+  return { ...loadSessionNames() };
+}
+
+/**
+ * Remove a persistent name when a session ends.
+ */
+export function removePersistentSessionName(itermSessionId: string): void {
+  const store = loadSessionNames();
+  delete store[itermSessionId];
+  saveSessionNames();
+}
