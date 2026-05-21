@@ -280,6 +280,19 @@ server.tool(
   },
 );
 
+server.tool(
+  "aibroker_get_persistent_name",
+  "Get the persisted user-chosen name for the current or a specific iTerm2 session. Returns null if not named.",
+  { itermSessionId: z.string().optional().describe("iTerm2 session UUID. Defaults to the caller's session.") },
+  async ({ itermSessionId }) => {
+    try {
+      const r = await hub.call_raw("get_persistent_name", { itermSessionId });
+      const name = (r as any).name;
+      return ok(name !== null ? `Persistent name: "${name}"` : "No persistent name set for this session");
+    } catch (e) { return err(e); }
+  },
+);
+
 server.tool("aibroker_discover", "Re-scan iTerm2 sessions and refresh registry", {}, async () => {
   try {
     const r = await hub.call_raw("discover", {});

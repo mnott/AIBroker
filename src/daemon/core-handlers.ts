@@ -27,7 +27,7 @@ import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
 import { WatcherClient } from "../ipc/client.js";
-import { saveVoiceConfig } from "../core/persistence.js";
+import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
@@ -972,6 +972,13 @@ export function registerCoreHandlers(
       if (session) manager.updateName(session.id, name);
     }
 
+    // Persist the user-chosen name so it survives daemon restarts and
+    // can be re-asserted after Claude Code's auto-title overwrites it.
+    if (itermSessionId) {
+      setPersistentSessionName(itermSessionId, name);
+      log(`Persisted name "${name}" for iTerm session ${itermSessionId.slice(0, 8)}`);
+    }
+
     // Set iTerm2 visuals directly if we know the session
     if (itermSessionId) {
       setItermSessionVar(itermSessionId, name);
@@ -987,6 +994,33 @@ export function registerCoreHandlers(
       } catch { /* best effort */ }
     }
     return { ok: true, result: { success: true, name } };
+  });
+
+  /**
+   * get_persistent_name — Retrieve the user-chosen persistent name for an iTerm2 session.
+   *
+   * Params: { itermSessionId: string }
+   * Result: { name: string | null }
+   */
+  server.on("get_persistent_name", async (req) => {
+    const { itermSessionId } = req.params as { itermSessionId?: string };
+    const rawId = itermSessionId ?? req.itermSessionId;
+    if (!rawId) return { ok: false, error: "itermSessionId is required" };
+    // Normalise "w0t0p0:UUID" → UUID
+    const id = rawId.includes(":") ? rawId.split(":").pop()! : rawId;
+    const name = getPersistentSessionName(id) ?? null;
+    return { ok: true, result: { name } };
+  });
+
+  /**
+   * get_all_persistent_names — Return all persisted iTerm2 session → name mappings.
+   *
+   * Used by PAI hooks to re-assert tab titles after Claude Code auto-titles overwrite them.
+   * Result: { names: Record<string, string> }
+   */
+  server.on("get_all_persistent_names", async (_req) => {
+    const names = getAllPersistentSessionNames();
+    return { ok: true, result: { names } };
   });
 
   /**
