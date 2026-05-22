@@ -28,7 +28,7 @@ import {
   clientQueues,
   updateSessionTtyCache,
 } from "../../core/state.js";
-import { saveSessionRegistry } from "../../core/persistence.js";
+import { saveSessionRegistry, getAllPersistentSessionNames } from "../../core/persistence.js";
 
 // ── Session Variable Helpers ──
 
@@ -143,9 +143,10 @@ end tell`;
 
 export function listClaudeSessions(): Array<{ id: string; name: string }> {
   const sessions = snapshotAllSessions();
+  const persistentNames = getAllPersistentSessionNames();
   return sessions
-    .filter((s) => s.name.toLowerCase().includes("claude") || s.paiName)
-    .map((s) => ({ id: s.id, name: s.paiName ?? s.name }));
+    .filter((s) => s.name.toLowerCase().includes("claude") || persistentNames[s.id])
+    .map((s) => ({ id: s.id, name: persistentNames[s.id] ?? s.name }));
 }
 
 /**
@@ -161,6 +162,7 @@ export function getSessionList(): Array<{
   atPrompt: boolean;
 }> {
   const snapshots = snapshotAllSessions();
+  const persistentNames = getAllPersistentSessionNames();
 
   // Update TTY cache
   updateSessionTtyCache(snapshots.map((s) => ({ id: s.id, tty: s.tty })));
@@ -171,14 +173,17 @@ export function getSessionList(): Array<{
     if (!aliveIds.has(id)) managedSessions.delete(id);
   }
 
-  return snapshots.map((s) => ({
-    id: s.id,
-    name: s.paiName ?? s.name,
-    path: "",
-    type: (s.name.toLowerCase().includes("claude") || !s.atPrompt) ? "claude" as const : "terminal" as const,
-    paiName: s.paiName,
-    atPrompt: s.atPrompt,
-  }));
+  return snapshots.map((s) => {
+    const paiName = persistentNames[s.id] ?? null;
+    return {
+      id: s.id,
+      name: paiName ?? s.name,
+      path: "",
+      type: (s.name.toLowerCase().includes("claude") || !s.atPrompt) ? "claude" as const : "terminal" as const,
+      paiName,
+      atPrompt: s.atPrompt,
+    };
+  });
 }
 
 // ── Session Creation ──

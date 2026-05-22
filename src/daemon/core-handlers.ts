@@ -27,14 +27,14 @@ import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
 import { WatcherClient } from "../ipc/client.js";
-import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames } from "../core/persistence.js";
+import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
-import { snapshotAllSessions, typeIntoSession } from "../adapters/iterm/core.js";
+import { snapshotAllSessions, typeIntoSession, clearAllPaiNames } from "../adapters/iterm/core.js";
 import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
@@ -84,15 +84,20 @@ export function registerCoreHandlers(
     // to enumerate live sessions without pulling scrollback content.
     // manager.listSessions() is always empty (nothing populates the internal registry).
     const snapshots = snapshotAllSessions();
-    const sessions = snapshots.map((s, i) => ({
-      index: i + 1,
-      sessionId: s.id,
-      name: s.name,
-      paiName: s.paiName ?? null,
-      atPrompt: s.atPrompt,
-      kind: s.paiName ? "claude" : "shell",
-      active: s.id === activeItermSessionId,
-    }));
+    // Merge paiName from the persistent store (faster + more reliable than iTerm variables).
+    const persistentNames = getAllPersistentSessionNames();
+    const sessions = snapshots.map((s, i) => {
+      const paiName = persistentNames[s.id] ?? null;
+      return {
+        index: i + 1,
+        sessionId: s.id,
+        name: s.name,
+        paiName,
+        atPrompt: s.atPrompt,
+        kind: (paiName || !s.atPrompt) ? "claude" : "shell",
+        active: s.id === activeItermSessionId,
+      };
+    });
     return { ok: true, result: { sessions } };
   });
 
@@ -676,8 +681,10 @@ export function registerCoreHandlers(
 
     // Session snapshots (iTerm sessions with idle/busy status)
     const snapshots = snapshotAllSessions();
+    const allPersistentNames = getAllPersistentSessionNames();
     const sessions = snapshots.map((snap, i) => {
-      const label = snap.paiName ?? snap.tabTitle ?? snap.name;
+      const paiName = allPersistentNames[snap.id] ?? null;
+      const label = paiName ?? snap.tabTitle ?? snap.name;
       const isActive = snap.id === activeItermSessionId;
       const cached = statusCache.get(snap.id);
       const hasFreshSummary = cached?.summary && Date.now() - cached.timestamp < 5 * 60 * 1000;
@@ -1021,6 +1028,41 @@ export function registerCoreHandlers(
   server.on("get_all_persistent_names", async (_req) => {
     const names = getAllPersistentSessionNames();
     return { ok: true, result: { names } };
+  });
+
+  /**
+   * clear_session_names — Wipe the persistent session-names store.
+   *
+   * Removes all entries from ~/.aibroker/session-names.json. Does NOT
+   * touch the iTerm2 user.paiName variables — call clear_pai_names for that.
+   * Optional param: { sessionId: string } to remove a single entry.
+   */
+  server.on("clear_session_names", async (req) => {
+    const { itermSessionId } = req.params as { itermSessionId?: string };
+    const names = getAllPersistentSessionNames();
+    if (itermSessionId) {
+      const id = itermSessionId.includes(":") ? itermSessionId.split(":").pop()! : itermSessionId;
+      removePersistentSessionName(id);
+      log(`Cleared persistent name for iTerm session ${id.slice(0, 8)}`);
+      return { ok: true, result: { cleared: 1 } };
+    }
+    // Clear all
+    for (const id of Object.keys(names)) {
+      removePersistentSessionName(id);
+    }
+    log(`Cleared all ${Object.keys(names).length} persistent session name(s)`);
+    return { ok: true, result: { cleared: Object.keys(names).length } };
+  });
+
+  /**
+   * clear_pai_names — Clear user.paiName variable from all live iTerm2 sessions.
+   *
+   * Recovery tool for corrupted state. Returns the number of sessions cleared.
+   */
+  server.on("clear_pai_names", async (_req) => {
+    const cleared = clearAllPaiNames();
+    log(`Cleared user.paiName from ${cleared} iTerm session(s)`);
+    return { ok: true, result: { cleared } };
   });
 
   /**
