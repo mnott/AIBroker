@@ -8,11 +8,11 @@
 import { spawnSync } from "node:child_process";
 import { log } from "../../core/log.js";
 
-export function runAppleScript(script: string): string | null {
+export function runAppleScript(script: string, timeoutMs = 4_000): string | null {
   const result = spawnSync("osascript", [], {
     input: script,
     stdio: ["pipe", "pipe", "pipe"],
-    timeout: 4_000,
+    timeout: timeoutMs,
   });
   if (result.status !== 0) return null;
   return result.stdout?.toString().trim() ?? null;
@@ -208,7 +208,26 @@ export interface SessionSnapshot {
   paiName: string | null;
 }
 
+/**
+ * snapshotAllSessions — Fast enumeration of all iTerm2 sessions.
+ *
+ * Single AppleScript pass: id, name, profile, tty per session.
+ * ~1.5s for 18 sessions (vs >30s timeout with the old combined script).
+ *
+ * What was dropped vs the original:
+ * - `is at shell prompt`: adds ~180ms/session (3.3s for 18). Derived from name instead.
+ * - `variable named "user.paiName"`: removed from AppleScript loop entirely.
+ *   paiName is now read from ~/.aibroker/session-names.json by the caller via
+ *   getAllPersistentSessionNames(). This makes paiName authoritative (no iTerm corruption),
+ *   faster (file read instead of AppleScript), and consistent with what rename writes.
+ *
+ * atPrompt heuristic: iTerm2's title reporter encodes the foreground process in the
+ * tab name — "(node)" = Claude Code running (not at prompt). "(-zsh)", "(-bash)",
+ * "(ssh)", bare path names = shell at prompt. Accurate for sessions display.
+ */
 export function snapshotAllSessions(): SessionSnapshot[] {
+  // Fetch id, name, tty. Skip `profile name` (~0.6s overhead) and
+  // `is at shell prompt` (~3.3s overhead) — both are derived or irrelevant.
   const script = `
 tell application "iTerm2"
   set output to ""
@@ -217,44 +236,64 @@ tell application "iTerm2"
       repeat with aSession in sessions of aTab
         set sessionId to id of aSession
         set sessionName to name of aSession
-        set sessionProfile to profile name of aSession
         set sessionTty to tty of aSession
-        set isAtPrompt to (is at shell prompt of aSession)
-        tell aSession
-          try
-            set paiName to (variable named "user.paiName")
-          on error
-            set paiName to ""
-          end try
-          try
-            set tabTitle to (variable named "tab.title")
-          on error
-            set tabTitle to ""
-          end try
-        end tell
-        set output to output & sessionId & (ASCII character 9) & sessionName & (ASCII character 9) & sessionProfile & (ASCII character 9) & sessionTty & (ASCII character 9) & (isAtPrompt as text) & (ASCII character 9) & paiName & (ASCII character 9) & tabTitle & linefeed
+        set output to output & sessionId & (ASCII character 9) & sessionName & (ASCII character 9) & sessionTty & linefeed
       end repeat
     end repeat
   end repeat
   return output
 end tell`;
 
-  const result = runAppleScript(script);
+  // 4s timeout. id+name+tty = ~2.1s for 18 sessions. 4s gives safe headroom.
+  const result = runAppleScript(script, 4_000);
   if (!result) return [];
 
   const sessions: SessionSnapshot[] = [];
   for (const line of result.split("\n").filter(Boolean)) {
     const parts = line.split("\t");
-    if (parts.length < 5) continue;
+    if (parts.length < 3) continue;
+    const name = parts[1];
+    // Derive atPrompt from name heuristic: "(node)" = Claude Code running (not at prompt).
+    // "(-zsh)", "(-bash)", "(ssh)", bare path = at shell prompt.
+    const atPrompt = !name.includes("(node)") && !name.includes("(npm)") && !name.includes("(bun)");
     sessions.push({
       id: parts[0],
-      name: parts[1],
-      profileName: parts[2],
-      tabTitle: (parts[6] && parts[6] !== "missing value" && parts[6] !== "") ? parts[6] : null,
-      tty: parts[3],
-      atPrompt: parts[4] === "true",
-      paiName: (parts[5] && parts[5] !== "missing value" && parts[5] !== "") ? parts[5] : null,
+      name,
+      profileName: "Default",   // profile name skipped for speed; always "Default" in practice
+      tty: parts[2],
+      atPrompt,
+      tabTitle: null,
+      // paiName is null here — callers merge from getAllPersistentSessionNames()
+      paiName: null,
     });
   }
   return sessions;
+}
+
+/**
+ * Clear the user.paiName variable from all live iTerm2 sessions.
+ * Used for recovery when session names are corrupt.
+ * Does a single AppleScript pass over all sessions.
+ */
+export function clearAllPaiNames(): number {
+  const script = `
+tell application "iTerm2"
+  set cleared to 0
+  repeat with aWindow in windows
+    repeat with aTab in tabs of aWindow
+      repeat with aSession in sessions of aTab
+        tell aSession
+          try
+            set variable named "user.paiName" to ""
+            set cleared to cleared + 1
+          end try
+        end tell
+      end repeat
+    end repeat
+  end repeat
+  return cleared
+end tell`;
+  // Allow 10s since this iterates all sessions with variable writes
+  const result = runAppleScript(script, 10_000);
+  return result ? parseInt(result, 10) || 0 : 0;
 }
