@@ -57,6 +57,21 @@ import {
 import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
+import { getAllPersistentSessionNames } from "../../core/persistence.js";
+
+/**
+ * Enrich snapshots with paiName from the persistent JSON store.
+ * snapshotAllSessions() always returns paiName=null since v0.7.10;
+ * the authoritative source is ~/.aibroker/session-names.json.
+ */
+function enrichedSnapshots(): ReturnType<typeof snapshotAllSessions> {
+  const snaps = snapshotAllSessions();
+  const persistentNames = getAllPersistentSessionNames();
+  for (const snap of snaps) {
+    snap.paiName = persistentNames[snap.id] ?? null;
+  }
+  return snaps;
+}
 
 const WS_PORT = parseInt(process.env.PAILOT_PORT ?? "8765", 10);
 
@@ -228,7 +243,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
   const clientActiveId = typeof args?.activeSessionId === "string" ? args.activeSessionId : undefined;
 
   // Auto-discover Claude-related iTerm2 tabs so freshly-started daemons can match
-  const liveSnapshots = snapshotAllSessions();
+  const liveSnapshots = enrichedSnapshots();
   const liveIds = new Set(liveSnapshots.map(s => s.id));
   if (liveSnapshots.length > 0) {
     hybridManager.pruneDeadVisualSessions(liveIds);
@@ -237,7 +252,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
   const seenTabs = new Set<string>();
   for (const snap of liveSnapshots) {
     if (!isClaudeRelated(snap)) continue;
-    const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+    const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
     if (seenTabs.has(displayName)) continue;
     seenTabs.add(displayName);
     if (!knownIds.has(snap.id)) {
@@ -258,7 +273,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
     if (idx < 0 && liveIds.has(clientActiveId)) {
       const snap = liveSnapshots.find(s => s.id === clientActiveId);
       if (snap) {
-        const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+        const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
         hybridManager.registerVisualSession(displayName, "", clientActiveId);
         sessions = hybridManager.listSessions();
         idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
@@ -297,7 +312,7 @@ end tell`)?.trim() ?? "";
     if (idx < 0 && liveIds.has(focusedId)) {
       const snap = liveSnapshots.find(s => s.id === focusedId);
       if (snap) {
-        const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+        const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
         hybridManager.registerVisualSession(displayName, "", focusedId);
         sessions = hybridManager.listSessions();
         idx = sessions.findIndex(s => s.backendSessionId === focusedId);
@@ -339,7 +354,7 @@ function handleSessionsCommand(ws: WebSocket): void {
   // Prune visual sessions whose iTerm2 tabs have been closed.
   // ONLY prune if snapshotAllSessions returns results — an empty result
   // likely means AppleScript failed, not that all sessions are gone.
-  const liveSnapshots = snapshotAllSessions();
+  const liveSnapshots = enrichedSnapshots();
   if (liveSnapshots.length > 0) {
     const liveIds = new Set(liveSnapshots.map(s => s.id));
     hybridManager.pruneDeadVisualSessions(liveIds);
@@ -352,7 +367,7 @@ function handleSessionsCommand(ws: WebSocket): void {
   const seenTabs = new Set<string>();
   for (const snap of liveSnapshots) {
     if (!isClaudeRelated(snap)) continue;
-    const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+    const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
     if (seenTabs.has(displayName)) continue; // skip split panes in same tab
     seenTabs.add(displayName);
     if (!knownIds.has(snap.id)) {
@@ -908,12 +923,12 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
     // can be tagged with sessionId even before a PAILot client connects.
     if (hybridManager) {
       try {
-        const liveSnapshots = snapshotAllSessions();
+        const liveSnapshots = enrichedSnapshots();
         const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
         const seenTabs = new Set<string>();
         for (const snap of liveSnapshots) {
           if (!isClaudeRelated(snap)) continue;
-          const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+          const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
           if (seenTabs.has(displayName)) continue;
           seenTabs.add(displayName);
           if (!knownIds.has(snap.id)) {
@@ -1215,9 +1230,9 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
         if (match) sessionName = match.name;
       } else {
         // Fallback: scan iTerm tabs for the session name
-        const snaps = snapshotAllSessions();
+        const snaps = enrichedSnapshots();
         const snap = snaps.find(s => s.id.startsWith(resolvedSession) || resolvedSession.startsWith(s.id));
-        if (snap) sessionName = snap.tabTitle ?? snap.paiName ?? snap.name;
+        if (snap) sessionName = snap.paiName ?? snap.tabTitle ?? snap.name;
       }
     }
     const preview = text.replace(/\s+/g, " ").trim().slice(0, 100);
@@ -1300,9 +1315,9 @@ export async function broadcastVoice(
         const match = hybridManager.listSessions().find(s => s.backendSessionId.startsWith(resolvedSession) || resolvedSession.startsWith(s.backendSessionId));
         if (match) voiceSessionName = match.name;
       } else {
-        const snaps = snapshotAllSessions();
+        const snaps = enrichedSnapshots();
         const snap = snaps.find(s => s.id.startsWith(resolvedSession) || resolvedSession.startsWith(s.id));
-        if (snap) voiceSessionName = snap.tabTitle ?? snap.paiName ?? snap.name;
+        if (snap) voiceSessionName = snap.paiName ?? snap.tabTitle ?? snap.name;
       }
     }
     const preview = transcript.replace(/\s+/g, " ").trim().slice(0, 100);
@@ -1379,7 +1394,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
   switch (command) {
     case "sessions": {
       // Prune dead sessions and publish current list via MQTT
-      const liveSnapshots = snapshotAllSessions();
+      const liveSnapshots = enrichedSnapshots();
       const liveIds = new Set(liveSnapshots.map(s => s.id));
       if (liveSnapshots.length > 0) {
         hybridManager.pruneDeadVisualSessions(liveIds);
@@ -1388,7 +1403,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       const seenTabs = new Set<string>();
       for (const snap of liveSnapshots) {
         if (!isClaudeRelated(snap)) continue;
-        const displayName = snap.tabTitle ?? snap.paiName ?? snap.name;
+        const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
         if (seenTabs.has(displayName)) continue;
         seenTabs.add(displayName);
         if (!knownIds.has(snap.id)) {
