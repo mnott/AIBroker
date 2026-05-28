@@ -10,7 +10,7 @@
  *   - aibroker_*  (17) — hub-level: status, sessions, TTS, dictation, image gen, session orchestration
  *   - whatsapp_*  (11) — proxied to whazaa adapter via adapter_call
  *   - telegram_*  (11) — proxied to telex adapter via adapter_call
- *   - pailot_*     (3) — direct hub calls for PAILot mobile app
+ *   - pailot_*     (4) — direct hub calls for PAILot mobile app
  *
  * Usage in ~/.claude.json:
  *   "aibroker": {
@@ -925,6 +925,20 @@ server.tool(
       if (msgs.length === 0) return ok("No new messages.");
       const lines = msgs.map((m: any) => `[${new Date(m.timestamp).toISOString()}] ${m.body}`);
       return ok(lines.join("\n"));
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "pailot_debug_state",
+  "Ask the PAILot app to report its current session list exactly as it is rendering it — including the resolved displayed name, raw paiName, tabTitle, source, and activeSessionId. Use this to debug name-resolution issues on the mobile side. Requires the app to be connected; times out after ~5 s if the app is unreachable.",
+  {
+    timeout: z.number().min(1).max(30).optional().describe("Seconds to wait for the app response (default 5)"),
+  },
+  async ({ timeout }) => {
+    try {
+      const r = await hub.call_raw("pailot_debug_state", { timeout }) as any;
+      return ok(JSON.stringify(r, null, 2));
     } catch (e) { return err(e); }
   },
 );

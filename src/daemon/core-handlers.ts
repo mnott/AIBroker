@@ -26,15 +26,17 @@ import { registerToken as apnsRegisterToken, getTokens as apnsGetTokens } from "
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
+import { mqttRequestDebugState } from "../adapters/pailot/mqtt-broker.js";
 import { WatcherClient } from "../ipc/client.js";
-import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName } from "../core/persistence.js";
+import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName, lookupPersistentName } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
-import { snapshotAllSessions, typeIntoSession, clearAllPaiNames } from "../adapters/iterm/core.js";
+import { clearAllPaiNames } from "../adapters/iterm/core.js";
+import { snapshotAllSessions, typeIntoSession, setSessionTitle } from "../transport/sync-facade.js";
 import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
@@ -87,7 +89,7 @@ export function registerCoreHandlers(
     // Merge paiName from the persistent store (faster + more reliable than iTerm variables).
     const persistentNames = getAllPersistentSessionNames();
     const sessions = snapshots.map((s, i) => {
-      const paiName = persistentNames[s.id] ?? null;
+      const paiName = lookupPersistentName(persistentNames, s.id, s.aibrokerId);
       return {
         index: i + 1,
         sessionId: s.id,
@@ -735,6 +737,12 @@ export function registerCoreHandlers(
     if (!message) return { ok: false, error: "message is required" };
 
     const snapshots = snapshotAllSessions();
+    // Enrich with persistent names so target-by-name matches a renamed session
+    // (tmux names key on the durable @aibroker_id, not the volatile pane id).
+    const persistentNames = getAllPersistentSessionNames();
+    for (const snap of snapshots) {
+      snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
+    }
 
     let itermSessionId: string | null = null;
     let resolvedName: string | null = null;
@@ -954,6 +962,20 @@ export function registerCoreHandlers(
   });
 
   /**
+   * pailot_debug_state — Ask the PAILot app for its current rendered session list.
+   * Publishes a debug_state_request over MQTT and awaits the app's response.
+   */
+  server.on("pailot_debug_state", async (req) => {
+    const timeoutMs = ((req as any).timeout ?? 5) * 1000;
+    try {
+      const response = await mqttRequestDebugState(timeoutMs);
+      return { ok: true, result: response };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  });
+
+  /**
    * rename — Rename session: update registry, tab title, badge, and session variable.
    *
    * Resolves the caller's iTerm2 session from req.itermSessionId (set by IPC client
@@ -963,6 +985,28 @@ export function registerCoreHandlers(
   server.on("rename", async (req) => {
     const { name } = req.params as { name: string };
     if (!name) return { ok: false, error: "name is required" };
+
+    // A caller inside tmux identifies by $TMUX_PANE (correct per pane). Its
+    // inherited ITERM_SESSION_ID points at whatever iTerm tab first started the
+    // tmux server — a DIFFERENT session — so for tmux callers we MUST ignore it
+    // and key the name on the pane's durable @aibroker_id instead. (Renaming the
+    // wrong session is exactly the bug this guards against.)
+    if (req.tmuxPane) {
+      const tmuxPane = req.tmuxPane;
+      const snap = snapshotAllSessions().find((s) => s.id === tmuxPane);
+      const durableId = snap?.aibrokerId ?? tmuxPane;
+      setPersistentSessionName(durableId, name);
+      setSessionTitle(tmuxPane, name);
+      manager.updateName(durableId, name);
+      log(`Persisted name "${name}" for tmux pane ${tmuxPane} (key ${durableId.slice(0, 8)})`);
+      for (const adapter of registry.list()) {
+        try {
+          const client = new WatcherClient(adapter.socketPath);
+          await client.call_raw("rename", { name, sessionId: req.sessionId });
+        } catch { /* best effort */ }
+      }
+      return { ok: true, result: { success: true, name } };
+    }
 
     // Resolve caller's iTerm2 session UUID from "w0t0p0:UUID" format
     const rawItermId = req.itermSessionId;

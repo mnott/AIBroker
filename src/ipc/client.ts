@@ -38,6 +38,7 @@ export class WatcherClient {
     const params: Record<string, unknown> = { name: name ?? this.defaultName };
     const itermSessionId = process.env.ITERM_SESSION_ID;
     if (itermSessionId) params.itermSessionId = itermSessionId;
+    if (process.env.TMUX_PANE) params.tmuxPane = process.env.TMUX_PANE;
     return this.call("register", params);
   }
 
@@ -176,6 +177,7 @@ export class WatcherClient {
         };
         const itermId = process.env.ITERM_SESSION_ID;
         if (itermId) request.itermSessionId = itermId;
+        if (process.env.TMUX_PANE) request.tmuxPane = process.env.TMUX_PANE;
         socket!.write(JSON.stringify(request) + "\n");
       });
 

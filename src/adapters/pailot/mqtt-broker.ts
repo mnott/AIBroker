@@ -277,6 +277,33 @@ export function mqttPublishControl(payload: Record<string, unknown>): void {
   });
 }
 
+// --- Debug-state request/response (pailot_debug_state MCP tool) ---
+
+type DebugStateResolver = (payload: Record<string, unknown>) => void;
+const pendingDebugRequests = new Map<string, { resolve: DebugStateResolver; timer: ReturnType<typeof setTimeout> }>();
+
+/**
+ * Send a debug_state_request to the PAILot app and await its response.
+ * Returns the parsed response payload, or throws on timeout.
+ */
+export function mqttRequestDebugState(timeoutMs = 5000): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const requestId = randomUUID();
+    const timer = setTimeout(() => {
+      pendingDebugRequests.delete(requestId);
+      reject(new Error("pailot_debug_state: app did not respond within timeout"));
+    }, timeoutMs);
+    pendingDebugRequests.set(requestId, { resolve, timer });
+    mqttPublish("pailot/control/out", {
+      msgId: randomUUID(),
+      type: "debug_state_request",
+      requestId,
+      ts: Date.now(),
+    });
+    log(`[MQTT] debug_state_request sent (requestId=${requestId})`);
+  });
+}
+
 // --- Broker lifecycle ---
 
 export type MqttInboundHandler = (
@@ -427,6 +454,22 @@ export async function startMqttBroker(version?: string): Promise<void> {
 
         const command = (payload.command as string) ?? (payload.type as string);
         log(`[MQTT] <- command: ${command}`);
+
+        // Intercept debug_state_response — resolve pending promise, don't forward
+        if (command === "debug_state_response") {
+          const requestId = payload.requestId as string | undefined;
+          if (requestId && pendingDebugRequests.has(requestId)) {
+            const { resolve, timer } = pendingDebugRequests.get(requestId)!;
+            clearTimeout(timer);
+            pendingDebugRequests.delete(requestId);
+            resolve(payload);
+            log(`[MQTT] debug_state_response resolved (requestId=${requestId})`);
+          } else {
+            log(`[MQTT] debug_state_response: unknown requestId=${requestId ?? "(none)"}`);
+          }
+          return;
+        }
+
         inboundHandler?.(undefined, "command", payload);
       } catch (err) {
         const raw = packet.payload.toString();

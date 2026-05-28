@@ -7,7 +7,7 @@
  */
 
 import type { Backend, SessionBackendConfig } from "../../types/backend.js";
-import { typeIntoSession } from "../iterm/core.js";
+import { typeIntoSession } from "../../transport/sync-facade.js";
 import { log } from "../../core/log.js";
 import { activeItermSessionId, sessionRegistry } from "../../core/state.js";
 

@@ -43,16 +43,18 @@ import {
 import {
   runAppleScript,
   findClaudeSession,
-  isClaudeRunningInSession,
   isScreenLocked,
-  typeIntoSession,
-  pasteTextIntoSession,
   sendKeystrokeToSession,
   sendEscapeSequenceToSession,
   stripItermPrefix,
   writeToTty,
-  snapshotAllSessions,
 } from "../adapters/iterm/core.js";
+import {
+  isClaudeRunningInSession,
+  typeIntoSession,
+  pasteTextIntoSession,
+  snapshotAllSessions,
+} from "../transport/sync-facade.js";
 import { log } from "../core/log.js";
 import { statusCache } from "../core/status-cache.js";
 import { router } from "../core/router.js";

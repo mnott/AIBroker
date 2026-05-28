@@ -29,7 +29,8 @@ import type { CommandContext } from "./command-context.js";
 import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
 import { AibpBridge } from "../aibp/bridge.js";
-import { typeIntoSession, findClaudeSession, isClaudeRunningInSession } from "../adapters/iterm/core.js";
+import { findClaudeSession } from "../adapters/iterm/core.js";
+import { typeIntoSession, isClaudeRunningInSession } from "../transport/sync-facade.js";
 import { activeItermSessionId, setActiveItermSessionId, setLastRoutedSessionId } from "../core/state.js";
 import { pruneStaleContexts } from "./image-context.js";
 

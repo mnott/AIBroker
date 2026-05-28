@@ -206,28 +206,39 @@ export interface SessionSnapshot {
   tty: string;
   atPrompt: boolean;
   paiName: string | null;
+  /**
+   * Durable, transport-stable id. For tmux this is the pane's @aibroker_id
+   * (survives server restarts, unlike the volatile %N pane id). For iTerm it is
+   * undefined — the GUID in `id` is already stable. Persistent-name lookups key
+   * on this when present so a tmux session keeps its name across %N churn.
+   */
+  aibrokerId?: string | null;
 }
 
 /**
  * snapshotAllSessions — Fast enumeration of all iTerm2 sessions.
  *
- * Single AppleScript pass: id, name, profile, tty per session.
- * ~1.5s for 18 sessions (vs >30s timeout with the old combined script).
+ * Single AppleScript pass: id, name, tty, tab.title per session.
+ * ~1.5s for 16 sessions (vs >30s timeout with the old combined script).
  *
- * What was dropped vs the original:
+ * What is still dropped vs the original (kept out for speed):
  * - `is at shell prompt`: adds ~180ms/session (3.3s for 18). Derived from name instead.
- * - `variable named "user.paiName"`: removed from AppleScript loop entirely.
- *   paiName is now read from ~/.aibroker/session-names.json by the caller via
- *   getAllPersistentSessionNames(). This makes paiName authoritative (no iTerm corruption),
- *   faster (file read instead of AppleScript), and consistent with what rename writes.
+ * - `profile name`: ~0.6s overhead, always "Default" in practice.
+ * - `variable named "user.paiName"`: paiName is read from ~/.aibroker/session-names.json
+ *   by the caller via getAllPersistentSessionNames() — authoritative, no iTerm corruption.
+ *
+ * `tab.title` IS fetched (one variable read, measured ~1.5s total for 16 sessions). It was
+ * wrongly dropped in v0.7.10, which collapsed the display precedence `paiName ?? tabTitle ?? name`
+ * down to `paiName ?? name` — so any session without a persistent paiName rendered the raw
+ * iTerm process string ("claude (node)") instead of its tab title. Restoring it fixes that.
  *
  * atPrompt heuristic: iTerm2's title reporter encodes the foreground process in the
  * tab name — "(node)" = Claude Code running (not at prompt). "(-zsh)", "(-bash)",
  * "(ssh)", bare path names = shell at prompt. Accurate for sessions display.
  */
 export function snapshotAllSessions(): SessionSnapshot[] {
-  // Fetch id, name, tty. Skip `profile name` (~0.6s overhead) and
-  // `is at shell prompt` (~3.3s overhead) — both are derived or irrelevant.
+  // Fetch id, name, tty, tab.title. Skip `profile name` (~0.6s) and
+  // `is at shell prompt` (~3.3s) — both derived or irrelevant.
   const script = `
 tell application "iTerm2"
   set output to ""
@@ -237,21 +248,28 @@ tell application "iTerm2"
         set sessionId to id of aSession
         set sessionName to name of aSession
         set sessionTty to tty of aSession
-        set output to output & sessionId & (ASCII character 9) & sessionName & (ASCII character 9) & sessionTty & linefeed
+        tell aSession
+          try
+            set tabTitle to (variable named "tab.title")
+          on error
+            set tabTitle to ""
+          end try
+        end tell
+        set output to output & sessionId & (ASCII character 9) & sessionName & (ASCII character 9) & sessionTty & (ASCII character 9) & tabTitle & linefeed
       end repeat
     end repeat
   end repeat
   return output
 end tell`;
 
-  // 4s timeout. id+name+tty = ~2.1s for 18 sessions. 4s gives safe headroom.
+  // 4s timeout. id+name+tty+tab.title = ~1.5s for 16 sessions. 4s gives safe headroom.
   const result = runAppleScript(script, 4_000);
   if (!result) return [];
 
   const sessions: SessionSnapshot[] = [];
   for (const line of result.split("\n").filter(Boolean)) {
     const parts = line.split("\t");
-    if (parts.length < 3) continue;
+    if (parts.length < 4) continue;
     const name = parts[1];
     // Derive atPrompt from name heuristic: "(node)" = Claude Code running (not at prompt).
     // "(-zsh)", "(-bash)", "(ssh)", bare path = at shell prompt.
@@ -262,7 +280,7 @@ end tell`;
       profileName: "Default",   // profile name skipped for speed; always "Default" in practice
       tty: parts[2],
       atPrompt,
-      tabTitle: null,
+      tabTitle: (parts[3] && parts[3] !== "missing value" && parts[3] !== "") ? parts[3] : null,
       // paiName is null here — callers merge from getAllPersistentSessionNames()
       paiName: null,
     });

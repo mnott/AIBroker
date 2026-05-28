@@ -183,6 +183,21 @@ export function getAllPersistentSessionNames(): SessionNamesStore {
 }
 
 /**
+ * Resolve the persistent name for a session, preferring the durable id over the
+ * primary id. tmux pane ids (%N) reset on server restart, so tmux names are keyed
+ * on the pane's @aibroker_id (passed as `durableId`); iTerm GUIDs are already
+ * stable and pass `durableId` undefined.
+ */
+export function lookupPersistentName(
+  names: SessionNamesStore,
+  id: string,
+  durableId?: string | null,
+): string | null {
+  if (durableId && names[durableId]) return names[durableId];
+  return names[id] ?? null;
+}
+
+/**
  * Remove a persistent name when a session ends.
  */
 export function removePersistentSessionName(itermSessionId: string): void {
