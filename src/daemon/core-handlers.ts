@@ -25,7 +25,7 @@ import { randomUUID } from "node:crypto";
 import { registerToken as apnsRegisterToken, getTokens as apnsGetTokens } from "../apns/client.js";
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
-import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText } from "../adapters/pailot/gateway.js";
+import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText, handleMqttCommand } from "../adapters/pailot/gateway.js";
 import { mqttRequestDebugState } from "../adapters/pailot/mqtt-broker.js";
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName, lookupPersistentName } from "../core/persistence.js";
@@ -36,7 +36,7 @@ import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-project
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames } from "../adapters/iterm/core.js";
-import { snapshotAllSessions, typeIntoSession, setSessionTitle } from "../transport/sync-facade.js";
+import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId } from "../transport/sync-facade.js";
 import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
@@ -998,7 +998,23 @@ export function registerCoreHandlers(
       setPersistentSessionName(durableId, name);
       setSessionTitle(tmuxPane, name);
       manager.updateName(durableId, name);
-      log(`Persisted name "${name}" for tmux pane ${tmuxPane} (key ${durableId.slice(0, 8)})`);
+
+      // Visible surfaces: if this pane is being viewed in an iTerm tab, set the
+      // same iTerm visuals (red-overlay badge + tab title + paiName var) on the
+      // host tab. tmux keeps `set-titles off`, so Claude's own title escape stays
+      // trapped in pane_title and does NOT overwrite the iTerm tab title — so
+      // unlike the tmux pane title, these stick.
+      const viewerId = itermViewerSessionId(tmuxPane);
+      if (viewerId) {
+        setItermSessionVar(viewerId, name);
+        setItermTabName(viewerId, name);
+        setItermBadge(viewerId, name);
+      }
+      log(`Persisted name "${name}" for tmux pane ${tmuxPane} (key ${durableId.slice(0, 8)}, ${viewerId ? `iterm viewer ${viewerId.slice(0, 8)}` : "detached"})`);
+
+      // Refresh PAILot's session list (the daemon rename otherwise only reaches
+      // whazaa/telex, never the in-process PAILot gateway).
+      handleMqttCommand("sessions");
       for (const adapter of registry.list()) {
         try {
           const client = new WatcherClient(adapter.socketPath);
@@ -1037,7 +1053,9 @@ export function registerCoreHandlers(
       setItermBadge(itermSessionId, name);
     }
 
-    // Forward to all adapters (best effort — for PAILot session list sync)
+    // Refresh PAILot's session list (in-process gateway is not a registry adapter).
+    handleMqttCommand("sessions");
+    // Forward to all adapters (best effort — Whazaa/Telex session list sync)
     for (const adapter of registry.list()) {
       try {
         const client = new WatcherClient(adapter.socketPath);

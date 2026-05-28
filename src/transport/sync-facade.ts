@@ -113,4 +113,17 @@ export function setSessionTitle(id: string, title: string): boolean {
   return false;
 }
 
+/**
+ * For a tmux pane id, return the iTerm2 session id of the tab currently viewing
+ * it (via the tmux client tty → iTerm tty match), or null if detached / not on
+ * iTerm. Uses the RAW iTerm enumeration (not the de-duped facade list, which
+ * suppresses viewer tabs) so the host tab can still receive iTerm visuals.
+ */
+export function itermViewerSessionId(tmuxPaneId: string): string | null {
+  if (!allowTmux || !allowIterm) return null;
+  const tty = tmuxTransport.clientTtyForPane(tmuxPaneId);
+  if (!tty) return null;
+  return iterm.snapshotAllSessions().find((s) => s.tty === tty)?.id ?? null;
+}
+
 log(`sync-facade: transports permitted = [${[allowIterm ? "iterm" : null, allowTmux ? "tmux" : null].filter(Boolean).join(", ")}] (availability checked live per enumeration)`);
