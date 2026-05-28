@@ -84,15 +84,18 @@ function detectSessionId(): string | undefined {
 }
 
 // Resolve session identity:
-// 1. ITERM_SESSION_ID env var (most reliable — set by iTerm per tab)
-// 2. Try AIBP registration with hub (preferred — hub resolves identity)
-// 3. Fall back to TTY detection (legacy — fragile but works on macOS)
-_resolvedSessionId = process.env.ITERM_SESSION_ID?.split(":")[1] ?? detectSessionId();
+// 0. TMUX_PANE (when inside tmux) — the pane id IS the daemon's session id for a
+//    tmux session, and is correct per pane (ITERM_SESSION_ID would be the stale
+//    id of the iTerm tab that birthed the tmux server — a different session).
+// 1. ITERM_SESSION_ID env var (set by iTerm per tab)
+// 2. AIBP registration with hub (hub resolves identity)
+// 3. TTY detection (legacy — fragile but works on macOS)
+_resolvedSessionId = process.env.TMUX_PANE ?? process.env.ITERM_SESSION_ID?.split(":")[1] ?? detectSessionId();
 
 async function registerWithAibp(): Promise<void> {
   try {
     const pluginId = _resolvedSessionId ?? `mcp-${process.pid}`;
-    const sessionEnvId = process.env.ITERM_SESSION_ID?.split(":")[1] ?? _resolvedSessionId;
+    const sessionEnvId = process.env.TMUX_PANE ?? process.env.ITERM_SESSION_ID?.split(":")[1] ?? _resolvedSessionId;
     const result = await hub.call_raw("aibp_register", {
       pluginId,
       sessionEnvId,
@@ -112,6 +115,10 @@ async function registerWithAibp(): Promise<void> {
 void registerWithAibp();
 
 function getSessionId(): string | undefined {
+  // Inside tmux, the pane id is the authoritative per-session identity (it equals
+  // the daemon's snapshot id for tmux sessions). It must win over any AIBP/iTerm
+  // value, which would be the stale id of the tab that started the tmux server.
+  if (process.env.TMUX_PANE) return process.env.TMUX_PANE;
   // Prefer AIBP-resolved session, fall back to iTerm env var
   if (_resolvedSessionId) return _resolvedSessionId;
   const envId = process.env.ITERM_SESSION_ID?.split(":")[1];

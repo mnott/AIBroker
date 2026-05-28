@@ -99,6 +99,13 @@ export class IpcServer {
   }
 
   private async dispatch(req: IpcRequest): Promise<IpcResponse> {
+    // A tmux-hosted caller's ITERM_SESSION_ID is the stale id of the iTerm tab
+    // that started the tmux server (a different session). Identify the caller by
+    // its tmux pane id — which is exactly what session snapshots use as the id for
+    // tmux sessions — so mailbox drain, sender label, and response routing all
+    // target the right session. (rename inspects req.tmuxPane explicitly first.)
+    if (req.tmuxPane) req.itermSessionId = req.tmuxPane;
+
     // Auto-register unknown sessions
     if (req.method !== "register" && !sessionRegistry.has(req.sessionId)) {
       sessionRegistry.set(req.sessionId, {
