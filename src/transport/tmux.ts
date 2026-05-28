@@ -178,6 +178,23 @@ export class TmuxTransport implements SessionTransport {
     return new Set(out.split("\n").map((s) => s.trim()).filter(Boolean));
   }
 
+  /**
+   * tty of the terminal (e.g. iTerm tab) currently viewing the given pane's
+   * session, or null if the session is detached. Lets callers map a tmux pane
+   * back to its host iTerm tab so iTerm visuals (badge/tab title) can be set on
+   * the tab the user is actually looking at.
+   */
+  clientTtyForPane(paneId: string): string | null {
+    const session = runTmux(["display-message", "-p", "-t", paneId, "#{session_name}"]);
+    if (session == null) return null;
+    const name = session.trim();
+    if (!name) return null;
+    const out = runTmux(["list-clients", "-t", name, "-F", "#{client_tty}"]);
+    if (out == null) return null;
+    const tty = out.split("\n").map((s) => s.trim()).filter(Boolean)[0];
+    return tty ?? null;
+  }
+
   isBusy(id: string): boolean {
     const out = runTmux(["display-message", "-p", "-t", id, "#{pane_current_command}"]);
     if (out == null) return false;
