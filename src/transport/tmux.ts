@@ -39,11 +39,28 @@ function resolveTmuxBin(): string {
 }
 const TMUX_BIN = resolveTmuxBin();
 
+/**
+ * tmux transliterates non-ASCII output to "_" under a C/POSIX locale — which is
+ * exactly what launchd hands the daemon (no LANG/LC_*). That mangles BOTH the
+ * \x01 FIELD_SEP (→ "_", so list-panes rows no longer split and every field
+ * collapses into the "pane id") AND unicode pane titles. Forcing a UTF-8 locale
+ * keeps the separator and titles intact. ANTHROPIC_API_KEY is stripped from the
+ * spawned env per policy (never leak it to child processes).
+ */
+const TMUX_ENV: NodeJS.ProcessEnv = (() => {
+  const e: NodeJS.ProcessEnv = { ...process.env };
+  e.LC_ALL = "en_US.UTF-8";
+  e.LANG = "en_US.UTF-8";
+  delete e.ANTHROPIC_API_KEY;
+  return e;
+})();
+
 function runTmux(args: string[], timeoutMs = 4_000): string | null {
   const result = spawnSync(TMUX_BIN, args, {
     stdio: ["pipe", "pipe", "pipe"],
     timeout: timeoutMs,
     encoding: "utf8",
+    env: TMUX_ENV,
   });
   if (result.status !== 0) {
     const stderr = (result.stderr ?? "").toString().trim();
