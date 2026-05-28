@@ -28,7 +28,7 @@ import {
   clientQueues,
   updateSessionTtyCache,
 } from "../../core/state.js";
-import { saveSessionRegistry, getAllPersistentSessionNames } from "../../core/persistence.js";
+import { saveSessionRegistry, getAllPersistentSessionNames, lookupPersistentName } from "../../core/persistence.js";
 
 // ── Session Variable Helpers ──
 
@@ -145,8 +145,8 @@ export function listClaudeSessions(): Array<{ id: string; name: string }> {
   const sessions = snapshotAllSessions();
   const persistentNames = getAllPersistentSessionNames();
   return sessions
-    .filter((s) => s.name.toLowerCase().includes("claude") || persistentNames[s.id])
-    .map((s) => ({ id: s.id, name: persistentNames[s.id] ?? s.name }));
+    .filter((s) => s.name.toLowerCase().includes("claude") || lookupPersistentName(persistentNames, s.id, s.aibrokerId))
+    .map((s) => ({ id: s.id, name: lookupPersistentName(persistentNames, s.id, s.aibrokerId) ?? s.name }));
 }
 
 /**
@@ -174,7 +174,7 @@ export function getSessionList(): Array<{
   }
 
   return snapshots.map((s) => {
-    const paiName = persistentNames[s.id] ?? null;
+    const paiName = lookupPersistentName(persistentNames, s.id, s.aibrokerId);
     return {
       id: s.id,
       name: paiName ?? s.name,

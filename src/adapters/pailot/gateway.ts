@@ -39,7 +39,8 @@ import {
 } from "../../core/state.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, killSession, createClaudeSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
-import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, pasteTextIntoSession, snapshotAllSessions } from "../iterm/core.js";
+import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession } from "../iterm/core.js";
+import { pasteTextIntoSession, snapshotAllSessions } from "../../transport/sync-facade.js";
 import { hybridManager } from "../../core/hybrid.js";
 import {
   mqttPublishText,
@@ -57,7 +58,7 @@ import {
 import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
-import { getAllPersistentSessionNames } from "../../core/persistence.js";
+import { getAllPersistentSessionNames, lookupPersistentName } from "../../core/persistence.js";
 
 /**
  * Enrich snapshots with paiName from the persistent JSON store.
@@ -68,7 +69,7 @@ function enrichedSnapshots(): ReturnType<typeof snapshotAllSessions> {
   const snaps = snapshotAllSessions();
   const persistentNames = getAllPersistentSessionNames();
   for (const snap of snaps) {
-    snap.paiName = persistentNames[snap.id] ?? null;
+    snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
   }
   return snaps;
 }

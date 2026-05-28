@@ -7,7 +7,8 @@
  * Part of Session Orchestration (Phase 1, v0.7).
  */
 
-import { runAppleScript, withSessionAppleScript, snapshotAllSessions } from "../adapters/iterm/core.js";
+import { runAppleScript, withSessionAppleScript } from "../adapters/iterm/core.js";
+import { snapshotAllSessions } from "../transport/sync-facade.js";
 import { log } from "../core/log.js";
 
 export interface SessionContent {
