@@ -886,9 +886,11 @@ export function registerCoreHandlers(
       image?: boolean;
     };
     if (!text && !imageBase64) return { ok: false, error: "text or imageBase64 is required" };
-    // MCP server may not have ITERM_SESSION_ID — fall back to session that last
-    // received user input from PAILot (survives session switches during processing)
-    const sessionId = callerSessionId || lastRoutedSessionId || activeItermSessionId || undefined;
+    // A tmux caller is authoritatively its pane id (req.tmuxPane) — don't trust
+    // callerSessionId, which an older MCP derives from the stale ITERM_SESSION_ID.
+    // Otherwise: MCP server may not have ITERM_SESSION_ID — fall back to the session
+    // that last received PAILot input (survives session switches during processing).
+    const sessionId = req.tmuxPane || callerSessionId || lastRoutedSessionId || activeItermSessionId || undefined;
     log(`[pailot_send] callerSession=${callerSessionId?.slice(0, 8) ?? "none"} lastRouted=${lastRoutedSessionId?.slice(0, 8) ?? "none"} activeIterm=${activeItermSessionId?.slice(0, 8) ?? "none"} → resolved=${sessionId?.slice(0, 8) ?? "none"}`);
 
     try {
