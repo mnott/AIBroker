@@ -86,6 +86,38 @@ export class TmuxTransport implements SessionTransport {
     return runTmux(["list-panes", "-a"], 2_000) != null;
   }
 
+  /**
+   * Resolve a session's CURRENT pane id from a stable id. Accepts either a pane
+   * id ("%3" — returned as-is) or an @aibroker_id (looked up live). Pane ids are
+   * ephemeral and reused (every first pane is %0), so the public ops take the
+   * durable @aibroker_id as identity and resolve the live pane here. Returns null
+   * if no live pane carries that id.
+   */
+  paneFor(stableId: string): string | null {
+    if (stableId.startsWith("%")) return stableId;
+    const out = runTmux(["list-panes", "-a", "-F", `#{@aibroker_id}${FIELD_SEP}#{pane_id}`]);
+    if (out == null) return null;
+    for (const line of out.split("\n").filter(Boolean)) {
+      const [aid, pane] = line.split(FIELD_SEP);
+      if (aid && aid === stableId) return pane ?? null;
+    }
+    return null;
+  }
+
+  /**
+   * Durable @aibroker_id for a pane id (assigning one if the pane lacks it).
+   * Used to translate an inbound caller's $TMUX_PANE into the stable identity.
+   */
+  aibrokerIdForPane(paneId: string): string | null {
+    const existing = runTmux(["display-message", "-p", "-t", paneId, "#{@aibroker_id}"]);
+    if (existing == null) return null;
+    const id = existing.trim();
+    if (id) return id;
+    const fresh = randomUUID();
+    runTmux(["set-option", "-p", "-t", paneId, "@aibroker_id", fresh]);
+    return fresh;
+  }
+
   listSessions(): ManagedSession[] {
     const fmt = ["#{pane_id}", "#{pane_current_command}", "#{pane_title}", "#{pane_tty}", "#{@aibroker_id}"].join(FIELD_SEP);
     const out = runTmux(["list-panes", "-a", "-F", fmt]);
@@ -105,7 +137,9 @@ export class TmuxTransport implements SessionTransport {
 
       const cleanTitle = title && title.trim().length > 0 ? title.trim() : null;
       sessions.push({
-        id: paneId,
+        // Identity is the durable @aibroker_id, NOT the volatile pane id — so a
+        // new session reusing pane %0 is a distinct session everywhere upstream.
+        id: aibrokerId,
         name: cleanTitle ?? cmd ?? paneId,
         tabTitle: cleanTitle,
         tty: tty || null,
@@ -119,11 +153,13 @@ export class TmuxTransport implements SessionTransport {
 
   sendText(id: string, text: string, opts: SendOptions = {}): boolean {
     const { enter = true, verify = true, maxRetries = 3 } = opts;
+    const pane = this.paneFor(id);
+    if (pane == null) return false;
 
     let landed = false;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       // Literal send: `--` guards against text starting with '-'; `-l` = no key-name interpretation.
-      const sent = runTmux(["send-keys", "-t", id, "-l", "--", text]);
+      const sent = runTmux(["send-keys", "-t", pane, "-l", "--", text]);
       if (sent == null) return false;
 
       if (!verify) {
@@ -139,30 +175,32 @@ export class TmuxTransport implements SessionTransport {
       }
       for (let poll = 0; poll < 10; poll++) {
         syncSleep(60);
-        const shown = this.capture(id);
+        const shown = this.capture(pane);
         if (shown && shown.includes(probe)) {
           landed = true;
           break;
         }
       }
       if (landed) break;
-      log(`tmux sendText: text did not appear on attempt ${attempt + 1} for ${id}, retrying`);
+      log(`tmux sendText: text did not appear on attempt ${attempt + 1} for ${pane}, retrying`);
     }
 
     if (!landed) {
-      log(`tmux sendText: gave up after ${maxRetries} attempts for ${id}`);
+      log(`tmux sendText: gave up after ${maxRetries} attempts for ${pane}`);
       return false;
     }
 
     if (enter) {
       // Separate keystroke — combining text+Enter in one send is the unreliable path.
-      if (runTmux(["send-keys", "-t", id, "Enter"]) == null) return false;
+      if (runTmux(["send-keys", "-t", pane, "Enter"]) == null) return false;
     }
     return true;
   }
 
   capture(id: string, lines?: number): string | null {
-    const args = ["capture-pane", "-t", id, "-p"];
+    const pane = this.paneFor(id);
+    if (pane == null) return null;
+    const args = ["capture-pane", "-t", pane, "-p"];
     if (lines && lines > 0) args.push("-S", `-${lines}`);
     return runTmux(args);
   }
@@ -184,8 +222,10 @@ export class TmuxTransport implements SessionTransport {
    * back to its host iTerm tab so iTerm visuals (badge/tab title) can be set on
    * the tab the user is actually looking at.
    */
-  clientTtyForPane(paneId: string): string | null {
-    const session = runTmux(["display-message", "-p", "-t", paneId, "#{session_name}"]);
+  clientTtyForPane(id: string): string | null {
+    const pane = this.paneFor(id);
+    if (pane == null) return null;
+    const session = runTmux(["display-message", "-p", "-t", pane, "#{session_name}"]);
     if (session == null) return null;
     const name = session.trim();
     if (!name) return null;
@@ -196,7 +236,9 @@ export class TmuxTransport implements SessionTransport {
   }
 
   isBusy(id: string): boolean {
-    const out = runTmux(["display-message", "-p", "-t", id, "#{pane_current_command}"]);
+    const pane = this.paneFor(id);
+    if (pane == null) return false;
+    const out = runTmux(["display-message", "-p", "-t", pane, "#{pane_current_command}"]);
     if (out == null) return false;
     const cmd = out.trim();
     // Coarse layer: shell command => idle. A program (node/claude/ssh/…) => busy.
@@ -207,6 +249,8 @@ export class TmuxTransport implements SessionTransport {
   }
 
   setTitle(id: string, title: string): boolean {
-    return runTmux(["select-pane", "-t", id, "-T", title]) != null;
+    const pane = this.paneFor(id);
+    if (pane == null) return false;
+    return runTmux(["select-pane", "-t", pane, "-T", title]) != null;
   }
 }

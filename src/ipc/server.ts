@@ -11,6 +11,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import type { IpcRequest, IpcResponse } from "../types/ipc.js";
 import { log } from "../core/log.js";
 import { sessionRegistry, clientQueues } from "../core/state.js";
+import { aibrokerIdForPane } from "../transport/sync-facade.js";
 
 export type IpcHandler = (
   req: IpcRequest,
@@ -101,10 +102,11 @@ export class IpcServer {
   private async dispatch(req: IpcRequest): Promise<IpcResponse> {
     // A tmux-hosted caller's ITERM_SESSION_ID is the stale id of the iTerm tab
     // that started the tmux server (a different session). Identify the caller by
-    // its tmux pane id — which is exactly what session snapshots use as the id for
-    // tmux sessions — so mailbox drain, sender label, and response routing all
-    // target the right session. (rename inspects req.tmuxPane explicitly first.)
-    if (req.tmuxPane) req.itermSessionId = req.tmuxPane;
+    // its durable @aibroker_id (resolved from the pane) — which is exactly what
+    // session snapshots now use as the id for tmux sessions — so mailbox drain,
+    // sender label, and response routing all target the right, stable session and
+    // never collide with a later session that reuses the same pane id.
+    if (req.tmuxPane) req.itermSessionId = aibrokerIdForPane(req.tmuxPane) ?? req.tmuxPane;
 
     // Auto-register unknown sessions
     if (req.method !== "register" && !sessionRegistry.has(req.sessionId)) {

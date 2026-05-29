@@ -36,7 +36,7 @@ import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-project
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames } from "../adapters/iterm/core.js";
-import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId } from "../transport/sync-facade.js";
+import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane } from "../transport/sync-facade.js";
 import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
@@ -886,11 +886,12 @@ export function registerCoreHandlers(
       image?: boolean;
     };
     if (!text && !imageBase64) return { ok: false, error: "text or imageBase64 is required" };
-    // A tmux caller is authoritatively its pane id (req.tmuxPane) — don't trust
-    // callerSessionId, which an older MCP derives from the stale ITERM_SESSION_ID.
-    // Otherwise: MCP server may not have ITERM_SESSION_ID — fall back to the session
-    // that last received PAILot input (survives session switches during processing).
-    const sessionId = req.tmuxPane || callerSessionId || lastRoutedSessionId || activeItermSessionId || undefined;
+    // A tmux caller is authoritatively its durable @aibroker_id (resolved from the
+    // pane) — don't trust callerSessionId, which an older MCP derives from the stale
+    // ITERM_SESSION_ID. Otherwise: MCP may lack ITERM_SESSION_ID — fall back to the
+    // session that last received PAILot input (survives switches during processing).
+    const tmuxStable = req.tmuxPane ? (aibrokerIdForPane(req.tmuxPane) ?? req.tmuxPane) : undefined;
+    const sessionId = tmuxStable || callerSessionId || lastRoutedSessionId || activeItermSessionId || undefined;
     log(`[pailot_send] callerSession=${callerSessionId?.slice(0, 8) ?? "none"} lastRouted=${lastRoutedSessionId?.slice(0, 8) ?? "none"} activeIterm=${activeItermSessionId?.slice(0, 8) ?? "none"} → resolved=${sessionId?.slice(0, 8) ?? "none"}`);
 
     try {
@@ -995,8 +996,7 @@ export function registerCoreHandlers(
     // wrong session is exactly the bug this guards against.)
     if (req.tmuxPane) {
       const tmuxPane = req.tmuxPane;
-      const snap = snapshotAllSessions().find((s) => s.id === tmuxPane);
-      const durableId = snap?.aibrokerId ?? tmuxPane;
+      const durableId = aibrokerIdForPane(tmuxPane) ?? tmuxPane;
       setPersistentSessionName(durableId, name);
       setSessionTitle(tmuxPane, name);
       manager.updateName(durableId, name);
