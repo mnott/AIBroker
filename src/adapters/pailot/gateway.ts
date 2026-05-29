@@ -37,10 +37,10 @@ import {
   setLastRoutedSessionId,
   getAibpBridge,
 } from "../../core/state.js";
-import { setItermSessionVar, setItermTabName, setItermBadge, killSession, createClaudeSession } from "../iterm/sessions.js";
+import { setItermSessionVar, setItermTabName, setItermBadge, createClaudeSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
 import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession } from "../iterm/core.js";
-import { pasteTextIntoSession, snapshotAllSessions } from "../../transport/sync-facade.js";
+import { pasteTextIntoSession, snapshotAllSessions, typeIntoSession } from "../../transport/sync-facade.js";
 import { hybridManager } from "../../core/hybrid.js";
 import {
   mqttPublishText,
@@ -527,22 +527,44 @@ function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void
   }
 
   const target = sessions[idx];
-  // Kill the iTerm2 session if it's visual
-  if (target.kind === "visual" && target.backendSessionId) {
-    killSession(target.backendSessionId);
+  // Clean exit: send "/exit" to the Claude session so it terminates at the
+  // source (works for iTerm and tmux — typeIntoSession routes by id). Once CC
+  // exits, the tab/pane is back at a shell and enumeration no longer reports a
+  // Claude session, so it drops on its own — no record to "delete" and have
+  // rediscovered. If the tab was already closed this is a harmless no-op and the
+  // prune in handleSessionsCommand removes the ghost.
+  if (target.backendSessionId) {
+    typeIntoSession(target.backendSessionId, "/exit");
   }
   const removed = hybridManager.removeByIndex(idx + 1);
   if (removed) {
-    log(`[PAILot] removed ${removed.kind} session "${removed.name}" (${removed.id})`);
+    log(`[PAILot] exited ${removed.kind} session "${removed.name}" (${removed.id}) via /exit`);
   }
 
   // Send updated session list
   handleSessionsCommand(ws);
 }
 
+/**
+ * Guard against the "new" button spawning a burst of tabs. A retained/replayed
+ * MQTT command or an app retry can deliver several creates at once; ignore any
+ * create within 3s of the last so exactly one session is started.
+ */
+let lastCreateAt = 0;
+function createThrottled(): boolean {
+  const now = Date.now();
+  if (now - lastCreateAt < 3000) {
+    log("[PAILot] create throttled — duplicate within 3s ignored");
+    return true;
+  }
+  lastCreateAt = now;
+  return false;
+}
+
 function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}): void {
   const projectName = args.project as string | undefined;
   const path = args.path as string | undefined;
+  const requestedName = typeof args.name === "string" ? args.name.trim() : "";
 
   // PAI project launch — async path
   if (projectName) {
@@ -550,9 +572,12 @@ function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}):
     return;
   }
 
-  // Custom path — cd then claude
-  const command = path ? `cd ${path.replace(/"/g, '\\"')} && claude` : "claude";
-  const name = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
+  if (createThrottled()) { handleSessionsCommand(ws); return; }
+
+  // Launch via clc (the user's launcher: pins model + skip-perms so PAILot can
+  // drive the session without a permission prompt). cd into path first if given.
+  const command = path ? `cd ${path.replace(/"/g, '\\"')} && clc` : "clc";
+  const name = requestedName || (path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude");
 
   const sessionId = createClaudeSession(command);
   if (!sessionId) {
@@ -1005,6 +1030,10 @@ end tell`)?.trim() ?? "";
             case "rename":
               handleRenameCommand(ws, args);
               return;
+            case "refresh":
+              // Force a fresh enumeration + prune + re-push (closed tabs drop here).
+              handleSessionsCommand(ws);
+              return;
             case "remove":
               handleRemoveCommand(ws, args);
               return;
@@ -1393,6 +1422,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
   }
 
   switch (command) {
+    case "refresh":
     case "sessions": {
       // Prune dead sessions and publish current list via MQTT
       const liveSnapshots = enrichedSnapshots();
@@ -1507,8 +1537,10 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
         if (idx >= 0) {
           const target = sessions[idx];
-          if (target.kind === "visual" && target.backendSessionId) {
-            killSession(target.backendSessionId);
+          // Clean exit via "/exit" (routes to iTerm or tmux); enumeration then
+          // drops it. Already-closed tab → harmless no-op + prune.
+          if (target.backendSessionId) {
+            typeIntoSession(target.backendSessionId, "/exit");
           }
           hybridManager.removeByIndex(idx + 1);
         }
@@ -1517,9 +1549,11 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "create": {
+      if (createThrottled()) { handleMqttCommand("sessions"); break; }
       const path = args.path as string | undefined;
-      const command = path ? `cd ${path.replace(/"/g, '\\"')} && claude` : "claude";
-      const name = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
+      const requestedName = typeof args.name === "string" ? args.name.trim() : "";
+      const command = path ? `cd ${path.replace(/"/g, '\\"')} && clc` : "clc";
+      const name = requestedName || (path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude");
       const sessionId = createClaudeSession(command);
       if (!sessionId) { log("[MQTT] create: failed to create session"); break; }
       setItermSessionVar(sessionId, name);
