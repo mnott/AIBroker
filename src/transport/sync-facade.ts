@@ -79,11 +79,23 @@ export function snapshotAllSessions(): SessionSnapshot[] {
   return [...itermSessions, ...tmuxSessions.map(tmuxToSnapshot)];
 }
 
-/** tmux pane ids are "%N"; iTerm uses GUIDs. */
+/**
+ * Decide whether an id belongs to tmux. tmux session ids are now durable
+ * @aibroker_ids (a raw "%N" pane id may also appear during inbound translation).
+ * A "%N" is unambiguously tmux; otherwise check whether a live tmux pane carries
+ * that @aibroker_id (iTerm GUIDs won't match → routed to iTerm).
+ */
 function routeToTmux(id: string): boolean {
   if (!allowTmux) return false;
   if (!allowIterm) return true; // tmux is the only permitted transport
-  return id.startsWith("%");
+  if (id.startsWith("%")) return true;
+  return tmuxTransport.paneFor(id) != null;
+}
+
+/** Translate a caller's $TMUX_PANE into the durable @aibroker_id identity. */
+export function aibrokerIdForPane(paneId: string): string | null {
+  if (!allowTmux) return null;
+  return tmuxTransport.aibrokerIdForPane(paneId);
 }
 
 /** Inject text + Enter into a session. */
