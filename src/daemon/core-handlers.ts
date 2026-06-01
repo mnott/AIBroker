@@ -1014,6 +1014,12 @@ export function registerCoreHandlers(
       }
       log(`Persisted name "${name}" for tmux pane ${tmuxPane} (key ${durableId.slice(0, 8)}, ${viewerId ? `iterm viewer ${viewerId.slice(0, 8)}` : "detached"})`);
 
+      // Also label the Claude Code conversation itself so it shows in /resume's
+      // picker. /rename is a CLI slash command (intercepted on input, not a tool
+      // we can call), but typing it into the caller's own session feeds it as the
+      // next user prompt — the CLI then processes it after the current response.
+      typeIntoSession(durableId, `/rename ${name}`);
+
       // Refresh PAILot's session list (the daemon rename otherwise only reaches
       // whazaa/telex, never the in-process PAILot gateway).
       handleMqttCommand("sessions");
@@ -1053,6 +1059,10 @@ export function registerCoreHandlers(
       setItermSessionVar(itermSessionId, name);
       setItermTabName(itermSessionId, name);
       setItermBadge(itermSessionId, name);
+      // Also label the Claude Code conversation itself so it shows in /resume's
+      // picker. Typing /rename into the caller's stdin lets the CLI intercept it
+      // as the next prompt (slash commands are handled on input, not as tools).
+      typeIntoSession(itermSessionId, `/rename ${name}`);
     }
 
     // Refresh PAILot's session list (in-process gateway is not a registry adapter).
