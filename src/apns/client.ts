@@ -212,3 +212,28 @@ export async function sendPush(
   log(`[APNs] push delivery: ${succeeded}/${tokens.length} succeeded`);
   return succeeded;
 }
+
+/**
+ * Send a SILENT background push that clears the iOS home-screen badge.
+ * resetBadge() alone only resets the in-memory counter — iOS keeps displaying
+ * whatever number the last push set until a new push tells it otherwise. A
+ * SilentNotification with badge: 0 is delivered as a background push (no alert,
+ * no sound) and just repaints the icon. Call on app-connect (WS/MQTT) — the app
+ * being online means the user is reading, so any pending count is stale.
+ */
+export async function sendBadgeClear(): Promise<void> {
+  const tokens = getTokens();
+  if (tokens.length === 0) return;
+  const client = getApnsClient();
+  if (!client) return;
+  resetBadge();
+  try {
+    const { SilentNotification } = require("apns2");
+    await Promise.allSettled(
+      tokens.map((token) => client.send(new SilentNotification(token, { badge: 0 }))),
+    );
+    log(`[APNs] sent silent badge clear to ${tokens.length} token(s)`);
+  } catch (err) {
+    log(`[APNs] badge clear failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
