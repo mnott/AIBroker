@@ -989,6 +989,8 @@ end tell`)?.trim() ?? "";
     log(`PAILot client connected from ${addr}`);
     clients.add(ws);
     clientLastActive.set(ws, Date.now());
+    // App is online → user is reading. Clear the home-screen badge.
+    import("../../apns/client.js").then(m => m.sendBadgeClear()).catch(() => {});
 
     ws.on("pong", () => {
       clientLastActive.set(ws, Date.now());

@@ -503,9 +503,10 @@ export async function startMqttBroker(version?: string): Promise<void> {
     lastConnectTime.set(id, now);
     connectedClients.add(id);
     log(`[MQTT] client connected: ${id} (total: ${connectedClients.size})`);
-    // Reset APNs badge counter when a real PAILot app connects
+    // Clear the home-screen badge when a real PAILot app connects: resets the
+    // in-memory counter AND sends a silent push so iOS repaints the icon to 0.
     if (id.startsWith("pailot")) {
-      import("../../apns/client.js").then(m => m.resetBadge()).catch(() => {});
+      import("../../apns/client.js").then(m => m.sendBadgeClear()).catch(() => {});
     }
   });
 
