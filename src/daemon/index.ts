@@ -15,7 +15,7 @@ import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
 import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession } from "../adapters/pailot/gateway.js";
-import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping, getMqttClientCount } from "../adapters/pailot/mqtt-broker.js";
+import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping, getMqttClientCount, mqttPublishText, mqttPublishControl } from "../adapters/pailot/mqtt-broker.js";
 import { registerToken as apnsRegisterToken, sendPush as apnsSendPush } from "../apns/client.js";
 import { loadQueue, flushQueue } from "../adapters/pailot/message-queue.js";
 import { handleScreenshot } from "./screenshot.js";
@@ -351,6 +351,20 @@ export async function startDaemon(options?: {
     const routeSession = sessionId || undefined;
     if (!routeSession) {
       log(`[MQTT→Hub] no sessionId in inbound ${type} message — dropping`);
+      return;
+    }
+
+    // Validate against the live session list. A stale id (e.g. a Claude Code
+    // session was restarted and got a new id) would otherwise be passed to the
+    // bridge, where the lower transports silently fall back to the active
+    // session — landing the message in the wrong tab. Refuse to route, push a
+    // fresh session list, and tell the user.
+    const knownSession = manager.listSessions().some(s => s.backendSessionId === routeSession);
+    if (!knownSession) {
+      log(`[MQTT→Hub] Rejecting ${type} — sessionId=${routeSession.slice(0, 8)} is stale (no matching session). Refreshing client list.`);
+      mqttPublishControl({ type: "session_not_found", sessionId: routeSession });
+      handleMqttCommand("sessions");
+      mqttPublishText(routeSession, "⚠️ That session no longer exists on the host. Pick a session from the refreshed list and resend.");
       return;
     }
 

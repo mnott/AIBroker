@@ -396,9 +396,17 @@ export async function startMqttBroker(version?: string): Promise<void> {
     const sessionInMatch = topic.match(/^pailot\/([^/]+)\/in$/);
     if (sessionInMatch) {
       try {
-        // Strip control characters (0x00-0x1F) except \t \n \r before parsing
+        // Strip control characters (0x00-0x1F) except \t before parsing.
+        // Raw 0x0A and 0x0D are invalid inside JSON strings — the Flutter
+        // client occasionally emits them when serialising large pasted text.
+        // Escape them as \n / \r so JSON.parse accepts them and the resulting
+        // string preserves the original line breaks.
         const raw = packet.payload.toString();
-        const sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+        const sanitized = raw
+          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
+          .replace(/\r\n/g, "\\n")
+          .replace(/\n/g, "\\n")
+          .replace(/\r/g, "\\n");
         const payload = JSON.parse(sanitized) as Record<string, unknown>;
         const msgId = payload.msgId as string | undefined;
 
@@ -439,9 +447,17 @@ export async function startMqttBroker(version?: string): Promise<void> {
     // Match pailot/control/in — commands from app
     if (topic === "pailot/control/in") {
       try {
-        // Strip control characters (0x00-0x1F) except \t \n \r before parsing
+        // Strip control characters (0x00-0x1F) except \t before parsing.
+        // Raw 0x0A and 0x0D are invalid inside JSON strings — the Flutter
+        // client occasionally emits them when serialising large pasted text.
+        // Escape them as \n / \r so JSON.parse accepts them and the resulting
+        // string preserves the original line breaks.
         const raw = packet.payload.toString();
-        const sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+        const sanitized = raw
+          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
+          .replace(/\r\n/g, "\\n")
+          .replace(/\n/g, "\\n")
+          .replace(/\r/g, "\\n");
         const payload = JSON.parse(sanitized) as Record<string, unknown>;
         const msgId = payload.msgId as string | undefined;
 

@@ -1073,6 +1073,21 @@ end tell`)?.trim() ?? "";
         // We use it for routing instead of guessing from activeItermSessionId.
         const pailotSessionId = typeof msg.sessionId === "string" ? msg.sessionId : undefined;
 
+        // Validate against the live session list. A stale id (e.g. a Claude Code
+        // session was restarted and got a new id) would otherwise silently fall
+        // back to the active session and the message would land in the wrong tab.
+        // Refuse to route, push a fresh session list, and tell the user.
+        if (pailotSessionId && hybridManager) {
+          const known = hybridManager.listSessions().some(s => s.backendSessionId === pailotSessionId);
+          if (!known) {
+            log(`[PAILot] Rejecting message — sessionId=${pailotSessionId.slice(0, 8)} is stale (no matching session). Refreshing client list.`);
+            mqttPublishControl({ type: "session_not_found", sessionId: pailotSessionId });
+            handleMqttCommand("sessions");
+            mqttPublishText(pailotSessionId, "⚠️ That session no longer exists on the host. Pick a session from the refreshed list and resend.");
+            return;
+          }
+        }
+
         // Helper: resolve the routing target for this message.
         // Prefers the explicit PAILot session ID; falls back to active session.
         const routeTarget = pailotSessionId || activeItermSessionId;
