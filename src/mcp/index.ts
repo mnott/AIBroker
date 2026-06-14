@@ -950,6 +950,50 @@ server.tool(
   },
 );
 
+// ═══════════════════════════════════════════════════════════════════════════
+// OTA Tools
+// ═══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  "ota_publish",
+  "Publish an IPA or APK to the aibroker-ota install hub. Returns the install URL.",
+  {
+    slug: z.string().min(1).regex(/^[a-z0-9-]+$/).describe("App slug (lowercase alphanumeric + hyphens)"),
+    name: z.string().min(1).describe("Display name"),
+    bundleId: z.string().min(1).describe("Bundle ID / package name"),
+    version: z.string().min(1).describe("Version string"),
+    platform: z.enum(["ios", "android"]).describe("ios or android"),
+    filePath: z.string().min(1).describe("Absolute host path to .ipa or .apk"),
+  },
+  async ({ slug, name, bundleId, version, platform, filePath }) => {
+    try {
+      const { existsSync } = await import("node:fs");
+      if (!existsSync(filePath)) return err(`File not found: ${filePath}`);
+
+      // Use curl for multipart upload — avoids pulling in a fetch FormData polyfill
+      const { execSync: exec } = await import("node:child_process");
+      const result = exec(
+        [
+          "curl", "-sf", "-X", "POST",
+          "http://127.0.0.1:8765/api/apps",
+          "-F", `slug=${slug}`,
+          "-F", `name=${name}`,
+          "-F", `bundleId=${bundleId}`,
+          "-F", `version=${version}`,
+          "-F", `platform=${platform}`,
+          "-F", `file=@${filePath}`,
+        ].join(" "),
+        { encoding: "utf-8" },
+      );
+      const parsed = JSON.parse(result);
+      if (parsed.installUrl) {
+        return ok(`Published. Install URL: ${parsed.installUrl}`);
+      }
+      return ok(result);
+    } catch (e) { return err(e); }
+  },
+);
+
 // ── Startup ──
 
 async function main() {

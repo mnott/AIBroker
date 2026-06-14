@@ -9,6 +9,12 @@
  *   aibroker stop               Send SIGTERM to daemon
  *   aibroker create-adapter <name> [--display-name <Name>] [--output <dir>]
  *                               Scaffold a new adapter from the built-in template
+ *   aibroker ota <subcommand>   OTA install hub (Docker + Tailscale Serve)
+ *     up                        Start container, write .env, configure Tailscale Serve
+ *     down                      Stop container
+ *     status                    Show container + tailscale serve status
+ *     logs [-f]                 Show container logs
+ *     setup-serve               Configure Tailscale Serve only
  */
 
 import { startDaemon, DAEMON_SOCKET_PATH } from "./index.js";
@@ -114,6 +120,12 @@ switch (command) {
     break;
   }
 
+  case "ota": {
+    const { runOta } = await import("./ota.js");
+    await runOta(rest);
+    break;
+  }
+
   case "create-adapter": {
     // Parse arguments: name, --display-name <Name>, --output <dir>
     const adapterName = rest.find((a) => !a.startsWith("--"));
@@ -147,6 +159,7 @@ switch (command) {
     console.log("  stop               Stop the running daemon");
     console.log("  ping               Quick heartbeat check");
     console.log("  create-adapter     Scaffold a new adapter project");
+    console.log("  ota <sub>          OTA hub: up|down|status|logs|setup-serve");
     console.log("  help               Show this help");
     console.log("\nFlags:");
     console.log("  --version, -v      Show version");
@@ -154,6 +167,6 @@ switch (command) {
 
   default:
     console.error(`Unknown command: ${command}`);
-    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|help]");
+    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|help]");
     process.exit(1);
 }

@@ -1,0 +1,26 @@
+services:
+  aibroker-ota:
+    build:
+      context: ./ota
+      dockerfile: Dockerfile
+    container_name: aibroker-ota
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ${HOME}/.aibroker/ota:/data
+    environment:
+      - DATA_DIR=/data
+      - AIBROKER_OTA_PUBLISHERS=${AIBROKER_OTA_PUBLISHERS:-}
+      - TRUST_HEADER=${TRUST_HEADER:-true}
+    user: "${UID}:${GID}"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8765/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
