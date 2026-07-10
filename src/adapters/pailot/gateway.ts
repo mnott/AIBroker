@@ -37,7 +37,7 @@ import {
   setLastRoutedSessionId,
   getAibpBridge,
 } from "../../core/state.js";
-import { setItermSessionVar, setItermTabName, setItermBadge, createClaudeSession } from "../iterm/sessions.js";
+import { setItermSessionVar, setItermTabName, setItermBadge, createClaudeSession, killSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
 import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession } from "../iterm/core.js";
 import { pasteTextIntoSession, snapshotAllSessions, typeIntoSession } from "../../transport/sync-facade.js";
@@ -58,7 +58,7 @@ import {
 import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
-import { getAllPersistentSessionNames, lookupPersistentName } from "../../core/persistence.js";
+import { getAllPersistentSessionNames, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
 
 /**
  * Enrich snapshots with paiName from the persistent JSON store.
@@ -561,6 +561,35 @@ function createThrottled(): boolean {
   return false;
 }
 
+/**
+ * Poll until an iTerm session is back at a shell prompt (foreground process is no
+ * longer node/Claude — atPrompt heuristic), then run cb. Used so a re-home waits
+ * for a proper /exit + end-session finalization to finish instead of guessing a
+ * fixed delay. Falls through after ~24s so a stuck exit can't hang the tab.
+ */
+function whenAtShellPrompt(sessionId: string, cb: () => void, attempts = 30): void {
+  const snap = snapshotAllSessions().find(s => s.id === sessionId);
+  if ((snap && snap.atPrompt) || attempts <= 0) { cb(); return; }
+  setTimeout(() => whenAtShellPrompt(sessionId, cb, attempts - 1), 800);
+}
+
+/**
+ * Build the shell command to launch Claude in `cwd`, replicating PAI's launcher:
+ * `claude --name <name>` sets the session label, and the single initial-prompt
+ * arg `$'/Name <name>\ngo'` advance-enters the /Name skill (tab + /resume label)
+ * then `go` (resume) — deterministic, no timing. `--dangerously-skip-permissions`
+ * so PAILot can drive the session without permission prompts.
+ */
+function claudeLaunchCommand(cwd: string, name: string): string {
+  const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;          // POSIX single-quote
+  const ansiC = name.replace(/'/g, "");                                // keep the $'...' simple
+  // Double backslash: createClaudeSession embeds this in an AppleScript string
+  // literal, which collapses `\\n` → `\n`; zsh's $'...' then turns `\n` into a
+  // real newline so `/Name <name>` and `go` become two queued inputs.
+  const prompt = `$'/Name ${ansiC}\\\\ngo'`;
+  return `cd ${sq(cwd)} && claude --name ${sq(name)} --dangerously-skip-permissions ${prompt}`;
+}
+
 function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}): void {
   const projectName = args.project as string | undefined;
   const path = args.path as string | undefined;
@@ -631,7 +660,7 @@ async function handleCreateFromProject(ws: WebSocket, projectName: string): Prom
 
 async function handleProjectsCommand(ws: WebSocket): Promise<void> {
   try {
-    const projects = await listPaiProjects();
+    const projects = await listPaiProjects(true);
     const list = projects.map(p => ({
       name: p.displayName || p.name,
       slug: p.slug,
@@ -1532,6 +1561,10 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       const sessionId = args.sessionId as string | undefined;
       const name = args.name as string | undefined;
       if (sessionId && name) {
+        // Persist so the rename survives re-enumeration: enrichedSnapshots reads
+        // paiName from ~/.aibroker/session-names.json and it wins over the tab
+        // title — without this the name reverts on the next sessions refresh.
+        setPersistentSessionName(sessionId, name);
         const sessions = hybridManager.listSessions();
         const session = sessions.find(s => s.backendSessionId === sessionId);
         if (session) {
@@ -1554,23 +1587,54 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
         if (idx >= 0) {
           const target = sessions[idx];
-          // Clean exit via "/exit" (routes to iTerm or tmux); enumeration then
-          // drops it. Already-closed tab → harmless no-op + prune.
-          if (target.backendSessionId) {
-            typeIntoSession(target.backendSessionId, "/exit");
-          }
+          const sid = target.backendSessionId;
+          // Graceful Claude shutdown first (/exit preserves /resume), then hard-
+          // close the iTerm tab so a re-enumeration can't resurrect it. Refresh
+          // the list only AFTER the tab is gone — an immediate refresh re-adds the
+          // still-open tab (the "it reappears" bug).
+          if (sid) typeIntoSession(sid, "/exit");
           hybridManager.removeByIndex(idx + 1);
+          setTimeout(() => {
+            try { if (sid) killSession(sid); } catch (e) { log(`[MQTT] killSession failed: ${e}`); }
+            setTimeout(() => handleMqttCommand("sessions"), 600);
+          }, 2000);
+        } else {
+          handleMqttCommand("sessions");
         }
-        handleMqttCommand("sessions");
       }
       break;
     }
     case "create": {
+      // PAI project launch — opens Claude in the project's rootPath.
+      const projectName = args.project as string | undefined;
+      if (projectName) {
+        const projectDisplay = (typeof args.name === "string" && args.name.trim()) ? args.name.trim() : projectName;
+        (async () => {
+          try {
+            const { itermSessionId } = await launchPaiProject(projectName);
+            hybridManager!.registerVisualSession(projectDisplay, "", itermSessionId);
+            const list = hybridManager!.listSessions();
+            const pidx = list.findIndex(s => s.backendSessionId === itermSessionId);
+            if (pidx >= 0) {
+              hybridManager!.switchToIndex(pidx + 1);
+              setActiveItermSessionId(itermSessionId);
+              setLastRoutedSessionId(itermSessionId);
+            }
+            setPersistentSessionName(itermSessionId, projectDisplay);
+            mqttPublishControl({ type: "session_switched", name: projectDisplay, sessionId: itermSessionId });
+            handleMqttCommand("sessions");
+          } catch (err) {
+            log(`[MQTT] project launch failed: ${err}`);
+            mqttPublishControl({ type: "error", message: `Failed to launch project: ${err instanceof Error ? err.message : String(err)}` });
+          }
+        })();
+        break;
+      }
       if (createThrottled()) { handleMqttCommand("sessions"); break; }
       const path = args.path as string | undefined;
       const requestedName = typeof args.name === "string" ? args.name.trim() : "";
-      const command = path ? `cd ${path.replace(/"/g, '\\"')} && clc` : "clc";
       const name = requestedName || (path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude");
+      const command = claudeLaunchCommand(path ?? "~", name);
       const sessionId = createClaudeSession(command);
       if (!sessionId) { log("[MQTT] create: failed to create session"); break; }
       setItermSessionVar(sessionId, name);
@@ -1584,8 +1648,62 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         setActiveItermSessionId(sessionId);
         setLastRoutedSessionId(sessionId);
       }
+      setPersistentSessionName(sessionId, name);
       mqttPublishControl({ type: "session_switched", name, sessionId });
       handleMqttCommand("sessions");
+      break;
+    }
+    case "rehome": {
+      // "Switch topic": re-home an EXISTING tab to a new directory without
+      // spawning a session. A live Claude owns the TTY, so we exit it gracefully
+      // (/exit preserves /resume), then relaunch clc in the new dir in the SAME
+      // iTerm tab — the session id is unchanged, so the app keeps following it.
+      const rid = args.sessionId as string | undefined;
+      const rpath = args.path as string | undefined;
+      const rname = (typeof args.name === "string" && args.name.trim())
+        ? args.name.trim()
+        : (rpath ? rpath.split("/").filter(Boolean).pop() ?? "Session" : "Session");
+      if (!rid || !rpath) { handleMqttCommand("sessions"); break; }
+      typeIntoSession(rid, "/exit");
+      // Wait for /exit to fully finalize (tab back at a shell prompt) before
+      // relaunching, so the end-session work isn't cut short. Short initial delay
+      // lets /exit register, then poll atPrompt.
+      setTimeout(() => whenAtShellPrompt(rid, () => {
+        typeIntoSession(rid, claudeLaunchCommand(rpath, rname));
+        setItermSessionVar(rid, rname);
+        setItermTabName(rid, rname);
+        setItermBadge(rid, rname);
+        const s = hybridManager!.listSessions().find(x => x.backendSessionId === rid);
+        if (s) s.name = rname;
+        setPersistentSessionName(rid, rname);
+        setActiveItermSessionId(rid);
+        setLastRoutedSessionId(rid);
+        mqttPublishControl({ type: "session_switched", name: rname, sessionId: rid });
+        handleMqttCommand("sessions");
+      }), 1200);
+      break;
+    }
+    case "projects": {
+      // Return ALL active PAI projects (not just the curated shortlist) so the
+      // app's incremental search can find anything with history — see gateway
+      // `listPaiProjects(true)`.
+      (async () => {
+        try {
+          const projects = await listPaiProjects(true);
+          const list = projects.map(p => ({
+            name: p.displayName || p.name,   // shown in the picker
+            launch: p.name,                  // canonical key for create {project}
+            slug: p.slug,
+            path: p.rootPath,
+            sessions: p.sessionCount,
+            lastActive: p.lastActive,
+          }));
+          mqttPublishControl({ type: "projects", projects: list });
+        } catch (err) {
+          log(`[MQTT] projects list failed: ${err}`);
+          mqttPublishControl({ type: "projects", projects: [] });
+        }
+      })();
       break;
     }
     case "catch_up": {
