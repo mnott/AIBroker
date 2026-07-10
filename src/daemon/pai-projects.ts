@@ -43,24 +43,22 @@ interface Cache {
 }
 
 const CACHE_TTL_MS = 30_000;
-let _cache: Cache | null = null;
-
-function isCacheValid(): boolean {
-  if (!_cache) return false;
-  return Date.now() - _cache.fetchedAt < CACHE_TTL_MS;
-}
+let _cache: Cache | null = null;       // curated shortlist
+let _cacheAll: Cache | null = null;    // all active projects (--all)
 
 /** Invalidate the project list cache (e.g. after launching a project). */
 export function invalidatePaiProjectCache(): void {
   _cache = null;
+  _cacheAll = null;
 }
 
 // ── Raw CLI call ──
 
 /** Call `pai project names --json` and parse the JSON output. */
-async function fetchFromCli(): Promise<PaiProject[]> {
+async function fetchFromCli(all: boolean): Promise<PaiProject[]> {
   try {
-    const { stdout } = await execFileAsync("pai", ["project", "names", "--json"], {
+    const args = all ? ["project", "names", "--json", "--all"] : ["project", "names", "--json"];
+    const { stdout } = await execFileAsync("pai", args, {
       timeout: 5_000,
       env: { ...process.env },
     });
@@ -119,14 +117,16 @@ async function fetchFromCli(): Promise<PaiProject[]> {
  * Return all named PAI projects.
  * Results are cached for 30 seconds.
  */
-export async function listPaiProjects(): Promise<PaiProject[]> {
-  if (isCacheValid()) {
-    return _cache!.projects;
+export async function listPaiProjects(all = false): Promise<PaiProject[]> {
+  const cache = all ? _cacheAll : _cache;
+  if (cache && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
+    return cache.projects;
   }
 
-  const projects = await fetchFromCli();
-  _cache = { projects, fetchedAt: Date.now() };
-  log(`pai-projects: loaded ${projects.length} project(s)`);
+  const projects = await fetchFromCli(all);
+  const entry = { projects, fetchedAt: Date.now() };
+  if (all) _cacheAll = entry; else _cache = entry;
+  log(`pai-projects: loaded ${projects.length} project(s)${all ? " (all)" : ""}`);
   return projects;
 }
 
@@ -135,7 +135,11 @@ export async function listPaiProjects(): Promise<PaiProject[]> {
  * Matching is case-insensitive.
  */
 export async function findPaiProject(name: string): Promise<PaiProject | undefined> {
-  const projects = await listPaiProjects();
+  // Resolve against ALL registered projects, not just the curated shortlist —
+  // the picker now offers every project (listPaiProjects(true)), so a launch of a
+  // non-shortlisted project (e.g. glidr) must resolve here too, or it fails with
+  // "project not found".
+  const projects = await listPaiProjects(true);
   const needle = name.toLowerCase();
   return projects.find(
     (p) =>
@@ -202,7 +206,18 @@ export async function launchPaiProject(
     parts.push(`export ${key}=${shellEscape(value)}`);
   }
   parts.push(`cd ${shellEscape(project.rootPath)}`);
-  parts.push(`claude ${flags}`.trim());
+  // Replicate PAI's launch: `--name` sets the session label, and the single
+  // initial-prompt arg `$'/Name <name>\ngo'` advance-enters the /Name skill
+  // (tab + /resume label) then `go` — deterministic, no timing.
+  const label = project.displayName || project.name;
+  const ansiC = label.replace(/'/g, "");
+  // Double backslash — collapsed to `\n` by AppleScript, then to a real newline
+  // by zsh's $'...', so "/Name <name>" and "go" are two queued inputs.
+  const prompt = `$'/Name ${ansiC}\\\\ngo'`;
+  const claudeFlags = flags.includes("--dangerously-skip-permissions")
+    ? flags
+    : `--dangerously-skip-permissions ${flags}`.trim();
+  parts.push(`claude ${claudeFlags} --name ${shellEscape(label)} ${prompt}`);
 
   const command = parts.join(" && ");
   const sessionId = `pai-${project.slug}-${Date.now()}`;
