@@ -126,6 +126,12 @@ switch (command) {
     break;
   }
 
+  case "sessions": {
+    const { runSessions } = await import("./sessions.js");
+    await runSessions(rest);
+    break;
+  }
+
   case "create-adapter": {
     // Parse arguments: name, --display-name <Name>, --output <dir>
     const adapterName = rest.find((a) => !a.startsWith("--"));
@@ -160,6 +166,7 @@ switch (command) {
     console.log("  ping               Quick heartbeat check");
     console.log("  create-adapter     Scaffold a new adapter project");
     console.log("  ota <sub>          OTA hub: up|down|status|logs|setup-serve");
+    console.log("  sessions <sub>     Session backup: snapshot|restore|checkpoint|list|install");
     console.log("  help               Show this help");
     console.log("\nFlags:");
     console.log("  --version, -v      Show version");
@@ -167,6 +174,6 @@ switch (command) {
 
   default:
     console.error(`Unknown command: ${command}`);
-    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|help]");
+    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|sessions|help]");
     process.exit(1);
 }
