@@ -305,10 +305,11 @@ export function registerCoreHandlers(
    * infrastructure failure is an error.
    */
   server.on("dispatch", async (req) => {
-    const { project, message, noSpawn, spawnTimeoutMs, deliverTimeoutMs } = req.params as {
+    const { project, message, noSpawn, budgetMs, spawnTimeoutMs, deliverTimeoutMs } = req.params as {
       project?: string;
       message?: string;
       noSpawn?: boolean;
+      budgetMs?: number;
       spawnTimeoutMs?: number;
       deliverTimeoutMs?: number;
     };
@@ -317,7 +318,7 @@ export function registerCoreHandlers(
 
     const { dispatch } = await import("./dispatch.js");
     try {
-      const result = await dispatch(project, message, { noSpawn, spawnTimeoutMs, deliverTimeoutMs });
+      const result = await dispatch(project, message, { noSpawn, budgetMs, spawnTimeoutMs, deliverTimeoutMs });
       return { ok: true, result: { ...result } };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };

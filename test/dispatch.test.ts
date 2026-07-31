@@ -34,6 +34,7 @@ function deps(over: Partial<DispatchDeps> = {}): DispatchDeps {
     deliver: async () => "ok",
     launch: async () => { throw new Error("launch should not have been called"); },
     waitReady: async () => true,
+    now: () => 0,
     ...over,
   };
 }
@@ -144,6 +145,103 @@ test("multi-line bodies with quotes and backticks survive intact", async () => {
     deliver: async (_id, b) => { body = b; return "ok"; },
   }));
   assert.ok(body.endsWith(nasty), "the body must not be mangled or escaped");
+});
+
+// ── the shared budget ───────────────────────────────────────────────────────
+//
+// The caller wraps this process in its own kill timer. If our stages each held
+// an independent limit they would sum past the caller's budget, it would kill
+// us before our deadline fired, and its timeout would mask our reason — a
+// failure that cannot be reproduced from this side. --timeout is therefore ONE
+// budget shared by every stage.
+
+/** Deps with a controllable clock; `spend` advances it inside a stage. */
+function timed(over: Partial<DispatchDeps> = {}) {
+  let clock = 0;
+  const d = deps({
+    now: () => clock,
+    ...over,
+  });
+  return { deps: d, spend: (ms: number) => { clock += ms; }, elapsed: () => clock };
+}
+
+test("spawn wait and delivery share the budget, never sum past it", async () => {
+  let readyGot = 0;
+  let deliverGot = 0;
+  const t = timed();
+  t.deps.sessions = () => [];
+  t.deps.launch = async () => ({ itermSessionId: "NEW" });
+  // Readiness returns as soon as the input box appears — here after 10s of its
+  // 60s allowance — so the rest of the budget must carry over to delivery.
+  t.deps.waitReady = async (_id, ms) => { readyGot = ms; t.spend(10_000); return true; };
+  t.deps.deliver = async (_id, _b, ms) => { deliverGot = ms; return "ok"; };
+
+  const r = await dispatch("whazaa", "x", { budgetMs: 60_000 }, t.deps);
+
+  assert.equal(r.outcome, "spawned");
+  assert.ok(readyGot <= 60_000, `readiness got ${readyGot}ms of a 60s budget`);
+  assert.equal(deliverGot, 50_000, "delivery gets what booting did not use");
+  assert.ok(
+    t.elapsed() + deliverGot <= 60_000,
+    `worst case ${t.elapsed() + deliverGot}ms exceeds the 60s budget`,
+  );
+});
+
+test("a slow boot leaves delivery a smaller slice, not a fresh one", async () => {
+  let deliverGot = 0;
+  const t = timed();
+  t.deps.sessions = () => [];
+  t.deps.launch = async () => ({ itermSessionId: "NEW" });
+  t.deps.waitReady = async () => { t.spend(50_000); return true; }; // boot ate 50 of 60
+  t.deps.deliver = async (_id, _b, ms) => { deliverGot = ms; return "ok"; };
+
+  await dispatch("whazaa", "x", { budgetMs: 60_000 }, t.deps);
+  assert.equal(deliverGot, 10_000, "delivery should get only the remaining 10s");
+});
+
+test("a boot that eats the whole budget is reported, not blamed on the session", async () => {
+  const t = timed();
+  t.deps.sessions = () => [];
+  t.deps.launch = async () => ({ itermSessionId: "NEW" });
+  t.deps.waitReady = async () => { t.spend(60_000); return true; };
+  t.deps.deliver = async () => { throw new Error("must not deliver with no budget left"); };
+
+  const r = await dispatch("whazaa", "x", { budgetMs: 60_000 }, t.deps);
+  assert.equal(r.outcome, "unreachable");
+  assert.match(r.reason, /budget was spent/);
+});
+
+test("the caller's budget overrides a larger per-stage default", async () => {
+  // Default spawn wait is 90s; a 30s budget must win, or we outlive the caller.
+  let readyGot = 0;
+  const t = timed();
+  t.deps.sessions = () => [];
+  t.deps.launch = async () => ({ itermSessionId: "NEW" });
+  t.deps.waitReady = async (_id, ms) => { readyGot = ms; return true; };
+
+  await dispatch("whazaa", "x", { budgetMs: 30_000 }, t.deps);
+  assert.equal(readyGot, 30_000);
+});
+
+test("no budget means the per-stage defaults apply unchanged", async () => {
+  let readyGot = 0;
+  const t = timed();
+  t.deps.sessions = () => [];
+  t.deps.launch = async () => ({ itermSessionId: "NEW" });
+  t.deps.waitReady = async (_id, ms) => { readyGot = ms; return true; };
+
+  await dispatch("whazaa", "x", {}, t.deps);
+  assert.equal(readyGot, 90_000, "unbudgeted callers keep the old behaviour");
+});
+
+test("delivery to an already-live session respects the budget too", async () => {
+  let deliverGot = 0;
+  const t = timed();
+  t.deps.sessions = () => live("Whazaa");
+  t.deps.deliver = async (_id, _b, ms) => { deliverGot = ms; return "ok"; };
+
+  await dispatch("whazaa", "x", { budgetMs: 20_000 }, t.deps);
+  assert.equal(deliverGot, 20_000);
 });
 
 // ── session matching (PAI's bite #1) ────────────────────────────────────────

@@ -129,6 +129,8 @@ Resolution uses the **curated** alias list only, never `pai project names --all`
 
 `spawned` means *confirmed submitted*, not *tab opened* — delivery is verified by watching the message leave the input box and land in the transcript, which works whether the session is idle or busy.
 
+`--timeout SECONDS` is a **total budget for the whole dispatch**, not a per-stage cap: the readiness wait and the delivery share it, retries included. Callers that wrap this in their own kill timer should set it below theirs — then AIBroker always times out first and returns a reason, instead of being killed and surfacing as the caller's own timeout with the cause lost.
+
 The logic lives in the daemon (`dispatch` IPC), so MCP, PAILot and adapters can route work without shelling out; the CLI is a thin, versioned wrapper for shell callers.
 
 ### 6. Connect an adapter
