@@ -144,6 +144,32 @@ test("submitAndConfirm retries before giving up", async () => {
   assert.equal(attempts, 3);
 });
 
+test("retries never push the call past its budget", async () => {
+  // A 4s floor per attempt used to override a smaller budget: three attempts
+  // ran 12s regardless, outliving a caller that allowed less.
+  let clock = 0;
+  let sends = 0;
+  const io: TerminalIO = {
+    capture: () => BUSY, // never submits, so it always uses the full allowance
+    send: () => { sends++; },
+    sleep: async () => { clock += 500; },
+    now: () => clock,
+  };
+  assert.equal(await submitAndConfirm("S1", "[Task] x", 3_000, io), "no-ack");
+  assert.ok(clock <= 3_000, `ran for ${clock}ms on a 3000ms budget`);
+  assert.ok(sends >= 1, "should still have tried at least once");
+});
+
+test("a zero budget sends nothing and reports honestly", async () => {
+  const io: TerminalIO = {
+    capture: () => BUSY,
+    send: () => { throw new Error("must not send with no budget"); },
+    sleep: async () => {},
+    now: () => 0,
+  };
+  assert.equal(await submitAndConfirm("S1", "[Task] x", 0, io), "no-ack");
+});
+
 test("an unreadable session is reported without sending", async () => {
   const io: TerminalIO = {
     capture: () => null,

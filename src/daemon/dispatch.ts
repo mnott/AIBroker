@@ -53,9 +53,20 @@ export interface DispatchResult {
 export interface DispatchOptions {
   /** Never launch a session; report `skipped` instead. */
   noSpawn?: boolean;
-  /** How long a freshly spawned session may take to accept input. */
+  /**
+   * Total wall-clock budget for the WHOLE dispatch, caller-supplied.
+   *
+   * Stages must share one deadline, not hold their own. Spawning runs
+   * readiness and then delivery in sequence, so per-stage limits add up: a 180s
+   * readiness limit plus a 120s delivery limit is a 300s worst case, which
+   * silently outlives a caller that budgeted 180s and kills the process itself.
+   * The caller then sees its own timeout instead of our reason — a failure we
+   * cannot reproduce from this side. One budget, split across the stages.
+   */
+  budgetMs?: number;
+  /** Cap on the readiness wait, within the budget. */
   spawnTimeoutMs?: number;
-  /** How long to wait for the receiving session to finish reacting. */
+  /** Cap on the delivery wait, within the budget. */
   deliverTimeoutMs?: number;
 }
 
@@ -70,6 +81,8 @@ export interface DispatchDeps {
   deliver: (sessionId: string, body: string, timeoutMs: number) => Promise<AckResult>;
   launch: (project: PaiProject) => Promise<{ itermSessionId: string }>;
   waitReady: (sessionId: string, timeoutMs: number) => Promise<boolean>;
+  /** Clock for the shared budget; injectable so budget maths is testable. */
+  now: () => number;
 }
 
 /** A spawned Claude needs to boot and run its `/Name … go` preamble first. */
@@ -205,10 +218,18 @@ export async function submitAndConfirm(
   const needle = flatten(body.split("\n").find((l) => l.trim().length > 0) ?? body).slice(0, 48);
   if (!needle) return "no-ack";
 
-  const perAttempt = Math.max(4000, Math.floor(timeoutMs / retries));
+  // `timeoutMs` is a hard ceiling on this call, retries included. An earlier
+  // version floored the per-attempt wait at 4s, which quietly overrode a
+  // smaller budget: three attempts still ran for 12s when the caller allowed
+  // less. Anything that can outlive the caller's own kill timer defeats the
+  // point of being handed a budget at all.
+  const overallDeadline = io.now() + timeoutMs;
+  const perAttempt = Math.max(Math.min(4000, timeoutMs), Math.floor(timeoutMs / retries));
+
   for (let attempt = 1; attempt <= retries; attempt++) {
+    if (io.now() >= overallDeadline) break;
     io.send(sessionId, body);
-    const deadline = io.now() + perAttempt;
+    const deadline = Math.min(overallDeadline, io.now() + perAttempt);
     while (io.now() < deadline) {
       await io.sleep(500);
       const frame = io.capture(sessionId);
@@ -256,6 +277,7 @@ const realDeps: DispatchDeps = {
   resolve: findCuratedPaiProject,
   sessions: liveSessions,
   deliver: submitAndConfirm,
+  now: () => Date.now(),
   launch: launchResolvedPaiProject,
   waitReady: waitForReady,
 };
@@ -280,8 +302,14 @@ export async function dispatch(
   opts: DispatchOptions = {},
   deps: DispatchDeps = realDeps,
 ): Promise<DispatchResult> {
-  const spawnTimeoutMs = opts.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS;
-  const deliverTimeoutMs = opts.deliverTimeoutMs ?? DEFAULT_DELIVER_TIMEOUT_MS;
+  const startedAt = deps.now();
+  const budgetMs = opts.budgetMs;
+  /** Time left in the caller's budget; Infinity when they set none. */
+  const left = (): number =>
+    budgetMs === undefined ? Infinity : Math.max(0, budgetMs - (deps.now() - startedAt));
+
+  const spawnTimeoutMs = Math.min(opts.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS, left());
+  const deliverTimeoutMs = () => Math.min(opts.deliverTimeoutMs ?? DEFAULT_DELIVER_TIMEOUT_MS, left());
 
   const project = await deps.resolve(projectName);
   if (!project) {
@@ -301,7 +329,15 @@ export async function dispatch(
   // ── already running? ──
   const existing = findSessionForProject(project, deps.sessions());
   if (existing) {
-    const res = await deps.deliver(existing.id, body, deliverTimeoutMs);
+    if (left() <= 0) {
+      return {
+        outcome: "unreachable",
+        project: label,
+        session: existing.label,
+        reason: `Budget of ${Math.round((budgetMs ?? 0) / 1000)}s left no time to deliver in.`,
+      };
+    }
+    const res = await deps.deliver(existing.id, body, deliverTimeoutMs());
     if (res === "ok") {
       return { outcome: "delivered", project: label, session: existing.label, reason: "" };
     }
@@ -348,7 +384,21 @@ export async function dispatch(
     };
   }
 
-  const res = await deps.deliver(itermSessionId, body, deliverTimeoutMs);
+  // Booting can eat the whole budget. Say so, rather than attempting a delivery
+  // with no time left and blaming the session for not answering.
+  if (left() <= 0) {
+    return {
+      outcome: "unreachable",
+      project: label,
+      session: label,
+      reason:
+        `Launched a session in ${project.rootPath} and it came up, but the ` +
+        `${Math.round((budgetMs ?? 0) / 1000)}s budget was spent getting there, ` +
+        `leaving none to deliver in. Raise the timeout.`,
+    };
+  }
+
+  const res = await deps.deliver(itermSessionId, body, deliverTimeoutMs());
   if (res === "ok") {
     return { outcome: "spawned", project: label, session: label, reason: "" };
   }

@@ -38,7 +38,10 @@ function usage(): void {
   --message TEXT       inline body, for short one-liners
   --json               emit a single JSON object on stdout
   --no-spawn           never launch a session; report "skipped" instead
-  --timeout SECONDS    how long a spawned session may take to come up (default 90)
+  --timeout SECONDS    TOTAL budget for the whole dispatch — spawn wait and
+                       delivery share it, so it is a real upper bound. Set it
+                       below your own kill timer and you always get a reason
+                       back instead of a killed process.
 
 Outcomes (all exit 0 — they are results, not failures):
   delivered      a live session accepted it
@@ -73,9 +76,13 @@ export async function runDispatch(args: string[]): Promise<void> {
     return;
   }
 
+  // A TOTAL budget for the whole dispatch, not a per-stage cap. Callers wrap
+  // this process in their own kill timer; if our stages each held a separate
+  // limit they would sum past the caller's, and the caller would kill us before
+  // our own deadline fired — surfacing as its timeout, with our reason lost.
   const timeout = val("--timeout");
-  const spawnTimeoutMs = timeout !== undefined ? Number(timeout) * 1000 : undefined;
-  if (spawnTimeoutMs !== undefined && (!Number.isFinite(spawnTimeoutMs) || spawnTimeoutMs < 0)) {
+  const budgetMs = timeout !== undefined ? Number(timeout) * 1000 : undefined;
+  if (budgetMs !== undefined && (!Number.isFinite(budgetMs) || budgetMs < 0)) {
     console.error(`--timeout expects a non-negative number of seconds, got "${timeout}"`);
     process.exitCode = 2;
     return;
@@ -87,7 +94,7 @@ export async function runDispatch(args: string[]): Promise<void> {
       project,
       message,
       noSpawn: has("--no-spawn"),
-      spawnTimeoutMs,
+      budgetMs,
     });
     result = res as unknown as DispatchResult;
   } catch (err) {
