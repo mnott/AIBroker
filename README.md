@@ -105,7 +105,33 @@ aibroker sessions restore      # after: reopens every session in its own iTerm2 
 
 The manifest (`~/.aibroker/session-restore.json`) is a **registry, not a mirror**: snapshots merge into it, so closing a session — or shutting everything down before a reboot — never removes anything. Entries leave only via `aibroker sessions forget NAME` or `aibroker sessions prune --older-than DAYS`, and every write keeps a `.bak`. See `aibroker sessions help` for the rest.
 
-### 5. Connect an adapter
+### 5. Dispatch work to a project's session
+
+```bash
+aibroker dispatch <project> --stdin --json [--no-spawn]
+```
+
+Resolves a project to its running Claude session and delivers a message, launching the session if none is running. One atomic call: a caller doing list → launch → send itself races, because a session can start or die between the check and the send.
+
+The body comes in over **stdin** — task bodies are multi-line and carry quotes and backticks, which argv mangles. Messages arrive prefixed `[Task]`, meaning *act on it, do not reply* (unlike `[Session:NAME]`, there is no sender left to reply to).
+
+Outcomes are results, not errors — all exit 0, so a batch keeps going:
+
+| outcome | meaning |
+|---|---|
+| `delivered` | a live session accepted it |
+| `spawned` | none was running; one was launched and accepted it |
+| `unlaunchable` | no curated alias — run `pai project name <identifier> <shortname>` |
+| `unreachable` | tab opened but the session never accepted input |
+| `skipped` | no live session and `--no-spawn` was set |
+
+Resolution uses the **curated** alias list only, never `pai project names --all`: the full set has no aliases and real ambiguity (several registry rows share a display name at different paths), so widening it dispatches work to the wrong directory silently. Bus participation is opt-in by design.
+
+`spawned` means *confirmed submitted*, not *tab opened* — delivery is verified by watching the message leave the input box and land in the transcript, which works whether the session is idle or busy.
+
+The logic lives in the daemon (`dispatch` IPC), so MCP, PAILot and adapters can route work without shelling out; the CLI is a thin, versioned wrapper for shell callers.
+
+### 6. Connect an adapter
 
 ```bash
 # WhatsApp

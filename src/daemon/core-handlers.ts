@@ -295,6 +295,35 @@ export function registerCoreHandlers(
     return { ok: true, result: { project } };
   });
 
+  /**
+   * dispatch — resolve a project to a session and deliver a work order.
+   *
+   * The daemon owns this, not the CLI: `aibroker dispatch` is a thin wrapper so
+   * shell callers (PAI's task bus) get a stable, versioned boundary, while MCP,
+   * PAILot and adapters can route work through the same path without shelling
+   * out. Routing outcomes come back as results with ok:true — only genuine
+   * infrastructure failure is an error.
+   */
+  server.on("dispatch", async (req) => {
+    const { project, message, noSpawn, spawnTimeoutMs, deliverTimeoutMs } = req.params as {
+      project?: string;
+      message?: string;
+      noSpawn?: boolean;
+      spawnTimeoutMs?: number;
+      deliverTimeoutMs?: number;
+    };
+    if (!project) return { ok: false, error: "project is required" };
+    if (!message) return { ok: false, error: "message is required" };
+
+    const { dispatch } = await import("./dispatch.js");
+    try {
+      const result = await dispatch(project, message, { noSpawn, spawnTimeoutMs, deliverTimeoutMs });
+      return { ok: true, result: { ...result } };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
   server.on("pai_launch", async (req) => {
     const { name } = req.params as { name: string };
     if (!name) return { ok: false, error: "name is required" };
