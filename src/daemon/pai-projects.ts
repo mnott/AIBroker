@@ -130,6 +130,35 @@ export async function listPaiProjects(all = false): Promise<PaiProject[]> {
   return projects;
 }
 
+/** Case-insensitive match of a needle against a project's name, aliases or slug. */
+function matchProject(projects: PaiProject[], name: string): PaiProject | undefined {
+  const needle = name.trim().toLowerCase();
+  if (!needle) return undefined;
+  return projects.find(
+    (p) =>
+      p.name.toLowerCase() === needle ||
+      p.names.some((n) => n.toLowerCase() === needle) ||
+      p.slug.toLowerCase() === needle,
+  );
+}
+
+/**
+ * Find a project by any of its names or aliases, among CURATED projects only.
+ *
+ * Deliberately narrower than findPaiProject(). The `--all` set is ~118 entries
+ * with empty `names` and genuine ambiguity — three separate registry rows share
+ * the display name "Glidr" at different paths — so resolving a task against it
+ * silently dispatches work to the wrong directory. Bus participation therefore
+ * stays opt-in: a project joins by being given an alias
+ * (`pai project name <identifier> <shortname>`), and anything without one is
+ * reported as unlaunchable rather than guessed at.
+ *
+ * Matching is case-insensitive.
+ */
+export async function findCuratedPaiProject(name: string): Promise<PaiProject | undefined> {
+  return matchProject(await listPaiProjects(false), name);
+}
+
 /**
  * Find a project by any of its names or aliases.
  * Matching is case-insensitive.
@@ -139,14 +168,7 @@ export async function findPaiProject(name: string): Promise<PaiProject | undefin
   // the picker now offers every project (listPaiProjects(true)), so a launch of a
   // non-shortlisted project (e.g. glidr) must resolve here too, or it fails with
   // "project not found".
-  const projects = await listPaiProjects(true);
-  const needle = name.toLowerCase();
-  return projects.find(
-    (p) =>
-      p.name.toLowerCase() === needle ||
-      p.names.some((n) => n.toLowerCase() === needle) ||
-      p.slug.toLowerCase() === needle,
-  );
+  return matchProject(await listPaiProjects(true), name);
 }
 
 /**
@@ -193,6 +215,23 @@ export async function launchPaiProject(
   if (!project) {
     throw new Error(`PAI project "${name}" not found`);
   }
+  return launchResolvedPaiProject(project);
+}
+
+/**
+ * Launch an ALREADY-RESOLVED project.
+ *
+ * Callers that resolved against a narrower set than findPaiProject() must use
+ * this. Passing a name back into launchPaiProject() launders it through the
+ * `--all` set a second time, so a careful curated resolve can still end up
+ * opening a different project that happens to share the display name — there
+ * are three "Glidr" rows at three different paths. Once resolution has picked
+ * a row, that row is what gets launched.
+ */
+export async function launchResolvedPaiProject(
+  project: PaiProject,
+): Promise<{ itermSessionId: string; sessionId: string }> {
+  const name = project.name;
 
   // Get effective config (project overrides global defaults)
   const effective = await getEffectiveConfig(name) ?? project.sessionConfig ?? {};
