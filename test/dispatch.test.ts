@@ -211,6 +211,44 @@ test("a boot that eats the whole budget is reported, not blamed on the session",
   assert.match(r.reason, /budget was spent/);
 });
 
+test("an exhausted budget launches NOTHING, rather than a tab it cannot use", async () => {
+  // Launching with no time to deliver cannot succeed, and leaves a real session
+  // running that nobody asked for — then blames it for not becoming ready.
+  const t = timed();
+  t.deps.sessions = () => [];
+  t.deps.launch = async () => { throw new Error("must not launch with no budget"); };
+
+  const r = await dispatch("whazaa", "x", { budgetMs: 0 }, t.deps);
+  assert.equal(r.outcome, "unreachable");
+  assert.equal(r.session, "", "no session was created, so none should be named");
+  assert.match(r.reason, /none was/);
+  assert.doesNotMatch(r.reason, /did not become ready/, "must not blame a session that never existed");
+});
+
+test("a budget-clipped readiness failure blames the budget, not the session", async () => {
+  // The diagnostic sends people to the right place: a wait cut short by the
+  // caller's timeout is not evidence that the tab is broken.
+  const t = timed();
+  t.deps.sessions = () => [];
+  t.deps.launch = async () => ({ itermSessionId: "NEW" });
+  t.deps.waitReady = async () => false;
+
+  const r = await dispatch("whazaa", "x", { budgetMs: 5_000 }, t.deps);
+  assert.equal(r.outcome, "unreachable");
+  assert.match(r.reason, /caller's 5s budget/);
+  assert.match(r.reason, /before suspecting the session/);
+});
+
+test("an unclipped readiness failure does point at the session", async () => {
+  const t = timed();
+  t.deps.sessions = () => [];
+  t.deps.launch = async () => ({ itermSessionId: "NEW" });
+  t.deps.waitReady = async () => false;
+
+  const r = await dispatch("whazaa", "x", {}, t.deps);
+  assert.match(r.reason, /check why it did not start/);
+});
+
 test("the caller's budget overrides a larger per-stage default", async () => {
   // Default spawn wait is 90s; a 30s budget must win, or we outlive the caller.
   let readyGot = 0;
