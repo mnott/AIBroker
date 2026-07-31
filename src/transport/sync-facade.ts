@@ -29,6 +29,7 @@
 
 import * as iterm from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
+import { ItermTransport } from "./iterm.js";
 import { TmuxTransport } from "./tmux.js";
 import type { ManagedSession } from "./session-transport.js";
 import { log } from "../core/log.js";
@@ -36,6 +37,7 @@ import { log } from "../core/log.js";
 const override = (process.env.AIBROKER_TRANSPORT ?? "").trim().toLowerCase();
 
 const tmuxTransport = new TmuxTransport();
+const itermTransport = new ItermTransport();
 
 // Override GATES which transports are permitted; availability is then checked
 // LIVE on every enumeration (NOT frozen at boot), so a tmux server started after
@@ -108,6 +110,16 @@ export function typeIntoSession(id: string, text: string): boolean {
 export function pasteTextIntoSession(id: string, text: string): boolean {
   if (routeToTmux(id)) return tmuxTransport.sendText(id, text, { enter: false });
   return iterm.pasteTextIntoSession(id, text);
+}
+
+/**
+ * Read what a session is currently showing. Used by checkpoint's ack detection,
+ * which watches for the screen to change (message landed) and then settle
+ * (Claude finished). Returns null when the session can't be read.
+ */
+export function captureSession(id: string, lines?: number): string | null {
+  if (routeToTmux(id)) return tmuxTransport.capture(id, lines);
+  return itermTransport.capture(id);
 }
 
 /** True when a foreground program (Claude) is running, not at a shell prompt. */
