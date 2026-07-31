@@ -359,6 +359,24 @@ export async function dispatch(
   }
 
   // ── spawn, wait for it to come up, then deliver ──
+
+  // Check the budget BEFORE launching, not after waiting for readiness.
+  // Launching with no time to deliver cannot succeed, and it is not a harmless
+  // failure: it leaves a real Claude session running that nobody asked for, and
+  // then blames it for "not becoming ready" — sending whoever reads the result
+  // to inspect a tab that was never given a chance.
+  if (left() <= 0) {
+    return {
+      outcome: "unreachable",
+      project: label,
+      session: "",
+      reason:
+        `Budget of ${Math.round((budgetMs ?? 0) / 1000)}s was already spent before a session ` +
+        `could be launched, so none was — nothing to investigate at the project end. ` +
+        `Raise the timeout.`,
+    };
+  }
+
   let itermSessionId: string;
   try {
     ({ itermSessionId } = await deps.launch(project));
@@ -379,8 +397,14 @@ export async function dispatch(
       project: label,
       session: label,
       reason:
-        `Launched a session in ${project.rootPath} but it did not become ready ` +
-        `within ${Math.round(spawnTimeoutMs / 1000)}s. The tab is open — check why it did not start.`,
+        `Launched a session in ${project.rootPath} but it did not become ready within ` +
+        `${Math.round(spawnTimeoutMs / 1000)}s` +
+        (budgetMs !== undefined && spawnTimeoutMs < DEFAULT_SPAWN_TIMEOUT_MS
+          // Say which limit actually bit. A budget-clipped wait points at the
+          // caller's timeout, not at a session that may be perfectly healthy.
+          ? ` — that was the caller's ${Math.round(budgetMs / 1000)}s budget, not the ` +
+            `${Math.round(DEFAULT_SPAWN_TIMEOUT_MS / 1000)}s default, so raise the timeout before suspecting the session.`
+          : `. The tab is open — check why it did not start.`),
     };
   }
 
