@@ -33,6 +33,7 @@ import { ItermTransport } from "./iterm.js";
 import { TmuxTransport } from "./tmux.js";
 import type { ManagedSession } from "./session-transport.js";
 import { isClaudeReady } from "./screen.js";
+import { audit } from "../daemon/audit.js";
 import { log } from "../core/log.js";
 
 const override = (process.env.AIBROKER_TRANSPORT ?? "").trim().toLowerCase();
@@ -144,6 +145,17 @@ function refuse(id: string, text: string): false {
     `which would execute the text rather than read it. ` +
     `First 60 chars: ${JSON.stringify(text.slice(0, 60))}`,
   );
+  // Also record it. A refusal here is the single most safety-relevant thing
+  // this process does, and until now it only reached a log nobody tails —
+  // which makes it indistinguishable from never having happened. Only the
+  // send_to_session path audited its own refusals; every other caller
+  // (inbound WhatsApp/Telegram delivery, the session backend, PAILot chunk
+  // writes) went through here and left no trace in the trail at all.
+  audit({
+    action: "refuse", actor: "aibroker:transport", target: id,
+    outcome: "refused", body: text,
+    reason: "target terminal is a shell, not a live Claude prompt — a shell would execute this",
+  });
   return false;
 }
 
