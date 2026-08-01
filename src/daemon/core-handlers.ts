@@ -37,6 +37,7 @@ import { readSessionContent, readAllSessionContent } from "./session-content.js"
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession } from "../transport/sync-facade.js";
+import { matchSession } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
 import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
@@ -909,18 +910,17 @@ export function registerCoreHandlers(
       //
       // Preference order: a live Claude session beats a shell; an exact name
       // match beats a substring one.
-      const lower = target.toLowerCase();
-      const matches = snapshots.filter(
-        (s) => (s.paiName ?? s.name).toLowerCase().includes(lower),
-      );
-      const score = (s: typeof snapshots[number]): number => {
-        const label = (s.paiName ?? s.name).toLowerCase();
-        return (isClaudeSession(s.id) ? 2 : 0) + (label === lower ? 1 : 0);
-      };
-      const best = matches.slice().sort((a, b) => score(b) - score(a))[0];
+      // Shared with dispatch's project matching — see core/session-match.ts.
+      // `prefer` is what keeps a live Claude session ahead of a shell, and
+      // substring is enabled here (unlike dispatch) because a human typing a
+      // target expects "clickr" to find "Clickr (node)".
+      const best = matchSession([target], snapshots, {
+        kinds: ["exact", "normalised", "substring"],
+        prefer: (s) => (isClaudeSession(s.id) ? 1 : 0),
+      });
       if (best) {
-        itermSessionId = best.id;
-        resolvedName = best.paiName ?? best.name;
+        itermSessionId = best.session.id;
+        resolvedName = best.label;
       }
     }
 
@@ -1224,8 +1224,18 @@ export function registerCoreHandlers(
       action?: string; projectId?: string; owner?: string; projectName?: string;
     };
     try {
-      const { listGrants, grantIngress, revokeIngress } = await import("./todoist-ingress.js");
+      const { listGrants, grantIngress, revokeIngress, projectForOwner } = await import("./todoist-ingress.js");
       if (!action || action === "list") return { ok: true, result: { grants: listGrants() } };
+      if (action === "resolve") {
+        if (!owner) return { ok: false, error: "owner is required" };
+        const g = projectForOwner(owner);
+        return {
+          ok: true,
+          result: g
+            ? { found: true, projectId: g.projectId, projectName: g.projectName ?? null, owner: g.owner ?? null }
+            : { found: false, owner },
+        };
+      }
       if (action === "add") {
         if (!projectId) return { ok: false, error: "projectId is required" };
         const g = grantIngress(projectId, { owner, projectName });
@@ -1236,6 +1246,26 @@ export function registerCoreHandlers(
         return { ok: true, result: { revoked: revokeIngress(projectId) } };
       }
       return { ok: false, error: `unknown action: ${action}` };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /**
+   * todoist_task — create a task without handing it back to yourself.
+   *
+   * A session filing into an ingress project is writing to its own inbox. This
+   * marks the task so the receiver drops it instead of dispatching it back.
+   */
+  server.on("todoist_task", async (req) => {
+    const { content, projectId, description, dueString } = req.params as {
+      content?: string; projectId?: string; description?: string; dueString?: string;
+    };
+    if (!content?.trim()) return { ok: false, error: "content is required" };
+    try {
+      const { createTask } = await import("./todoist-reply.js");
+      const r = await createTask(content, { projectId, description, dueString });
+      return { ok: true, result: { taskId: r.taskId } };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }

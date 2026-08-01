@@ -45,6 +45,7 @@ import {
   type TerminalIO,
 } from "./terminal-screen.js";
 import { log } from "../core/log.js";
+import { matchSession } from "../core/session-match.js";
 
 export type DispatchOutcome =
   | "delivered"
@@ -145,34 +146,15 @@ export function findSessionForProject(
   project: PaiProject,
   sessions: { id: string; name: string; paiName: string | null }[],
 ): { id: string; label: string } | null {
-  const wanted = new Set(
-    [project.displayName, project.name, project.slug, ...project.names]
-      .filter(Boolean)
-      .map(normaliseLabel),
+  // Exact and separator-folded only — never substring. A project called `sl`
+  // would otherwise match any session whose title contains those letters, and
+  // here a wrong match does not spawn, it delivers work to the wrong session.
+  const hit = matchSession(
+    [project.displayName, project.name, project.slug, ...project.names],
+    sessions,
+    { kinds: ["exact", "normalised"] },
   );
-  for (const s of sessions) {
-    const label = s.paiName ?? s.name;
-    if (label && wanted.has(normaliseLabel(label))) return { id: s.id, label };
-  }
-  return null;
-}
-
-/**
- * Fold a session label and a project name onto common ground.
- *
- * Aliases are written machine-style — `jobs-matthias` — and sessions are named
- * by a human — `Jobs Matthias`. Comparing them literally means the two forms of
- * the same name miss each other, and a miss here does not fail: it SPAWNS. A
- * live session holding the whole conversation is passed over and a fresh tab
- * opens in the right directory with none of the context, which looks like
- * success from every angle except the one that matters.
- *
- * Separators are therefore not significant: hyphen, underscore and whitespace
- * all fold to a single space. Two projects distinguishable only by punctuation
- * would be a naming collision anyway.
- */
-function normaliseLabel(s: string): string {
-  return s.toLowerCase().replace(/[\s_-]+/g, " ").trim();
+  return hit ? { id: hit.session.id, label: hit.label } : null;
 }
 
 /** Enumerate live sessions with their persistent (PAI) names resolved. */

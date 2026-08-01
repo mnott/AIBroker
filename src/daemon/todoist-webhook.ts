@@ -225,9 +225,18 @@ export function route(
   const description = typeof data.description === "string" ? data.description : "";
   const taskId = typeof data.id === "string" ? data.id : String(data.id ?? "");
 
-  // Our own writes come back as events. Drop them before anything else, or an
-  // agent's comment becomes an instruction to an agent.
-  if (content.startsWith(AGENT_MARK) || description.startsWith(AGENT_MARK)) {
+  // Our own writes come back as events. Drop the ECHO — the event that fires
+  // the instant we write — or an agent's own note becomes an instruction to
+  // itself, which is how a session probing due-date parsing handed itself a
+  // dozen tasks in four minutes.
+  //
+  // Deliberately NOT applied to reminder:fired. Filing work for yourself to do
+  // later is the point of this channel: a click-to-run task with a schedule,
+  // "run the sweep at 08:00", a reminder set now for next week. Those are
+  // agent-authored on purpose and must fire when their time comes. What must
+  // not happen is the write bouncing straight back.
+  const isEcho = e.event_name === "item:added" || e.event_name === "note:added";
+  if (isEcho && (content.startsWith(AGENT_MARK) || description.startsWith(AGENT_MARK))) {
     return { act: false, reason: "agent-authored content, ignored to avoid an echo loop" };
   }
 
@@ -515,7 +524,11 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
           ? `\n\n[note: ${twins} open tasks in this project share this title — say which id you answered on]`
           : "";
 
-        const delivered = `${decision.body}${twinWarning}\n\n[todoist:${decision.taskId}]`;
+        // The project rides along with the task id. A session asked to file a
+        // follow-up otherwise has to guess which project is "its own", and a
+        // guess from its alias creates a second project the user never sees.
+        const fromProject = String(event.event_data?.project_id ?? "");
+        const delivered = `${decision.body}${twinWarning}\n\n[todoist:${decision.taskId}${fromProject ? ` in:${fromProject}` : ""}]`;
         const r = await deps.deliver(decision.project, delivered,
           isComment ? { prefix: "[Task:comment]" } : undefined);
         // Remember who took it, so a later comment reaches the same session.

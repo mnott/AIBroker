@@ -153,6 +153,26 @@ Or ask any session with the Todoist MCP for `find-projects`.
 
 ---
 
+## 3a. Granting a project, while you are using it
+
+The allowlist began as one environment variable read at daemon start. Grants can also be made at runtime, which is what makes "create me a project and let me talk to that session" a thing you can ask for rather than a file edit and a restart:
+
+```bash
+aibroker todoist ingress list
+aibroker todoist ingress add <projectId>=<owner> --name "Claude 🤖/Whazaa"
+aibroker todoist ingress remove <projectId>
+```
+
+Effective on the next webhook, no restart. Every change is recorded in the audit trail, because granting a project the right to execute in your sessions is exactly the kind of change that should be.
+
+**Deleting the project revokes its grant automatically.** A grant outliving the thing it points at reads as though access is still open — and if the id were ever reused, it silently would be. The boundary only ever shrinks on its own.
+
+**The allowlist is not a subtree.** A project created under an allowed parent is *not* allowed; it has to be granted. That is deliberate — a project added later must not silently become a place that runs commands with your full rights — but it does mean every new project needs one `ingress add`.
+
+**Owner names must be dispatchable.** An owner is a curated PAI alias, not merely the title of a running tab. A grant pointing at a name dispatch cannot resolve looks perfectly configured and routes nowhere; the audit says `unlaunchable`, which is the only sign you get.
+
+---
+
 ## 4. Configure the daemon
 
 In `~/.aibroker/env`:
@@ -239,6 +259,8 @@ A label **cannot** smuggle a task in from outside the allowlist. The boundary is
 | No owner and no default | Refuses to guess |
 | A repeated delivery | Todoist retries; work must not run twice |
 
+A delivered task carries a `[todoist:<taskId> in:<projectId>]` trailer so the session can answer on it and file follow-ups in the right place. When more than one open task in the project shares a title, the body also carries a warning: two identically named tasks are indistinguishable in a list, so an answer posted on one is — to whoever is watching the other — indistinguishable from being ignored.
+
 ---
 
 ## 6. Verify
@@ -269,6 +291,61 @@ aibroker audit --action webhook --bodies
 ```
 
 Nothing arriving at all usually means the webhook was never activated, or the app has no installed users.
+
+---
+
+## 7. Answering, and the loop that must not happen
+
+A task is often a question. The answer belongs on the task, not in a terminal the asker is not looking at.
+
+```
+todoist_reply(taskId, text)     # posts a comment; does NOT complete the task
+```
+
+Every delivery carries what a reply needs:
+
+```
+[todoist:<taskId> in:<projectId>]
+```
+
+Completion is deliberately left to the human. An answer nobody has read is not done, and a completed task drops out of the list taking its comments with it.
+
+### Filing work for yourself — later, yes; instantly, no
+
+Scheduling your own work is the point of this channel. A click-to-run task with a recurrence — *"Job sweep — run it and mail me the list, every day at 08:00"* — is agent-authored on purpose and must fire when its time comes.
+
+What must not happen is the **write bouncing straight back**. A task a session creates in an ingress project fires `item:added` immediately, routing dispatches it, and the session receives its own note as a work order it never asked for. On 2026-08-01 a session probing due-date parsing handed itself twelve test tasks in four minutes.
+
+So the 🤖 mark suppresses the *echo*, not the task:
+
+| Event | Marked content |
+|---|---|
+| `item:added` | dropped — this is the write bouncing back |
+| `note:added` | dropped — same, for comments |
+| `reminder:fired` | **delivered** — the schedule is why the task exists |
+
+```
+todoist_task(content, {projectId, description, dueString})
+```
+
+applies the mark. Reach for a raw Todoist tool only for projects that reach nobody. As with replies, the mark is applied by the writer rather than trusted to the caller — "remember the prefix" is not a safety mechanism.
+
+Due dates still fire nothing. If you want a task to come back to you, give it a **reminder**.
+
+### Do not create a project you already have
+
+A session knows itself by its alias, `jobs-matthias`. The project a human made for it is called `Jobs Matthias`. A session comparing those literally finds nothing and creates a second project; work then splits across two lists and the human watches the wrong one.
+
+```
+todoist_ingress(action: "resolve", owner: "jobs-matthias")
+→ { found: true, projectId: "…", projectName: "Claude 🤖/Jobs Matthias" }
+```
+
+Resolve before creating. Owner matching folds separators, so every written form of the name finds the same project.
+
+### Never open a blocking prompt for a channel message
+
+A multi-select or any modal freezes the session, and whoever sent the task is not at that terminal to answer it. Decide routine choices and say which you took; if it genuinely needs the human, ask **on the channel** with `todoist_reply` and stop. A question on a task can be answered from a phone. A modal cannot.
 
 ---
 

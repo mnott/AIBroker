@@ -177,3 +177,76 @@ test("a failed lookup reports zero, never a phantom duplicate", async () => {
   const impl = (async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
   assert.equal(await countTasksWithTitle("p", "x", impl), 0);
 });
+
+// ── writing into your own inbox ─────────────────────────────────────────────
+//
+// A session filing a task into an ingress project is writing to its own inbox:
+// item:added fires, routing dispatches it, and the session receives its own
+// note as a work order. On 2026-08-01 a session probing due-date parsing was
+// handed twelve of its own test tasks in four minutes.
+
+test("a task created by a session is marked, so it cannot dispatch back", async () => {
+  const { createTask } = await import("../src/daemon/todoist-reply.js");
+  const { impl, seen } = captureFetch(200, { id: "t-1" });
+  await createTask("ZZ due probe 2026-08-02", { projectId: "p-1", dueString: "tomorrow" }, impl);
+  assert.ok(seen.payload.content.startsWith(AGENT_MARK));
+  assert.equal(seen.payload.project_id, "p-1");
+  assert.equal(seen.payload.due_string, "tomorrow");
+  assert.equal(seen.url, "https://api.todoist.com/api/v1/tasks");
+});
+
+test("a marked task is dropped by routing, closing the loop", () => {
+  const cfg: WebhookConfig = {
+    secret: "s", port: 1, bind: "127.0.0.1", path: "/todoist", oauthPath: "/oauth",
+    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "jobs-matthias"]]),
+    defaultOwner: "broker",
+  };
+  const echo: TodoistEvent = {
+    event_name: "item:added",
+    event_data: { id: "t-1", content: `${AGENT_MARK} ZZ due probe`, project_id: "p-1", labels: [] },
+  };
+  const d = route(echo, cfg, ["jobs-matthias"]);
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /echo loop/);
+});
+
+test("a refused create surfaces the status rather than reporting a task id", async () => {
+  const { createTask } = await import("../src/daemon/todoist-reply.js");
+  const { impl } = captureFetch(400, { error: "bad" });
+  await assert.rejects(() => createTask("x", {}, impl), /400/);
+});
+
+// ── filing work for LATER is the point ──────────────────────────────────────
+
+test("an agent-authored task still fires its reminder", () => {
+  // The echo guard must not kill scheduled work. A click-to-run task with a
+  // recurrence — "run the sweep at 08:00" — is agent-authored on purpose and
+  // has to fire when its time comes. Suppressing it would have silently broken
+  // the job-sweep trigger the moment it was marked.
+  const cfg: WebhookConfig = {
+    secret: "s", port: 1, bind: "127.0.0.1", path: "/todoist", oauthPath: "/oauth",
+    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "jobs-matthias"]]),
+    defaultOwner: "broker",
+  };
+  const fired: TodoistEvent = {
+    event_name: "reminder:fired",
+    event_data: { id: "t-9", content: `${AGENT_MARK} Job sweep — run it and mail me the list`, project_id: "p-1", labels: [] },
+  };
+  const d = route(fired, cfg, ["jobs-matthias"]);
+  assert.equal(d.act, true, "a scheduled trigger must survive the echo guard");
+  assert.equal(d.act && d.project, "jobs-matthias");
+});
+
+test("the same task's creation is still suppressed", () => {
+  // Only the write that bounces back instantly is dropped.
+  const cfg: WebhookConfig = {
+    secret: "s", port: 1, bind: "127.0.0.1", path: "/todoist", oauthPath: "/oauth",
+    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "jobs-matthias"]]),
+    defaultOwner: "broker",
+  };
+  const created: TodoistEvent = {
+    event_name: "item:added",
+    event_data: { id: "t-9", content: `${AGENT_MARK} Job sweep — run it and mail me the list`, project_id: "p-1", labels: [] },
+  };
+  assert.equal(route(created, cfg, ["jobs-matthias"]).act, false);
+});

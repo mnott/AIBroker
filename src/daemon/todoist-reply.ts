@@ -164,3 +164,56 @@ export async function countTasksWithTitle(
     return typeof c === "string" && sameTitle(c, title);
   }).length;
 }
+
+/**
+ * Create a task as the agent.
+ *
+ * A session that files a task into an ingress project is writing into its own
+ * inbox: `item:added` fires, routing sends it straight back, and the session
+ * receives its own note as a work order. That happened on 2026-08-01 — a
+ * session probing due-date parsing created a dozen test tasks and was handed
+ * every one of them back within seconds.
+ *
+ * The mark is applied here rather than trusted to the caller, for the same
+ * reason it is on replies: "remember the prefix" is not a safety mechanism.
+ * `route()` drops marked content before anything else, so a task created this
+ * way cannot come back as an instruction.
+ */
+export async function createTask(
+  content: string,
+  opts: { projectId?: string; description?: string; dueString?: string } = {},
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ taskId: string }> {
+  const token = loadToken();
+  if (!token) throw new Error("no Todoist authorisation on file — run `aibroker todoist auth`");
+
+  const marked = content.trimStart().startsWith(AGENT_MARK) ? content : `${AGENT_MARK} ${content}`;
+  const res = await fetchImpl("https://api.todoist.com/api/v1/tasks", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `${token.token_type} ${token.access_token}`,
+    },
+    body: JSON.stringify({
+      content: marked,
+      project_id: opts.projectId,
+      description: opts.description,
+      due_string: opts.dueString,
+    }),
+  });
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`task create failed with ${res.status}: ${raw.slice(0, 200)}`);
+
+  let parsed: { id?: string };
+  try {
+    parsed = JSON.parse(raw) as typeof parsed;
+  } catch {
+    throw new Error(`task create returned unparseable body: ${raw.slice(0, 200)}`);
+  }
+  audit({
+    action: "todoist-task", actor: "aibroker", target: `todoist:project:${opts.projectId ?? "inbox"}`,
+    outcome: "created", body: marked,
+  });
+  log(`todoist: created task ${parsed.id ?? "?"}`);
+  return { taskId: parsed.id ?? "?" };
+}
