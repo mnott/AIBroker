@@ -8,13 +8,47 @@
 import { spawnSync } from "node:child_process";
 import { log } from "../../core/log.js";
 
-export function runAppleScript(script: string, timeoutMs = 4_000): string | null {
+/** Throttle identical failures so a persistent fault logs steadily, not per-poll. */
+const lastLogged = new Map<string, number>();
+function logThrottled(key: string, message: string): void {
+  const now = Date.now();
+  const prev = lastLogged.get(key) ?? 0;
+  if (now - prev < 30_000) return;
+  lastLogged.set(key, now);
+  log(message);
+}
+
+// Default budget. Deliberately generous: exceeding it yields null, which every
+// caller turns into "nothing there" rather than "I could not tell", so a tight
+// default trades a rare slow call for a silent wrong answer. iTerm AppleScript
+// cost scales with open sessions and scrollback, both of which grow over time.
+export function runAppleScript(script: string, timeoutMs = 15_000): string | null {
   const result = spawnSync("osascript", [], {
     input: script,
     stdio: ["pipe", "pipe", "pipe"],
     timeout: timeoutMs,
   });
-  if (result.status !== 0) return null;
+
+  if (result.status !== 0 || result.error) {
+    // NEVER fail silently here. Every session feature — send_to_session,
+    // session_content, dispatch — is built on this call, and a null turns into
+    // an empty session list that is indistinguishable from "nothing is open".
+    // A timeout 50ms over budget therefore looked exactly like an empty
+    // machine, and took the whole hub down with nothing in the log to show it.
+    const first = script.trim().split("\n")[0].slice(0, 60);
+    const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
+      || result.signal === "SIGTERM";
+    const stderr = result.stderr?.toString().trim().slice(0, 200) ?? "";
+    logThrottled(
+      `${first}|${timedOut}`,
+      timedOut
+        ? `osascript TIMED OUT after ${timeoutMs}ms — callers will see an empty result. Script: ${first}…`
+        : `osascript failed (status ${result.status}${result.signal ? `, signal ${result.signal}` : ""})` +
+          `${stderr ? `: ${stderr}` : ""}. Script: ${first}…`,
+    );
+    return null;
+  }
+
   return result.stdout?.toString().trim() ?? null;
 }
 
@@ -262,8 +296,14 @@ tell application "iTerm2"
   return output
 end tell`;
 
-  // 4s timeout. id+name+tty+tab.title = ~1.5s for 16 sessions. 4s gives safe headroom.
-  const result = runAppleScript(script, 4_000);
+  // Timeout scales with the work: iTerm's AppleScript cost grows with the
+  // number of open sessions, so a fixed budget silently expires as the user
+  // opens more tabs. A previous 4s constant was measured at ~1.5s for 16
+  // sessions and called "safe headroom"; at 22 sessions the same script took
+  // 4.05s and every enumeration returned empty, killing all session features
+  // at once. Budget generously — this is a correctness floor, not a latency
+  // target, and a slow answer beats a confidently wrong empty one.
+  const result = runAppleScript(script, 30_000);
   if (!result) return [];
 
   const sessions: SessionSnapshot[] = [];
