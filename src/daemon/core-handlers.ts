@@ -141,13 +141,27 @@ export function registerCoreHandlers(
     for (const [name, health] of registry.getAllHealth()) {
       adapterHealth[name] = health;
     }
+    // Report LIVE sessions, not manager.listSessions(). That internal registry
+    // only holds sessions the hub itself launched, and it empties on every
+    // daemon restart — so it read 20 while enumeration was broken and every
+    // send was failing, then 0 once enumeration was fixed and everything
+    // worked. A status line that inverts the truth is worse than none: it
+    // reads as "no sessions registered with the hub" on a perfectly healthy
+    // hub. Use the same source send_to_session resolves against, so status
+    // agrees with behaviour.
+    const live = snapshotAllSessions();
+    const persistentNames = getAllPersistentSessionNames();
+    const activeSnap = live.find((s) => s.id === activeItermSessionId);
+
     return {
       ok: true,
       result: {
         version: HUB_VERSION,
         adapters: registry.list().map(a => a.name),
-        activeSessions: manager.listSessions().length,
-        activeSession: manager.activeSession?.name ?? null,
+        activeSessions: live.length,
+        activeSession: activeSnap
+          ? (lookupPersistentName(persistentNames, activeSnap.id, activeSnap.aibrokerId) ?? activeSnap.name)
+          : null,
         adapterHealth,
       },
     };
