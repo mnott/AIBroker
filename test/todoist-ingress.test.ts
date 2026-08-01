@@ -16,7 +16,7 @@ const scratch = mkdtempSync(join(tmpdir(), "aibroker-ingress-"));
 process.env.HOME = scratch;
 mkdirSync(join(scratch, ".aibroker"), { recursive: true });
 
-const { grantIngress, revokeIngress, listGrants, applyGrants } = await import("../src/daemon/todoist-ingress.js");
+const { grantIngress, revokeIngress, listGrants, applyGrants, projectForOwner } = await import("../src/daemon/todoist-ingress.js");
 import type { WebhookConfig } from "../src/daemon/todoist-webhook.js";
 
 const base: WebhookConfig = {
@@ -92,4 +92,22 @@ test("revoking is idempotent, so a repeated delete event is harmless", () => {
   grantIngress("gone", { owner: "broker" });
   assert.equal(revokeIngress("gone"), true);
   assert.equal(revokeIngress("gone"), false);
+});
+
+// ── finding the project you already have ────────────────────────────────────
+
+test("an owner resolves to its project, separators folded", () => {
+  // A session knows itself as `jobs-matthias`; the human made `Jobs Matthias`.
+  // Comparing those literally is how a second project gets created and the
+  // work splits across two lists.
+  grantIngress("p-jobs", { owner: "jobs-matthias", projectName: "Jobs Matthias" });
+  assert.equal(projectForOwner("jobs-matthias")?.projectId, "p-jobs");
+  assert.equal(projectForOwner("Jobs Matthias")?.projectId, "p-jobs");
+  assert.equal(projectForOwner("JOBS_MATTHIAS")?.projectId, "p-jobs");
+});
+
+test("an unknown owner resolves to nothing rather than a near match", () => {
+  // Returning the wrong project would be worse than returning none: the caller
+  // would file into it confidently.
+  assert.equal(projectForOwner("jobs-grazyna"), undefined);
 });

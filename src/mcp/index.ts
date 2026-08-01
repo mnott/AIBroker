@@ -174,13 +174,14 @@ const server = new McpServer(
       "| `[PAILot]` | Text from PAILot app | `pailot_send` (text reply) |",
       "| `[PAILot:voice]` | Voice from PAILot app | `pailot_tts` (VOICE reply — NEVER pailot_send) |",
       "| `[Session:NAME]` | Text from another Claude Code session | `aibroker_send_to_session` (reply to NAME) |",
-      "| `[Task]` | A work order or question from the task bus | Act on it. If it asked anything, answer with `todoist_reply` using the id in the `[todoist:…]` trailer — the asker filed it from a phone and will not see this terminal. Leave the task open; closing it is theirs. |",
+      "| `[Task]` | A work order or question from the task bus | Act on it. If it asked anything, answer with `todoist_reply` using the id in the `[todoist:<taskId> in:<projectId>]` trailer — the asker filed it from a phone and will not see this terminal. File any follow-up task into that same `in:` project; NEVER create a project named after your alias, one already exists under a human-readable name (`todoist_ingress` action `resolve`). Leave the task open; closing it is theirs. |",
       "| `[Task:comment]` | A comment on a task you already handled | A correction or follow-up to work in flight, NOT a new work order — adjust what you did, do not start over. Same `[todoist:…]` trailer, same reply route. |",
       "| _no prefix_ | User typing at the terminal | Terminal only — do NOT send to any channel |",
       "",
       "### Rules",
       "",
       "- **NEVER open a blocking interactive prompt for a channel message.** Multi-select menus and any modal that waits for a keypress freeze the session, and the person who sent the message is not at this terminal to answer it — so the session is stuck until someone notices, and the answer they wanted never comes. This applies to every prefixed message: `[Task]`, `[Task:comment]`, `[PAILot]`, `[Whazaa]`, `[Telex]`, `[Session:…]`. Instead: decide it yourself if the choice is routine, and say which option you took and why; if it genuinely needs the human, ASK ON THE CHANNEL IT CAME FROM (`todoist_reply`, `pailot_send`, `whatsapp_send`, …) and stop there. A question asked on the channel can be answered from a phone; a modal cannot.",
+      "- **A task you create in an ingress project comes straight back to you.** Filing there fires `item:added`, routing dispatches it, and you receive your own note as a work order — a session probing due-date parsing once handed itself twelve tasks in four minutes. Use `todoist_task`, which marks it so that echo is dropped. Scheduling your own work for LATER is fine and intended: a marked task's `reminder:fired` is still delivered, so a click-to-run task with a recurrence works exactly as you would want. Only use a raw Todoist tool for projects that reach nobody.",
       "- **Strip the prefix** before processing the message content.",
       "- **Match the medium**: text in → text out, voice in → voice out. This is NON-NEGOTIABLE.",
       "- **Same content**: send the same response as the terminal — do not shorten or paraphrase.",
@@ -464,9 +465,9 @@ server.tool(
 
 server.tool(
   "todoist_ingress",
-  "List or change which Todoist projects may reach a session. A task filed into an allowed project becomes an instruction a session runs with the user's full rights, so this is a security boundary: grant deliberately, never speculatively, and tell the user what you granted. Takes effect immediately — no daemon restart. Every change is recorded in the audit trail.",
+  "List, resolve or change which Todoist projects may reach a session. BEFORE creating any Todoist project for a session, call action:\"resolve\" with that session's owner name — a project almost certainly already exists under a human-readable name (`Jobs Matthias`) that will not match the alias you know yourself by (`jobs-matthias`), and creating a second one splits the work so the user watches the wrong list. A task filed into an allowed project becomes an instruction a session runs with the user's full rights, so granting is a security boundary: grant deliberately, never speculatively, and tell the user what you granted. Takes effect immediately — no daemon restart. Every change is recorded in the audit trail.",
   {
-    action: z.enum(["list", "add", "remove"]).describe("list (default), add, or remove"),
+    action: z.enum(["list", "resolve", "add", "remove"]).describe("list (default), resolve (find the project for an owner), add, or remove"),
     projectId: z.string().optional().describe("Todoist project id. Required for add and remove."),
     owner: z.string().optional().describe("Session that owns work filed there — a curated PAI alias, not merely a running tab name. Omit to fall through to the default owner."),
     projectName: z.string().optional().describe("Human-readable label, so the stored grant is readable later"),
@@ -475,6 +476,23 @@ server.tool(
     try {
       const r = await hub.call_raw("todoist_ingress", { action, projectId, owner, projectName });
       return ok(JSON.stringify(r, null, 2));
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "todoist_task",
+  "Create a Todoist task from a session. ALWAYS use this instead of a generic Todoist tool when the project is one that reaches a session (anything under the ingress allowlist): a task you file there fires item:added, routing sends it straight back, and you receive your own note as a work order you never asked for. This marks the task so that echo is dropped. Scheduling your own work still works and is encouraged — a marked task's reminder:fired IS delivered, so give it a dueString with a reminder when you want it to come back to you later. Due dates alone fire nothing.",
+  {
+    content: z.string().min(1).describe("Task title. The 🤖 mark is added automatically; do not add it yourself."),
+    projectId: z.string().optional().describe("Todoist project id. Use the `in:` value from the [todoist:…] trailer, or todoist_ingress action resolve. Omitted means Inbox."),
+    description: z.string().optional().describe("Longer body, notes, runbook"),
+    dueString: z.string().optional().describe("Natural language due date, e.g. \"tomorrow at 09:00\" or \"every monday\""),
+  },
+  async ({ content, projectId, description, dueString }) => {
+    try {
+      const r = await hub.call_raw("todoist_task", { content, projectId, description, dueString });
+      return ok(`Created task ${(r as any).taskId ?? ""}`);
     } catch (e) { return err(e); }
   },
 );

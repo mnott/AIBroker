@@ -58,6 +58,25 @@ export function listGrants(): IngressGrant[] {
   return read().grants;
 }
 
+/**
+ * Which project belongs to this session.
+ *
+ * Exists because a session knows itself by its alias — `jobs-matthias` — while
+ * the project a human made for it is called `Jobs Matthias`. Asked to file a
+ * task "in my project", a session that compares those literally finds nothing
+ * and creates a second project named after the alias. Two projects then look
+ * like one, work lands in whichever the session picked, and the human watches
+ * the other. Ask here instead of guessing from a name.
+ *
+ * Owner matching folds separators, for the same reason session matching does.
+ */
+export function projectForOwner(owner: string): IngressGrant | undefined {
+  const want = owner.toLowerCase().replace(/[\s_-]+/g, " ").trim();
+  return read().grants.find(
+    (g) => (g.owner ?? "").toLowerCase().replace(/[\s_-]+/g, " ").trim() === want,
+  );
+}
+
 /** Grant a project the right to reach a session. Idempotent. */
 export function grantIngress(projectId: string, opts: { owner?: string; projectName?: string } = {}): IngressGrant {
   const s = read();
