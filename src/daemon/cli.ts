@@ -138,6 +138,12 @@ switch (command) {
     break;
   }
 
+  case "ask": {
+    const { runAsk } = await import("./ask-cli.js");
+    await runAsk(rest);
+    break;
+  }
+
   case "create-adapter": {
     // Parse arguments: name, --display-name <Name>, --output <dir>
     const adapterName = rest.find((a) => !a.startsWith("--"));
@@ -174,6 +180,7 @@ switch (command) {
     console.log("  ota <sub>          OTA hub: up|down|status|logs|setup-serve");
     console.log("  sessions <sub>     Session backup: snapshot|restore|checkpoint|list|install");
     console.log("  dispatch <project> Deliver a work order to a project's session (--stdin --json)");
+    console.log("  ask <project>      Ask a session a question and wait for its reply (--stdin --json)");
     console.log("  help               Show this help");
     console.log("\nFlags:");
     console.log("  --version, -v      Show version");
@@ -181,6 +188,6 @@ switch (command) {
 
   default:
     console.error(`Unknown command: ${command}`);
-    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|sessions|dispatch|help]");
+    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|sessions|dispatch|ask|help]");
     process.exit(1);
 }
