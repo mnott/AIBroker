@@ -152,7 +152,19 @@ For callers with no session and no mailbox — a launchd poller checking whether
 
 Every probe of an idle session does inject a message that stays in that session's context, so keep the text short and probe rarely.
 
-### 7. Audit what one session did to another
+### 7. File work from your phone or watch (optional)
+
+```bash
+tailscale funnel --bg --https=8443 http://127.0.0.1:8766
+```
+
+Add a task in Todoist and it reaches the session that owns it — no polling, because Todoist pushes. Set a **reminder** rather than a due date to schedule work: `reminder:fired` is a webhook event, a task merely becoming due is not.
+
+This is an execution ingress, so it is narrow by construction: every request must carry a valid HMAC signature, only explicitly allowlisted projects can reach a session, and an empty allowlist accepts nothing rather than everything. Todoist's Inbox cannot be shared, which is what makes quick capture from a watch safe.
+
+Full setup, routing rules and the security model: **[docs/todoist.md](docs/todoist.md)**.
+
+### 8. Audit what one session did to another
 
 ```bash
 aibroker audit                       # recent cross-session activity
@@ -172,7 +184,7 @@ Bodies are stored in full, because a summary of a message is exactly the self-re
 
 The format is deliberately plain JSONL: greppable with the tools already on the machine, appendable by any other tool that wants to contribute events, and a torn final line costs one record rather than the file. Set `AIBROKER_AUDIT_FILE` to relocate it.
 
-### 8. Connect an adapter
+### 9. Connect an adapter
 
 ```bash
 # WhatsApp
@@ -413,6 +425,7 @@ Addressing is explicit: `hub:machine-b/session:abc` routes through the bridge to
 | [mcp-tools.md](docs/mcp-tools.md) | All 42 MCP tools with parameters |
 | [adapters.md](docs/adapters.md) | Adapter development guide |
 | [pailot.md](docs/pailot.md) | PAILot iOS app integration |
+| [todoist.md](docs/todoist.md) | Todoist inbound channel: webhook setup, routing, security model |
 | [mesh.md](docs/mesh.md) | Multi-machine mesh networking |
 | [ipc.md](docs/ipc.md) | IPC protocol and message format |
 | [tts-stt.md](docs/tts-stt.md) | Voice pipeline details |

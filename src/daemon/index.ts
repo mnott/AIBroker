@@ -14,6 +14,7 @@ import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
+import { startTodoistWebhook } from "./todoist-webhook.js";
 import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession } from "../adapters/pailot/gateway.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping, getMqttClientCount, mqttPublishText, mqttPublishControl } from "../adapters/pailot/mqtt-broker.js";
 import { registerToken as apnsRegisterToken, sendPush as apnsSendPush } from "../apns/client.js";
@@ -292,6 +293,18 @@ export async function startDaemon(options?: {
   registerCoreHandlers(ipcServer, adapterRegistry, apiBackend, manager);
   ipcServer.start();
   adapterRegistry.startHealthPolling();
+
+  // Todoist inbound channel. Enabled only when TODOIST_CLIENT_SECRET is set;
+  // a task filed from a phone or fired by a reminder reaches the owning
+  // session through the same dispatch path as everything else, so it inherits
+  // the shell guard, the delivery confirmation and the audit trail.
+  startTodoistWebhook({
+    deliver: async (project, body) => {
+      const { dispatch } = await import("./dispatch.js");
+      const r = await dispatch(project, body, {});
+      return { outcome: r.outcome, session: r.session, reason: r.reason || undefined };
+    },
+  });
 
   // Prune stale image contexts every 5 minutes (30-minute TTL enforced inside)
   setInterval(() => {
