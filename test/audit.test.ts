@@ -18,7 +18,8 @@ import { join } from "node:path";
 const DIR = mkdtempSync(join(tmpdir(), "aibroker-audit-"));
 process.env.AIBROKER_AUDIT_FILE = join(DIR, "audit.jsonl");
 
-const { audit, noteInbound, readAudit, auditPath } = await import("../src/daemon/audit.js");
+const { audit, noteInbound, readAudit, auditPath, newAuditId, resolveBody, INLINE_BODY_MAX } =
+  await import("../src/daemon/audit.js");
 
 const TAG = "t";
 
@@ -99,6 +100,83 @@ test("the log is one JSON object per line", () => {
   for (const l of lines.slice(-20)) {
     assert.doesNotThrow(() => JSON.parse(l), `not valid JSON: ${l.slice(0, 80)}`);
   }
+});
+
+// ── multi-writer contract ───────────────────────────────────────────────────
+//
+// This file is meant to have more than one producer. An O_APPEND write is only
+// atomic up to a small kernel limit (512 bytes on macOS), so a multi-KB line
+// can interleave with another writer's and corrupt the file — the exact failure
+// the format exists to avoid, arriving through the door left open by storing
+// bodies in full. Real lines here already reached 3.5KB with one writer.
+
+test("a large body is spilled so the LINE stays small", () => {
+  const big = "x".repeat(50_000);
+  const id = audit({ action: "send", actor: `${TAG}-A`, target: `${TAG}-B`, outcome: "delivered", body: big });
+
+  const line = readFileSync(auditPath(), "utf-8").split("\n").filter(Boolean).find((l) => l.includes(id))!;
+  assert.ok(line.length < 2_000, `line is ${line.length} bytes — must stay small for atomic append`);
+
+  const ev = readAudit({ session: `${TAG}-A` }).find((e) => e.id === id)!;
+  assert.ok(ev.bodyRef, "a spilled body must be referenced by hash");
+  assert.equal(ev.bodyBytes, 50_000, "the true size is recorded so a preview is obvious");
+  assert.equal(resolveBody(ev), big, "and the full body is still recoverable");
+});
+
+test("no line exceeds the atomic-append budget, whatever is thrown at it", () => {
+  audit({
+    action: "ask", actor: `${TAG}-A`, target: `${TAG}-B`, outcome: "replied",
+    body: "y".repeat(80_000),
+    meta: { reply: "z".repeat(80_000) },   // meta is free-form and must be bounded too
+  });
+  const lines = readFileSync(auditPath(), "utf-8").split("\n").filter(Boolean);
+  for (const l of lines) {
+    assert.ok(l.length < 4_096, `a ${l.length}-byte line can interleave with another writer`);
+  }
+});
+
+test("a small body stays inline — no sidecar for the common case", () => {
+  const id = audit({ action: "send", actor: `${TAG}-A`, target: `${TAG}-B`, outcome: "delivered", body: "short" });
+  const ev = readAudit({ session: `${TAG}-A` }).find((e) => e.id === id)!;
+  assert.equal(ev.body, "short");
+  assert.equal(ev.bodyRef, undefined);
+  assert.equal(resolveBody(ev), "short");
+});
+
+test("identical bodies share one sidecar", () => {
+  const body = "q".repeat(INLINE_BODY_MAX + 500);
+  const a = audit({ action: "send", actor: `${TAG}-A`, target: `${TAG}-B`, outcome: "delivered", body });
+  const b = audit({ action: "send", actor: `${TAG}-A`, target: `${TAG}-B`, outcome: "delivered", body });
+  const evs = readAudit({ session: `${TAG}-A` });
+  const ra = evs.find((e) => e.id === a)!.bodyRef;
+  const rb = evs.find((e) => e.id === b)!.bodyRef;
+  assert.equal(ra, rb, "content addressing means a repeated body costs one file");
+});
+
+test("a missing sidecar degrades loudly rather than returning a silent truncation", () => {
+  const ev = { id: "x", ts: "", action: "send", actor: "a", target: "b", outcome: "ok",
+    body: "preview", bodyRef: "0".repeat(64), bodyBytes: 9999 };
+  const out = resolveBody(ev)!;
+  assert.match(out, /full body unavailable/, "a truncated body must not pass as whole");
+});
+
+test("ids are namespaced, sortable and unique", () => {
+  // The shape other producers replicate: `<ns>-<base36 ms>-<base36 random>`.
+  const id = newAuditId();
+  assert.match(id, /^ab-[0-9a-z]+-[0-9a-z]{6}$/);
+  assert.ok(newAuditId("pai").startsWith("pai-"), "another writer namespaces its own ids");
+
+  const ids = new Set(Array.from({ length: 5_000 }, () => newAuditId()));
+  assert.equal(ids.size, 5_000, "no collisions within a burst");
+
+  const [a, b] = [newAuditId(), newAuditId()];
+  assert.ok(a.split("-")[1] <= b.split("-")[1], "the time component sorts chronologically");
+});
+
+test("ids from different producers never collide", () => {
+  const mine = new Set(Array.from({ length: 2_000 }, () => newAuditId("ab")));
+  const theirs = Array.from({ length: 2_000 }, () => newAuditId("pai"));
+  assert.ok(theirs.every((t) => !mine.has(t)), "the namespace alone guarantees this");
 });
 
 test("a truncated trailing line does not break reading", () => {

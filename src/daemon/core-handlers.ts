@@ -72,10 +72,12 @@ function callerLabel(req: IpcRequest): string {
     const snap = snapshotAllSessions().find((s) => s.id === id);
     if (snap) {
       const paiName = lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId);
-      return paiName ?? snap.name;
+      // Namespaced per the audit multi-writer contract: bare names collide
+      // across producers once more than one writes to the trail.
+      return `session:${paiName ?? snap.name}`;
     }
   }
-  return id ?? req.tmuxPane ?? req.sessionId ?? "unknown";
+  return `session:${id ?? req.tmuxPane ?? req.sessionId ?? "unknown"}`;
 }
 
 export function registerCoreHandlers(
@@ -941,7 +943,7 @@ export function registerCoreHandlers(
       // to type this into a shell" is exactly the kind of thing that otherwise
       // leaves no trace anywhere.
       audit({
-        action: "refuse", actor: senderLabel, target: resolvedName ?? target,
+        action: "refuse", actor: `session:${senderLabel}`, target: resolvedName ?? target,
         outcome: "refused", body: message,
         reason: "target terminal is a shell, not a live Claude prompt",
       });
@@ -965,14 +967,14 @@ export function registerCoreHandlers(
     const success = typeIntoSession(itermSessionId, prefixedMessage);
     if (!success) {
       audit({
-        action: "send", actor: senderLabel, target: resolvedName ?? target,
+        action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
         outcome: "failed", body: message, reason: "write to session failed",
       });
       return { ok: false, error: `Failed to type into session "${resolvedName}" (${itermSessionId})` };
     }
 
     const eventId = audit({
-      action: "send", actor: senderLabel, target: resolvedName ?? target,
+      action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
       outcome: "delivered", body: message,
     });
     // The recipient's next outgoing action can now be attributed to this one,
