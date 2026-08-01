@@ -224,7 +224,7 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
       if (!verifySignature(raw, req.headers["x-todoist-hmac-sha256"] as string | undefined, cfg.secret)) {
         // Unsigned or wrongly signed: someone found the endpoint. Worth a record.
         audit({
-          action: "webhook", actor: "todoist", target: "aibroker",
+          action: "webhook", actor: "todoist:unsigned", target: "aibroker",
           outcome: "rejected", reason: "invalid or missing HMAC signature",
         });
         log("todoist-webhook: rejected a request with an invalid signature");
@@ -257,7 +257,7 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
 
       if (!decision.act) {
         audit({
-          action: "webhook", actor: who, target: "aibroker",
+          action: "webhook", actor: `todoist:${who}`, target: "aibroker",
           outcome: "ignored", reason: decision.reason,
           meta: { event: event.event_name, task: (event.event_data?.content as string) ?? undefined },
         });
@@ -267,14 +267,14 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
       try {
         const r = await deps.deliver(decision.project, decision.body);
         audit({
-          action: "webhook", actor: who, target: r.session || decision.project,
+          action: "webhook", actor: `todoist:${who}`, target: r.session || decision.project,
           outcome: r.outcome, body: decision.body, reason: r.reason,
           meta: { event: event.event_name, taskId: decision.taskId },
         });
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         audit({
-          action: "webhook", actor: who, target: decision.project,
+          action: "webhook", actor: `todoist:${who}`, target: decision.project,
           outcome: "failed", body: decision.body, reason,
           meta: { event: event.event_name, taskId: decision.taskId },
         });

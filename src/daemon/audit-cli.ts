@@ -4,7 +4,7 @@
  * Reads the file directly rather than going through the daemon: an audit trail
  * you cannot inspect when the daemon is down is not much of an audit trail.
  */
-import { readAudit, auditPath, type AuditEvent } from "./audit.js";
+import { readAudit, auditPath, resolveBody, type AuditEvent } from "./audit.js";
 
 function usage(): void {
   console.log(`aibroker audit — what one session did to another
@@ -43,8 +43,14 @@ function render(e: AuditEvent, bodies: boolean): void {
   console.log(`${time} [${e.id}]${chain} ${e.actor} ${icon} ${e.target}  ${e.action}:${e.outcome}`);
   if (e.reason) console.log(`         ${oneLine(e.reason, 110)}`);
   if (e.body) {
-    if (bodies) for (const l of e.body.split("\n")) console.log(`       | ${l}`);
-    else console.log(`       | ${oneLine(e.body)}`);
+    if (bodies) {
+      // Pull the full text back from its sidecar when the line only holds a preview.
+      const full = resolveBody(e) ?? e.body;
+      for (const l of full.split("\n")) console.log(`       | ${l}`);
+    } else {
+      const more = e.bodyRef ? ` [+${(e.bodyBytes ?? 0) - e.body.length}B — see --bodies]` : "";
+      console.log(`       | ${oneLine(e.body)}${more}`);
+    }
   }
   const reply = e.meta?.reply;
   if (typeof reply === "string") console.log(`       < ${bodies ? reply : oneLine(reply)}`);
