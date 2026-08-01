@@ -33,7 +33,17 @@ import {
 } from "./pai-projects.js";
 import { getAllPersistentSessionNames, lookupPersistentName } from "../core/persistence.js";
 import { type AckResult } from "./sessions.js";
-import { captureSession, typeIntoSession } from "../transport/sync-facade.js";
+import {
+  INPUT_LINE,
+  CLAUDE_UI,
+  flatten,
+  inputBoxLines,
+  isClaudeReady,
+  hasBeenSubmitted,
+  realIO,
+  sleep,
+  type TerminalIO,
+} from "./terminal-screen.js";
 import { log } from "../core/log.js";
 
 export type DispatchOutcome =
@@ -104,22 +114,15 @@ const READY_POLL_MS = 1_000;
  */
 export const TASK_PREFIX = "[Task]";
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-/** Terminal access, injectable so the screen heuristics can be tested on real frames. */
-export interface TerminalIO {
-  capture: (id: string) => string | null;
-  send: (id: string, text: string) => void;
-  sleep: (ms: number) => Promise<void>;
-  now: () => number;
-}
-
-const realIO: TerminalIO = {
-  capture: (id) => captureSession(id, 60),
-  send: (id, text) => { typeIntoSession(id, text); },
-  sleep,
-  now: () => Date.now(),
-};
+// Screen-reading lives in terminal-screen.ts, shared with `ask`. Re-exported
+// here because these were dispatch's before `ask` needed them too.
+export {
+  isClaudeReady,
+  hasBeenSubmitted,
+  flatten,
+  realIO,
+  type TerminalIO,
+} from "./terminal-screen.js";
 
 /**
  * Find a running session for `project`.
@@ -155,13 +158,8 @@ function liveSessions(): { id: string; name: string; paiName: string | null }[] 
   }));
 }
 
-/** The line Claude's input box is drawn on. */
-const INPUT_LINE = /^\s*❯/;
-/** Claude's input box: a prompt caret sitting inside a run of box-drawing rule. */
-const CLAUDE_UI = /─{20,}/;
-
-/** Collapse whitespace so wrapped/padded terminal text compares sanely. */
-function flatten(s: string): string { return s.replace(/\s+/g, " ").trim(); }
+/** A live session with its persistent PAI name resolved. */
+export interface LiveSession { id: string; name: string; paiName: string | null }
 
 /**
  * Wait until a freshly launched session can ACCEPT input.
@@ -185,11 +183,6 @@ export async function waitForReady(
     if (isClaudeReady(frame)) return true;
   }
   return false;
-}
-
-/** True when a frame shows Claude's input box drawn and ready to take text. */
-export function isClaudeReady(frame: string): boolean {
-  return CLAUDE_UI.test(frame) && frame.split("\n").some((l) => INPUT_LINE.test(l));
 }
 
 /**
@@ -238,38 +231,6 @@ export async function submitAndConfirm(
     }
   }
   return "no-ack";
-}
-
-/**
- * Has `needle` left the input box and landed in the transcript?
- *
- * Present on screen is not enough — text sitting unsubmitted in the input box is
- * also "present". Submission is the moment it appears while the ❯ line no longer
- * holds it.
- */
-export function hasBeenSubmitted(frame: string, needle: string): boolean {
-  const stillTyped = inputBoxLines(frame).some((l) => flatten(l).includes(needle.slice(0, 24)));
-  return !stillTyped && flatten(frame).includes(needle);
-}
-
-/**
- * The lines inside Claude's input box.
- *
- * A caret alone will not do: Claude echoes each submitted message into the
- * transcript with the SAME `❯` marker, so "a ❯ line contains our text" is true
- * both before and after submitting — the check it was meant to power would
- * never fire. The input box is identified structurally instead, as the region
- * between the last two horizontal rules at the bottom of the frame.
- */
-function inputBoxLines(frame: string): string[] {
-  const lines = frame.split("\n");
-  const rules: number[] = [];
-  lines.forEach((l, i) => { if (CLAUDE_UI.test(l)) rules.push(i); });
-  if (rules.length >= 2) {
-    const [open, close] = [rules[rules.length - 2], rules[rules.length - 1]];
-    return lines.slice(open + 1, close);
-  }
-  return lines.filter((l) => INPUT_LINE.test(l)); // no box drawn — best effort
 }
 
 /** Production wiring for DispatchDeps. */

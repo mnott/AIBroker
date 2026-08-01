@@ -133,7 +133,26 @@ Resolution uses the **curated** alias list only, never `pai project names --all`
 
 The logic lives in the daemon (`dispatch` IPC), so MCP, PAILot and adapters can route work without shelling out; the CLI is a thin, versioned wrapper for shell callers.
 
-### 6. Connect an adapter
+### 6. Ask a session whether it is still alive
+
+```bash
+aibroker ask <project> --stdin --timeout 60 --json
+```
+
+For callers with no session and no mailbox — a launchd poller checking whether the session it handed work to is still going. **Never spawns**: a probe that creates the thing it is probing turns a dead session into a fresh one and reports health.
+
+| state | meaning |
+|---|---|
+| `replied` | it answered; `reply` holds its words |
+| `busy` | mid-turn and still producing output. **Alive** — nothing was sent |
+| `silent` | idle, took the question, never answered. Genuinely suspicious |
+| `absent` | no live session for that project |
+
+**`busy` is positive evidence of life and must not count toward a stuck threshold.** Claude Code queues typed input while mid-turn and only reads it when the turn ends, so a session busy doing exactly the work it was given cannot answer — and a short timeout would report it as silent. Since a scheduler probes precisely when a task has overrun, that false positive would fire constantly. Liveness is therefore decided *before* any question is sent, which also means a working session pays no token cost for being probed.
+
+Every probe of an idle session does inject a message that stays in that session's context, so keep the text short and probe rarely.
+
+### 7. Connect an adapter
 
 ```bash
 # WhatsApp

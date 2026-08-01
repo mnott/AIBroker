@@ -339,6 +339,30 @@ export function registerCoreHandlers(
     }
   });
 
+  /**
+   * ask — put a question to a project's session and wait for its answer.
+   *
+   * Never spawns: a probe that creates the session it is probing reports health
+   * for a session that had died.
+   */
+  server.on("ask", async (req) => {
+    const { project, question, timeoutMs } = req.params as {
+      project?: string;
+      question?: string;
+      timeoutMs?: number;
+    };
+    if (!project) return { ok: false, error: "project is required" };
+    if (!question) return { ok: false, error: "question is required" };
+
+    const { ask } = await import("./ask.js");
+    try {
+      const result = await ask(project, question, { timeoutMs });
+      return { ok: true, result: { ...result } };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
   server.on("pai_launch", async (req) => {
     const { name } = req.params as { name: string };
     if (!name) return { ok: false, error: "name is required" };
