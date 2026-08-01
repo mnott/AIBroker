@@ -331,3 +331,63 @@ test("the description still rides along when the address is stripped", () => {
   const d = route(task({ content: "pai do xyz", description: "context here", labels: [] }), cfg, KNOWN);
   assert.equal(d.act && d.body, "do xyz\n\ncontext here");
 });
+
+// ── the checkbox as a Run Now button ────────────────────────────────────────
+//
+// Ticking a RECURRING task does not close it: Todoist advances the due date and
+// the task stays open. That is the click-to-run pattern — a checkbox used as a
+// trigger. Everything else about completion is unchanged, because "done" must
+// never start work: get this wrong and ticking something off starts the thing
+// you thought you were finishing.
+
+const recurringTrigger = (over: Record<string, unknown> = {}): TodoistEvent => ({
+  event_name: "item:completed",
+  triggered_at: "2026-08-01T20:00:00.0Z",
+  initiator: { email: "owner@example.com", id: "1" },
+  event_data: {
+    id: "task-run", content: "Job sweep — run it and mail me the list",
+    description: "", project_id: INGRESS,
+    labels: ["pai:whazaa"], due: { is_recurring: true },
+    ...over,
+  },
+});
+
+test("completing a recurring, addressed task dispatches it", () => {
+  const d = route(recurringTrigger(), cfg, ["whazaa"]);
+  assert.equal(d.act, true);
+  assert.equal(d.act && d.project, "whazaa");
+});
+
+test("completing a one-off task still starts nothing", () => {
+  // The default and the important case: finishing work must not restart it.
+  const d = route(recurringTrigger({ due: { is_recurring: false } }), cfg, ["whazaa"]);
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /no action taken/);
+});
+
+test("a task with no due date at all still starts nothing", () => {
+  const d = route(recurringTrigger({ due: undefined }), cfg, ["whazaa"]);
+  assert.equal(d.act, false);
+});
+
+test("a recurring task without a routing label is not a trigger", () => {
+  // A recurring shopping list in an ingress project must not become a work
+  // order because someone ticked it. The label is the opt-in.
+  const d = route(recurringTrigger({ labels: [] }), cfg, ["whazaa"]);
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /no action taken/);
+});
+
+test("a task already claimed by a runner is not dispatched again", () => {
+  // PAI's poller sets pai-running before anything else. Two mechanisms
+  // watching one checkbox must not both fire for the same tick.
+  const d = route(recurringTrigger({ labels: ["pai:whazaa", "pai-running"] }), cfg, ["whazaa"]);
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /already in flight/);
+});
+
+test("the running label blocks even a plain completion", () => {
+  const d = route(recurringTrigger({ due: { is_recurring: false }, labels: ["pai-running"] }), cfg, ["whazaa"]);
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /already in flight/);
+});
