@@ -250,3 +250,52 @@ test("the same task's creation is still suppressed", () => {
   };
   assert.equal(route(created, cfg, ["jobs-matthias"]).act, false);
 });
+
+// ── a claim that flaps ──────────────────────────────────────────────────────
+//
+// Observed twice on 2026-08-01: the claim write failed with 401 and a
+// retry_after of a few seconds, the dispatch proceeded unclaimed, and PAI's
+// poller then read the same tick as a fresh request. The failure was in a log
+// file and nowhere else.
+
+test("a 401 carrying retry_after is retried once", async () => {
+  let calls = 0;
+  const impl = (async (_u: string | URL | Request, init?: RequestInit) => {
+    calls++;
+    // First lookup flaps; the retry succeeds and the POST follows.
+    if (calls === 1) {
+      return new Response(JSON.stringify({ error: "Unauthorized", error_code: 477, error_extra: { retry_after: 1 } }), { status: 401 });
+    }
+    if (init?.method === "POST") return new Response("{}", { status: 200 });
+    return new Response(JSON.stringify({ labels: ["pai:jobs-matthias"] }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const { setTaskLabel } = await import("../src/daemon/todoist-reply.js");
+  const labels = await setTaskLabel("t-flap", "pai-running", true, impl);
+  assert.deepEqual(labels, ["pai:jobs-matthias", "pai-running"]);
+  assert.equal(calls, 3, "lookup, retried lookup, then the write");
+});
+
+test("a second failure gives up rather than retrying forever", async () => {
+  // One retry covers a flap. More would turn a deliberate hint into a lock
+  // that blocks the dispatch waiting behind it.
+  let calls = 0;
+  const impl = (async () => {
+    calls++;
+    return new Response(JSON.stringify({ error: "Unauthorized", error_extra: { retry_after: 1 } }), { status: 401 });
+  }) as unknown as typeof fetch;
+
+  const { setTaskLabel } = await import("../src/daemon/todoist-reply.js");
+  await assert.rejects(() => setTaskLabel("t-flap2", "pai-running", true, impl), /401/);
+  assert.equal(calls, 2, "one attempt, one retry");
+});
+
+test("a failure with no retry_after is not retried", async () => {
+  // A hard refusal is not a flap; retrying it just doubles the load that may
+  // have caused it.
+  let calls = 0;
+  const impl = (async () => { calls++; return new Response("nope", { status: 403 }); }) as unknown as typeof fetch;
+  const { setTaskLabel } = await import("../src/daemon/todoist-reply.js");
+  await assert.rejects(() => setTaskLabel("t-hard", "pai-running", true, impl), /403/);
+  assert.equal(calls, 1);
+});

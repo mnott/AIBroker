@@ -231,13 +231,25 @@ export async function setTaskLabel(
   label: string,
   present: boolean,
   fetchImpl: typeof fetch = fetch,
+  attempt = 1,
 ): Promise<string[]> {
   const token = await getAccessToken();
   if (!token) throw new Error("no Todoist authorisation on file — run `aibroker todoist auth`");
   const auth = { authorization: `${token.token_type} ${token.access_token}` };
 
   const got = await fetchImpl(`https://api.todoist.com/api/v1/tasks/${encodeURIComponent(taskId)}`, { headers: auth });
-  if (!got.ok) throw new Error(`task lookup failed with ${got.status}`);
+  if (!got.ok) {
+    // Todoist returns 401 with a retry_after for what behaves like throttling,
+    // in bursts of a few seconds. One retry covers a flap; more would turn a
+    // deliberate hint into a lock that blocks the dispatch behind it.
+    const body = await got.text();
+    const retryAfter = Number(/"retry_after"\s*:\s*(\d+)/.exec(body)?.[1] ?? 0);
+    if (attempt === 1 && retryAfter > 0 && retryAfter <= 30) {
+      await new Promise((r) => setTimeout(r, (retryAfter + 1) * 1000));
+      return setTaskLabel(taskId, label, present, fetchImpl, 2);
+    }
+    throw new Error(`task lookup failed with ${got.status}${retryAfter ? ` (retry_after ${retryAfter}s)` : ""}`);
+  }
   const current = JSON.parse(await got.text()) as { labels?: unknown[] };
   const labels = Array.isArray(current.labels) ? current.labels.map(String) : [];
 
