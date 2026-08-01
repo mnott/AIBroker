@@ -152,7 +152,27 @@ For callers with no session and no mailbox — a launchd poller checking whether
 
 Every probe of an idle session does inject a message that stays in that session's context, so keep the text short and probe rarely.
 
-### 7. Connect an adapter
+### 7. Audit what one session did to another
+
+```bash
+aibroker audit                       # recent cross-session activity
+aibroker audit --session Youdrill    # everything touching one session
+aibroker audit --trace <id>          # follow one causation chain
+aibroker audit --bodies              # full message bodies
+aibroker audit --json                # raw JSONL, for piping
+```
+
+Every daemon-mediated cross-session action — `send`, `dispatch`, `ask`, `launch`, and refusals — is appended to `~/.aibroker/audit.jsonl`, one JSON object per line, **before and independently of whatever the acting agent later reports**.
+
+That distinction is the point. Sessions can now message each other, dispatch work, spawn new sessions and probe for liveness, and chains form that nobody designed: an observation in one project reaching a second session which relays it to a third. Without a record, the only account of any of it is each participant's own — a session that acts and does not mention it leaves no trace, and a session that ends takes its side of the story with it.
+
+Bodies are stored in full, because a summary of a message is exactly the self-report this replaces. Refusals are stored too: "the hub declined to type this into a shell" is part of the history.
+
+`--trace` walks a chain in both directions — what led to an event, and what it led to. Causation is inferred from the last message an actor received, which reconstructs `A→B→C` correctly in the ordinary case but is a heuristic, not proof: an agent may act for reasons of its own.
+
+The format is deliberately plain JSONL: greppable with the tools already on the machine, appendable by any other tool that wants to contribute events, and a torn final line costs one record rather than the file. Set `AIBROKER_AUDIT_FILE` to relocate it.
+
+### 8. Connect an adapter
 
 ```bash
 # WhatsApp
