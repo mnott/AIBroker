@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { log } from "../core/log.js";
+import { GuardedStore } from "../core/json-store.js";
 
 const require = createRequire(import.meta.url);
 
@@ -74,25 +75,36 @@ function getApnsClient(): any | null {
 
 // --- Token storage ---
 
-function loadTokens(): string[] {
-  try {
-    if (!existsSync(TOKENS_FILE)) return [];
-    const raw = readFileSync(TOKENS_FILE, "utf-8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((t): t is string => typeof t === "string") : [];
-  } catch {
-    return [];
+/**
+ * Registered device tokens.
+ *
+ * Guarded because the read-then-write cycle here silently deletes devices: an
+ * unreadable token file used to read as `[]`, the newly registering device was
+ * appended to nothing, and the save persisted a one-element list. Every other
+ * device stops receiving push, with no error at any point — and a notification
+ * that never arrives is not something anyone notices for days.
+ */
+let _tokenStore: GuardedStore<string[]> | null = null;
+
+function tokenStore(): GuardedStore<string[]> {
+  if (_tokenStore === null) {
+    _tokenStore = new GuardedStore<string[]>(TOKENS_FILE, () => [], "[APNs]");
   }
+  return _tokenStore;
+}
+
+function loadTokens(): string[] {
+  const raw = tokenStore().load();
+  // Tolerate a hand-edited file that parsed but isn't the expected shape.
+  return Array.isArray(raw) ? raw.filter((t): t is string => typeof t === "string") : [];
 }
 
 function saveTokens(tokens: string[]): void {
-  try {
-    const dir = join(homedir(), ".aibroker");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), "utf-8");
-  } catch (err) {
-    log(`[APNs] failed to save tokens: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  const store = tokenStore();
+  const cache = store.load();
+  cache.length = 0;
+  cache.push(...tokens);
+  store.save();
 }
 
 /**

@@ -13,6 +13,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { log } from "../../core/log.js";
+import { saveJson } from "../../core/json-store.js";
 
 const QUEUE_DIR = join(homedir(), ".aibroker");
 const QUEUE_FILE = join(QUEUE_DIR, "pailot-queue.json");
@@ -83,7 +84,14 @@ function scheduleSave(): void {
     dirty = false;
     try {
       const state: QueueState = { nextSeq, messages };
-      writeFileSync(QUEUE_FILE, JSON.stringify(state), "utf-8");
+      // Atomic, so a crash mid-write cannot truncate the queue into the corrupt
+      // state that makes the next load discard it. No .bak: this saves on a
+      // 500ms debounce and copying the whole buffer each time would cost more
+      // than the backup is worth. Unlike the name and token stores, refusing to
+      // save on a corrupt read would be wrong here — undelivered messages are
+      // not recoverable from a broken file, so starting fresh IS the correct
+      // recovery and blocking writes would disable the queue permanently.
+      saveJson(QUEUE_FILE, state, { backup: false });
     } catch (err) {
       log(`[MQ] save error: ${err instanceof Error ? err.message : err}`);
     }
