@@ -255,3 +255,24 @@ export async function setTaskLabel(
   if (!res.ok) throw new Error(`label update failed with ${res.status}: ${(await res.text()).slice(0, 120)}`);
   return next;
 }
+
+/** The task's current due date, or undefined when it has none or cannot be read. */
+export async function fetchTaskDue(
+  taskId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | undefined> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return undefined;
+    const res = await fetchImpl(`https://api.todoist.com/api/v1/tasks/${encodeURIComponent(taskId)}`, {
+      headers: { authorization: `${token.token_type} ${token.access_token}` },
+    });
+    if (!res.ok) return undefined;
+    const t = JSON.parse(await res.text()) as { due?: { date?: string } };
+    return t.due?.date;
+  } catch {
+    // Unreadable is not "not completed" — the caller treats undefined as
+    // "cannot tell" and allows the release rather than stranding a finished run.
+    return undefined;
+  }
+}
