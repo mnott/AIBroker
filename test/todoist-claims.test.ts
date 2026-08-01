@@ -155,20 +155,30 @@ test("a claim released early is not resurrected by the sweep", () => {
 // trust an ordering we do not control — a stuck claim released by a timer is
 // the direction both sides agreed to fail in.
 
-test("releasing before the completion lands is refused", () => {
+test("releasing while the task is still overdue is refused", () => {
+  // Unclaimed AND overdue is ordinary overdue work: the next poll dispatches it,
+  // and the same run happens again looking spontaneous.
   clear();
-  const due = inHours(24);
-  recordClaim("t-early-release", undefined, due);
-  const v = mayRelease("t-early-release", due);
+  recordClaim("t-early-release", undefined, inHours(-2));
+  const v = mayRelease("t-early-release", inHours(-2));
   assert.equal(v.ok, false);
-  assert.match((v as { reason: string }).reason, /has not been completed yet/);
+  assert.match((v as { reason: string }).reason, /still overdue/);
 });
 
-test("releasing after the completion is allowed", () => {
-  // `pai task done` advances the recurrence again, past the recorded occurrence.
+test("releasing once the due date is in the future is allowed", () => {
   clear();
   recordClaim("t-done-release", undefined, inHours(24));
   assert.equal(mayRelease("t-done-release", inHours(48)).ok, true);
+});
+
+test("a schedule repair that moves the date BACKWARDS still allows release", () => {
+  // PAI restores the occurrence a manual trigger consumed, so the due can move
+  // back legitimately. Comparing against the occurrence recorded at claim time
+  // would refuse a release on a run that genuinely finished — a stuck claim
+  // caused by a correct repair. What matters is only whether it is overdue.
+  clear();
+  recordClaim("t-restored", undefined, inHours(48));
+  assert.equal(mayRelease("t-restored", inHours(9)).ok, true, "restored to an earlier, still-future slot");
 });
 
 test("an unrecorded claim is releasable — there is nothing to protect", () => {
