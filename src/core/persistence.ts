@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 import { log } from "./log.js";
+import { GuardedStore } from "./json-store.js";
 import {
   sessionRegistry,
   clientQueues,
@@ -31,6 +32,9 @@ let _appDir = join(homedir(), ".aibroker");
  */
 export function setAppDir(dir: string): void {
   _appDir = dir;
+  // The name store binds its path at construction, so a later dir change must
+  // invalidate it or it would keep reading (and writing) the previous location.
+  resetSessionNamesCache();
 }
 
 export function getAppDir(): string {
@@ -142,19 +146,41 @@ const SESSION_NAMES_FILE = "session-names.json";
 
 type SessionNamesStore = Record<string, string>;
 
-/** In-memory cache for the persistent name store. */
-let _sessionNamesCache: SessionNamesStore | null = null;
+/**
+ * The persistent name store.
+ *
+ * Guarded rather than a plain `?? {}`: this file maps every session id to its
+ * PAI name, and those names are what dispatch and name-targeted sends resolve
+ * against. Reading it as empty and then saving one rename over the top would
+ * discard the lot, silently, on an operation that reports success — and the
+ * result is cached, so a single unreadable read at startup would keep
+ * truncating the file for the rest of the daemon's life.
+ */
+let _sessionNames: GuardedStore<SessionNamesStore> | null = null;
+
+function sessionNames(): GuardedStore<SessionNamesStore> {
+  // Built lazily: _appDir is configurable and may be set after module load.
+  if (_sessionNames === null) {
+    _sessionNames = new GuardedStore<SessionNamesStore>(
+      join(_appDir, SESSION_NAMES_FILE),
+      () => ({}),
+      "session-names",
+    );
+  }
+  return _sessionNames;
+}
 
 function loadSessionNames(): SessionNamesStore {
-  if (_sessionNamesCache !== null) return _sessionNamesCache;
-  _sessionNamesCache = safeReadJson<SessionNamesStore>(SESSION_NAMES_FILE) ?? {};
-  return _sessionNamesCache;
+  return sessionNames().load();
 }
 
 function saveSessionNames(): void {
-  if (_sessionNamesCache !== null) {
-    safeWriteJson(SESSION_NAMES_FILE, _sessionNamesCache);
-  }
+  sessionNames().save();
+}
+
+/** Drop the cached name store (used when the app dir changes, and by tests). */
+export function resetSessionNamesCache(): void {
+  _sessionNames = null;
 }
 
 /**
