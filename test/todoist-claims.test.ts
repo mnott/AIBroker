@@ -18,7 +18,8 @@ process.env.HOME = scratch;
 mkdirSync(join(scratch, ".aibroker"), { recursive: true });
 
 const {
-  recordClaim, forgetClaim, listClaims, expiredClaims, sweepAbandonedClaims, CLAIM_MAX_AGE_MS,
+  recordClaim, forgetClaim, listClaims, expiredClaims, sweepAbandonedClaims,
+  claimDeadline, CLAIM_MIN_AGE_MS, CLAIM_FALLBACK_AGE_MS,
 } = await import("../src/daemon/todoist-claims.js");
 
 const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
@@ -29,26 +30,62 @@ function clear(): void {
   for (const c of listClaims()) forgetClaim(c.taskId);
 }
 
+const inHours = (h: number) => new Date(Date.now() + h * 3600_000).toISOString();
+
 test("a fresh claim is not expired", () => {
-  recordClaim("t-fresh");
+  clear();
+  recordClaim("t-fresh", undefined, inHours(24));
   assert.equal(expiredClaims().some((c) => c.taskId === "t-fresh"), false);
 });
 
-test("a claim older than the window is expired", () => {
-  recordClaim("t-old", ago(CLAIM_MAX_AGE_MS + 60_000));
-  assert.equal(expiredClaims().some((c) => c.taskId === "t-old"), true);
+test("the deadline is the next occurrence, not a fixed duration", () => {
+  // A flat window cannot stay behind an adaptive one. PAI releases at
+  // max(expected x 10, 120 min); a flat 180 min sat behind that only for tasks
+  // expected under 18 minutes and IN FRONT of it for every real routine, so the
+  // less informed release fired first.
+  const daily = { claimedAt: new Date().toISOString(), nextDue: inHours(24) };
+  const hours = (claimDeadline(daily) - Date.now()) / 3600_000;
+  assert.ok(hours > 23 && hours < 24, `deadline at ${hours}h should sit just inside the next run`);
 });
 
-test("the window is longer than PAI's, so the better-informed release wins", () => {
-  // PAI ages its own claims at max(expected x 10, 120 min) and knows what the
-  // task usually costs. This is only ever the backstop for a machine running
-  // the webhook trigger with no poller at all.
-  assert.ok(CLAIM_MAX_AGE_MS > 120 * 60 * 1000);
+test("a claim never survives into the run it would block", () => {
+  // Past the next occurrence the trigger arrives and the claim suppresses it,
+  // which is the silence again.
+  const c = { claimedAt: ago(20 * 3600_000), nextDue: inHours(0.01) };
+  assert.ok(claimDeadline(c) < Date.parse(c.nextDue));
+});
+
+test("a slow run is not released in its first two hours", () => {
+  // Even a frequent task: a run is allowed to overrun its own period once.
+  const hourly = { claimedAt: new Date().toISOString(), nextDue: inHours(1) };
+  assert.equal(claimDeadline(hourly), Date.parse(hourly.claimedAt) + CLAIM_MIN_AGE_MS);
+});
+
+test("with no known occurrence it falls back to twelve hours", () => {
+  // Chosen to clear an adaptive poller's default rather than to be right.
+  const c = { claimedAt: new Date().toISOString() };
+  assert.equal(claimDeadline(c), Date.parse(c.claimedAt) + CLAIM_FALLBACK_AGE_MS);
+  assert.ok(CLAIM_FALLBACK_AGE_MS > 5 * 3600_000, "must clear PAI's 30-minute default of 5h");
+});
+
+test("a four-hour run on a daily task is left alone", () => {
+  // The concrete regression: a flat 3h window released this claim mid-run and
+  // the next poll dispatched a second sweep alongside the first.
+  clear();
+  recordClaim("t-slow", ago(4 * 3600_000), inHours(20));
+  assert.equal(expiredClaims().some((c) => c.taskId === "t-slow"), false);
+});
+
+test("a claim recorded in the old bare-timestamp shape still ages", () => {
+  // 0.17.2 stored a string. An upgrade must not strand those forever.
+  clear();
+  recordClaim("t-legacy", ago(CLAIM_FALLBACK_AGE_MS + 3600_000));
+  assert.equal(expiredClaims().some((c) => c.taskId === "t-legacy"), true);
 });
 
 test("sweeping releases the label and forgets the claim", async () => {
   clear();
-  recordClaim("t-sweep", ago(CLAIM_MAX_AGE_MS + 1000));
+  recordClaim("t-sweep", ago(CLAIM_FALLBACK_AGE_MS + 1000));
   const released: string[] = [];
   const done = await sweepAbandonedClaims(async (id) => { released.push(id); });
   assert.deepEqual(done, ["t-sweep"]);
@@ -60,7 +97,7 @@ test("a failed release keeps the record, to be retried next sweep", async () => 
   clear();
   // Forgetting a claim we could not actually remove would leave the label on
   // the task forever with nothing tracking it — the exact silence being fixed.
-  recordClaim("t-fail", ago(CLAIM_MAX_AGE_MS + 1000));
+  recordClaim("t-fail", ago(CLAIM_FALLBACK_AGE_MS + 1000));
   const done = await sweepAbandonedClaims(async () => { throw new Error("api down"); });
   assert.deepEqual(done, []);
   assert.equal(listClaims().some((c) => c.taskId === "t-fail"), true);
@@ -70,7 +107,7 @@ test("releasing is idempotent, so two releasers converge", async () => {
   clear();
   // PAI may release the same claim. Removing an absent label is a no-op, which
   // is why two releasers are safe where two dispatchers would not be.
-  recordClaim("t-twice", ago(CLAIM_MAX_AGE_MS + 1000));
+  recordClaim("t-twice", ago(CLAIM_FALLBACK_AGE_MS + 1000));
   await sweepAbandonedClaims(async () => {});
   const second = await sweepAbandonedClaims(async () => {});
   assert.deepEqual(second, []);

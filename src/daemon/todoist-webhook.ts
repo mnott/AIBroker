@@ -566,7 +566,14 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
           await setTaskLabel(decision.taskId, RUNNING_LABEL, true);
           // Remember when, so a claim nobody comes back for can be released.
           const { recordClaim } = await import("./todoist-claims.js");
-          recordClaim(decision.taskId);
+          recordClaim(
+            decision.taskId,
+            undefined,
+            // Todoist has already advanced the due date by the time a completion
+            // reaches us, so this is the NEXT occurrence — the point past which
+            // a surviving claim would block the very trigger it guards.
+            (event.event_data?.due as { date?: string } | undefined)?.date,
+          );
         } catch (err) {
           log(`todoist-webhook: could not claim ${decision.taskId} — ${err instanceof Error ? err.message : String(err)}`);
         }
