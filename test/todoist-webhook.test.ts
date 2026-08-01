@@ -391,3 +391,34 @@ test("the running label blocks even a plain completion", () => {
   assert.equal(d.act, false);
   assert.match((d as { reason: string }).reason, /already in flight/);
 });
+
+// ── defining a trigger is not pulling it ────────────────────────────────────
+//
+// Found live on 2026-08-01: creating a click-to-run task with a pai: label
+// dispatched it on item:added, and ticking it dispatched it again half a second
+// later. One intent, two runs. Adding a crontab line does not run the job.
+
+test("creating a recurring, addressed task does NOT run it", () => {
+  const d = route(task({ due: { is_recurring: true } }), cfg, ["whazaa"]);
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /will run when fired or ticked, not now/);
+});
+
+test("creating an ordinary task still runs it", () => {
+  // Only a RECURRING labelled task is a trigger definition. Everything filed
+  // from a watch must still dispatch on creation.
+  assert.equal(route(task(), cfg, ["whazaa"]).act, true);
+});
+
+test("creating a recurring task with no routing label still runs it", () => {
+  // "water the plants, every monday" filed into an ingress project is work,
+  // not a trigger: it has no label saying where it should go.
+  const d = route(task({ due: { is_recurring: true }, labels: [], project_id: OWNED }), cfg, ["whazaa"]);
+  assert.equal(d.act, true);
+});
+
+test("a fired reminder on a trigger still dispatches", () => {
+  // The whole point of defining one.
+  const e = { ...task({ due: { is_recurring: true } }), event_name: "reminder:fired" };
+  assert.equal(route(e, cfg, ["whazaa"]).act, true);
+});

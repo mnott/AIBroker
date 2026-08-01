@@ -322,6 +322,10 @@ So completion dispatches when **all three** hold:
 
 Everything else about completion is unchanged. Ticking off a one-off task, or a recurring one with no routing label, starts nothing: get that wrong and finishing something starts the thing you thought you were finishing.
 
+**Creating a trigger does not fire it.** A recurring, labelled task filed into an ingress project is a *definition* — adding a crontab line does not run the job. It runs when its reminder fires, or when you tick it. Without that rule, filing a click-to-run task dispatches it once on creation and again on the first tick: one intent, two runs, half a second apart.
+
+**Whichever path dispatches also claims the task.** The webhook adds `pai-running` before dispatching and removes it again if the dispatch never landed. Honouring another runner's claim is only half an interlock — a path that dispatches and leaves the task unclaimed lets the next poller see an advanced due date with nothing on it, conclude the box was ticked, and run the same work again.
+
 `pai-running` is the interlock between mechanisms. A poller that claims a tick sets it before doing anything else, so a crash leaves the task visibly in flight rather than silently dispatched twice — and the webhook path honours it, because two mechanisms watching one checkbox must not both fire.
 
 ### Filing work for yourself — later, yes; instantly, no

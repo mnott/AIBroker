@@ -217,3 +217,41 @@ export async function createTask(
   log(`todoist: created task ${parsed.id ?? "?"}`);
   return { taskId: parsed.id ?? "?" };
 }
+
+/**
+ * Add or remove a label on a task.
+ *
+ * Used to CLAIM a trigger before dispatching it. Honouring another runner's
+ * claim is only half an interlock: a path that dispatches and leaves the task
+ * unclaimed lets the next poller see an advanced due date with no claim on it,
+ * conclude the box was ticked, and dispatch the same work again.
+ */
+export async function setTaskLabel(
+  taskId: string,
+  label: string,
+  present: boolean,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string[]> {
+  const token = await getAccessToken();
+  if (!token) throw new Error("no Todoist authorisation on file — run `aibroker todoist auth`");
+  const auth = { authorization: `${token.token_type} ${token.access_token}` };
+
+  const got = await fetchImpl(`https://api.todoist.com/api/v1/tasks/${encodeURIComponent(taskId)}`, { headers: auth });
+  if (!got.ok) throw new Error(`task lookup failed with ${got.status}`);
+  const current = JSON.parse(await got.text()) as { labels?: unknown[] };
+  const labels = Array.isArray(current.labels) ? current.labels.map(String) : [];
+
+  const has = labels.some((l) => l.toLowerCase() === label.toLowerCase());
+  if (has === present) return labels;
+  const next = present
+    ? [...labels, label]
+    : labels.filter((l) => l.toLowerCase() !== label.toLowerCase());
+
+  const res = await fetchImpl(`https://api.todoist.com/api/v1/tasks/${encodeURIComponent(taskId)}`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ labels: next }),
+  });
+  if (!res.ok) throw new Error(`label update failed with ${res.status}: ${(await res.text()).slice(0, 120)}`);
+  return next;
+}

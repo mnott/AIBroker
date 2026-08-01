@@ -52,6 +52,21 @@ export const AGENT_MARK = "🤖";
  */
 export const RUNNING_LABEL = "pai-running";
 
+/**
+ * Is this task a click-to-run trigger rather than a piece of work?
+ *
+ * Two conditions, and both matter. It RECURS, so ticking it reschedules rather
+ * than ends it — that is what makes a checkbox usable as a button. And it
+ * carries an explicit routing label, so it was built to be dispatched: without
+ * that, a recurring shopping list in an allowed project becomes a work order
+ * the first time someone ticks it.
+ */
+export function isTrigger(data: Record<string, unknown>): boolean {
+  const labels = Array.isArray(data.labels) ? (data.labels as unknown[]).map(String) : [];
+  const due = data.due as { is_recurring?: boolean } | undefined;
+  return Boolean(due?.is_recurring) && labels.some((l) => l.toLowerCase().startsWith("pai:"));
+}
+
 export interface TodoistEvent {
   event_name: string;
   user_id?: string;
@@ -254,6 +269,14 @@ export function route(
   if (!ACTIONABLE.has(e.event_name)) {
     return { act: false, reason: `event ${e.event_name} is not actionable` };
   }
+
+  // Creating a recurring, addressed task DEFINES a trigger; it does not pull
+  // it. Adding a crontab line does not run the job. Without this, filing a
+  // click-to-run task fires it once on creation and then again on the first
+  // tick — one intent, two runs, half a second apart.
+  if (e.event_name === "item:added" && isTrigger(data)) {
+    return { act: false, reason: "recurring trigger defined — it will run when fired or ticked, not now" };
+  }
   // Completion is the human saying "done"; it must never start work.
   //
   // Except for one shape, which is not an ending at all. Ticking a RECURRING
@@ -269,13 +292,10 @@ export function route(
   //     already claimed this tick is not raced by the webhook
   if (e.event_name === "item:completed") {
     const labels = Array.isArray(data.labels) ? (data.labels as unknown[]).map(String) : [];
-    const due = data.due as { is_recurring?: boolean } | undefined;
-    const addressed = labels.some((l) => l.toLowerCase().startsWith("pai:"));
-
     if (labels.some((l) => l.toLowerCase() === RUNNING_LABEL)) {
       return { act: false, reason: `task is already in flight (${RUNNING_LABEL}) — completion ignored` };
     }
-    if (!due?.is_recurring || !addressed) {
+    if (!isTrigger(data)) {
       return { act: false, reason: "task completed — recorded, no action taken" };
     }
     // Falls through to normal routing: a trigger goes wherever its label says.
@@ -534,6 +554,21 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         return;
       }
 
+      // Claim a trigger before dispatching, and release it if the dispatch
+      // does not land. Honouring another runner's claim is only half an
+      // interlock: a path that dispatches and leaves the task unclaimed lets
+      // the next poller see an advanced due date with nothing on it, conclude
+      // the box was ticked, and run the same sweep again.
+      const claiming = event.event_name === "item:completed" && isTrigger(event.event_data ?? {});
+      if (claiming) {
+        try {
+          const { setTaskLabel } = await import("./todoist-reply.js");
+          await setTaskLabel(decision.taskId, RUNNING_LABEL, true);
+        } catch (err) {
+          log(`todoist-webhook: could not claim ${decision.taskId} — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
       try {
         // The id rides along so the session can answer on the task it came
         // from. Without it the reply has nowhere to go but a terminal the
@@ -567,6 +602,18 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         // Recorded on the way out and only on a real delivery: a task nobody
         // accepted has no owner to inherit.
         if (!isComment && r.outcome === "delivered") rememberOwner(decision.taskId, decision.project);
+
+        // Release a claim the dispatch did not earn. "queued" keeps it — the
+        // work IS in flight, the session is simply mid-turn — but a trigger
+        // that never reached anyone must go back to being tickable, or the
+        // button is dead until someone removes the label by hand.
+        if (claiming && r.outcome !== "delivered" && r.outcome !== "queued" && r.outcome !== "spawned") {
+          try {
+            const { setTaskLabel } = await import("./todoist-reply.js");
+            await setTaskLabel(decision.taskId, RUNNING_LABEL, false);
+            log(`todoist-webhook: released ${RUNNING_LABEL} on ${decision.taskId} — dispatch was ${r.outcome}`);
+          } catch { /* the claim is a hint, not a lock; a stuck one is visible */ }
+        }
         audit({
           action: "webhook", actor: `todoist:${who}`, target: r.session || decision.project,
           outcome: r.outcome, body: decision.body, reason: r.reason,
