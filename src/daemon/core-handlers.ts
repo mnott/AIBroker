@@ -1272,13 +1272,27 @@ export function registerCoreHandlers(
   });
 
   server.on("todoist_reply", async (req) => {
-    const { taskId, text } = req.params as { taskId?: string; text?: string };
+    const { taskId, text, release } = req.params as { taskId?: string; text?: string; release?: boolean };
     if (!taskId) return { ok: false, error: "taskId is required" };
     if (!text?.trim()) return { ok: false, error: "text is required" };
     try {
-      const { replyToTask } = await import("./todoist-reply.js");
+      const { replyToTask, setTaskLabel } = await import("./todoist-reply.js");
       const r = await replyToTask(taskId, text);
-      return { ok: true, result: { taskId: r.taskId, commentId: r.commentId } };
+
+      // A triggered run holds pai-running until someone takes it off. Nothing
+      // else here does: the webhook sets it at dispatch and only releases it on
+      // a failed dispatch or at the next occurrence, so a session that finishes
+      // its work and says nothing leaves the trigger suppressed until then —
+      // one missed run, looking exactly like a run nobody asked for.
+      let released = false;
+      if (release) {
+        const { RUNNING_LABEL } = await import("./todoist-webhook.js");
+        const { forgetClaim } = await import("./todoist-claims.js");
+        await setTaskLabel(taskId, RUNNING_LABEL, false);
+        forgetClaim(taskId);
+        released = true;
+      }
+      return { ok: true, result: { taskId: r.taskId, commentId: r.commentId, released } };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }

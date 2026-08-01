@@ -118,3 +118,26 @@ test("a completed dispatch forgets its claim without waiting for the sweep", () 
   forgetClaim("t-done");
   assert.equal(listClaims().some((c) => c.taskId === "t-done"), false);
 });
+
+// ── who takes the claim off ─────────────────────────────────────────────────
+//
+// The webhook sets pai-running at dispatch and only removes it on a failed
+// dispatch or at the next occurrence. Nothing else here does. So a session that
+// finishes its work and says nothing leaves the trigger suppressed until then —
+// one silently missed run, looking exactly like a run nobody asked for. The
+// finished run has to be able to release its own claim.
+
+test("a finished run forgets its claim immediately", () => {
+  clear();
+  recordClaim("t-finished", undefined, inHours(24));
+  assert.equal(listClaims().some((c) => c.taskId === "t-finished"), true);
+  forgetClaim("t-finished");
+  assert.equal(listClaims().some((c) => c.taskId === "t-finished"), false);
+});
+
+test("a claim released early is not resurrected by the sweep", () => {
+  clear();
+  recordClaim("t-early", ago(48 * 3600_000), inHours(-1));
+  forgetClaim("t-early");
+  assert.deepEqual(expiredClaims().filter((c) => c.taskId === "t-early"), []);
+});
