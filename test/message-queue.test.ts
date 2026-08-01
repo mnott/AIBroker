@@ -6,21 +6,32 @@
 
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
+import { writeFileSync, unlinkSync, existsSync, mkdirSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-// We test the module's logic by importing and calling its functions.
-// The queue file path is hardcoded to ~/.aibroker/pailot-queue.json,
-// so we test the core API behavior without mocking the filesystem.
-import {
+// The queue path is derived from homedir() at import time, so HOME is redirected
+// BEFORE the module loads.
+//
+// This file used to say "the path is hardcoded to ~/.aibroker/pailot-queue.json,
+// so we test the core API behavior without mocking the filesystem" — and then
+// wrote to it. Every run overwrote the live PAILot offline queue: on 2026-08-01
+// a 95 MB queue of buffered messages became 885 bytes of test fixtures. Nothing
+// reported it, because a test that destroys production data still passes.
+//
+// A test must not be able to touch anything a user owns.
+const scratch = mkdtempSync(join(tmpdir(), "aibroker-queue-"));
+process.env.HOME = scratch;
+mkdirSync(join(scratch, ".aibroker"), { recursive: true });
+
+const {
   loadQueue,
   flushQueue,
   enqueue,
   getAfter,
   getLatestSeq,
   isContentType,
-} from "../src/adapters/pailot/message-queue.js";
+} = await import("../src/adapters/pailot/message-queue.js");
 
 describe("message-queue", () => {
   // Each test starts with a fresh queue by loading with a clean state
