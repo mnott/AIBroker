@@ -29,10 +29,41 @@ import { log } from "../core/log.js";
 
 const FILE = join(homedir(), ".aibroker", "todoist-claims.json");
 
-/** Longer than PAI's 120-minute floor, so the better-informed release wins. */
-export const CLAIM_MAX_AGE_MS = 3 * 60 * 60 * 1000;
+/**
+ * The invariant, and why it is not a constant.
+ *
+ * A flat window cannot stay behind an adaptive one. PAI releases at
+ * max(expected x 10, 120 min); a flat 180 min sat BEHIND it only for tasks
+ * expected to run under 18 minutes, and in front of it for every real routine —
+ * so the less informed release fired first. A four-hour sweep would have had
+ * its claim released at three hours, and the next poll, seeing an unclaimed
+ * overdue task, would have dispatched a second run alongside the first: the
+ * duplicate the interlock exists to prevent, produced by the backstop.
+ *
+ * The honest bound is not a duration at all. A claim must not survive INTO THE
+ * NEXT SCHEDULED RUN — past that point the next trigger arrives and the claim
+ * blocks it, which is the silence again. So the deadline is the next occurrence
+ * itself, which Todoist has already told us: on completion of a recurring task
+ * the due date has advanced, and the payload carries it.
+ *
+ * That is always outside any per-task timer shorter than one period, without
+ * having to guess anyone else's arithmetic.
+ */
+export const CLAIM_DEADLINE_MARGIN_MS = 5 * 60 * 1000;
 
-interface Store { claims: Record<string, string> }
+/** A run is allowed to be slow. Nothing is released in its first two hours. */
+export const CLAIM_MIN_AGE_MS = 2 * 60 * 60 * 1000;
+
+/** Used only when the next occurrence is unknown — comfortably past PAI's default. */
+export const CLAIM_FALLBACK_AGE_MS = 12 * 60 * 60 * 1000;
+
+interface ClaimRecord {
+  claimedAt: string;
+  /** Next occurrence, when the payload carried one. */
+  nextDue?: string;
+}
+
+interface Store { claims: Record<string, ClaimRecord | string> }
 
 function read(): Store {
   const r = loadJson<Store>(FILE);
@@ -40,11 +71,20 @@ function read(): Store {
   return { claims: {} };
 }
 
-export function recordClaim(taskId: string, at: string = new Date().toISOString()): void {
+export function recordClaim(
+  taskId: string,
+  at: string = new Date().toISOString(),
+  nextDue?: string,
+): void {
   if (!taskId) return;
   const s = read();
-  s.claims[taskId] = at;
+  s.claims[taskId] = { claimedAt: at, nextDue };
   saveJson(FILE, s);
+}
+
+/** Tolerates the pre-0.17.3 shape, where a claim was a bare timestamp. */
+function asRecord(v: ClaimRecord | string): ClaimRecord {
+  return typeof v === "string" ? { claimedAt: v } : v;
 }
 
 export function forgetClaim(taskId: string): void {
@@ -54,16 +94,34 @@ export function forgetClaim(taskId: string): void {
   saveJson(FILE, s);
 }
 
-export function listClaims(): Array<{ taskId: string; claimedAt: string }> {
+export function listClaims(): Array<{ taskId: string; claimedAt: string; nextDue?: string }> {
   const s = read();
-  return Object.entries(s.claims).map(([taskId, claimedAt]) => ({ taskId, claimedAt }));
+  return Object.entries(s.claims).map(([taskId, v]) => ({ taskId, ...asRecord(v) }));
 }
 
-/** Claims old enough that whatever took them is not coming back. */
+/**
+ * When a claim stops being credible.
+ *
+ * The next occurrence, less a small margin, so the claim is gone before the
+ * trigger it would block. With no known occurrence, a flat twelve hours —
+ * chosen to clear an adaptive poller's default rather than to be right.
+ */
+export function claimDeadline(c: { claimedAt: string; nextDue?: string }): number {
+  const claimed = Date.parse(c.claimedAt);
+  const floor = claimed + CLAIM_MIN_AGE_MS;
+  const due = c.nextDue ? Date.parse(c.nextDue) : NaN;
+  const deadline = Number.isFinite(due)
+    ? due - CLAIM_DEADLINE_MARGIN_MS
+    : claimed + CLAIM_FALLBACK_AGE_MS;
+  // A run is allowed to be slow even when the next occurrence is close.
+  return Math.max(deadline, floor);
+}
+
+/** Claims whose deadline has passed — whatever took them is not coming back. */
 export function expiredClaims(now: number = Date.now()): Array<{ taskId: string; ageMs: number }> {
   return listClaims()
-    .map((c) => ({ taskId: c.taskId, ageMs: now - Date.parse(c.claimedAt) }))
-    .filter((c) => Number.isFinite(c.ageMs) && c.ageMs >= CLAIM_MAX_AGE_MS);
+    .filter((c) => Number.isFinite(Date.parse(c.claimedAt)) && now >= claimDeadline(c))
+    .map((c) => ({ taskId: c.taskId, ageMs: now - Date.parse(c.claimedAt) }));
 }
 
 /**
