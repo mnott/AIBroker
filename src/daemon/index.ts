@@ -10,11 +10,13 @@ import { homedir, tmpdir } from "node:os";
 import { unlinkSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { setLogPrefix, log } from "../core/log.js";
+import { loadEnvFile } from "../core/env.js";
 import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
 import { startTodoistWebhook } from "./todoist-webhook.js";
+import { startMailboxWatch } from "./mailbox-watch.js";
 import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession } from "../adapters/pailot/gateway.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping, getMqttClientCount, mqttPublishText, mqttPublishControl } from "../adapters/pailot/mqtt-broker.js";
 import { registerToken as apnsRegisterToken, sendPush as apnsSendPush } from "../apns/client.js";
@@ -31,7 +33,7 @@ import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
 import { AibpBridge } from "../aibp/bridge.js";
 import { findClaudeSession } from "../adapters/iterm/core.js";
-import { typeIntoSession, isClaudeRunningInSession } from "../transport/sync-facade.js";
+import { typeIntoSession, isClaudeRunningInSession, snapshotAllSessions } from "../transport/sync-facade.js";
 import { activeItermSessionId, setActiveItermSessionId, setLastRoutedSessionId } from "../core/state.js";
 import { pruneStaleContexts } from "./image-context.js";
 
@@ -84,33 +86,8 @@ export async function startDaemon(options?: {
   // Load environment from ~/.aibroker/env (KEY=VALUE, one per line)
   // This allows launchd-managed daemons to pick up API tokens without
   // needing them in the plist or shell profile.
-  const envFile = join(appDir, "env");
-  if (existsSync(envFile)) {
-    try {
-      const lines = readFileSync(envFile, "utf-8").split("\n");
-      let loaded = 0;
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const eq = trimmed.indexOf("=");
-        if (eq === -1) continue;
-        const key = trimmed.slice(0, eq).trim();
-        let value = trimmed.slice(eq + 1).trim();
-        // Strip surrounding quotes
-        if ((value.startsWith('"') && value.endsWith('"')) ||
-            (value.startsWith("'") && value.endsWith("'"))) {
-          value = value.slice(1, -1);
-        }
-        if (!process.env[key]) {
-          process.env[key] = value;
-          loaded++;
-        }
-      }
-      if (loaded > 0) log(`Loaded ${loaded} env var(s) from ${envFile}`);
-    } catch (err) {
-      log(`Warning: could not read ${envFile}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+  const loaded = loadEnvFile(appDir);
+  if (loaded > 0) log(`Loaded ${loaded} env var(s) from ${join(appDir, "env")}`);
 
   // Initialize session management
   const apiBackend = new APIBackend({
@@ -298,11 +275,33 @@ export async function startDaemon(options?: {
   // a task filed from a phone or fired by a reminder reaches the owning
   // session through the same dispatch path as everything else, so it inherits
   // the shell guard, the delivery confirmation and the audit trail.
+  // "Queued" is true when it is said and false if nobody ever reads it. This
+  // is the thing that notices the difference.
+  startMailboxWatch();
+
   startTodoistWebhook({
-    deliver: async (project, body) => {
+    deliver: async (project, body, opts) => {
       const { dispatch } = await import("./dispatch.js");
-      const r = await dispatch(project, body, {});
+      const r = await dispatch(project, body, { prefix: opts?.prefix });
       return { outcome: r.outcome, session: r.session, reason: r.reason || undefined };
+    },
+    // Curated PAI aliases FIRST — those are the names dispatch can actually
+    // resolve. Live session names are added too, but a name that only exists
+    // as a running tab will be addressed and then fail to launch, which is
+    // worse than not recognising it: it looks delivered and is not.
+    knownOwners: async () => {
+      const names: string[] = [];
+      try {
+        const { listPaiProjects } = await import("./pai-projects.js");
+        for (const p of await listPaiProjects()) names.push(...(p.names ?? [p.name]));
+      } catch (e) {
+        log(`todoist: could not list PAI projects for addressing — ${e instanceof Error ? e.message : String(e)}`);
+      }
+      for (const s of snapshotAllSessions()) {
+        const n = s.paiName ?? s.name;
+        if (n) names.push(n);
+      }
+      return names;
     },
   });
 

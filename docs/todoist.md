@@ -48,22 +48,35 @@ Todoist's **Inbox cannot be shared**, which is why including it is safe and why 
 
 Todoist calls from the public internet, so the endpoint must be publicly reachable. The receiver binds to loopback and expects a TLS terminator in front.
 
-### Tailscale Funnel (recommended)
+Two hard constraints decide everything here:
 
-**Funnel, not Serve.** Serve is reachable only from inside your tailnet, and Todoist's servers are not in it. This is the single easiest mistake to make.
+| Constraint | Consequence |
+|---|---|
+| **Todoist silently refuses any URL with a port.** | The endpoint must be on **443**. `https://host:8443/todoist` is *accepted by the form and never saved* — no error, the webhook simply stays *Not configured*. |
+| **Serve is tailnet-only; Todoist calls from the public internet.** | Port 443 must be **Funnel**, not Serve. |
+
+Together those mean: **Funnel on 443, no port in the URL.** This is the single easiest thing to get wrong, and both halves fail quietly.
+
+### Tailscale Funnel
 
 ```bash
-tailscale funnel --bg --https=8443 http://127.0.0.1:8766
+tailscale funnel --bg --https=443 --set-path=/todoist http://127.0.0.1:8766/todoist
 tailscale funnel status
 ```
 
 Constraints worth knowing:
 
-- Funnel listens only on **443, 8443 or 10000**.
-- A port cannot be Serve and Funnel at the same time — if 443 is already a Serve, use 8443.
+- Funnel listens only on **443, 8443 or 10000** — and only 443 gives a portless URL.
+- A port cannot be Serve and Funnel at the same time. If 443 is already a tailnet-only Serve, moving it to Funnel makes **every path on that port public**; move anything that should stay private to another port first.
 - Requires MagicDNS, HTTPS certs, and the `funnel` node attribute in your tailnet policy.
 
-Your endpoint is then `https://<host>.<tailnet>.ts.net:8443/todoist`.
+Your endpoint is then `https://<host>.<tailnet>.ts.net/todoist`.
+
+You also need a **tailnet-only Serve on 443** for the OAuth landing, because Todoist rejects a redirect URL that carries a port:
+
+```bash
+tailscale serve --bg --https=443 --set-path=/oauth http://127.0.0.1:8766/oauth
+```
 
 ### Alternatives
 
@@ -80,18 +93,50 @@ Any of these work, since the receiver only needs a proxy that terminates TLS and
 In Todoist: **Settings → Integrations → App Management → Add new integration**.
 
 1. Name it (Todoist's brand rules forbid "Todoist" as the primary name — e.g. `AIBroker Bridge`).
-2. Copy the **Client secret**. This signs the webhooks.
-3. Set an **OAuth redirect URL** — any URL on your endpoint, e.g. `https://<host>.<tailnet>.ts.net:8443/oauth`. It does not need to serve anything, but the app cannot be authorised without one.
+2. Copy the **Client ID** and the **Client secret**. The secret signs the webhooks; the id is needed for the OAuth step below.
+3. Set an **OAuth redirect URL**: `https://<host>.<tailnet>.ts.net/oauth` — **no port**.
 4. Open **Webhooks** and set:
-   - **Callback URL**: `https://<host>.<tailnet>.ts.net:8443/todoist`
+   - **Callback URL**: `https://<host>.<tailnet>.ts.net/todoist` — **no port here either**
    - **Events**: `item:added`, `item:completed`, `reminder:fired`
-5. **Save the settings**, then **activate the webhook**, then **install the app for yourself**.
+
+> **Neither URL field accepts a port, and they fail differently.** The redirect URL says so — *"Invalid URL"* under the field. The callback URL says nothing at all: the form accepts the text, `Activate webhook` appears to do nothing, and the status stays *Not configured* forever. If activation seems broken, the port is the first thing to remove.
+5. **Save the settings**, then **activate the webhook**.
+
+> **The save button is at the bottom of the dialog and is easy to miss entirely.** `Save settings` lives in a sticky footer inside the settings modal. If the browser window is shorter than the modal, that footer is clipped off-screen and there appears to be no way to save at all — the form then looks like it "silently drops" everything you type. Zoom out (`⌘-`) until the footer with `Cancel` / `Save settings` is visible before filling anything in.
+
+> **Fill the app fields first, save, and only then touch the Webhooks block.** Editing the OAuth redirect URL re-renders the webhook sub-form and clears the callback URL and every event checkbox without saying so.
 
 > **Copy the client secret from the clipboard button, not by eye.** It is 32 hex characters and `0`/`4`/`d` are easy to transpose; a single wrong character means every webhook fails HMAC verification and is silently rejected as unsigned. Check `aibroker audit --action webhook` if deliveries never arrive.
 
-> **Verify the settings persisted by reloading the page.** The settings form can report success while dropping the callback URL, the event checkboxes and the redirect URL. Reload and confirm all three are still there before moving on.
+> **Verify the settings persisted by reloading the page.**
 
-> The webhook only fires for accounts that have **installed** the app. If `Number of users: 0`, nothing will ever be delivered.
+> `Number of users` in the console is not a reliable signal — it can read `0` for an account that has genuinely authorised the app. Trust `aibroker todoist status` instead.
+
+---
+
+## 2a. Authorise the account — the step that is easy to miss
+
+**Todoist does not deliver webhooks to the account that created the app.** Delivery is switched on per user when that user completes the OAuth flow, and the console's *Install for myself* button is not that flow. An app that is listed under *Installed* can still have authorised nobody.
+
+Todoist's own guidance is to run the flow by hand: open the authorize URL, read the `code` out of the address bar with developer tools, then exchange it from something that can POST. That instruction describes a missing endpoint — so the daemon serves it:
+
+```bash
+aibroker todoist auth                       # prints the authorize URL, mints a state
+aibroker todoist auth --scope data:read_write,data:delete   # if the bridge should delete tasks
+```
+
+Open the URL, approve, and Todoist returns you to the redirect URL. The daemon answers it: it checks the state, makes the token exchange itself, stores the token at `~/.aibroker/todoist-oauth.json` (mode `0600`), and tells you on the page whether it worked. The token value is never logged and never enters the audit trail — only the fact of an authorisation and its scope.
+
+```bash
+aibroker todoist status
+```
+
+```
+Authorised 2026-08-01T15:40:29.589Z
+Scope: data:delete,data:read_write
+```
+
+The attempt is good for 15 minutes and for exactly one callback. A callback with no pending authorisation behind it is refused *before* the client secret is spent.
 
 Start narrow with those three events. Add more once loop behaviour is proven — `note:added` in particular is what agent comments trigger.
 
@@ -115,6 +160,9 @@ In `~/.aibroker/env`:
 ```bash
 # Client secret from the App Management Console. Signs every webhook.
 TODOIST_CLIENT_SECRET=<32-hex-client-secret>
+# Client id from the same page. Only used by the OAuth landing.
+TODOIST_CLIENT_ID=<32-hex-client-id>
+# TODOIST_OAUTH_PATH=/oauth        # must match the registered redirect URL
 
 TODOIST_WEBHOOK_PORT=8766
 TODOIST_WEBHOOK_PATH=/todoist
@@ -145,8 +193,38 @@ If instead you see `not configured` or `TODOIST_INGRESS_PROJECTS is empty — re
 Most explicit wins:
 
 1. **A `pai:<name>` label** — `pai:whazaa` goes to the Whazaa session wherever it was filed *within the allowlist*.
-2. **The project it was filed in** — if that project has an `=owner` mapping. "Put it in the Whazaa list."
-3. **`TODOIST_DEFAULT_OWNER`** — Inbox capture from a watch, where there is no project and no label.
+2. **A name at the front of the text** — `pai send a whatsapp message` goes to the PAI session, and the address is stripped so the session receives `send a whatsapp message`.
+3. **The project it was filed in** — if that project has an `=owner` mapping. "Put it in the Whazaa list."
+4. **`TODOIST_DEFAULT_OWNER`** — Inbox capture from a watch, where there is no project, no label and no name.
+
+Text beats project deliberately: what you wrote is more considered than where quick-capture happened to put it.
+
+### Addressing by text
+
+A label costs several taps on a phone and more on a watch. The first word of what you were going to type anyway costs nothing:
+
+```
+pai send a whatsapp message      → PAI session, body "send a whatsapp message"
+clickr: check the permissions    → Clickr session ("name:" and "name," also work)
+Buy milk on the way home         → default owner, text untouched
+```
+
+Two rules keep this from misfiring:
+
+- **Only names already known are accepted** — running sessions plus every owner in `TODOIST_INGRESS_PROJECTS`. Otherwise `Home improvements` becomes a work order for the Home session.
+- **A one-word task is never an address.** There would be nothing left to act on.
+
+An owner named in config is addressable even when its session isn't running: the task routes and delivery reports that nobody is home, which is more useful than reading the word as prose.
+
+### Near misses
+
+`@pai do x` as plain text, a `PAI` label, a `pai` label — each *looks* like an instruction about where the task should go, none of them parse, and all three used to land on the default owner in silence. A request that isn't honoured is now recorded:
+
+```
+aibroker audit --action webhook
+```
+
+The record carries `nearMiss` alongside the `rule` that actually chose the owner, so "it went somewhere unexpected" is answerable after the fact rather than a matter of memory. The task is still delivered — a routing miss must not swallow the work.
 
 A label **cannot** smuggle a task in from outside the allowlist. The boundary is the project; the label only chooses among sessions you already trust.
 
@@ -165,11 +243,17 @@ A label **cannot** smuggle a task in from outside the allowlist. The boundary is
 
 ## 6. Verify
 
+**Test from outside the tailnet, or you are not testing anything.** MagicDNS resolves your Funnel hostname to its *tailnet* address, so a plain `curl` from your own machine connects peer-to-peer on `100.x` and never touches the Funnel ingress. It returns a perfectly convincing `401` while the public path is completely untested. Force the public address:
+
 ```bash
-# Signed requests only — unsigned must be refused
+dig +short @8.8.8.8 <host>.<tailnet>.ts.net       # → 185.40.x.x (Funnel ingress)
+
+# Signed requests only — unsigned must be refused, over the PUBLIC path
 curl -s -o /dev/null -w "%{http_code}\n" -X POST -d '{}' \
+  --resolve <host>.<tailnet>.ts.net:8443:<ingress-ip> \
   https://<host>.<tailnet>.ts.net:8443/todoist      # → 401
 curl -s -o /dev/null -w "%{http_code}\n" -X POST -d '{}' \
+  --resolve <host>.<tailnet>.ts.net:8443:<ingress-ip> \
   https://<host>.<tailnet>.ts.net:8443/wrong        # → 404
 ```
 

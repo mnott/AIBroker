@@ -174,11 +174,13 @@ const server = new McpServer(
       "| `[PAILot]` | Text from PAILot app | `pailot_send` (text reply) |",
       "| `[PAILot:voice]` | Voice from PAILot app | `pailot_tts` (VOICE reply — NEVER pailot_send) |",
       "| `[Session:NAME]` | Text from another Claude Code session | `aibroker_send_to_session` (reply to NAME) |",
-      "| `[Task]` | A dispatched work order from the task bus | **Do NOT reply** — act on it, then close it on the tracker |",
+      "| `[Task]` | A work order or question from the task bus | Act on it. If it asked anything, answer with `todoist_reply` using the id in the `[todoist:…]` trailer — the asker filed it from a phone and will not see this terminal. Leave the task open; closing it is theirs. |",
+      "| `[Task:comment]` | A comment on a task you already handled | A correction or follow-up to work in flight, NOT a new work order — adjust what you did, do not start over. Same `[todoist:…]` trailer, same reply route. |",
       "| _no prefix_ | User typing at the terminal | Terminal only — do NOT send to any channel |",
       "",
       "### Rules",
       "",
+      "- **NEVER open a blocking interactive prompt for a channel message.** Multi-select menus and any modal that waits for a keypress freeze the session, and the person who sent the message is not at this terminal to answer it — so the session is stuck until someone notices, and the answer they wanted never comes. This applies to every prefixed message: `[Task]`, `[Task:comment]`, `[PAILot]`, `[Whazaa]`, `[Telex]`, `[Session:…]`. Instead: decide it yourself if the choice is routine, and say which option you took and why; if it genuinely needs the human, ASK ON THE CHANNEL IT CAME FROM (`todoist_reply`, `pailot_send`, `whatsapp_send`, …) and stop there. A question asked on the channel can be answered from a phone; a modal cannot.",
       "- **Strip the prefix** before processing the message content.",
       "- **Match the medium**: text in → text out, voice in → voice out. This is NON-NEGOTIABLE.",
       "- **Same content**: send the same response as the terminal — do not shorten or paraphrase.",
@@ -461,8 +463,40 @@ server.tool(
 );
 
 server.tool(
+  "todoist_ingress",
+  "List or change which Todoist projects may reach a session. A task filed into an allowed project becomes an instruction a session runs with the user's full rights, so this is a security boundary: grant deliberately, never speculatively, and tell the user what you granted. Takes effect immediately — no daemon restart. Every change is recorded in the audit trail.",
+  {
+    action: z.enum(["list", "add", "remove"]).describe("list (default), add, or remove"),
+    projectId: z.string().optional().describe("Todoist project id. Required for add and remove."),
+    owner: z.string().optional().describe("Session that owns work filed there — a curated PAI alias, not merely a running tab name. Omit to fall through to the default owner."),
+    projectName: z.string().optional().describe("Human-readable label, so the stored grant is readable later"),
+  },
+  async ({ action, projectId, owner, projectName }) => {
+    try {
+      const r = await hub.call_raw("todoist_ingress", { action, projectId, owner, projectName });
+      return ok(JSON.stringify(r, null, 2));
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "todoist_reply",
+  "Answer on the Todoist task a [Task] work order came from, as a comment. Use this whenever a task asked a question — the reply appears under the task on the asker's phone instead of only in this terminal. The 🤖 prefix is added automatically so the comment is not read back as a new instruction. Does NOT complete the task: leave that to the human, or the answer disappears from their list with it.",
+  {
+    taskId: z.string().min(1).describe("Todoist task id, as reported in the audit trail for the delivery"),
+    text: z.string().min(1).describe("The answer. Plain text or Markdown; do not add the 🤖 prefix yourself."),
+  },
+  async ({ taskId, text }) => {
+    try {
+      const r = await hub.call_raw("todoist_reply", { taskId, text });
+      return ok(`Replied on task ${(r as any).taskId ?? taskId}`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
   "aibroker_send_to_session",
-  "Send a message to another iTerm2 session by typing it into the session's terminal AND depositing it into that session's AIBP mailbox. The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can read structured messages via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message.",
+  "Send a message to another iTerm2 session by typing it into the session's terminal AND depositing it into that session's AIBP mailbox. The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can read structured messages via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message. The result distinguishes `delivered: true` (the target was observed taking it) from `delivered: false, queued: true` (typed but unconfirmed — the target is probably mid-task; the message is in its mailbox). Do not read ok:true as \"they have seen it\".",
   {
     target: z.string().min(1).describe("Session to send to: index (1-based), name substring, or iTerm2 session UUID"),
     message: z.string().min(1).describe("The raw message content. Do NOT include a [Session:...] prefix — the hub auto-prepends [Session:SENDER_NAME] for routing."),

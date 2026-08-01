@@ -42,10 +42,16 @@ function ensureDataDirs(): void {
 }
 
 function setupTailscaleServe(): void {
-  // Idempotent — tailscale serve is safe to run multiple times
+  // Idempotent — tailscale serve is safe to run multiple times.
+  //
+  // Deliberately 8443, not 443. Port 443 carries the Todoist webhook, and that
+  // one has to be a Funnel because Todoist calls from the public internet and
+  // refuses a URL with a port in it. Funnel is a property of the whole port:
+  // anything routed on 443 is public. The OTA hub serves app binaries and an
+  // upload API, so it stays on a tailnet-only port of its own.
   const cmds = [
-    "tailscale serve --bg --https=443 --set-path=/install/ http://127.0.0.1:8765/install/",
-    "tailscale serve --bg --https=443 --set-path=/api/ http://127.0.0.1:8765/api/",
+    "tailscale serve --bg --https=8443 --set-path=/install/ http://127.0.0.1:8765/install/",
+    "tailscale serve --bg --https=8443 --set-path=/api/ http://127.0.0.1:8765/api/",
   ];
   for (const cmd of cmds) {
     console.log(`+ ${cmd}`);

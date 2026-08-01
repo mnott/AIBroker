@@ -6,6 +6,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
 
 /**
@@ -216,31 +217,31 @@ export function isScreenLocked(): boolean {
   }
 }
 
+/**
+ * Write a line to a tty device.
+ *
+ * This used to build `sh -c "printf '%s\n' '<text>' > <ttyPath>"`. Two things
+ * were wrong with that. The path was interpolated unquoted, so everything after
+ * the `/dev/ttys` prefix the check required was shell syntax rather than a
+ * filename. And the text — arbitrary inbound WhatsApp/Telegram/Todoist content —
+ * was held inside single quotes by one hand-rolled escape that had to stay
+ * exactly right forever. Neither risk is worth running a shell to copy bytes
+ * into a file descriptor, so it no longer runs one.
+ */
 export function writeToTty(ttyPath: string, text: string): boolean {
-  if (!ttyPath || !ttyPath.startsWith("/dev/ttys")) {
+  if (!/^\/dev\/ttys[A-Za-z0-9]+$/.test(ttyPath)) {
     log(`writeToTty: invalid tty path "${ttyPath}"`);
     return false;
   }
 
-  const statResult = spawnSync("test", ["-c", ttyPath], {
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: 1_000,
-  });
-  if (statResult.status !== 0) {
-    log(`writeToTty: device not found: ${ttyPath}`);
-    return false;
-  }
-
-  const safeText = text.replace(/'/g, "'\\''");
-  const writeResult = spawnSync(
-    "sh",
-    ["-c", `printf '%s\\n' '${safeText}' > ${ttyPath}`],
-    { stdio: ["pipe", "pipe", "pipe"], timeout: 2_000 }
-  );
-
-  if (writeResult.status !== 0) {
-    const stderr = writeResult.stderr?.toString().trim() ?? "";
-    log(`writeToTty: failed for ${ttyPath} — ${stderr || "exit " + writeResult.status}`);
+  try {
+    if (!statSync(ttyPath).isCharacterDevice()) {
+      log(`writeToTty: not a character device: ${ttyPath}`);
+      return false;
+    }
+    writeFileSync(ttyPath, text + "\n");
+  } catch (err) {
+    log(`writeToTty: failed for ${ttyPath} — ${(err as Error).message}`);
     return false;
   }
 

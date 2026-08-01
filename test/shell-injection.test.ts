@@ -17,7 +17,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { isClaudeReady } from "../src/transport/screen.js";
+import { writeToTty } from "../src/adapters/iterm/core.js";
 
 const RULE = "─".repeat(60);
 
@@ -83,6 +87,38 @@ test("an empty or unreadable frame is not writable", () => {
   // recoverable, executing a message in a shell is not.
   assert.equal(isClaudeReady(""), false);
   assert.equal(isClaudeReady("   \n  \n"), false);
+});
+
+/**
+ * The guard above decides WHETHER to write. These decide HOW, and the two used
+ * to disagree: writeToTty built `sh -c "printf '%s\n' '<text>' > <ttyPath>"`
+ * with the path interpolated unquoted, so a path only had to start with
+ * /dev/ttys to pass the check and could carry a command after that.
+ */
+test("a tty path carrying a shell command is refused, not executed", () => {
+  const marker = join(tmpdir(), "aibroker-tty-injection-probe");
+  rmSync(marker, { force: true });
+
+  // Under the old `sh -c … > ${ttyPath}`, this passed startsWith("/dev/ttys")
+  // and `touch` ran.
+  assert.equal(writeToTty(`/dev/ttys000; touch ${marker}`, "hello"), false);
+  assert.equal(existsSync(marker), false, "the path must never reach a shell");
+
+  rmSync(marker, { force: true });
+});
+
+test("only a bare tty device path is accepted", () => {
+  for (const bad of [
+    "/dev/ttys000 && id",
+    "/dev/ttys000`id`",
+    "/dev/ttys000$(id)",
+    "/dev/ttys000/../../etc/passwd",
+    "/dev/ttys000 /dev/ttys001",
+    "/etc/passwd",
+    "",
+  ]) {
+    assert.equal(writeToTty(bad, "hello"), false, `accepted ${JSON.stringify(bad)}`);
+  }
 });
 
 test("a payload that is merely documentation is still executable", () => {

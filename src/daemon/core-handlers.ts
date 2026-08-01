@@ -60,6 +60,15 @@ function getPackageVersion(): string {
 const HUB_VERSION = getPackageVersion();
 
 /**
+ * How long send_to_session waits for the target to take the message.
+ *
+ * Much shorter than a dispatch budget: a caller is waiting on this reply, and
+ * an unconfirmed message is not lost — it is in the mailbox. Better to say
+ * "queued" quickly than to block for a minute to say "delivered".
+ */
+const SEND_ACK_TIMEOUT_MS = 15_000;
+
+/**
  * Best human-readable identity for whoever made this call, for the audit trail.
  *
  * Falls back through raw ids rather than to "unknown": an unattributed action
@@ -956,32 +965,78 @@ export function registerCoreHandlers(
       };
     }
 
-    // Deposit into the target session's mailbox (structured receive)
-    depositToSessionMailbox(itermSessionId, senderLabel, message);
+    // Deposit into the target session's mailbox (structured receive). This is
+    // what makes the message recoverable even when the typed copy is not seen:
+    // the target can always drain it with aibroker_receive.
+    const evicted = depositToSessionMailbox(itermSessionId, senderLabel, message);
+    if (evicted) {
+      // A full mailbox used to drop its oldest message with no trace — the
+      // same silent loss this mailbox exists to prevent, one level down.
+      audit({
+        action: "send", actor: `session:${evicted.from}`, target: resolvedName ?? target,
+        outcome: "evicted", body: evicted.content,
+        reason: "mailbox full — oldest undrained message discarded to make room",
+      });
+    }
 
     // Prefix with session routing tag so the receiving Claude knows to route the response back
     // This is analogous to [Whazaa], [PAILot], [Telex] prefixes for other channels
     const prefixedMessage = `[Session:${senderLabel}] ${message}`;
 
-    // Also type into the terminal (ensures text appears even if target isn't polling mailbox)
-    const success = typeIntoSession(itermSessionId, prefixedMessage);
-    if (!success) {
-      audit({
+    // Confirm the target actually took it, rather than reporting success for a
+    // write that landed in an input box and scrolled out of attention.
+    //
+    // typeIntoSession() returns whether the WRITE happened. That is not the
+    // same question. A message typed into a busy session sits unsubmitted and
+    // this used to be audited as "delivered" — the sender saw ok:true for a
+    // message that was never read. submitAndConfirm() watches for the one
+    // transition that only happens on submit: the text leaves the input line
+    // and appears above it.
+    // retries = 1, and that is load-bearing. submitAndConfirm defaults to three
+    // attempts because dispatch may be talking to a session that was not ready
+    // and where an earlier attempt never landed at all. Here the session is
+    // live and the text is already sitting in its input box: typing it again is
+    // not a retry, it is a second copy. The first version of this fix used the
+    // default and delivered one message to PAI three times — the exact mirror
+    // of the bug it was fixing, one delivery reported as three instead of three
+    // reported as one. An unconfirmed message is queued in the mailbox, which
+    // is what makes a single attempt safe.
+    const { submitAndConfirm } = await import("./dispatch.js");
+    const ack = await submitAndConfirm(itermSessionId, prefixedMessage, SEND_ACK_TIMEOUT_MS, undefined, 1);
+
+    if (ack === "ok") {
+      const eventId = audit({
         action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
-        outcome: "failed", body: message, reason: "write to session failed",
+        outcome: "delivered", body: message,
       });
-      return { ok: false, error: `Failed to type into session "${resolvedName}" (${itermSessionId})` };
+      // The recipient's next outgoing action can now be attributed to this one,
+      // which is what turns isolated events into a traceable chain.
+      noteInbound(resolvedName ?? target, eventId);
+      return {
+        ok: true,
+        result: { sent: true, delivered: true, queued: true, sessionId: itermSessionId, name: resolvedName },
+      };
     }
 
+    // Not delivered — but not lost either. Say which, in both the audit and the
+    // result, because "queued" and "delivered" are different promises and the
+    // caller is entitled to know which one it got.
+    const reason = ack === "unreadable"
+      ? "could not read the target terminal, so submission could not be confirmed"
+      : "typed but never observed leaving the input box — the target may be mid-task";
     const eventId = audit({
       action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
-      outcome: "delivered", body: message,
+      outcome: "queued", body: message, reason,
     });
-    // The recipient's next outgoing action can now be attributed to this one,
-    // which is what turns isolated events into a traceable chain.
     noteInbound(resolvedName ?? target, eventId);
-
-    return { ok: true, result: { sent: true, sessionId: itermSessionId, name: resolvedName } };
+    return {
+      ok: true,
+      result: {
+        sent: true, delivered: false, queued: true,
+        sessionId: itermSessionId, name: resolvedName,
+        note: `${reason}. It is in the session's mailbox and readable with aibroker_receive.`,
+      },
+    };
   });
 
   /**
@@ -1145,6 +1200,57 @@ export function registerCoreHandlers(
       return { ok: true, result: response };
     } catch (e) {
       return { ok: false, error: String(e) };
+    }
+  });
+
+  /**
+   * todoist_reply — Answer on the task a work order came from.
+   *
+   * The reply lands where the question was asked, so a task filed from a watch
+   * can be answered without the human walking to a terminal. The task is left
+   * open on purpose: an answer nobody has read is not done, and a completed
+   * task drops out of the list taking its comments with it.
+   */
+  /**
+   * todoist_ingress — grant or list the projects allowed to reach a session.
+   *
+   * Exposed so "make me a project for the Whazaa session and let me talk to it"
+   * is one operation rather than a file edit and a daemon restart. Still
+   * explicit, still audited: this is the boundary that decides which projects
+   * can execute in your sessions.
+   */
+  server.on("todoist_ingress", async (req) => {
+    const { action, projectId, owner, projectName } = req.params as {
+      action?: string; projectId?: string; owner?: string; projectName?: string;
+    };
+    try {
+      const { listGrants, grantIngress, revokeIngress } = await import("./todoist-ingress.js");
+      if (!action || action === "list") return { ok: true, result: { grants: listGrants() } };
+      if (action === "add") {
+        if (!projectId) return { ok: false, error: "projectId is required" };
+        const g = grantIngress(projectId, { owner, projectName });
+        return { ok: true, result: { granted: true, projectId: g.projectId, owner: g.owner ?? null } };
+      }
+      if (action === "remove") {
+        if (!projectId) return { ok: false, error: "projectId is required" };
+        return { ok: true, result: { revoked: revokeIngress(projectId) } };
+      }
+      return { ok: false, error: `unknown action: ${action}` };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  server.on("todoist_reply", async (req) => {
+    const { taskId, text } = req.params as { taskId?: string; text?: string };
+    if (!taskId) return { ok: false, error: "taskId is required" };
+    if (!text?.trim()) return { ok: false, error: "text is required" };
+    try {
+      const { replyToTask } = await import("./todoist-reply.js");
+      const r = await replyToTask(taskId, text);
+      return { ok: true, result: { taskId: r.taskId, commentId: r.commentId } };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   });
 

@@ -210,3 +210,124 @@ test("an empty allowlist accepts NOTHING — it fails closed", () => {
   assert.equal(route(task({ project_id: INBOX }), empty).act, false);
   assert.equal(route(task({ project_id: "anything" }), empty).act, false);
 });
+
+// ── addressing by text ──────────────────────────────────────────────────────
+//
+// Typing a label is several taps on a phone and worse on a watch. The cheapest
+// address is the first word of what you were going to type anyway, so these
+// tests pin down when a first word IS an address and — more importantly — when
+// it is not, because reading "Home improvements" as a work order for the Home
+// session would be worse than not having the feature.
+
+const KNOWN = ["pai", "home", "clickr"];
+
+test("a leading known name addresses the task and is stripped from the body", () => {
+  const d = route(task({ content: "pai send a whatsapp message", labels: [] }), cfg, KNOWN);
+  assert.equal(d.act, true);
+  if (!d.act) return;
+  assert.equal(d.project, "pai");
+  assert.equal(d.rule, "address");
+  assert.equal(d.body, "send a whatsapp message");
+});
+
+test("the name may be followed by a colon or comma", () => {
+  for (const c of ["pai: do xyz", "pai, do xyz"]) {
+    const d = route(task({ content: c, labels: [] }), cfg, KNOWN);
+    assert.equal(d.act && d.project, "pai", c);
+    assert.equal(d.act && d.body, "do xyz", c);
+  }
+});
+
+test("an unknown first word is left alone — it is prose, not an address", () => {
+  const d = route(task({ content: "Buy milk on the way home", labels: [] }), cfg, KNOWN);
+  assert.equal(d.act, true);
+  if (!d.act) return;
+  assert.equal(d.project, "broker", "falls through to the default owner");
+  assert.equal(d.rule, "default");
+  assert.equal(d.body, "Buy milk on the way home", "nothing is eaten off the front");
+});
+
+test("a known name only counts at the front", () => {
+  const d = route(task({ content: "ask pai about the sweep", labels: [] }), cfg, KNOWN);
+  assert.equal(d.act && d.body, "ask pai about the sweep");
+  assert.equal(d.act && d.rule, "default");
+});
+
+test("a one-word task is never an address — there would be nothing left to do", () => {
+  const d = route(task({ content: "pai", labels: [] }), cfg, KNOWN);
+  assert.equal(d.act && d.rule, "default");
+  assert.equal(d.act && d.body, "pai");
+});
+
+test("a label still beats a name in the text", () => {
+  const d = route(task({ content: "pai do xyz", labels: ["pai:whazaa"] }), cfg, KNOWN);
+  assert.equal(d.act && d.project, "whazaa");
+  assert.equal(d.act && d.rule, "label");
+  assert.equal(d.act && d.body, "pai do xyz", "only the address rule edits the text");
+});
+
+test("a name in the text beats the project it was filed in", () => {
+  // What you wrote is more deliberate than where quick-capture put it.
+  const d = route(task({ content: "pai do xyz", project_id: OWNED, labels: [] }), cfg, KNOWN);
+  assert.equal(d.act && d.project, "pai");
+  assert.equal(d.act && d.rule, "address");
+});
+
+test("a configured owner is addressable even when its session is not running", () => {
+  // Otherwise "clickr do xyz" is read as prose and silently does the wrong
+  // thing; better to route it and let delivery report that nobody is home.
+  const d = route(task({ content: "whazaa do xyz", labels: [] }), cfg, []);
+  assert.equal(d.act && d.project, "whazaa");
+  assert.equal(d.act && d.rule, "address");
+});
+
+// ── near misses ─────────────────────────────────────────────────────────────
+//
+// Three attempts in a row failed silently in real use: "@pai" as plain text,
+// then a "PAI" label, then a "pai" label. Each looked like an instruction about
+// where the task should go, none parsed, and every one landed on the default
+// owner with nothing said. An unhonoured request must be recorded.
+
+test("a bare label naming a known owner routes — one tap is the point", () => {
+  // @pai in Todoist's picker is one tap; pai:pai is several. Both must work.
+  for (const l of ["pai", "PAI"]) {
+    const d = route(task({ content: "do xyz", labels: [l] }), cfg, KNOWN);
+    assert.equal(d.act && d.project, "pai", l);
+    assert.equal(d.act && d.rule, "label", l);
+    assert.equal(d.nearMiss, undefined, l);
+  }
+});
+
+test("a label that names nobody is still a near miss", () => {
+  const d = route(task({ content: "do xyz", labels: ["paix"] }), cfg, KNOWN);
+  assert.match(d.nearMiss ?? "", /names nobody/);
+});
+
+test("an ordinary label is left alone", () => {
+  // "urgent" must not be read as an attempt to address a session.
+  const d = route(task({ content: "do xyz", labels: ["urgent"] }), cfg, KNOWN);
+  assert.equal(d.nearMiss, undefined);
+  assert.equal(d.act && d.rule, "default");
+});
+
+test("addressing an unknown name explicitly is a near miss", () => {
+  const d = route(task({ content: "nosuchsession: do xyz", labels: [] }), cfg, KNOWN);
+  assert.match(d.nearMiss ?? "", /no session by that name/);
+  assert.equal(d.act && d.project, "broker", "still delivered, so the task is not lost");
+});
+
+test("ordinary prose produces no near miss", () => {
+  const d = route(task({ content: "Buy milk", labels: [] }), cfg, KNOWN);
+  assert.equal(d.nearMiss, undefined);
+});
+
+test("a correct label produces no near miss", () => {
+  const d = route(task({ content: "do xyz", labels: ["pai:home"] }), cfg, KNOWN);
+  assert.equal(d.nearMiss, undefined);
+  assert.equal(d.act && d.project, "home");
+});
+
+test("the description still rides along when the address is stripped", () => {
+  const d = route(task({ content: "pai do xyz", description: "context here", labels: [] }), cfg, KNOWN);
+  assert.equal(d.act && d.body, "do xyz\n\ncontext here");
+});
