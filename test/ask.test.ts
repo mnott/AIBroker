@@ -162,6 +162,20 @@ test("spinner and status lines are stripped from the reply", () => {
   assert.doesNotMatch(reply, /Cogitated/, "elapsed-time lines are not part of the answer");
 });
 
+test("a one-word wrapped tail of the echo is not returned as the reply", () => {
+  // Observed live: the reply came back as "action.\n[…] Received — …" because
+  // the echo's final wrapped line was the single word "action." — too short for
+  // any overlap threshold to catch. Such a line is made entirely of the
+  // question's own words, which a real answer essentially never is.
+  const q = "Guard regression check after the fix. One short sentence confirming you received this. No other action.";
+  const frame = screen(
+    "❯ Guard regression check after the fix. One short sentence confirming you received this. No other\n" +
+    "  action.\n\n" +
+    "⏺ Received — acknowledged, no other action taken.",
+  );
+  assert.equal(extractReply(frame, q), "Received — acknowledged, no other action taken.");
+});
+
 test("tool-result chrome is not returned as the reply", () => {
   // Observed live: "⎿  1 skill available" was rendered above the answer and
   // came back as the first line of it.

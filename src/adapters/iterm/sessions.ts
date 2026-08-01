@@ -236,6 +236,9 @@ end tell`;
 export async function restartSession(itermSessionId: string, command = "claude"): Promise<void> {
   sendKeystrokeToSession(itermSessionId, 3); // Ctrl+C
   await new Promise((r) => setTimeout(r, 500));
+  // Uses the RAW core primitive, not the guarded facade, deliberately:
+  // addressing a shell is the whole point here — Ctrl+C has just dropped this
+  // tab out of Claude so the launch command can be typed into it.
   typeIntoSession(itermSessionId, command);
 }
 

@@ -88,8 +88,6 @@ export {
   withSessionAppleScript,
   sendKeystrokeToSession,
   sendEscapeSequenceToSession,
-  typeIntoSession,
-  pasteTextIntoSession,
   findClaudeSession,
   isClaudeRunningInSession,
   isItermRunning,
@@ -99,6 +97,28 @@ export {
   snapshotAllSessions,
 } from "./adapters/iterm/core.js";
 export type { SessionSnapshot } from "./adapters/iterm/core.js";
+
+/**
+ * Session writes come from the GUARDED facade, not the raw iTerm primitives.
+ *
+ * These used to be re-exported straight from adapters/iterm/core.js, which
+ * writes to a tty with no idea what is reading it. When a session's Claude has
+ * exited, its tab is still there at a shell prompt — and a shell executes what
+ * it is sent. That is not hypothetical: an ordinary status message containing a
+ * fenced code block had its example command run, creating a real task.
+ *
+ * The guarded versions refuse to write unless the target is showing a live
+ * Claude prompt. Same signature, plus an optional `{ allowShell: true }` for
+ * callers that genuinely mean to address a shell (launching a session).
+ * Anything relying on the old unguarded behaviour to write into a shell must
+ * now say so explicitly.
+ */
+export {
+  typeIntoSession,
+  pasteTextIntoSession,
+  isClaudeSession,
+  invalidateReadyCache,
+} from "./transport/sync-facade.js";
 export {
   setItermSessionVar,
   setItermTabName,

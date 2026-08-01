@@ -36,7 +36,7 @@ import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-project
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames } from "../adapters/iterm/core.js";
-import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane } from "../transport/sync-facade.js";
+import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession } from "../transport/sync-facade.js";
 import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
@@ -835,14 +835,29 @@ export function registerCoreHandlers(
         resolvedName = target;
       }
     } else {
-      // Name match (case-insensitive, prefers paiName, falls back to session name)
+      // Name match, case-insensitive, preferring paiName over the raw name.
+      //
+      // Ranked rather than first-match. A substring search over every tab will
+      // happily resolve a departed session's name to a leftover SHELL whose
+      // path merely contains the same string — observed live: addressing
+      // "Clickr" after that session ended matched the shell tab sitting in
+      // ~/dev/ai/clickr, and the message was executed there. Every ended
+      // session leaves such a tab behind, so this is not a rare state.
+      //
+      // Preference order: a live Claude session beats a shell; an exact name
+      // match beats a substring one.
       const lower = target.toLowerCase();
-      const snap = snapshots.find(
+      const matches = snapshots.filter(
         (s) => (s.paiName ?? s.name).toLowerCase().includes(lower),
       );
-      if (snap) {
-        itermSessionId = snap.id;
-        resolvedName = snap.paiName ?? snap.name;
+      const score = (s: typeof snapshots[number]): number => {
+        const label = (s.paiName ?? s.name).toLowerCase();
+        return (isClaudeSession(s.id) ? 2 : 0) + (label === lower ? 1 : 0);
+      };
+      const best = matches.slice().sort((a, b) => score(b) - score(a))[0];
+      if (best) {
+        itermSessionId = best.id;
+        resolvedName = best.paiName ?? best.name;
       }
     }
 
@@ -865,6 +880,19 @@ export function registerCoreHandlers(
     const senderLabel = senderSnap
       ? (senderSnap.paiName ?? senderSnap.name)
       : (senderItermId ?? req.sessionId ?? "unknown");
+
+    // Refuse before depositing OR typing: if the target is a shell, the message
+    // is not merely undeliverable, it is executable. Say so plainly rather than
+    // reporting a generic write failure.
+    if (!isClaudeSession(itermSessionId)) {
+      return {
+        ok: false,
+        error:
+          `Session "${resolvedName}" is not running Claude — its terminal is at a shell prompt, ` +
+          `so nothing was sent (a shell would execute the message rather than read it). ` +
+          `An ended session leaves its tab behind; close it, or target a session that is running.`,
+      };
+    }
 
     // Deposit into the target session's mailbox (structured receive)
     depositToSessionMailbox(itermSessionId, senderLabel, message);
