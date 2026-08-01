@@ -78,6 +78,14 @@ export interface DispatchOptions {
   spawnTimeoutMs?: number;
   /** Cap on the delivery wait, within the budget. */
   deliverTimeoutMs?: number;
+  /**
+   * Routing prefix, when the default does not fit.
+   *
+   * A comment on a task in flight is a correction, not a new work order, and
+   * `[Task]` tells the receiving session to start. `[Task:comment]` tells it to
+   * adjust what it already has.
+   */
+  prefix?: string;
 }
 
 /**
@@ -140,13 +148,31 @@ export function findSessionForProject(
   const wanted = new Set(
     [project.displayName, project.name, project.slug, ...project.names]
       .filter(Boolean)
-      .map((s) => s.toLowerCase()),
+      .map(normaliseLabel),
   );
   for (const s of sessions) {
     const label = s.paiName ?? s.name;
-    if (label && wanted.has(label.toLowerCase())) return { id: s.id, label };
+    if (label && wanted.has(normaliseLabel(label))) return { id: s.id, label };
   }
   return null;
+}
+
+/**
+ * Fold a session label and a project name onto common ground.
+ *
+ * Aliases are written machine-style — `jobs-matthias` — and sessions are named
+ * by a human — `Jobs Matthias`. Comparing them literally means the two forms of
+ * the same name miss each other, and a miss here does not fail: it SPAWNS. A
+ * live session holding the whole conversation is passed over and a fresh tab
+ * opens in the right directory with none of the context, which looks like
+ * success from every angle except the one that matters.
+ *
+ * Separators are therefore not significant: hyphen, underscore and whitespace
+ * all fold to a single space. Two projects distinguishable only by punctuation
+ * would be a naming collision anyway.
+ */
+function normaliseLabel(s: string): string {
+  return s.toLowerCase().replace(/[\s_-]+/g, " ").trim();
 }
 
 /** Enumerate live sessions with their persistent (PAI) names resolved. */
@@ -288,7 +314,7 @@ export async function dispatch(
   }
 
   const label = project.displayName || project.name;
-  const body = `${TASK_PREFIX} ${message}`;
+  const body = `${opts.prefix ?? TASK_PREFIX} ${message}`;
 
   // ── already running? ──
   const existing = findSessionForProject(project, deps.sessions());

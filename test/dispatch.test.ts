@@ -315,3 +315,43 @@ test("the persistent PAI name wins over the raw session name", () => {
   const sessions = [{ id: "S1", name: "node", paiName: "Whazaa" }];
   assert.equal(findSessionForProject(p, sessions)?.id, "S1");
 });
+
+// ── separators are not significant ──────────────────────────────────────────
+//
+// A real miss on 2026-08-01: the alias is `jobs-matthias`, the session is named
+// `Jobs Matthias`, and they did not match. A miss here does not fail — it
+// SPAWNS. A live session holding the whole conversation was passed over and a
+// fresh tab opened in the right directory with none of the context, which looks
+// like success from every angle except the one that matters.
+
+test("a hyphenated alias matches a human-named session", () => {
+  const project = {
+    name: "jobs-matthias", names: ["jobs-matthias"],
+    slug: "09-job-search", displayName: "09 - Job Search",
+  } as unknown as Parameters<typeof findSessionForProject>[0];
+
+  const found = findSessionForProject(project, [
+    { id: "s-1", name: "✳ Jobs Matthias (node)", paiName: "Jobs Matthias" },
+  ]);
+  assert.equal(found?.id, "s-1");
+});
+
+test("underscores and doubled spaces fold the same way", () => {
+  const project = {
+    name: "jobs_matthias", names: ["jobs_matthias"], slug: "x", displayName: "x",
+  } as unknown as Parameters<typeof findSessionForProject>[0];
+
+  assert.equal(findSessionForProject(project, [
+    { id: "s-2", name: "t", paiName: "Jobs  Matthias" },
+  ])?.id, "s-2");
+});
+
+test("folding separators does not make different projects collide", () => {
+  const project = {
+    name: "jobs-grazyna", names: ["jobs-grazyna"], slug: "x", displayName: "x",
+  } as unknown as Parameters<typeof findSessionForProject>[0];
+
+  assert.equal(findSessionForProject(project, [
+    { id: "s-3", name: "t", paiName: "Jobs Matthias" },
+  ]), null);
+});

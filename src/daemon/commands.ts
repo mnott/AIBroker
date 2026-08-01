@@ -51,6 +51,7 @@ import {
 } from "../adapters/iterm/core.js";
 import {
   isClaudeRunningInSession,
+  isClaudeSession,
   typeIntoSession,
   pasteTextIntoSession,
   snapshotAllSessions,
@@ -174,7 +175,20 @@ end tell`);
       // Retry paste after wake
       if (typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok after wake`); return true; }
 
-      // Fallback: direct TTY write (works even when AppleScript paste is blocked)
+      // Fallback: direct TTY write (works even when AppleScript paste is blocked).
+      //
+      // Only reachable when the paste failed as TRANSPORT. A paste the shell
+      // guard REFUSED also returns false, and falling through to here wrote the
+      // very text the guard had just rejected onto the shell's screen — and then
+      // returned true, so the sender was told a message Claude never saw had
+      // been delivered, while the trail recorded a refusal and nothing after it.
+      // isClaudeSession is the guard's own predicate and answers from the 2s
+      // cache the refusal just populated, so asking costs nothing here.
+      if (!isClaudeSession(resolvedId)) {
+        log(`[deliver] ${resolvedId.slice(0, 8)} is not at a live Claude prompt — no TTY fallback`);
+        return false;
+      }
+
       const ttyPath = sessionTtyCache.get(resolvedId);
       if (ttyPath) {
         log(`[deliver] paste failed, trying TTY ${ttyPath}`);
@@ -206,17 +220,27 @@ end tell`);
 
     if (isScreenLocked()) {
       const targetId = bareSessionId || activeItermSessionId;
-      let ttyPath = targetId ? sessionTtyCache.get(targetId) : undefined;
+      if (!targetId) {
+        log("Screen locked — no target session for PTY fallback");
+        return false;
+      }
+      // Same guard as the paste path above. A locked screen does not make a
+      // shell tab a Claude prompt; it only takes away the route that would have
+      // noticed.
+      if (!isClaudeSession(targetId)) {
+        log(`Screen locked — ${targetId.slice(0, 8)} is not at a live Claude prompt, refusing PTY write`);
+        return false;
+      }
+
+      let ttyPath = sessionTtyCache.get(targetId);
 
       if (!ttyPath) {
         log("Screen locked — TTY cache miss, attempting live snapshot refresh");
-        const fresh = snapshotAllSessions();
-        updateSessionTtyCache(fresh);
-        ttyPath = targetId ? sessionTtyCache.get(targetId) : undefined;
-        if (!ttyPath && fresh.length > 0) {
-          ttyPath = fresh[0].tty;
-          log(`Screen locked — falling back to first available TTY: ${ttyPath}`);
-        }
+        updateSessionTtyCache(snapshotAllSessions());
+        ttyPath = sessionTtyCache.get(targetId);
+        // No "first available TTY" fallback. It delivered the message to
+        // whichever session happened to enumerate first — a stranger's tab —
+        // and reported success.
       }
 
       if (ttyPath) {

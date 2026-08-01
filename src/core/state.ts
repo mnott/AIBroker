@@ -136,26 +136,54 @@ export interface MailboxMessage {
   from: string;       // sender label (session name or "hub")
   content: string;    // message text
   timestamp: number;  // Unix ms
+  /**
+   * Set once this message has been reported as stale.
+   *
+   * "Queued" is an honest answer at the moment of sending and a false one four
+   * hours later: a message nobody drained is undelivered, not pending. The flag
+   * exists so the fault is reported once rather than every sweep.
+   */
+  staleReported?: boolean;
 }
 
 const sessionMailboxes = new Map<string, MailboxMessage[]>();
 
 const MAX_MAILBOX = 100;
 
+/**
+ * Deposit a message, returning anything the queue had to drop to fit it.
+ *
+ * The overflow used to be a bare `shift()`. A message evicted that way was
+ * undelivered and left no trace anywhere — the same silent drop this mailbox
+ * exists to prevent, one level down. The caller gets it back so it can be
+ * recorded.
+ */
 export function depositToSessionMailbox(
   itermSessionId: string,
   from: string,
   content: string,
-): void {
+): MailboxMessage | undefined {
   let queue = sessionMailboxes.get(itermSessionId);
   if (!queue) {
     queue = [];
     sessionMailboxes.set(itermSessionId, queue);
   }
+  let dropped: MailboxMessage | undefined;
   if (queue.length >= MAX_MAILBOX) {
-    queue.shift(); // drop oldest
+    dropped = queue.shift();
   }
   queue.push({ from, content, timestamp: Date.now() });
+  return dropped;
+}
+
+/**
+ * Read-only view of every mailbox, for anything that needs to age its contents.
+ *
+ * Returns the live message objects deliberately: a sweep marks what it has
+ * already reported, and copying would lose that.
+ */
+export function listSessionMailboxes(): Array<{ sessionId: string; messages: MailboxMessage[] }> {
+  return [...sessionMailboxes.entries()].map(([sessionId, messages]) => ({ sessionId, messages }));
 }
 
 export function drainSessionMailbox(itermSessionId: string): MailboxMessage[] {
