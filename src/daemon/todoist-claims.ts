@@ -157,36 +157,40 @@ export async function sweepAbandonedClaims(
 /**
  * May this claim be released yet?
  *
- * Releasing before the completion lands splits finishing a run into two steps
- * that are not atomic. A session that drops the claim and then dies leaves the
- * task unclaimed and still overdue — so the next poll dispatches it as ordinary
- * overdue work, and the same sweep runs a second time looking spontaneous.
+ * The risk being guarded is precise: a task that is UNCLAIMED AND OVERDUE is
+ * ordinary overdue work, and the next poll dispatches it. So a session that
+ * drops its claim before the completion lands makes the same run happen again,
+ * looking spontaneous. Finishing is two steps that are not atomic and the
+ * ordering is not ours to enforce, so we check the state instead of trusting it.
  *
- * The completion is observable: on a recurring task it advances the due date
- * again, past the occurrence recorded when the claim was taken. So we can tell
- * the two apart rather than trusting an ordering we do not control.
+ * The test is therefore "is the task still overdue", not "has the due date
+ * advanced past the occurrence I recorded". The first version compared against
+ * the recorded occurrence, which breaks the moment anything legitimately moves
+ * the date BACKWARDS — PAI restores the occurrence a manual trigger consumed,
+ * so a schedule repair would have made this refuse a release on a run that
+ * genuinely finished. A stuck claim caused by a correct repair.
  *
- * Refusing here inverts the failure in the direction both sides agreed on — a
- * claim stuck until a timer releases it, rather than a run nobody asked for.
+ * Refusing inverts the failure in the direction both sides agreed on: a claim
+ * stuck until a timer releases it, rather than a run nobody asked for.
  */
 export function mayRelease(taskId: string, currentDue: string | undefined): { ok: true } | { ok: false; reason: string } {
   const claim = listClaims().find((c) => c.taskId === taskId);
   // Nothing recorded: there is no in-flight run to protect.
   if (!claim) return { ok: true };
-  // No occurrence recorded, or none readable now — cannot tell, so allow it
-  // rather than strand a session that has genuinely finished.
-  if (!claim.nextDue || !currentDue) return { ok: true };
+  // Cannot tell — no due date, or the task could not be read. Allow it: a guard
+  // that strands a session unable to clear its own claim is the same silence
+  // one step along.
+  if (!currentDue) return { ok: true };
 
-  const claimed = Date.parse(claim.nextDue);
-  const now = Date.parse(currentDue);
-  if (!Number.isFinite(claimed) || !Number.isFinite(now)) return { ok: true };
-  if (now > claimed) return { ok: true };
+  const due = Date.parse(currentDue);
+  if (!Number.isFinite(due)) return { ok: true };
+  if (due > Date.now()) return { ok: true };
 
   return {
     ok: false,
     reason:
-      "the task has not been completed yet — its due date has not advanced since the trigger. " +
-      "Complete it first, then release: dropping the claim now would leave the task unclaimed " +
-      "and overdue, and the next poll would run it again.",
+      "the task is still overdue, so the completion has not landed. Complete it first, then " +
+      "release: dropping the claim while it is overdue leaves ordinary overdue work behind, " +
+      "and the next poll would run it again.",
   };
 }
