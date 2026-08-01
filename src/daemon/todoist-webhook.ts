@@ -564,6 +564,10 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         try {
           const { setTaskLabel } = await import("./todoist-reply.js");
           await setTaskLabel(decision.taskId, RUNNING_LABEL, true);
+          audit({
+            action: "todoist-claim", actor: "aibroker", target: `todoist:task:${decision.taskId}`,
+            outcome: "claimed",
+          });
           // Remember when, so a claim nobody comes back for can be released.
           const { recordClaim } = await import("./todoist-claims.js");
           recordClaim(
@@ -575,7 +579,19 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
             (event.event_data?.due as { date?: string } | undefined)?.date,
           );
         } catch (err) {
-          log(`todoist-webhook: could not claim ${decision.taskId} — ${err instanceof Error ? err.message : String(err)}`);
+          // Audited, not just logged. A successful claim and a failed one used
+          // to be indistinguishable from outside — the label was simply absent,
+          // and the only record was a line in a log file nobody reads until
+          // something has already gone wrong downstream. The dispatch still
+          // proceeds: the claim is a hint, and refusing to run the sweep
+          // because a label write failed would be the worse trade.
+          const reason = err instanceof Error ? err.message : String(err);
+          audit({
+            action: "todoist-claim", actor: "aibroker", target: `todoist:task:${decision.taskId}`,
+            outcome: "failed",
+            reason: `${reason} — dispatching UNCLAIMED, a poller may read this tick as a fresh request`,
+          });
+          log(`todoist-webhook: could not claim ${decision.taskId} — ${reason}`);
         }
       }
 
@@ -588,7 +604,7 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         // looks — to whoever is watching the other — exactly like being ignored.
         // The session is told, so it can say which id it answered on.
         let twins = 0;
-        if (!isComment) {
+        if (!isComment && !claiming) {
           try {
             const { countTasksWithTitle } = await import("./todoist-reply.js");
             twins = await countTasksWithTitle(
