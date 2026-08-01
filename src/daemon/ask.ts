@@ -119,12 +119,18 @@ export function extractReply(frame: string, question: string): string {
   // The echo wraps; skip its continuation lines too.
   if (lastEcho >= 0) {
     const qWords = flatten(question).split(" ").filter((w) => w.length > 3);
+    const qSet = new Set(flatten(question).toLowerCase().split(/\W+/).filter(Boolean));
     let j = lastEcho + 1;
     while (j < lines.length) {
       const f = flatten(lines[j]);
       if (!f) { j++; continue; }
       const overlap = qWords.filter((w) => f.includes(w)).length;
-      if (overlap > 0 && overlap >= Math.min(3, qWords.length)) { j++; continue; }
+      // A wrapped tail can be as short as one word ("action."), which no
+      // overlap threshold catches. Such a line is entirely made of the
+      // question's own words — a real answer essentially never is.
+      const words = f.toLowerCase().split(/\W+/).filter(Boolean);
+      const allFromQuestion = words.length > 0 && words.every((w) => qSet.has(w));
+      if (allFromQuestion || (overlap > 0 && overlap >= Math.min(3, qWords.length))) { j++; continue; }
       break;
     }
     lastEcho = j - 1;

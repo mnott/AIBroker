@@ -32,6 +32,7 @@ import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { ItermTransport } from "./iterm.js";
 import { TmuxTransport } from "./tmux.js";
 import type { ManagedSession } from "./session-transport.js";
+import { isClaudeReady } from "./screen.js";
 import { log } from "../core/log.js";
 
 const override = (process.env.AIBROKER_TRANSPORT ?? "").trim().toLowerCase();
@@ -100,16 +101,74 @@ export function aibrokerIdForPane(paneId: string): string | null {
   return tmuxTransport.aibrokerIdForPane(paneId);
 }
 
-/** Inject text + Enter into a session. */
-export function typeIntoSession(id: string, text: string): boolean {
+/**
+ * ── Shell-injection guard ───────────────────────────────────────────────────
+ *
+ * A session whose Claude has exited — crashed, suspended, or ended cleanly via
+ * `pai end` — leaves its tab alive at a shell prompt, keeps its persistent PAI
+ * name, and therefore still matches by project. Writing to it no longer reaches
+ * Claude: it reaches zsh, and zsh EXECUTES what it is sent.
+ *
+ * Reproduced twice for real. A probe question ran as a command; separately, an
+ * ordinary status message containing a fenced code block had its example
+ * command executed, creating a live Todoist task. The payload does not need to
+ * be adversarial — routine technical writing is full of backticks, which zsh
+ * expands as command substitution.
+ *
+ * The guard belongs here rather than in each caller: send_to_session, inbound
+ * WhatsApp/Telegram delivery, the session backend and PAILot chunk writes all
+ * carry arbitrary text into a session, and enumerating them is exactly how one
+ * gets missed. Callers that legitimately address a shell — launching a session
+ * types `cd … && claude …` into a fresh tab — pass `allowShell`.
+ */
+const READY_TTL_MS = 2_000;
+const readyCache = new Map<string, { at: number; ready: boolean }>();
+
+/** Is this session showing a live Claude prompt? Cached briefly for chunked writes. */
+function claudeHasTty(id: string): boolean {
+  const hit = readyCache.get(id);
+  const now = Date.now();
+  if (hit && now - hit.at < READY_TTL_MS) return hit.ready;
+
+  const frame = captureSession(id, 80);
+  // Unreadable is NOT treated as safe: refusing a legitimate send is recoverable,
+  // executing a message in a shell is not.
+  const ready = frame !== null && isClaudeReady(frame);
+  readyCache.set(id, { at: now, ready });
+  return ready;
+}
+
+function refuse(id: string, text: string): false {
+  log(
+    `REFUSED write to ${id}: no live Claude prompt — its terminal is at a shell, ` +
+    `which would execute the text rather than read it. ` +
+    `First 60 chars: ${JSON.stringify(text.slice(0, 60))}`,
+  );
+  return false;
+}
+
+/** Inject text + Enter into a session. Refuses a shell unless `allowShell`. */
+export function typeIntoSession(id: string, text: string, opts: { allowShell?: boolean } = {}): boolean {
+  if (!opts.allowShell && !claudeHasTty(id)) return refuse(id, text);
   if (routeToTmux(id)) return tmuxTransport.sendText(id, text, { enter: true });
   return iterm.typeIntoSession(id, text);
 }
 
-/** Inject text WITHOUT Enter (chunked / partial sends). */
-export function pasteTextIntoSession(id: string, text: string): boolean {
+/** Inject text WITHOUT Enter (chunked / partial sends). Same guard. */
+export function pasteTextIntoSession(id: string, text: string, opts: { allowShell?: boolean } = {}): boolean {
+  if (!opts.allowShell && !claudeHasTty(id)) return refuse(id, text);
   if (routeToTmux(id)) return tmuxTransport.sendText(id, text, { enter: false });
   return iterm.pasteTextIntoSession(id, text);
+}
+
+/** Drop a cached readiness verdict (call right after launching into a tab). */
+export function invalidateReadyCache(id?: string): void {
+  if (id) readyCache.delete(id); else readyCache.clear();
+}
+
+/** True when the session is currently showing a live Claude prompt. */
+export function isClaudeSession(id: string): boolean {
+  return claudeHasTty(id);
 }
 
 /**
