@@ -326,6 +326,8 @@ Everything else about completion is unchanged. Ticking off a one-off task, or a 
 
 **Whichever path dispatches also claims the task.** The webhook adds `pai-running` before dispatching and removes it again if the dispatch never landed. Honouring another runner's claim is only half an interlock — a path that dispatches and leaves the task unclaimed lets the next poller see an advanced due date with nothing on it, conclude the box was ticked, and run the same work again.
 
+**A claim nobody comes back for is released.** A session that dies mid-turn would otherwise leave the trigger claimed forever: the webhook skips it, and the routine is dead until someone notices it stopped — permanent silence, which is worse than a duplicate. Claims older than three hours are released on the housekeeping sweep. Elapsed time only, never "the session looks gone": the hub has returned an empty session list while nineteen sessions were running, and a recovery that trusts that spawns a duplicate per task. The window is deliberately longer than PAI's, so a poller that knows what the task usually costs releases first and this is only ever the backstop. Releasing twice is harmless — removing an absent label is a no-op — which is why two releasers are safe where two dispatchers would not be.
+
 `pai-running` is the interlock between mechanisms. A poller that claims a tick sets it before doing anything else, so a crash leaves the task visibly in flight rather than silently dispatched twice — and the webhook path honours it, because two mechanisms watching one checkbox must not both fire.
 
 ### Filing work for yourself — later, yes; instantly, no

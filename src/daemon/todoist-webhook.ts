@@ -564,6 +564,9 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         try {
           const { setTaskLabel } = await import("./todoist-reply.js");
           await setTaskLabel(decision.taskId, RUNNING_LABEL, true);
+          // Remember when, so a claim nobody comes back for can be released.
+          const { recordClaim } = await import("./todoist-claims.js");
+          recordClaim(decision.taskId);
         } catch (err) {
           log(`todoist-webhook: could not claim ${decision.taskId} — ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -611,6 +614,8 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
           try {
             const { setTaskLabel } = await import("./todoist-reply.js");
             await setTaskLabel(decision.taskId, RUNNING_LABEL, false);
+            const { forgetClaim } = await import("./todoist-claims.js");
+            forgetClaim(decision.taskId);
             log(`todoist-webhook: released ${RUNNING_LABEL} on ${decision.taskId} — dispatch was ${r.outcome}`);
           } catch { /* the claim is a hint, not a lock; a stuck one is visible */ }
         }
