@@ -41,9 +41,42 @@ export const realIO: TerminalIO = {
   now: () => Date.now(),
 };
 
-/** True when a frame shows Claude's input box drawn and ready to take text. */
+/** A shell prompt: the tail of a line ending in a common prompt terminator. */
+const SHELL_PROMPT = /[➜$%#»]\s*$/;
+
+/**
+ * True when Claude's input box is LIVE at the bottom of the screen.
+ *
+ * "Contains a box somewhere" is not enough, and the difference is a safety
+ * issue rather than a cosmetic one. When Claude exits — crashes, is suspended,
+ * or is quit — its whole UI stays in the terminal's scrollback while a shell
+ * prompt appears underneath. A frame-wide search still finds the rules and the
+ * `❯`, declares the session ready, and the caller then types into a live shell,
+ * where zsh EXECUTES the text. Observed: a probe question ran as a command
+ * ("zsh: no matches found: ok?"). A dispatched task body is multi-line and full
+ * of backticks, so the same path would run arbitrary fragments of it.
+ *
+ * A live box is therefore required to be at the bottom: the closing rule near
+ * the end of the visible frame, with nothing shell-prompt-shaped after it.
+ */
 export function isClaudeReady(frame: string): boolean {
-  return CLAUDE_UI.test(frame) && frame.split("\n").some((l) => INPUT_LINE.test(l));
+  const lines = frame.split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return false;
+
+  let lastRule = -1;
+  lines.forEach((l, i) => { if (CLAUDE_UI.test(l)) lastRule = i; });
+  if (lastRule < 0) return false;
+
+  // Claude renders only its status lines below the box; a shell fills the rest
+  // of the screen, pushing the box further and further up.
+  if (lines.length - 1 - lastRule > 8) return false;
+
+  // Belt and braces: an explicit prompt below the box means the shell has it.
+  for (let i = lastRule + 1; i < lines.length; i++) {
+    if (SHELL_PROMPT.test(lines[i])) return false;
+  }
+
+  return lines.some((l) => INPUT_LINE.test(l));
 }
 
 /**

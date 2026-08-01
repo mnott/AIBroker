@@ -91,6 +91,8 @@ export interface DispatchDeps {
   deliver: (sessionId: string, body: string, timeoutMs: number) => Promise<AckResult>;
   launch: (project: PaiProject) => Promise<{ itermSessionId: string }>;
   waitReady: (sessionId: string, timeoutMs: number) => Promise<boolean>;
+  /** Read a session's screen, to confirm Claude still owns the tty. */
+  capture: (sessionId: string) => string | null;
   /** Clock for the shared budget; injectable so budget maths is testable. */
   now: () => number;
 }
@@ -238,6 +240,7 @@ const realDeps: DispatchDeps = {
   resolve: findCuratedPaiProject,
   sessions: liveSessions,
   deliver: submitAndConfirm,
+  capture: (id) => realIO.capture(id),
   now: () => Date.now(),
   launch: launchResolvedPaiProject,
   waitReady: waitForReady,
@@ -298,6 +301,24 @@ export async function dispatch(
         reason: `Budget of ${Math.round((budgetMs ?? 0) / 1000)}s left no time to deliver in.`,
       };
     }
+    // Confirm Claude is actually the thing at the prompt before typing a work
+    // order into it. A session whose Claude has exited keeps its PAI name and
+    // still matches here, but the tty now belongs to a shell — and a shell
+    // EXECUTES what it is sent. Task bodies are multi-line and full of
+    // backticks, so this is the difference between a failed delivery and
+    // running fragments of a task description as commands.
+    const frame = deps.capture(existing.id);
+    if (frame !== null && !isClaudeReady(frame)) {
+      return {
+        outcome: "unreachable",
+        project: label,
+        session: existing.label,
+        reason:
+          `Session "${existing.label}" is no longer running Claude — its terminal is at a shell ` +
+          `prompt. Nothing was sent, because a shell would execute the message rather than read it.`,
+      };
+    }
+
     const res = await deps.deliver(existing.id, body, deliverTimeoutMs());
     if (res === "ok") {
       return { outcome: "delivered", project: label, session: existing.label, reason: "" };
