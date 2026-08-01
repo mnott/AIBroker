@@ -58,6 +58,19 @@ export function startMailboxWatch(): void {
     } catch (e) {
       log(`mailbox-watch: sweep failed — ${e instanceof Error ? e.message : String(e)}`);
     }
+    // Same housekeeping tick, same principle: a state that can persist has to
+    // know how long it has been in that state. A trigger claimed by a run that
+    // died is a routine that has silently stopped.
+    void (async () => {
+      try {
+        const { sweepAbandonedClaims } = await import("./todoist-claims.js");
+        const { setTaskLabel } = await import("./todoist-reply.js");
+        const { RUNNING_LABEL } = await import("./todoist-webhook.js");
+        await sweepAbandonedClaims((taskId) => setTaskLabel(taskId, RUNNING_LABEL, false).then(() => undefined));
+      } catch (e) {
+        log(`mailbox-watch: claim sweep failed — ${e instanceof Error ? e.message : String(e)}`);
+      }
+    })();
   }, SWEEP_INTERVAL_MS);
   // Never hold the process open for a housekeeping timer.
   timer.unref?.();
