@@ -326,6 +326,8 @@ Everything else about completion is unchanged. Ticking off a one-off task, or a 
 
 **Whichever path dispatches also claims the task.** The webhook adds `pai-running` before dispatching and removes it again if the dispatch never landed. Honouring another runner's claim is only half an interlock — a path that dispatches and leaves the task unclaimed lets the next poller see an advanced due date with nothing on it, conclude the box was ticked, and run the same work again.
 
+**A finished run releases its own claim.** `todoist_reply(taskId, text, {release: true})` posts the answer and removes `pai-running` in one call. Nothing else here takes it off on success — the webhook only releases on a failed dispatch or at the deadline — so a session that finishes and says nothing leaves the trigger suppressed until its next occurrence: one silently missed run, indistinguishable from a run nobody asked for.
+
 **A claim nobody comes back for is released** — at the next occurrence, less a small margin. A session that dies mid-turn would otherwise leave the trigger claimed forever: the webhook skips it, and the routine is dead until someone notices it stopped.
 
 The deadline is the *next scheduled run*, not a duration, and that distinction is the whole design. A claim that survives into the next occurrence blocks the very trigger it was guarding, so the occurrence is the real bound — and Todoist has already told us where it is, since completing a recurring task advances the due date before the event reaches us.

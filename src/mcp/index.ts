@@ -499,14 +499,15 @@ server.tool(
 
 server.tool(
   "todoist_reply",
-  "Answer on the Todoist task a [Task] work order came from, as a comment. Use this whenever a task asked a question — the reply appears under the task on the asker's phone instead of only in this terminal. The 🤖 prefix is added automatically so the comment is not read back as a new instruction. Does NOT complete the task: leave that to the human, or the answer disappears from their list with it.",
+  "Answer on the Todoist task a [Task] work order came from, as a comment. If the task arrived as a TRIGGER (a recurring task you were dispatched from), pass release:true once the run is finished — otherwise the pai-running claim stays on the task and the next scheduled run is silently suppressed. Use this whenever a task asked a question — the reply appears under the task on the asker's phone instead of only in this terminal. The 🤖 prefix is added automatically so the comment is not read back as a new instruction. Does NOT complete the task: leave that to the human, or the answer disappears from their list with it.",
   {
     taskId: z.string().min(1).describe("Todoist task id, as reported in the audit trail for the delivery"),
     text: z.string().min(1).describe("The answer. Plain text or Markdown; do not add the 🤖 prefix yourself."),
+    release: z.boolean().optional().describe("Set true when you have FINISHED a run that arrived as a trigger (a recurring task you were dispatched from). It removes the pai-running claim so the next tick can fire. Leaving it set blocks the trigger until its next occurrence — one silently missed run."),
   },
-  async ({ taskId, text }) => {
+  async ({ taskId, text, release }) => {
     try {
-      const r = await hub.call_raw("todoist_reply", { taskId, text });
+      const r = await hub.call_raw("todoist_reply", { taskId, text, release });
       return ok(`Replied on task ${(r as any).taskId ?? taskId}`);
     } catch (e) { return err(e); }
   },
