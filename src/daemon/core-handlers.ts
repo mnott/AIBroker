@@ -37,6 +37,8 @@ import { readSessionContent, readAllSessionContent } from "./session-content.js"
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession } from "../transport/sync-facade.js";
+import { audit, noteInbound } from "./audit.js";
+import type { IpcRequest } from "../types/ipc.js";
 import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
@@ -56,6 +58,25 @@ function getPackageVersion(): string {
 }
 
 const HUB_VERSION = getPackageVersion();
+
+/**
+ * Best human-readable identity for whoever made this call, for the audit trail.
+ *
+ * Falls back through raw ids rather than to "unknown": an unattributed action
+ * is the thing the audit log exists to prevent, so a GUID beats a blank.
+ */
+function callerLabel(req: IpcRequest): string {
+  const raw = req.itermSessionId;
+  const id = raw ? (raw.includes(":") ? raw.split(":").pop()! : raw) : undefined;
+  if (id) {
+    const snap = snapshotAllSessions().find((s) => s.id === id);
+    if (snap) {
+      const paiName = lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId);
+      return paiName ?? snap.name;
+    }
+  }
+  return id ?? req.tmuxPane ?? req.sessionId ?? "unknown";
+}
 
 export function registerCoreHandlers(
   server: IpcServer,
@@ -331,11 +352,23 @@ export function registerCoreHandlers(
     if (!message) return { ok: false, error: "message is required" };
 
     const { dispatch } = await import("./dispatch.js");
+    const actor = callerLabel(req);
     try {
       const result = await dispatch(project, message, { noSpawn, budgetMs, spawnTimeoutMs, deliverTimeoutMs });
+      const eventId = audit({
+        action: "dispatch", actor, target: result.session || project,
+        outcome: result.outcome, body: message,
+        reason: result.reason || undefined,
+        meta: { project: result.project },
+      });
+      if (result.outcome === "delivered" || result.outcome === "spawned") {
+        noteInbound(result.session, eventId);
+      }
       return { ok: true, result: { ...result } };
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      const reason = err instanceof Error ? err.message : String(err);
+      audit({ action: "dispatch", actor, target: project, outcome: "failed", body: message, reason });
+      return { ok: false, error: reason };
     }
   });
 
@@ -355,11 +388,22 @@ export function registerCoreHandlers(
     if (!question) return { ok: false, error: "question is required" };
 
     const { ask } = await import("./ask.js");
+    const actor = callerLabel(req);
     try {
       const result = await ask(project, question, { timeoutMs });
+      audit({
+        action: "ask", actor, target: result.session || project,
+        outcome: result.state, body: question,
+        reason: result.reason || undefined,
+        // The answer is the substance of the exchange; without it the record
+        // shows that a question was asked but not what came back.
+        meta: result.reply ? { reply: result.reply } : undefined,
+      });
       return { ok: true, result: { ...result } };
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      const reason = err instanceof Error ? err.message : String(err);
+      audit({ action: "ask", actor, target: project, outcome: "failed", body: question, reason });
+      return { ok: false, error: reason };
     }
   });
 
@@ -372,8 +416,16 @@ export function registerCoreHandlers(
     try {
       ({ itermSessionId, sessionId } = await launchPaiProject(name));
     } catch (err: unknown) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      const reason = err instanceof Error ? err.message : String(err);
+      audit({ action: "launch", actor: callerLabel(req), target: name, outcome: "failed", reason });
+      return { ok: false, error: reason };
     }
+    // Creating a session is a cross-session action: it puts a new agent on the
+    // machine, in a directory, doing work nobody may be watching.
+    audit({
+      action: "launch", actor: callerLabel(req), target: name, outcome: "spawned",
+      meta: { itermSessionId },
+    });
 
     // Register the visual session with HybridSessionManager
     const project = await findPaiProject(name);
@@ -885,6 +937,14 @@ export function registerCoreHandlers(
     // is not merely undeliverable, it is executable. Say so plainly rather than
     // reporting a generic write failure.
     if (!isClaudeSession(itermSessionId)) {
+      // Recorded: a refusal is part of the history too, and "the hub declined
+      // to type this into a shell" is exactly the kind of thing that otherwise
+      // leaves no trace anywhere.
+      audit({
+        action: "refuse", actor: senderLabel, target: resolvedName ?? target,
+        outcome: "refused", body: message,
+        reason: "target terminal is a shell, not a live Claude prompt",
+      });
       return {
         ok: false,
         error:
@@ -904,8 +964,20 @@ export function registerCoreHandlers(
     // Also type into the terminal (ensures text appears even if target isn't polling mailbox)
     const success = typeIntoSession(itermSessionId, prefixedMessage);
     if (!success) {
+      audit({
+        action: "send", actor: senderLabel, target: resolvedName ?? target,
+        outcome: "failed", body: message, reason: "write to session failed",
+      });
       return { ok: false, error: `Failed to type into session "${resolvedName}" (${itermSessionId})` };
     }
+
+    const eventId = audit({
+      action: "send", actor: senderLabel, target: resolvedName ?? target,
+      outcome: "delivered", body: message,
+    });
+    // The recipient's next outgoing action can now be attributed to this one,
+    // which is what turns isolated events into a traceable chain.
+    noteInbound(resolvedName ?? target, eventId);
 
     return { ok: true, result: { sent: true, sessionId: itermSessionId, name: resolvedName } };
   });
