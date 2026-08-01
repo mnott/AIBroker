@@ -34,6 +34,8 @@ function deps(over: Partial<DispatchDeps> = {}): DispatchDeps {
     deliver: async () => "ok",
     launch: async () => { throw new Error("launch should not have been called"); },
     waitReady: async () => true,
+    // A healthy Claude prompt by default; tests override to simulate a shell.
+    capture: () => `${"─".repeat(60)} P ──\n❯\n${"─".repeat(60)}\n  status`,
     now: () => 0,
     ...over,
   };
