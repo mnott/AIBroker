@@ -253,7 +253,7 @@ A label **cannot** smuggle a task in from outside the allowlist. The boundary is
 | Situation | Why |
 |---|---|
 | Project not in the allowlist | The security boundary |
-| `item:completed` | Completion is you saying *done* — it must never start work |
+| `item:completed` | Completion is you saying *done* — it must never start work, **unless** it is a recurring task carrying a `pai:<name>` label (see below) |
 | Content starting with 🤖 | Written by an agent; ignored to prevent echo loops |
 | Empty task content | Nothing to act on |
 | No owner and no default | Refuses to guess |
@@ -309,6 +309,20 @@ Every delivery carries what a reply needs:
 ```
 
 Completion is deliberately left to the human. An answer nobody has read is not done, and a completed task drops out of the list taking its comments with it.
+
+### The checkbox as a Run Now button
+
+Ticking a **recurring** task does not close it — Todoist advances the due date and the task stays open. That makes the checkbox a natural trigger, and `item:completed` arrives within a second, unambiguously.
+
+So completion dispatches when **all three** hold:
+
+- the task **recurs** — completing it is a reschedule, not an ending
+- it carries an explicit **`pai:<name>` label** — it was built to be dispatched
+- it does **not** carry `pai-running` — a runner has already claimed this tick
+
+Everything else about completion is unchanged. Ticking off a one-off task, or a recurring one with no routing label, starts nothing: get that wrong and finishing something starts the thing you thought you were finishing.
+
+`pai-running` is the interlock between mechanisms. A poller that claims a tick sets it before doing anything else, so a crash leaves the task visibly in flight rather than silently dispatched twice — and the webhook path honours it, because two mechanisms watching one checkbox must not both fire.
 
 ### Filing work for yourself — later, yes; instantly, no
 

@@ -42,6 +42,16 @@ import { handleOAuthCallback } from "./todoist-oauth.js";
 /** Prefix on anything an agent writes back to Todoist, so we ignore our own echo. */
 export const AGENT_MARK = "🤖";
 
+/**
+ * Label a runner puts on a task it has claimed.
+ *
+ * PAI's poller sets it before doing anything else, so a crash leaves the task
+ * visibly in flight rather than silently dispatched twice. The webhook path
+ * honours the same label: two mechanisms watching the same checkbox must not
+ * both fire for one tick.
+ */
+export const RUNNING_LABEL = "pai-running";
+
 export interface TodoistEvent {
   event_name: string;
   user_id?: string;
@@ -245,8 +255,30 @@ export function route(
     return { act: false, reason: `event ${e.event_name} is not actionable` };
   }
   // Completion is the human saying "done"; it must never start work.
+  //
+  // Except for one shape, which is not an ending at all. Ticking a RECURRING
+  // task does not close it — Todoist advances the due date and the task stays
+  // open. That is the click-to-run pattern: a checkbox used as a Run Now
+  // button, which is how "run the sweep" is meant to be triggered by hand.
+  //
+  // Three conditions, all required, because getting this wrong means ticking
+  // something off starts work you thought you were finishing:
+  //   - the task recurs, so completing it is a reschedule, not a close
+  //   - it carries an explicit routing label, so it was built to be dispatched
+  //   - it is not already in flight (`pai-running`), so a poller that has
+  //     already claimed this tick is not raced by the webhook
   if (e.event_name === "item:completed") {
-    return { act: false, reason: "task completed — recorded, no action taken" };
+    const labels = Array.isArray(data.labels) ? (data.labels as unknown[]).map(String) : [];
+    const due = data.due as { is_recurring?: boolean } | undefined;
+    const addressed = labels.some((l) => l.toLowerCase().startsWith("pai:"));
+
+    if (labels.some((l) => l.toLowerCase() === RUNNING_LABEL)) {
+      return { act: false, reason: `task is already in flight (${RUNNING_LABEL}) — completion ignored` };
+    }
+    if (!due?.is_recurring || !addressed) {
+      return { act: false, reason: "task completed — recorded, no action taken" };
+    }
+    // Falls through to normal routing: a trigger goes wherever its label says.
   }
 
   const projectId = typeof data.project_id === "string" ? data.project_id : "";
