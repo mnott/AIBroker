@@ -17,7 +17,7 @@
  */
 
 import { AGENT_MARK } from "./todoist-webhook.js";
-import { loadToken } from "./todoist-oauth.js";
+import { getAccessToken } from "./todoist-oauth.js";
 import { log } from "../core/log.js";
 import { audit } from "./audit.js";
 
@@ -45,7 +45,7 @@ export async function fetchParentTask(
   taskId: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<ParentTask> {
-  const token = loadToken();
+  const token = await getAccessToken();
   if (!token) throw new Error("no Todoist authorisation on file — run `aibroker todoist auth`");
 
   const res = await fetchImpl(`https://api.todoist.com/api/v1/tasks/${encodeURIComponent(taskId)}`, {
@@ -79,7 +79,7 @@ export async function replyToTask(
   text: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<ReplyResult> {
-  const token = loadToken();
+  const token = await getAccessToken();
   if (!token) {
     throw new Error("no Todoist authorisation on file — run `aibroker todoist auth`");
   }
@@ -136,7 +136,7 @@ export async function countTasksWithTitle(
   title: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<number> {
-  const token = loadToken();
+  const token = await getAccessToken();
   if (!token || !projectId || !title.trim()) return 0;
 
   const res = await fetchImpl(
@@ -184,7 +184,7 @@ export async function createTask(
   opts: { projectId?: string; description?: string; dueString?: string } = {},
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ taskId: string }> {
-  const token = loadToken();
+  const token = await getAccessToken();
   if (!token) throw new Error("no Todoist authorisation on file — run `aibroker todoist auth`");
 
   const marked = content.trimStart().startsWith(AGENT_MARK) ? content : `${AGENT_MARK} ${content}`;

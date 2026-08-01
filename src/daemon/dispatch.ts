@@ -14,6 +14,10 @@
  * lacks an alias. Only genuine infrastructure failure throws.
  *
  *   delivered    — a live session accepted it
+ *   queued       — typed into a live session that was mid-turn. Claude Code
+ *                  queues input during a turn, so silence is not evidence of
+ *                  non-delivery. This is SUCCESS: never retry it. Retrying
+ *                  duplicates, and one trigger became three job sweeps.
  *   spawned      — no session ran; we launched one and it accepted it
  *   unlaunchable — no curated alias. Setup gap: `pai project name <id> <short>`
  *   unreachable  — tab opened but the session never accepted input. Runtime bug.
@@ -49,6 +53,7 @@ import { matchSession } from "../core/session-match.js";
 
 export type DispatchOutcome =
   | "delivered"
+  | "queued"
   | "spawned"
   | "unlaunchable"
   | "unreachable"
@@ -97,7 +102,7 @@ export interface DispatchOptions {
 export interface DispatchDeps {
   resolve: (name: string) => Promise<PaiProject | undefined>;
   sessions: () => { id: string; name: string; paiName: string | null }[];
-  deliver: (sessionId: string, body: string, timeoutMs: number) => Promise<AckResult>;
+  deliver: (sessionId: string, body: string, timeoutMs: number, io?: TerminalIO, retries?: number) => Promise<AckResult>;
   launch: (project: PaiProject) => Promise<{ itermSessionId: string }>;
   waitReady: (sessionId: string, timeoutMs: number) => Promise<boolean>;
   /** Read a session's screen, to confirm Claude still owns the tty. */
@@ -327,15 +332,34 @@ export async function dispatch(
       };
     }
 
-    const res = await deps.deliver(existing.id, body, deliverTimeoutMs());
+    // One attempt, never three. The text is already in a live session's input
+    // box; typing it again does not retry, it duplicates — one trigger became
+    // three full job sweeps on 2026-08-01. Retries belong to the spawn path
+    // below, where an earlier attempt may genuinely never have landed.
+    const res = await deps.deliver(existing.id, body, deliverTimeoutMs(), undefined, 1);
     if (res === "ok") {
       return { outcome: "delivered", project: label, session: existing.label, reason: "" };
     }
+    if (res === "unreadable") {
+      return {
+        outcome: "unreachable",
+        project: label,
+        session: existing.label,
+        reason: `Live session found but ${ackReason(res)}.`,
+      };
+    }
+    // Typed into a live session that did not react in time. Claude Code queues
+    // input while a turn is running and does not read it until the turn ends,
+    // so silence is not evidence of non-delivery — it is the ordinary state of
+    // a session that is busy working. Calling that `unreachable` made a caller
+    // count a strike, report the routine as not running, and dispatch again.
     return {
-      outcome: "unreachable",
+      outcome: "queued",
       project: label,
       session: existing.label,
-      reason: `Live session found but ${ackReason(res)}.`,
+      reason:
+        `Typed into live session "${existing.label}", which was still working and had not read it ` +
+        `within the window. This is delivery, not failure — do NOT retry.`,
     };
   }
 

@@ -59,9 +59,19 @@ export async function runTodoist(args: string[]): Promise<void> {
         console.log("Run: aibroker todoist auth");
         process.exit(1);
       }
-      // Never print the token. What matters is that one exists, and what it can do.
+      // Never print the token. What matters is that one exists, what it can do,
+      // and — the thing that bit us — whether it is still valid.
       console.log(`Authorised ${token.obtained_at}`);
       console.log(`Scope: ${token.scope ?? "(unreported)"}`);
+      if (token.expires_at) {
+        const left = Math.round((Date.parse(token.expires_at) - Date.now()) / 60000);
+        console.log(`Expires: ${token.expires_at} (${left} min)`);
+        console.log(token.refresh_token
+          ? "Refresh: automatic — refreshed on demand before it expires"
+          : "Refresh: NONE ON FILE — this token will stop working and cannot renew itself");
+      } else {
+        console.log("Expires: no expiry reported (legacy long-lived token)");
+      }
       break;
     }
 

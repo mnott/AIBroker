@@ -37,6 +37,14 @@ export interface StoredToken {
   token_type: string;
   scope?: string;
   obtained_at: string;
+  /**
+   * Rotated on every refresh — the previous one stops working.
+   *
+   * Absent for legacy apps, which get a ten-year access token instead.
+   */
+  refresh_token?: string;
+  /** Absolute expiry, ISO. Todoist issues one-hour access tokens. */
+  expires_at?: string;
 }
 
 interface Pending {
@@ -124,7 +132,24 @@ export async function exchangeCode(
   const text = await res.text();
   if (!res.ok) throw new Error(`token exchange returned ${res.status}: ${text.slice(0, 200)}`);
 
-  let body: { access_token?: string; token_type?: string; scope?: string; error?: string };
+  return parseTokenResponse(text);
+}
+
+/**
+ * Turn a token response into something storable.
+ *
+ * `expires_in` and `refresh_token` are the fields that matter and were dropped
+ * by the first version of this module. Todoist issues ONE-HOUR access tokens,
+ * so a token stored without them works beautifully and then stops, roughly an
+ * hour later, with a 401 that reads exactly like a revoked grant. That cost two
+ * rounds of "the authorisation lapsed again" before anyone read the response
+ * body closely enough to notice what had been thrown away.
+ */
+function parseTokenResponse(text: string): StoredToken {
+  let body: {
+    access_token?: string; token_type?: string; scope?: string;
+    expires_in?: number; refresh_token?: string; error?: string;
+  };
   try {
     body = JSON.parse(text) as typeof body;
   } catch {
@@ -138,7 +163,92 @@ export async function exchangeCode(
     token_type: body.token_type ?? "Bearer",
     scope: body.scope,
     obtained_at: new Date().toISOString(),
+    refresh_token: body.refresh_token,
+    expires_at: body.expires_in
+      ? new Date(Date.now() + body.expires_in * 1000).toISOString()
+      : undefined,
   };
+}
+
+/** Refresh a little early: a token that expires mid-request is a failed request. */
+const REFRESH_MARGIN_MS = 120_000;
+
+export function isExpired(t: StoredToken, now: number = Date.now()): boolean {
+  if (!t.expires_at) return false; // legacy long-lived token
+  return Date.parse(t.expires_at) - REFRESH_MARGIN_MS <= now;
+}
+
+/**
+ * Trade the refresh token for a new access token.
+ *
+ * The refresh token ROTATES: the one we present stops working and the response
+ * carries its replacement. Failing to store the new one turns the next refresh
+ * into `invalid_grant`, which is indistinguishable from a revoked grant and
+ * sends whoever debugs it to the wrong place.
+ */
+export async function refreshAccessToken(
+  clientId: string,
+  clientSecret: string,
+  token: StoredToken,
+  fetchImpl: typeof fetch = fetch,
+): Promise<StoredToken> {
+  if (!token.refresh_token) throw new Error("no refresh token on file — run `aibroker todoist auth`");
+
+  const res = await fetchImpl("https://api.todoist.com/oauth/access_token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: "refresh_token",
+      refresh_token: token.refresh_token,
+    }).toString(),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`token refresh returned ${res.status}: ${text.slice(0, 200)}`);
+
+  const next = parseTokenResponse(text);
+  // Todoist may omit the scope on a refresh; keep what the grant actually has.
+  if (!next.scope) next.scope = token.scope;
+  // A rotation that returns no new refresh token leaves the old one valid.
+  if (!next.refresh_token) next.refresh_token = token.refresh_token;
+  saveToken(next);
+  log(`todoist-oauth: refreshed, valid until ${next.expires_at ?? "(no expiry)"}`);
+  audit({
+    action: "todoist-oauth", actor: "aibroker", target: "aibroker",
+    outcome: "refreshed", meta: { scope: next.scope },
+  });
+  return next;
+}
+
+/**
+ * The token to use right now, refreshed if it is about to expire.
+ *
+ * Every caller should go through this rather than `loadToken()`: an hour is
+ * short enough that "it worked when I tested it" proves nothing.
+ */
+export async function getAccessToken(fetchImpl: typeof fetch = fetch): Promise<StoredToken | null> {
+  const t = loadToken();
+  if (!t) return null;
+  if (!isExpired(t)) return t;
+
+  const clientId = process.env.TODOIST_CLIENT_ID;
+  const clientSecret = process.env.TODOIST_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    log("todoist-oauth: token expired and cannot refresh — TODOIST_CLIENT_ID/SECRET not set");
+    return t;
+  }
+  try {
+    return await refreshAccessToken(clientId, clientSecret, t, fetchImpl);
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    log(`todoist-oauth: refresh failed — ${reason}`);
+    audit({
+      action: "todoist-oauth", actor: "aibroker", target: "aibroker",
+      outcome: "failed", reason: `refresh failed — ${reason}`,
+    });
+    return t; // let the caller's 401 speak for itself rather than inventing one
+  }
 }
 
 function page(title: string, detail: string, ok: boolean): string {

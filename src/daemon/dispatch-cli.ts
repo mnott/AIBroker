@@ -45,6 +45,9 @@ function usage(): void {
 
 Outcomes (all exit 0 — they are results, not failures):
   delivered      a live session accepted it
+  queued         typed into a live session that was mid-turn. Claude Code
+                 queues input during a turn, so no reaction is not evidence
+                 of non-delivery. Treat as SUCCESS — retrying duplicates.
   spawned        no session ran; one was launched and accepted it
   unlaunchable   no curated alias — run \`pai project name <id> <shortname>\`
   unreachable    tab opened but the session never accepted input
