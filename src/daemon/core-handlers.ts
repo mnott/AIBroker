@@ -1285,14 +1285,23 @@ export function registerCoreHandlers(
       // its work and says nothing leaves the trigger suppressed until then —
       // one missed run, looking exactly like a run nobody asked for.
       let released = false;
+      let releaseRefused: string | undefined;
       if (release) {
         const { RUNNING_LABEL } = await import("./todoist-webhook.js");
-        const { forgetClaim } = await import("./todoist-claims.js");
-        await setTaskLabel(taskId, RUNNING_LABEL, false);
-        forgetClaim(taskId);
-        released = true;
+        const { forgetClaim, mayRelease } = await import("./todoist-claims.js");
+        const { fetchTaskDue } = await import("./todoist-reply.js");
+        // Check the completion actually landed before dropping the guard.
+        const verdict = mayRelease(taskId, await fetchTaskDue(taskId));
+        if (verdict.ok) {
+          await setTaskLabel(taskId, RUNNING_LABEL, false);
+          forgetClaim(taskId);
+          released = true;
+        } else {
+          releaseRefused = verdict.reason;
+          log(`todoist-reply: refused to release ${taskId} — ${verdict.reason}`);
+        }
       }
-      return { ok: true, result: { taskId: r.taskId, commentId: r.commentId, released } };
+      return { ok: true, result: { taskId: r.taskId, commentId: r.commentId, released, releaseRefused } };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }

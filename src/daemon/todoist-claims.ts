@@ -153,3 +153,40 @@ export async function sweepAbandonedClaims(
   }
   return released;
 }
+
+/**
+ * May this claim be released yet?
+ *
+ * Releasing before the completion lands splits finishing a run into two steps
+ * that are not atomic. A session that drops the claim and then dies leaves the
+ * task unclaimed and still overdue — so the next poll dispatches it as ordinary
+ * overdue work, and the same sweep runs a second time looking spontaneous.
+ *
+ * The completion is observable: on a recurring task it advances the due date
+ * again, past the occurrence recorded when the claim was taken. So we can tell
+ * the two apart rather than trusting an ordering we do not control.
+ *
+ * Refusing here inverts the failure in the direction both sides agreed on — a
+ * claim stuck until a timer releases it, rather than a run nobody asked for.
+ */
+export function mayRelease(taskId: string, currentDue: string | undefined): { ok: true } | { ok: false; reason: string } {
+  const claim = listClaims().find((c) => c.taskId === taskId);
+  // Nothing recorded: there is no in-flight run to protect.
+  if (!claim) return { ok: true };
+  // No occurrence recorded, or none readable now — cannot tell, so allow it
+  // rather than strand a session that has genuinely finished.
+  if (!claim.nextDue || !currentDue) return { ok: true };
+
+  const claimed = Date.parse(claim.nextDue);
+  const now = Date.parse(currentDue);
+  if (!Number.isFinite(claimed) || !Number.isFinite(now)) return { ok: true };
+  if (now > claimed) return { ok: true };
+
+  return {
+    ok: false,
+    reason:
+      "the task has not been completed yet — its due date has not advanced since the trigger. " +
+      "Complete it first, then release: dropping the claim now would leave the task unclaimed " +
+      "and overdue, and the next poll would run it again.",
+  };
+}

@@ -19,7 +19,7 @@ mkdirSync(join(scratch, ".aibroker"), { recursive: true });
 
 const {
   recordClaim, forgetClaim, listClaims, expiredClaims, sweepAbandonedClaims,
-  claimDeadline, CLAIM_MIN_AGE_MS, CLAIM_FALLBACK_AGE_MS,
+  claimDeadline, mayRelease, CLAIM_MIN_AGE_MS, CLAIM_FALLBACK_AGE_MS,
 } = await import("../src/daemon/todoist-claims.js");
 
 const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
@@ -140,4 +140,46 @@ test("a claim released early is not resurrected by the sweep", () => {
   recordClaim("t-early", ago(48 * 3600_000), inHours(-1));
   forgetClaim("t-early");
   assert.deepEqual(expiredClaims().filter((c) => c.taskId === "t-early"), []);
+});
+
+
+// ── releasing before finishing ──────────────────────────────────────────────
+//
+// The release flag lets a session finish in two steps that are not atomic:
+// drop the claim, then complete the task. Drop first and die, and the task is
+// unclaimed and still overdue — so the next poll dispatches it as ordinary
+// overdue work and the same run happens again, looking spontaneous.
+//
+// The completion is observable: on a recurring task it advances the due date
+// past the occurrence recorded when the claim was taken. So refuse rather than
+// trust an ordering we do not control — a stuck claim released by a timer is
+// the direction both sides agreed to fail in.
+
+test("releasing before the completion lands is refused", () => {
+  clear();
+  const due = inHours(24);
+  recordClaim("t-early-release", undefined, due);
+  const v = mayRelease("t-early-release", due);
+  assert.equal(v.ok, false);
+  assert.match((v as { reason: string }).reason, /has not been completed yet/);
+});
+
+test("releasing after the completion is allowed", () => {
+  // `pai task done` advances the recurrence again, past the recorded occurrence.
+  clear();
+  recordClaim("t-done-release", undefined, inHours(24));
+  assert.equal(mayRelease("t-done-release", inHours(48)).ok, true);
+});
+
+test("an unrecorded claim is releasable — there is nothing to protect", () => {
+  clear();
+  assert.equal(mayRelease("t-unknown", inHours(24)).ok, true);
+});
+
+test("an unreadable due date allows the release rather than stranding a run", () => {
+  // "Cannot tell" must not become "not finished": that would leave a session
+  // that genuinely completed unable to clear its own claim.
+  clear();
+  recordClaim("t-nodue", undefined, inHours(24));
+  assert.equal(mayRelease("t-nodue", undefined).ok, true);
 });
