@@ -27,7 +27,12 @@ const {
   exchangeCode,
   handleOAuthCallback,
   loadToken,
+  saveToken,
+  isExpired,
+  refreshAccessToken,
+  getAccessToken,
 } = await import("../src/daemon/todoist-oauth.js");
+import type { StoredToken } from "../src/daemon/todoist-oauth.js";
 
 const PENDING = join(scratch, ".aibroker", "todoist-oauth-pending.json");
 const TOKEN = join(scratch, ".aibroker", "todoist-oauth.json");
@@ -154,4 +159,94 @@ test("missing client id is reported as configuration, not as a failed exchange",
     new URL("http://x/oauth?code=c&state=s"), { clientSecret: "secret" });
   assert.equal(r.status, 500);
   assert.match(r.html, /TODOIST_CLIENT_ID/);
+});
+
+// ── one-hour tokens ─────────────────────────────────────────────────────────
+//
+// Todoist issues access tokens that live for 3600 seconds, with a refresh
+// token that ROTATES on every use. The first version of this module stored
+// neither. The result worked perfectly and then stopped about an hour later
+// with a 401 that reads exactly like a revoked grant — twice, before anyone
+// read the response body closely enough to see what had been discarded.
+
+test("the exchange keeps expiry and refresh token", async () => {
+  cleanup();
+  const fake = (async () => new Response(JSON.stringify({
+    access_token: "a1", token_type: "Bearer", scope: "data:read_write",
+    expires_in: 3600, refresh_token: "r1",
+  }), { status: 200 })) as unknown as typeof fetch;
+
+  const t = await exchangeCode("cid", "secret", "code", fake);
+  assert.equal(t.refresh_token, "r1");
+  assert.ok(t.expires_at, "an expiry must be recorded");
+  const mins = (Date.parse(t.expires_at!) - Date.now()) / 60000;
+  assert.ok(mins > 55 && mins <= 60, `expiry ${mins} min should be about an hour`);
+});
+
+test("a token is treated as expired slightly early", () => {
+  // A token that expires mid-request is a failed request.
+  const soon: StoredToken = {
+    access_token: "a", token_type: "Bearer", obtained_at: new Date().toISOString(),
+    expires_at: new Date(Date.now() + 30_000).toISOString(),
+  };
+  assert.equal(isExpired(soon), true);
+
+  const fine: StoredToken = { ...soon, expires_at: new Date(Date.now() + 600_000).toISOString() };
+  assert.equal(isExpired(fine), false);
+});
+
+test("a legacy token with no expiry never looks expired", () => {
+  const legacy: StoredToken = {
+    access_token: "a", token_type: "Bearer", obtained_at: new Date().toISOString(),
+  };
+  assert.equal(isExpired(legacy), false);
+});
+
+test("refreshing stores the ROTATED refresh token", async () => {
+  cleanup();
+  saveToken({
+    access_token: "old", token_type: "Bearer", obtained_at: new Date().toISOString(),
+    refresh_token: "r1", expires_at: new Date(Date.now() - 1000).toISOString(), scope: "data:read_write",
+  });
+  let sent = "";
+  const fake = (async (_u: unknown, init?: RequestInit) => {
+    sent = String(init?.body);
+    return new Response(JSON.stringify({
+      access_token: "new", token_type: "Bearer", expires_in: 3600, refresh_token: "r2",
+    }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const t = await refreshAccessToken("cid", "secret", loadToken()!, fake);
+  assert.equal(t.access_token, "new");
+  assert.equal(t.refresh_token, "r2", "the old refresh token stops working — the new one must be kept");
+  assert.equal(loadToken()?.refresh_token, "r2", "and must be persisted");
+  assert.match(sent, /grant_type=refresh_token/);
+  assert.equal(t.scope, "data:read_write", "scope survives a refresh that omits it");
+});
+
+test("getAccessToken refreshes an expired token without being asked", async () => {
+  cleanup();
+  process.env.TODOIST_CLIENT_ID = "cid";
+  process.env.TODOIST_CLIENT_SECRET = "secret";
+  saveToken({
+    access_token: "old", token_type: "Bearer", obtained_at: new Date().toISOString(),
+    refresh_token: "r1", expires_at: new Date(Date.now() - 1000).toISOString(),
+  });
+  const fake = (async () => new Response(JSON.stringify({
+    access_token: "fresh", token_type: "Bearer", expires_in: 3600, refresh_token: "r2",
+  }), { status: 200 })) as unknown as typeof fetch;
+
+  assert.equal((await getAccessToken(fake))?.access_token, "fresh");
+});
+
+test("a failed refresh returns the old token rather than inventing a failure", async () => {
+  // Let the caller's real 401 speak. Returning null here would report "not
+  // authorised" for what may be a transient network problem.
+  cleanup();
+  saveToken({
+    access_token: "old", token_type: "Bearer", obtained_at: new Date().toISOString(),
+    refresh_token: "r1", expires_at: new Date(Date.now() - 1000).toISOString(),
+  });
+  const fake = (async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
+  assert.equal((await getAccessToken(fake))?.access_token, "old");
 });

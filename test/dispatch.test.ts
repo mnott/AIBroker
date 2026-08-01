@@ -107,12 +107,14 @@ test("spawned tab that comes up but never accepts the message -> unreachable", a
   assert.match(r.reason, /never reacted/);
 });
 
-test("a live session that never accepts the message -> unreachable", async () => {
+test("a live session that does not react in time -> queued, not unreachable", async () => {
+  // Was `unreachable` until 2026-08-01. It reported failure for a message that
+  // had arrived, and the caller retried it into three duplicate work orders.
   const r = await dispatch("whazaa", "x", {}, deps({
     sessions: () => live("Whazaa"),
     deliver: async () => "no-ack",
   }));
-  assert.equal(r.outcome, "unreachable");
+  assert.equal(r.outcome, "queued");
   assert.equal(r.session, "Whazaa");
 });
 
@@ -354,4 +356,43 @@ test("folding separators does not make different projects collide", () => {
   assert.equal(findSessionForProject(project, [
     { id: "s-3", name: "t", paiName: "Jobs Matthias" },
   ]), null);
+});
+
+// ── a busy session is not an unreachable one ────────────────────────────────
+//
+// Reported live on 2026-08-01 from the Jobs Matthias session: dispatch returned
+// unreachable ("never reacted") and the message had in fact arrived THREE
+// times. Claude Code queues typed input while a turn runs and does not read it
+// until the turn ends, so silence is the ordinary state of a session that is
+// working — not evidence of non-delivery. Calling it unreachable made the
+// caller count a strike, report the routine as not running, and dispatch again.
+
+test("a live session that is mid-turn reports queued, not unreachable", async () => {
+  let attempts = 0;
+  const r = await dispatch("whazaa", "run the sweep", {}, deps({
+    sessions: () => live("whazaa"),
+    deliver: async () => { attempts++; return "no-ack"; },
+  }));
+  assert.equal(r.outcome, "queued");
+  assert.match(r.reason, /do NOT retry/i);
+  assert.equal(attempts, 1, "one attempt — a retype duplicates the work order");
+});
+
+test("an unreadable terminal is still unreachable", async () => {
+  // "I could not look" is a different problem from "it is busy", and collapsing
+  // them sends whoever reads the result to the wrong place.
+  const r = await dispatch("whazaa", "x", {}, deps({
+    sessions: () => live("whazaa"),
+    deliver: async () => "unreadable",
+  }));
+  assert.equal(r.outcome, "unreachable");
+});
+
+test("delivery is attempted exactly once against a live session", async () => {
+  let attempts = 0;
+  await dispatch("whazaa", "x", {}, deps({
+    sessions: () => live("whazaa"),
+    deliver: async (_id, _b, _t, _io, retries) => { attempts = retries ?? 3; return "ok"; },
+  }));
+  assert.equal(attempts, 1, "dispatch must ask for a single attempt on a live session");
 });
