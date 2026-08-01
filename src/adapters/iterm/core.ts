@@ -8,14 +8,30 @@
 import { spawnSync } from "node:child_process";
 import { log } from "../../core/log.js";
 
-/** Throttle identical failures so a persistent fault logs steadily, not per-poll. */
+/**
+ * Throttle identical failures so a persistent fault logs steadily, not per-poll —
+ * but COUNT the suppressed ones and say how many.
+ *
+ * Throttling alone loses the rate, and the rate is the diagnosis. Two failures
+ * a minute and two thousand a minute produce an identical log at a 30s throttle,
+ * so a flapping fault reads the same as an occasional one. This is the same
+ * trap as a deferral that is logged but not counted: the record exists and
+ * still cannot tell you whether the thing is nearly fine or completely broken.
+ */
 const lastLogged = new Map<string, number>();
+const suppressed = new Map<string, number>();
+
 function logThrottled(key: string, message: string): void {
   const now = Date.now();
   const prev = lastLogged.get(key) ?? 0;
-  if (now - prev < 30_000) return;
+  if (now - prev < 30_000) {
+    suppressed.set(key, (suppressed.get(key) ?? 0) + 1);
+    return;
+  }
+  const hidden = suppressed.get(key) ?? 0;
+  suppressed.set(key, 0);
   lastLogged.set(key, now);
-  log(message);
+  log(hidden > 0 ? `${message} (+${hidden} more in the last ${Math.round((now - prev) / 1000)}s)` : message);
 }
 
 // Default budget. Deliberately generous: exceeding it yields null, which every
