@@ -187,3 +187,13 @@ export {
 export type { PaiProject } from "./daemon/pai-projects.js";
 export { createBrokerMessage } from "./types/broker.js";
 export type { BrokerMessage, BrokerMessageType, BrokerMessagePayload, RouteResult } from "./types/broker.js";
+
+// Guarded JSON persistence, exported so consumers stop carrying their own copy.
+//
+// Telex and Whazaa each grew a private safeReadJson/safeWriteJson pair that
+// returned null for a corrupt file exactly as for an absent one and wrote
+// non-atomically. That is how a corrupt cache becomes an empty one and a
+// corrupt registry becomes permanent. A copy of a fix is a fix that stops
+// travelling, so the primitive belongs here rather than in each consumer.
+export { loadJson, saveJson, GuardedStore } from "./core/json-store.js";
+export type { LoadResult } from "./core/json-store.js";
