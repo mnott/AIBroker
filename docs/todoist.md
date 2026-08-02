@@ -182,6 +182,10 @@ aibroker todoist ingress add <rootId>=<owner> --subtree
 
 grants the project **and every project nested under it, at any depth**, each inheriting the root's owner. A folder is not a second owner.
 
+**A granted root often has no owner** — `Claude 🤖` is a container, not a session — and its children are named after the sessions they serve: `Home`, `SL`, `Whazaa`. In that case a child takes **its own name** as its owner, matched against running sessions and configured aliases with separators folded, so `Jobs Matthias` resolves to `jobs-matthias`. An ancestor that *does* name an owner still wins, because `Executive Search 🎯` under `Jobs Matthias` belongs to jobs-matthias rather than to a session of its own. A name matching nothing leaves the owner unset and the ordinary rules apply — inventing an owner from an unrecognised name would be worse than falling through.
+
+Names are read from the project tree **by id**. Todoist's project search returns nothing for names containing emoji, so anything resolving a project by name would report one that plainly exists as absent.
+
 Still opt-in, and the residual risk is worth stating plainly: a project shared with you and later moved under a granted root inherits execution rights nobody considered for it. Grant subtrees to roots you own.
 
 Without `--subtree`, a grant covers exactly one project, which is the old behaviour and remains the right default for anything shared.

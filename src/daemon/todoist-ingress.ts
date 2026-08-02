@@ -168,6 +168,22 @@ export function expandThroughSubtree(
   cfg: WebhookConfig,
   projectId: string,
   ancestors: string[],
+  /**
+   * The project's own name, and the owners a name may resolve to.
+   *
+   * A granted root often has no owner of its own — "Claude 🤖" is a container,
+   * not a session — and its children are named after the sessions they belong
+   * to: Home, SL, Whazaa. Without this, every child of such a root inherits
+   * nothing and falls through to the default owner, so tasks filed into
+   * "Claude 🤖 / Home" arrive at whichever session the default names. That was
+   * the symptom: three projects created in one afternoon, all silently
+   * unreachable.
+   *
+   * The name is read from the project tree BY ID. Todoist's project search
+   * returns nothing for names containing emoji, so anything that looked a
+   * project up by name would report one that plainly exists as absent.
+   */
+  self?: { name?: string; known?: Iterable<string> },
 ): WebhookConfig {
   if (!projectId || cfg.ingressProjectIds.has(projectId)) return cfg;
 
@@ -178,9 +194,25 @@ export function expandThroughSubtree(
     const ids = new Set(cfg.ingressProjectIds);
     ids.add(projectId);
     const owners = new Map(cfg.projectOwners);
-    const owner = g.owner ?? cfg.projectOwners.get(ancestorId);
+    const owner = g.owner ?? cfg.projectOwners.get(ancestorId) ?? ownerFromName(self);
     if (owner) owners.set(projectId, owner);
     return { ...cfg, ingressProjectIds: ids, projectOwners: owners };
   }
   return cfg;
+}
+
+/**
+ * A project named after a session belongs to it.
+ *
+ * Separator-folded for the same reason session matching is: an alias is written
+ * `jobs-matthias` and a human names the folder `Jobs Matthias`.
+ */
+function ownerFromName(self?: { name?: string; known?: Iterable<string> }): string | undefined {
+  if (!self?.name || !self.known) return undefined;
+  const fold = (x: string) => x.toLowerCase().replace(/[\s_-]+/g, " ").trim();
+  const want = fold(self.name);
+  for (const k of self.known) {
+    if (k && fold(k) === want) return k.toLowerCase();
+  }
+  return undefined;
 }
