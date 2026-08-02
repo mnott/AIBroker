@@ -291,7 +291,7 @@ Todoist supplies `event_data_extra.old_item` for updates a user made directly. W
 | Situation | Why |
 |---|---|
 | Project not in the allowlist | The security boundary |
-| `item:completed` | Completion is you saying *done* — it must never start work, **unless** it is a recurring task carrying a `pai:<name>` label (see below) |
+| `item:completed` | Completion is you saying *done* — it must never start work, **unless** it is a recurring task carrying a `pai:<name>` label (see below). A completion hook may still run; see §7a. |
 | Content starting with 🤖 | Written by an agent; ignored to prevent echo loops |
 | Empty task content | Nothing to act on |
 | No owner and no default | Refuses to guess |
@@ -418,6 +418,21 @@ todoist_ingress(action: "resolve", owner: "jobs-matthias")
 ```
 
 Resolve before creating. Owner matching folds separators, so every written form of the name finds the same project.
+
+### A hook for the moment a box is ticked
+
+Completion dispatches nothing, by design. But it is not nothing: the comment thread on a ticked task leaves every list at that instant, and a one-off task disappears from any "open tasks" query entirely — so a poller cannot see it either. There is no second chance.
+
+```bash
+# ~/.aibroker/env
+TODOIST_ON_COMPLETED=/usr/local/bin/pai task archive {taskId} --quiet
+```
+
+Unset by default. `{taskId}` is substituted; the command runs **without a shell**, because the id arrives from the internet and a shell would make it part of a command line.
+
+**Give an absolute path.** Under launchd the daemon's `PATH` is `/usr/local/bin:/usr/bin:/bin` — no Homebrew, no node global bin — so a bare command name that works in your terminal may simply not exist here.
+
+**The exit code is the contract.** A non-zero exit is recorded as `hook-failed` with the stderr tail; success is recorded as `archived` rather than `ignored`. A hook that failed quietly would turn "recorded, no action taken" into a claim about something that did not happen, which is the one thing the audit trail exists to prevent.
 
 ### Never open a blocking prompt for a channel message
 

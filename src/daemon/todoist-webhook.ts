@@ -624,10 +624,23 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         log(`todoist-webhook: near miss — ${decision.nearMiss}`);
       }
 
+      // A completion has nothing to dispatch, but it is not nothing. The
+      // comment thread on a ticked task leaves every list at that moment, so a
+      // configured hook gets its chance before this is recorded as "ignored" —
+      // and its exit code decides what the record says.
+      let hook: { ran: boolean; ok: boolean; detail?: string } = { ran: false, ok: true };
+      if (event.event_name === "item:completed") {
+        const { runCompletedHook } = await import("./todoist-completed-hook.js");
+        hook = await runCompletedHook(String(event.event_data?.id ?? ""));
+      }
+
       if (!decision.act) {
         audit({
           action: "webhook", actor: `todoist:${who}`, target: "aibroker",
-          outcome: "ignored", reason: decision.reason,
+          outcome: hook.ran ? (hook.ok ? "archived" : "hook-failed") : "ignored",
+          reason: hook.ran
+            ? (hook.ok ? `${decision.reason} — completion hook ran` : `${decision.reason} — completion hook FAILED: ${hook.detail}`)
+            : decision.reason,
           meta: {
             event: event.event_name,
             task: (event.event_data?.content as string) ?? undefined,
