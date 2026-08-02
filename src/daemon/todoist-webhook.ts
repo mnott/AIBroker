@@ -630,7 +630,10 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         try {
           const { projectTree, ancestorsOf } = await import("./todoist-projects.js");
           const tree = await projectTree();
-          live = expandThroughSubtree(live, eventProject, ancestorsOf(eventProject, tree));
+          live = expandThroughSubtree(live, eventProject, ancestorsOf(eventProject, tree), {
+            name: tree.get(eventProject)?.name,
+            known: await (deps.knownOwners?.() ?? []),
+          });
         } catch (err) {
           log(`todoist-webhook: subtree lookup failed — ${err instanceof Error ? err.message : String(err)}`);
         }

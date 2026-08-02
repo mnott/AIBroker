@@ -181,3 +181,47 @@ test("ancestorsOf survives a cycle rather than hanging", () => {
   ]);
   assert.deepEqual(ancestorsOf("a", bad), ["b"]);
 });
+
+// ── a folder named after a session belongs to it ────────────────────────────
+//
+// A granted root is often a container with no owner of its own — "Claude 🤖" is
+// not a session — and its children are named after the sessions they serve:
+// Home, SL, Whazaa. Without name inference every one of them inherits nothing
+// and falls to the default owner. Three such projects were created in one
+// afternoon and all were silently unreachable.
+
+const KNOWN_OWNERS = ["home", "sl", "whazaa", "jobs-matthias"];
+
+test("a child of an ownerless granted root takes its own name as owner", () => {
+  clearGrants();
+  grantIngress("root", { subtree: true });          // no owner: it is a folder
+  const live = expandThroughSubtree(base, "home-id", ["root"], { name: "Home", known: KNOWN_OWNERS });
+  assert.ok(live.ingressProjectIds.has("home-id"));
+  assert.equal(live.projectOwners.get("home-id"), "home");
+});
+
+test("the granting ancestor's owner still wins over the name", () => {
+  // "Executive Search 🎯" under "Jobs Matthias" belongs to jobs-matthias, not to
+  // a session called Executive Search — a folder is not a second owner.
+  clearGrants();
+  grantIngress("jobs", { owner: "jobs-matthias", subtree: true });
+  const live = expandThroughSubtree(base, "exec-id", ["jobs"], { name: "Executive Search 🎯", known: KNOWN_OWNERS });
+  assert.equal(live.projectOwners.get("exec-id"), "jobs-matthias");
+});
+
+test("name matching folds separators", () => {
+  clearGrants();
+  grantIngress("root", { subtree: true });
+  const live = expandThroughSubtree(base, "jm-id", ["root"], { name: "Jobs Matthias", known: KNOWN_OWNERS });
+  assert.equal(live.projectOwners.get("jm-id"), "jobs-matthias");
+});
+
+test("a name matching nothing leaves the owner unset, not guessed", () => {
+  // Allowed through the subtree, but routed by the ordinary rules — inventing
+  // an owner from a name nobody recognises would be worse than falling through.
+  clearGrants();
+  grantIngress("root", { subtree: true });
+  const live = expandThroughSubtree(base, "misc-id", ["root"], { name: "Shopping", known: KNOWN_OWNERS });
+  assert.ok(live.ingressProjectIds.has("misc-id"));
+  assert.equal(live.projectOwners.get("misc-id"), undefined);
+});
