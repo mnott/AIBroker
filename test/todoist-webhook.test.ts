@@ -422,3 +422,98 @@ test("a fired reminder on a trigger still dispatches", () => {
   const e = { ...task({ due: { is_recurring: true } }), event_name: "reminder:fired" };
   assert.equal(route(e, cfg, ["whazaa"]).act, true);
 });
+
+// ── create, then classify ───────────────────────────────────────────────────
+//
+// The habitual workflow is to file a task first and label it second. At
+// item:added it is not yet routable and is correctly ignored — and the event
+// that MAKES it routable is an item:updated, which is not actionable. The event
+// that matters was precisely the one nothing subscribed to.
+//
+// Subscribing to item:updated wholesale would be worse than the gap: every edit
+// would dispatch. Only the STATE TRANSITION is safe.
+
+const updated = (
+  oldItem: Record<string, unknown>,
+  newItem: Record<string, unknown>,
+  extra: Record<string, unknown> = {},
+): TodoistEvent => ({
+  event_name: "item:updated",
+  triggered_at: "2026-08-02T09:00:00.0Z",
+  initiator: { email: "owner@example.com", id: "1" },
+  event_data: { id: "t-1", content: "Do the thing", description: "", ...newItem },
+  event_data_extra: { old_item: { id: "t-1", content: "Do the thing", ...oldItem }, ...extra },
+});
+
+test("labelling an unlabelled task in an ingress project dispatches it", () => {
+  const strict: WebhookConfig = { ...cfg, defaultOwner: undefined };
+  const d = route(
+    updated({ project_id: INGRESS, labels: [] }, { project_id: INGRESS, labels: ["pai:whazaa"] }),
+    strict, ["whazaa"],
+  );
+  assert.equal(d.act, true);
+  assert.equal(d.act && d.project, "whazaa");
+});
+
+test("moving a labelled task INTO an ingress project dispatches it", () => {
+  // The other half of the same transition: the address was there, the boundary
+  // was not.
+  const d = route(
+    updated({ project_id: "somewhere-else", labels: ["pai:whazaa"] }, { project_id: INGRESS, labels: ["pai:whazaa"] }),
+    cfg, ["whazaa"],
+  );
+  assert.equal(d.act, true);
+});
+
+test("renaming an already-routable task does NOT dispatch", () => {
+  // The failure mode of the naive fix: every edit becomes a work order.
+  const d = route(
+    updated({ project_id: INGRESS, labels: ["pai:whazaa"] }, { project_id: INGRESS, labels: ["pai:whazaa"] }),
+    cfg, ["whazaa"],
+  );
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /already routable/);
+});
+
+test("an edit that leaves a task unroutable does NOT dispatch", () => {
+  const strict: WebhookConfig = { ...cfg, defaultOwner: undefined };
+  const d = route(
+    updated({ project_id: "outside", labels: [] }, { project_id: "outside", labels: ["urgent"] }),
+    strict, ["whazaa"],
+  );
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /still not routable/);
+});
+
+test("an update reporting a completion is not read as a routing change", () => {
+  const strict: WebhookConfig = { ...cfg, defaultOwner: undefined };
+  const d = route(
+    updated({ project_id: INGRESS, labels: [] }, { project_id: INGRESS, labels: ["pai:whazaa"] },
+      { update_intent: "item_completed" }),
+    strict, ["whazaa"],
+  );
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /item_completed/);
+});
+
+test("an update with no previous state is ignored", () => {
+  // Nothing to compare, so nothing can be characterised — and acting would mean
+  // dispatching on an edit of unknown shape.
+  const e: TodoistEvent = { ...task(), event_name: "item:updated", event_data_extra: undefined };
+  const d = route(e, cfg, ["whazaa"]);
+  assert.equal(d.act, false);
+  assert.match((d as { reason: string }).reason, /no previous state/);
+});
+
+test("our own pai-running write does not look like a routing change", () => {
+  // Claiming a task fires item:updated. pai-running is not a routing label, so
+  // routability is unchanged and the echo stays ignored.
+  const d = route(
+    updated(
+      { project_id: INGRESS, labels: ["pai:whazaa"] },
+      { project_id: INGRESS, labels: ["pai:whazaa", "pai-running"] },
+    ),
+    cfg, ["whazaa"],
+  );
+  assert.equal(d.act, false);
+});
