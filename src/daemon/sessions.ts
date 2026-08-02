@@ -24,6 +24,7 @@
  *   checkpoint [--message M] [--only NAME] [--dry-run] [--timeout S]
  *                                             ask each to save state, VERIFIED
  *   list [--verbose]                          show the manifest
+ *   repoint NAME PATH                         set where a session should reopen
  *   forget NAME                               drop an entry
  *   prune [--older-than DAYS] [--dry-run]     drop entries not seen in a while
  *   install | uninstall                       manage the 5-min snapshot LaunchAgent
@@ -31,7 +32,7 @@
 import { execFileSync, execSync } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync, mkdirSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, basename, dirname } from "node:path";
+import { join, basename, dirname, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { WatcherClient } from "../ipc/client.js";
 import { captureSession, typeIntoSession } from "../transport/sync-facade.js";
@@ -56,6 +57,17 @@ interface Entry {
   lastSeen?: string;
   /** ISO timestamp of the first snapshot that ever saw it. */
   addedAt?: string;
+  /**
+   * The cwd was set deliberately and must not be overwritten by a sighting.
+   *
+   * A session's live directory is where it happens to be running, which is not
+   * always where it belongs: Solar was started in the home directory and later
+   * repointed at its real project. Without this the next snapshot sees the live
+   * process still in `~`, fails to match the corrected entry — the key is
+   * name+cwd — and adds a SECOND Solar. The correction would undo itself within
+   * five minutes, with nothing reporting that it had.
+   */
+  pinned?: boolean;
 }
 
 /** On-disk shape. v1 was a bare Entry[]; readManifest() accepts both. */
@@ -190,7 +202,21 @@ export function mergeEntries(existing: Entry[], fresh: Entry[], now: string): En
   const pending = new Map<string, Entry>();
   for (const e of fresh) pending.set(keyOf(e.name, e.cwd), e);
 
+  // A pinned entry answers to its NAME, not to name+cwd. Its whole purpose is
+  // that the live directory disagrees with the intended one, so keying on cwd
+  // would never match and the sighting would arrive as a duplicate.
+  const pinnedByName = new Map<string, Entry>();
+  for (const e of existing) if (e.pinned) pinnedByName.set(e.name, e);
+  for (const [k, f] of [...pending]) {
+    if (pinnedByName.has(f.name)) pending.delete(k);
+  }
+
   const merged = existing.map((e) => {
+    if (e.pinned) {
+      // Seen or not, the recorded cwd stands. Only the sighting is recorded.
+      const seen = fresh.some((f) => f.name === e.name);
+      return seen ? { ...e, lastSeen: now } : e;
+    }
     const k = keyOf(e.name, e.cwd);
     if (!pending.has(k)) return e; // not open now — keep it; that IS the point
     pending.delete(k);
@@ -198,6 +224,50 @@ export function mergeEntries(existing: Entry[], fresh: Entry[], now: string): En
   });
   for (const e of pending.values()) merged.push(e);
   return merged;
+}
+
+/**
+ * Point a session at where it belongs, and hold it there.
+ *
+ * The live directory is where a session happens to be running. Solar was
+ * started in the home directory and later given a real project, and every
+ * snapshot would otherwise have re-added it at `~` — the correction undoing
+ * itself within five minutes, silently, which is the failure this whole
+ * manifest was written to avoid.
+ */
+function doRepoint(name: string, dir: string): void {
+  const resolved = resolve(dir);
+  if (!existsSync(resolved)) {
+    console.error(`No such directory: ${resolved}`);
+    console.error("Refusing to point a session at a path that does not exist — a restore would");
+    console.error("open a tab in the wrong place and look like it worked.");
+    process.exit(1);
+  }
+
+  const manifest = readManifest();
+  let entries: Entry[] = manifest.entries;
+  const matches = entries.filter((e) => e.name === name);
+  if (matches.length === 0) {
+    console.error(`No session named "${name}" in the manifest.`);
+    console.error(`Known: ${entries.map((e) => e.name).join(", ") || "(none)"}`);
+    process.exit(1);
+  }
+
+  // More than one entry can share a name when the same session has been seen at
+  // different paths — exactly the state this command exists to clean up.
+  const kept = matches[0];
+  const dropped = matches.slice(1);
+  const before = kept.cwd;
+  kept.cwd = resolved;
+  kept.pinned = true;
+  if (dropped.length) {
+    entries = entries.filter((e) => e === kept || e.name !== name);
+  }
+  writeManifest(entries);
+
+  console.log(`${name}: ${before} -> ${resolved}`);
+  console.log("Pinned — snapshots will record that it was seen without moving it back.");
+  for (const d of dropped) console.log(`  dropped a duplicate entry at ${d.cwd}`);
 }
 
 function ago(iso?: string): string {
@@ -492,6 +562,7 @@ function usage(): void {
                                               for each to finish (default message: "pause session",
                                               default timeout: 120s per session)
   list       [--verbose]                      show the current manifest
+  repoint NAME PATH                           set where a session should reopen
   forget NAME                                 drop an entry from the manifest
   prune      [--older-than DAYS] [--dry-run]  drop entries not seen in DAYS (default ${DEFAULT_PRUNE_DAYS})
   install | uninstall                         manage the 5-min auto-snapshot LaunchAgent (${AGENT_LABEL})
@@ -556,6 +627,21 @@ async function dispatch(args: string[]): Promise<void> {
         const seen = has("--verbose") ? `${ago(e.lastSeen).padEnd(9)} ` : "";
         console.log(`  ${e.name.padEnd(24)} ${seen}${e.cwd}`);
       }
+      break;
+    }
+    case "repoint": {
+      const args = rest.filter((a) => !a.startsWith("--"));
+      const [name, ...pathParts] = args;
+      const dir = pathParts.join(" ");
+      if (!name || !dir) {
+        console.error("Usage: aibroker sessions repoint NAME /path/to/project");
+        console.error("");
+        console.error("Sets where a session should be REOPENED, which is not always where it");
+        console.error("happens to be running. The entry is pinned, so a snapshot records that");
+        console.error("it was seen without moving it back.");
+        process.exit(1);
+      }
+      doRepoint(name, dir);
       break;
     }
     case "forget": {
