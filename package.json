@@ -1,6 +1,6 @@
 {
   "name": "aibroker",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "Platform-agnostic AI message broker — routes between user channels and AI backends",
   "type": "module",
   "main": "dist/index.js",
@@ -9,7 +9,8 @@
     "dist",
     "templates",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "hooks"
   ],
   "bin": {
     "aibroker": "dist/daemon/cli.js",
