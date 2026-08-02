@@ -233,8 +233,14 @@ Most explicit wins:
 
 1. **A `pai:<name>` label** — `pai:whazaa` goes to the Whazaa session wherever it was filed *within the allowlist*.
 2. **A name at the front of the text** — `pai send a whatsapp message` goes to the PAI session, and the address is stripped so the session receives `send a whatsapp message`.
-3. **The project it was filed in** — if that project has an `=owner` mapping. "Put it in the Whazaa list."
-4. **`TODOIST_DEFAULT_OWNER`** — Inbox capture from a watch, where there is no project, no label and no name.
+3. **The session already holding the task** — a comment follows the work it belongs to.
+4. **The project it was filed in** — if that project has an `=owner` mapping. "Put it in the Whazaa list."
+5. **A bare `<name>` label** — one tap in Todoist's picker, but *below* the project mapping.
+6. **`TODOIST_DEFAULT_OWNER`** — Inbox capture from a watch, where there is no project, no label and no name.
+
+**A bare label ranks below the project, and that ordering was paid for.** A task moved from Clickr into the AIBroker project kept its old `clickr` label; the label won, and a comment meant for AIBroker was delivered to Clickr with nothing anywhere reporting a conflict. A label survives a move. A project mapping is a standing decision about that project. When they disagree, the container is the better evidence and the label is most likely a leftover — and the disagreement is recorded in the audit as a near miss rather than resolved in silence.
+
+`pai:<name>` still outranks everything, because typing the prefix is a deliberate act where a tap may be years old.
 
 Text beats project deliberately: what you wrote is more considered than where quick-capture happened to put it.
 

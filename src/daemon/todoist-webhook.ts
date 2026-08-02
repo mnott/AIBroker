@@ -178,7 +178,7 @@ export interface WebhookConfig {
 }
 
 /** Which rule chose the owner. Recorded, so a wrong guess is visible. */
-export type OwnerRule = "label" | "address" | "held" | "project" | "default";
+export type OwnerRule = "label" | "address" | "held" | "project" | "bare-label" | "default";
 
 export type RouteDecision =
   | { act: true; project: string; body: string; taskId: string; rule: OwnerRule; nearMiss?: string }
@@ -215,16 +215,19 @@ function detectNearMiss(labels: string[], firstToken: string | null, addressed: 
  * is accepted only when it matches something dispatch can actually resolve,
  * so an ordinary label like `urgent` stays an ordinary label.
  */
-function ownerFromLabels(labels: string[], known: Set<string>): string | undefined {
+function ownerFromLabels(labels: string[], known: Set<string>): { prefixed?: string; bare?: string } {
+  let prefixed: string | undefined;
+  let bare: string | undefined;
   for (const raw of labels.map((l) => l.trim())) {
     const low = raw.toLowerCase();
     if (low.startsWith("pai:")) {
       const name = raw.slice(4).trim();
-      if (name) return name;
+      if (name && !prefixed) prefixed = name;
+      continue;
     }
-    if (known.has(low)) return low;
+    if (known.has(low) && !bare) bare = low;
   }
-  return undefined;
+  return { prefixed, bare };
 }
 
 /**
@@ -384,23 +387,45 @@ export function route(
   //   2. a leading name in the text — "pai send a whatsapp message"
   //   3. the session already holding it — a comment follows its work
   //   4. the project it was filed in — "put it in the Whazaa list"
-  //   5. the configured default      — the watch case: Inbox, no label, no text address
+  //   5. a BARE <name> label        — one tap, but stale by default
+  //   6. the configured default      — the watch case: Inbox, no label, no address
+  //
+  // A bare label sits BELOW the project mapping, and that ordering was paid for.
+  // A task moved from Clickr into the AIBroker project kept its old `clickr`
+  // label; the label won, and a comment meant for AIBroker was delivered to
+  // Clickr. Nothing reported a conflict — it simply arrived in the wrong
+  // terminal. A label survives a move; a project mapping is a standing decision
+  // about that project, so when the two disagree the container is the better
+  // evidence and the label is most likely a leftover.
+  //
+  // `pai:<name>` still outranks everything, because typing the prefix is a
+  // deliberate act rather than a tap that might be years old.
   //
   // Text beats project: what you wrote is more deliberate than where it landed,
   // and on a watch the project is whatever the quick-capture button chose.
   const labels = Array.isArray(data.labels) ? (data.labels as unknown[]).map(String) : [];
-  const labelled = ownerFromLabels(labels, known);
+  const { prefixed: labelled, bare: bareLabel } = ownerFromLabels(labels, known);
 
   const addr = parseAddress(content, known);
   const nearMiss = detectNearMiss(labels, addr.firstToken, addr.addressed, known);
 
   let owner: string | undefined;
   let rule: OwnerRule;
+  const projectOwner = cfg.projectOwners.get(projectId);
   if (labelled) { owner = labelled; rule = "label"; }
   else if (addr.owner) { owner = addr.owner; rule = "address"; }
   else if (heldBy) { owner = heldBy; rule = "held"; }
-  else if (cfg.projectOwners.get(projectId)) { owner = cfg.projectOwners.get(projectId); rule = "project"; }
+  else if (projectOwner) { owner = projectOwner; rule = "project"; }
+  else if (bareLabel) { owner = bareLabel; rule = "bare-label"; }
   else { owner = cfg.defaultOwner; rule = "default"; }
+
+  // Two signals, two answers, and nothing anywhere saying so. Delivering to
+  // either without a record is how a comment reached the wrong terminal and was
+  // only found by someone reading it there.
+  const conflict = bareLabel && projectOwner && bareLabel !== projectOwner.toLowerCase()
+    ? `label "${bareLabel}" and project owner "${projectOwner}" disagree — used "${owner}" (${rule}); ` +
+      `a bare label survives a move, so it is probably left over. Use pai:<name> to override deliberately.`
+    : undefined;
 
   if (!owner) {
     return {
@@ -414,7 +439,7 @@ export function route(
   // the text exactly as written.
   const title = rule === "address" ? addr.rest : content;
   const body = description.trim() ? `${title}\n\n${description}` : title;
-  return { act: true, project: owner, body, taskId, rule, nearMiss };
+  return { act: true, project: owner, body, taskId, rule, nearMiss: nearMiss ?? conflict };
 }
 
 /** Bounded replay guard: Todoist retries, and a retry must not run work twice. */

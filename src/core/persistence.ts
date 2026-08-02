@@ -4,14 +4,18 @@
  * Parameterized by appDir (e.g. "~/.whazaa" or "~/.telex") so each
  * consumer uses its own data directory. Transport-specific store caches
  * (Baileys stores, Telegram chats) remain in per-project code.
+ *
+ * Both stores here load into module state at startup and save that state back,
+ * which is the read -> substitute-empty -> make-it-permanent shape described at
+ * the top of core/json-store.ts. They go through it: an unparseable file blocks
+ * writes instead of being replaced, and every write is atomic with a `.bak`.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
 import { log } from "./log.js";
-import { GuardedStore } from "./json-store.js";
+import { GuardedStore, loadJson, saveJson } from "./json-store.js";
 import {
   sessionRegistry,
   clientQueues,
@@ -35,29 +39,53 @@ export function setAppDir(dir: string): void {
   // The name store binds its path at construction, so a later dir change must
   // invalidate it or it would keep reading (and writing) the previous location.
   resetSessionNamesCache();
+  // Blocks are about the files under the previous directory; the new ones have
+  // not been read yet and start unblocked.
+  blockedFiles.clear();
 }
 
 export function getAppDir(): string {
   return _appDir;
 }
 
-function ensureDir(): void {
-  mkdirSync(_appDir, { recursive: true });
-}
+/**
+ * Files that exist but could not be parsed. Writing to one would replace bytes
+ * we were never able to read with the empty value we substituted for them.
+ *
+ * Sticky on purpose, exactly as in `GuardedStore`: both stores below load once
+ * at startup into module state and then save that state back, so a single
+ * unreadable read would otherwise keep truncating the file for the rest of the
+ * daemon's life. A later successful read clears the block.
+ */
+const blockedFiles = new Set<string>();
 
+/**
+ * Read a store under the app dir. `null` for both "absent" and "unreadable" —
+ * the difference is recorded in `blockedFiles`, so a caller substituting an
+ * empty default cannot make that default permanent.
+ */
 function safeReadJson<T>(filename: string): T | null {
-  try {
-    const path = join(_appDir, filename);
-    if (!existsSync(path)) return null;
-    return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {
+  const res = loadJson<T>(join(_appDir, filename));
+  if (res.status === "unreadable") {
+    blockedFiles.add(filename);
     return null;
   }
+  blockedFiles.delete(filename);
+  return res.status === "ok" ? res.data : null;
 }
 
+/** Write a store atomically, keeping a `.bak`. A no-op — loudly — when blocked. */
 function safeWriteJson(filename: string, data: unknown): void {
-  ensureDir();
-  writeFileSync(join(_appDir, filename), JSON.stringify(data, null, 2), "utf-8");
+  if (blockedFiles.has(filename)) {
+    log(`persistence: NOT saving ${filename} — it was unreadable at load. ` +
+        `The file is untouched; fix or remove it and restart to resume persistence.`);
+    return;
+  }
+  try {
+    saveJson(join(_appDir, filename), data);
+  } catch (err) {
+    log(`persistence: failed to save ${filename}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // ── Voice Config ──
