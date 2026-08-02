@@ -16,7 +16,15 @@ const scratch = mkdtempSync(join(tmpdir(), "aibroker-ingress-"));
 process.env.HOME = scratch;
 mkdirSync(join(scratch, ".aibroker"), { recursive: true });
 
-const { grantIngress, revokeIngress, listGrants, applyGrants, projectForOwner } = await import("../src/daemon/todoist-ingress.js");
+const {
+  grantIngress, revokeIngress, listGrants, applyGrants, projectForOwner, expandThroughSubtree,
+} = await import("../src/daemon/todoist-ingress.js");
+const { ancestorsOf } = await import("../src/daemon/todoist-projects.js");
+
+/** Grants persist across tests in one file — each subtree case owns the store. */
+function clearGrants(): void {
+  for (const g of listGrants()) revokeIngress(g.projectId);
+}
 import type { WebhookConfig } from "../src/daemon/todoist-webhook.js";
 
 const base: WebhookConfig = {
@@ -110,4 +118,66 @@ test("an unknown owner resolves to nothing rather than a near match", () => {
   // Returning the wrong project would be worse than returning none: the caller
   // would file into it confidently.
   assert.equal(projectForOwner("jobs-grazyna"), undefined);
+});
+
+
+// ── folders are not owners ──────────────────────────────────────────────────
+//
+// Matthias nested "Executive Search 🎯" under "Jobs Matthias". Eighteen tasks
+// moved out of the allowlist by being tidied up, and every one was refused with
+// "not an ingress project" — silently, and precisely when someone organised
+// their work. A sub-project is a folder; ownership belongs to the granted root.
+
+const tree = new Map([
+  ["root", { id: "root", name: "Claude 🤖" }],
+  ["jobs", { id: "jobs", name: "Jobs Matthias", parentId: "root" }],
+  ["exec", { id: "exec", name: "Executive Search 🎯", parentId: "jobs" }],
+  ["deep", { id: "deep", name: "Deeper", parentId: "exec" }],
+  ["other", { id: "other", name: "Somewhere else" }],
+]);
+
+test("a child of a subtree grant is allowed and inherits its owner", () => {
+  grantIngress("jobs", { owner: "jobs-matthias", subtree: true });
+  const live = expandThroughSubtree(base, "exec", ancestorsOf("exec", tree));
+  assert.ok(live.ingressProjectIds.has("exec"));
+  assert.equal(live.projectOwners.get("exec"), "jobs-matthias");
+});
+
+test("inheritance reaches any depth, not just direct children", () => {
+  // The PAI bug was root-plus-one-level. A grandchild was never even queried.
+  grantIngress("jobs", { owner: "jobs-matthias", subtree: true });
+  const live = expandThroughSubtree(base, "deep", ancestorsOf("deep", tree));
+  assert.ok(live.ingressProjectIds.has("deep"));
+  assert.equal(live.projectOwners.get("deep"), "jobs-matthias");
+});
+
+test("a grant WITHOUT subtree does not cover its children", () => {
+  // Subtree is opt-in. Nothing becomes an ingress that nobody granted.
+  clearGrants();
+  grantIngress("jobs", { owner: "jobs-matthias" });
+  const live = expandThroughSubtree(base, "exec", ancestorsOf("exec", tree));
+  assert.equal(live.ingressProjectIds.has("exec"), false);
+});
+
+test("a project outside every granted tree stays refused", () => {
+  clearGrants();
+  grantIngress("jobs", { owner: "jobs-matthias", subtree: true });
+  const live = expandThroughSubtree(base, "other", ancestorsOf("other", tree));
+  assert.equal(live.ingressProjectIds.has("other"), false);
+});
+
+test("an already-allowed project is returned untouched", () => {
+  // The ordinary path must cost nothing.
+  clearGrants();
+  const live = expandThroughSubtree(base, "from-env", []);
+  assert.equal(live, base, "same object — no copy, no work");
+});
+
+test("ancestorsOf survives a cycle rather than hanging", () => {
+  // A hung receiver is indistinguishable from a webhook that never arrived.
+  const bad = new Map([
+    ["a", { id: "a", name: "a", parentId: "b" }],
+    ["b", { id: "b", name: "b", parentId: "a" }],
+  ]);
+  assert.deepEqual(ancestorsOf("a", bad), ["b"]);
 });

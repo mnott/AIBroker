@@ -167,7 +167,19 @@ Effective on the next webhook, no restart. Every change is recorded in the audit
 
 **Deleting the project revokes its grant automatically.** A grant outliving the thing it points at reads as though access is still open — and if the id were ever reused, it silently would be. The boundary only ever shrinks on its own.
 
-**The allowlist is not a subtree.** A project created under an allowed parent is *not* allowed; it has to be granted. That is deliberate — a project added later must not silently become a place that runs commands with your full rights — but it does mean every new project needs one `ingress add`.
+**Sub-projects are folders, not owners** — but only if you say so. A project nested under an allowed one is *not* automatically allowed: organising tasks into `Jobs Matthias / Executive Search 🎯` moves them outside the allowlist and every one is refused, silently, precisely when someone tidies up.
+
+```bash
+aibroker todoist ingress add <rootId>=<owner> --subtree
+```
+
+grants the project **and every project nested under it, at any depth**, each inheriting the root's owner. A folder is not a second owner.
+
+Still opt-in, and the residual risk is worth stating plainly: a project shared with you and later moved under a granted root inherits execution rights nobody considered for it. Grant subtrees to roots you own.
+
+Without `--subtree`, a grant covers exactly one project, which is the old behaviour and remains the right default for anything shared.
+
+Resolution keys on **project id, never on name**. Todoist's project search returns nothing for names containing emoji — `Executive Search 🎯` is invisible to a name query — so a resolver that fell back to matching names would report "no such project" for one that plainly exists.
 
 **Owner names must be dispatchable.** An owner is a curated PAI alias, not merely the title of a running tab. A grant pointing at a name dispatch cannot resolve looks perfectly configured and routes nowhere; the audit says `unlaunchable`, which is the only sign you get.
 

@@ -31,6 +31,21 @@ const FILE = join(homedir(), ".aibroker", "todoist-ingress.json");
 
 export interface IngressGrant {
   projectId: string;
+  /**
+   * Does this grant cover the project's descendants?
+   *
+   * Opt-in per grant, deliberately. A sub-project is a folder, not a second
+   * owner: someone organising their work into "Jobs Matthias / Executive
+   * Search" has not made a decision about execution ingress, and before this
+   * existed those tasks were refused with "not an ingress project" — silently,
+   * and exactly when they tidied up.
+   *
+   * Still not implicit inheritance: granting a subtree is a decision, made
+   * once, and the residual risk is worth stating. A project shared with you and
+   * later moved under a granted root inherits execution rights nobody
+   * considered for it. Grant subtrees to roots you own.
+   */
+  subtree?: boolean;
   /** Human-readable, for the CLI and for reading the file a month from now. */
   projectName?: string;
   /** Session that owns work filed here. Unset falls through to the default. */
@@ -78,7 +93,10 @@ export function projectForOwner(owner: string): IngressGrant | undefined {
 }
 
 /** Grant a project the right to reach a session. Idempotent. */
-export function grantIngress(projectId: string, opts: { owner?: string; projectName?: string } = {}): IngressGrant {
+export function grantIngress(
+  projectId: string,
+  opts: { owner?: string; projectName?: string; subtree?: boolean } = {},
+): IngressGrant {
   const s = read();
   const existing = s.grants.find((g) => g.projectId === projectId);
   const grant: IngressGrant = existing ?? {
@@ -87,13 +105,14 @@ export function grantIngress(projectId: string, opts: { owner?: string; projectN
   };
   if (opts.owner !== undefined) grant.owner = opts.owner;
   if (opts.projectName !== undefined) grant.projectName = opts.projectName;
+  if (opts.subtree !== undefined) grant.subtree = opts.subtree;
   if (!existing) s.grants.push(grant);
   saveJson(FILE, s);
 
   audit({
     action: "ingress", actor: "aibroker", target: `todoist:project:${projectId}`,
     outcome: existing ? "updated" : "granted",
-    reason: `${opts.projectName ?? projectId} → ${grant.owner ?? "(default owner)"}`,
+    reason: `${opts.projectName ?? projectId} → ${grant.owner ?? "(default owner)"}${grant.subtree ? " (and descendants)" : ""}`,
   });
   log(`todoist-ingress: ${existing ? "updated" : "granted"} ${opts.projectName ?? projectId} → ${grant.owner ?? "default"}`);
   return grant;
@@ -132,4 +151,36 @@ export function applyGrants(cfg: WebhookConfig): WebhookConfig {
     if (g.owner) owners.set(g.projectId, g.owner);
   }
   return { ...cfg, ingressProjectIds: ids, projectOwners: owners };
+}
+
+/**
+ * Allow a project reachable through an ancestor that granted its subtree.
+ *
+ * Returns a config with that project added, so everything downstream — the
+ * boundary check, the owner lookup, comment routing via a parent task — works
+ * unchanged. The owner is inherited from the nearest granting ancestor, because
+ * a folder is not a second owner.
+ *
+ * Returns the config untouched when nothing applies, so the ordinary path costs
+ * nothing.
+ */
+export function expandThroughSubtree(
+  cfg: WebhookConfig,
+  projectId: string,
+  ancestors: string[],
+): WebhookConfig {
+  if (!projectId || cfg.ingressProjectIds.has(projectId)) return cfg;
+
+  const grants = listGrants();
+  for (const ancestorId of ancestors) {
+    const g = grants.find((x) => x.projectId === ancestorId && x.subtree);
+    if (!g) continue;
+    const ids = new Set(cfg.ingressProjectIds);
+    ids.add(projectId);
+    const owners = new Map(cfg.projectOwners);
+    const owner = g.owner ?? cfg.projectOwners.get(ancestorId);
+    if (owner) owners.set(projectId, owner);
+    return { ...cfg, ingressProjectIds: ids, projectOwners: owners };
+  }
+  return cfg;
 }

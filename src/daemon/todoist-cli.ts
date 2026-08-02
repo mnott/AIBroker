@@ -19,6 +19,7 @@ function usage(): void {
   console.log("  status                         Show whether an authorisation is on file");
   console.log("  ingress list                   Projects allowed to reach a session");
   console.log("  ingress add <id> [=owner]      Grant a project ingress, effective immediately");
+  console.log("      --subtree                  ...and every project nested under it");
   console.log("  ingress remove <id>            Revoke a grant");
   console.log("");
   console.log(`Default scope: ${DEFAULT_SCOPE}. Add data:delete only if the bridge should remove tasks.`);
@@ -89,18 +90,23 @@ export async function runTodoist(args: string[]): Promise<void> {
         const grants = listGrants();
         console.log(grants.length ? "\nGranted at runtime:" : "\nNo runtime grants.");
         for (const g of grants) {
-          console.log(`  ${g.projectId}${g.projectName ? ` (${g.projectName})` : ""} → ${g.owner ?? "(default owner)"}  since ${g.grantedAt.slice(0, 10)}`);
+          console.log(`  ${g.projectId}${g.projectName ? ` (${g.projectName})` : ""} → ${g.owner ?? "(default owner)"}${g.subtree ? " + descendants" : ""}  since ${g.grantedAt.slice(0, 10)}`);
         }
         break;
       }
 
       if (action === "add") {
-        if (!arg) { console.error("Usage: aibroker todoist ingress add <projectId>[=owner] [--name <label>]"); process.exit(1); }
+        if (!arg) { console.error("Usage: aibroker todoist ingress add <projectId>[=owner] [--name <label>] [--subtree]"); process.exit(1); }
         const [projectId, owner] = arg.split("=").map((s) => s.trim());
         const nameIdx = rest.indexOf("--name");
         const projectName = nameIdx !== -1 ? rest[nameIdx + 1] : undefined;
-        const g = grantIngress(projectId, { owner: owner || undefined, projectName });
-        console.log(`Granted ${g.projectName ?? g.projectId} → ${g.owner ?? "(default owner)"}. Effective immediately.`);
+        const subtree = rest.includes("--subtree");
+        const g = grantIngress(projectId, { owner: owner || undefined, projectName, subtree });
+        console.log(`Granted ${g.projectName ?? g.projectId} → ${g.owner ?? "(default owner)"}${g.subtree ? " and every project under it" : ""}. Effective immediately.`);
+        if (subtree) {
+          console.log("Sub-projects inherit this owner. A project shared with you and later moved");
+          console.log("under this one would inherit it too — grant subtrees to roots you own.");
+        }
         break;
       }
 
