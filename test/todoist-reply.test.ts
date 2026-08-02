@@ -258,36 +258,57 @@ test("the same task's creation is still suppressed", () => {
 // poller then read the same tick as a fresh request. The failure was in a log
 // file and nowhere else.
 
-test("a 401 carrying retry_after is retried once", async () => {
+test("a 401 is refreshed and retried, never re-presented as-is", async () => {
+  // Todoist is explicit: 401 with error_code 477 means the token is invalid or
+  // expired, and "do not wait and retry the same invalid or expired token".
+  // The first version of this slept for retry_after and presented the same dead
+  // token again — it could only ever fail twice and call it a flap.
+  process.env.TODOIST_CLIENT_ID = "cid";
+  process.env.TODOIST_CLIENT_SECRET = "secret";
+  saveToken({
+    // Deliberately NOT expired: a 401 means invalid NOW, and a token can be
+    // invalid long before its stated expiry.
+    access_token: "stale", token_type: "Bearer", obtained_at: new Date().toISOString(),
+    refresh_token: "r1", expires_at: new Date(Date.now() + 3600_000).toISOString(),
+  });
   let calls = 0;
-  const impl = (async (_u: string | URL | Request, init?: RequestInit) => {
+  const impl = (async (url: string | URL | Request, init?: RequestInit) => {
     calls++;
-    // First lookup flaps; the retry succeeds and the POST follows.
-    if (calls === 1) {
-      return new Response(JSON.stringify({ error: "Unauthorized", error_code: 477, error_extra: { retry_after: 1 } }), { status: 401 });
+    if (String(url).includes("/oauth/access_token")) {
+      return new Response(JSON.stringify({
+        access_token: "fresh", token_type: "Bearer", expires_in: 3600, refresh_token: "r2",
+      }), { status: 200 });
+    }
+    const auth = (init?.headers as Record<string, string>)?.authorization ?? "";
+    if (auth.includes("stale")) {
+      return new Response(JSON.stringify({ error_code: 477, error_extra: { retry_after: 3 } }), { status: 401 });
     }
     if (init?.method === "POST") return new Response("{}", { status: 200 });
-    return new Response(JSON.stringify({ labels: ["pai:jobs-matthias"] }), { status: 200 });
+    return new Response(JSON.stringify({ labels: [] }), { status: 200 });
   }) as unknown as typeof fetch;
 
   const { setTaskLabel } = await import("../src/daemon/todoist-reply.js");
-  const labels = await setTaskLabel("t-flap", "pai-running", true, impl);
-  assert.deepEqual(labels, ["pai:jobs-matthias", "pai-running"]);
-  assert.equal(calls, 3, "lookup, retried lookup, then the write");
+  const labels = await setTaskLabel("t-401", "pai-running", true, impl);
+  assert.deepEqual(labels, ["pai-running"]);
+  assert.ok(calls >= 3, "the stale lookup, a refresh, then the retry");
 });
 
-test("a second failure gives up rather than retrying forever", async () => {
-  // One retry covers a flap. More would turn a deliberate hint into a lock
-  // that blocks the dispatch waiting behind it.
+test("a 401 with no refresh token says re-authorise rather than retrying", async () => {
+  // Legacy apps have no refresh path, so nothing helps and the error should say
+  // so rather than leave it to be inferred from a second identical failure.
+  saveToken({ access_token: "dead", token_type: "Bearer", obtained_at: new Date().toISOString() });
   let calls = 0;
   const impl = (async () => {
     calls++;
-    return new Response(JSON.stringify({ error: "Unauthorized", error_extra: { retry_after: 1 } }), { status: 401 });
+    return new Response(JSON.stringify({ error_code: 477 }), { status: 401 });
   }) as unknown as typeof fetch;
 
   const { setTaskLabel } = await import("../src/daemon/todoist-reply.js");
-  await assert.rejects(() => setTaskLabel("t-flap2", "pai-running", true, impl), /401/);
-  assert.equal(calls, 2, "one attempt, one retry");
+  await assert.rejects(
+    () => setTaskLabel("t-dead", "pai-running", true, impl),
+    /cannot be refreshed \(no refresh token on file\)/,
+  );
+  assert.equal(calls, 1, "no retry of a token that cannot be renewed");
 });
 
 test("a failure with no retry_after is not retried", async () => {
