@@ -289,13 +289,48 @@ test("a configured owner is addressable even when its session is not running", (
 // owner with nothing said. An unhonoured request must be recorded.
 
 test("a bare label naming a known owner routes — one tap is the point", () => {
-  // @pai in Todoist's picker is one tap; pai:pai is several. Both must work.
+  // @pai in Todoist's picker is one tap; pai:pai is several. Both must work,
+  // in a project that has no owner of its own to disagree with.
   for (const l of ["pai", "PAI"]) {
-    const d = route(task({ content: "do xyz", labels: [l] }), cfg, KNOWN);
+    const d = route(task({ content: "do xyz", labels: [l], project_id: INGRESS }), cfg, KNOWN);
     assert.equal(d.act && d.project, "pai", l);
-    assert.equal(d.act && d.rule, "label", l);
+    assert.equal(d.act && d.rule, "bare-label", l);
     assert.equal(d.nearMiss, undefined, l);
   }
+});
+
+// ── a label survives a move; a project mapping is a standing decision ───────
+//
+// Live on 2026-08-02: a task was moved from Clickr into the AIBroker project
+// and kept its old bare `clickr` label. The label won, and a comment meant for
+// AIBroker was delivered to Clickr. Nothing reported a conflict — it arrived in
+// the wrong terminal and was found by someone reading it there.
+
+test("a stale bare label loses to the project it was moved into", () => {
+  const d = route(task({ content: "check the config pattern", labels: ["clickr"], project_id: OWNED }), cfg, ["clickr", "whazaa"]);
+  assert.equal(d.act && d.project, "whazaa", "the project mapping, not the leftover label");
+  assert.equal(d.act && d.rule, "project");
+});
+
+test("the disagreement is recorded, not just resolved", () => {
+  // Picking a side silently is how this stayed invisible.
+  const d = route(task({ content: "x", labels: ["clickr"], project_id: OWNED }), cfg, ["clickr", "whazaa"]);
+  assert.match(d.nearMiss ?? "", /disagree/);
+  assert.match(d.nearMiss ?? "", /probably left over/);
+});
+
+test("pai:<name> still overrides the project — the prefix is deliberate", () => {
+  // Typing the prefix is an act; a bare label may be years old.
+  const d = route(task({ content: "x", labels: ["pai:clickr"], project_id: OWNED }), cfg, ["clickr", "whazaa"]);
+  assert.equal(d.act && d.project, "clickr");
+  assert.equal(d.act && d.rule, "label");
+  assert.equal(d.nearMiss, undefined, "an explicit override is not a conflict");
+});
+
+test("a bare label agreeing with its project raises nothing", () => {
+  const d = route(task({ content: "x", labels: ["whazaa"], project_id: OWNED }), cfg, ["whazaa"]);
+  assert.equal(d.act && d.project, "whazaa");
+  assert.equal(d.nearMiss, undefined);
 });
 
 test("a label that names nobody is still a near miss", () => {
