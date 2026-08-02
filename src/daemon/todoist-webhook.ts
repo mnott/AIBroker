@@ -67,6 +67,58 @@ export function isTrigger(data: Record<string, unknown>): boolean {
   return Boolean(due?.is_recurring) && labels.some((l) => l.toLowerCase().startsWith("pai:"));
 }
 
+/**
+ * Did this update turn an unroutable task into a routable one?
+ *
+ * Routable means both halves of the boundary are satisfied: the task sits in an
+ * ingress project AND names an owner. Either alone is not enough — the project
+ * is the security boundary, the label or project mapping is the address.
+ *
+ * Needs `event_data_extra.old_item`, which Todoist includes for updates a user
+ * made directly. Without it there is no transition to observe and the update is
+ * ignored, which is the safe direction: acting would mean dispatching on an
+ * edit we cannot characterise.
+ */
+export function routabilityTransition(
+  e: TodoistEvent,
+  cfg: WebhookConfig,
+): { becameRoutable: boolean; reason: string } {
+  const old = e.event_data_extra?.old_item as Record<string, unknown> | undefined;
+  if (!old) {
+    return { becameRoutable: false, reason: "event item:updated is not actionable (no previous state to compare)" };
+  }
+  // A completion arrives as its own event; an update that merely reports one
+  // must not be read as a routing change.
+  const intent = e.event_data_extra?.update_intent;
+  if (intent === "item_completed" || intent === "item_uncompleted") {
+    return { becameRoutable: false, reason: `event item:updated is not actionable (${String(intent)})` };
+  }
+
+  const routable = (d: Record<string, unknown> | undefined): boolean => {
+    if (!d) return false;
+    const projectId = typeof d.project_id === "string" ? d.project_id : "";
+    if (!cfg.ingressProjectIds.has(projectId)) return false;
+    const labels = Array.isArray(d.labels) ? (d.labels as unknown[]).map(String) : [];
+    const hasOwner =
+      labels.some((l) => l.toLowerCase().startsWith("pai:")) ||
+      cfg.projectOwners.has(projectId) ||
+      Boolean(cfg.defaultOwner);
+    return hasOwner;
+  };
+
+  const before = routable(old);
+  const after = routable(e.event_data);
+  if (before || !after) {
+    return {
+      becameRoutable: false,
+      reason: before
+        ? "event item:updated is not actionable (task was already routable)"
+        : "event item:updated is not actionable (task is still not routable)",
+    };
+  }
+  return { becameRoutable: true, reason: "" };
+}
+
 export interface TodoistEvent {
   event_name: string;
   user_id?: string;
@@ -266,7 +318,22 @@ export function route(
   }
 
   const ACTIONABLE = new Set(["item:added", "item:completed", "reminder:fired", "note:added"]);
-  if (!ACTIONABLE.has(e.event_name)) {
+
+  // The create-then-classify case: a task is filed first and labelled second,
+  // so at item:added it is not yet routable and is correctly ignored — and the
+  // event that MAKES it routable is an item:updated, which is not actionable.
+  // The event that matters is precisely the one nothing subscribes to.
+  //
+  // Subscribing to item:updated wholesale would be worse than the gap: every
+  // edit would dispatch. What is safe is the STATE TRANSITION — unroutable to
+  // routable, and only that. Renaming a task, moving it between two allowed
+  // projects, or adding any other label all leave routability unchanged and
+  // stay ignored.
+  if (e.event_name === "item:updated") {
+    const t = routabilityTransition(e, cfg);
+    if (!t.becameRoutable) return { act: false, reason: t.reason };
+    // Falls through to normal routing.
+  } else if (!ACTIONABLE.has(e.event_name)) {
     return { act: false, reason: `event ${e.event_name} is not actionable` };
   }
 

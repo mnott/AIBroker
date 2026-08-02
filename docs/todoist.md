@@ -248,6 +248,25 @@ The record carries `nearMiss` alongside the `rule` that actually chose the owner
 
 A label **cannot** smuggle a task in from outside the allowlist. The boundary is the project; the label only chooses among sessions you already trust.
 
+### Create, then classify
+
+Filing a task first and labelling it second is the common workflow, and it used to fall through a hole: at `item:added` the task is not yet routable and is correctly ignored, while the event that *makes* it routable is an `item:updated` — which is not actionable. The event that mattered was precisely the one nothing subscribed to.
+
+`item:updated` is now acted on for exactly one thing: the **transition from unroutable to routable**. Routable means both halves hold — the task is in an ingress project *and* names an owner.
+
+| Change | Result |
+|---|---|
+| `pai:<name>` label added to a task in an ingress project | dispatched |
+| task moved into an ingress project, already labelled | dispatched |
+| renamed, re-described, re-prioritised while already routable | ignored |
+| edited while still unroutable | ignored |
+| an update reporting a completion | ignored — completion is its own event |
+| our own `pai-running` claim write | ignored — not a routing label, routability unchanged |
+
+Subscribing to `item:updated` wholesale would be worse than the gap it closes: every edit would become a work order. A transition is not an event type, and that distinction is the whole safety property.
+
+Todoist supplies `event_data_extra.old_item` for updates a user made directly. Without it there is nothing to compare, so the update is ignored — acting would mean dispatching on an edit that cannot be characterised.
+
 ### What is ignored
 
 | Situation | Why |
