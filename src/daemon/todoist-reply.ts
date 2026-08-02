@@ -239,16 +239,41 @@ export async function setTaskLabel(
 
   const got = await fetchImpl(`https://api.todoist.com/api/v1/tasks/${encodeURIComponent(taskId)}`, { headers: auth });
   if (!got.ok) {
-    // Todoist returns 401 with a retry_after for what behaves like throttling,
-    // in bursts of a few seconds. One retry covers a flap; more would turn a
-    // deliberate hint into a lock that blocks the dispatch behind it.
     const body = await got.text();
-    const retryAfter = Number(/"retry_after"\s*:\s*(\d+)/.exec(body)?.[1] ?? 0);
-    if (attempt === 1 && retryAfter > 0 && retryAfter <= 30) {
-      await new Promise((r) => setTimeout(r, (retryAfter + 1) * 1000));
-      return setTaskLabel(taskId, label, present, fetchImpl, 2);
+    // 401 with error_code 477 means the TOKEN is invalid or expired — it is not
+    // throttling, whatever the retry_after suggests. Todoist's own guidance is
+    // explicit: "do not wait and retry the same invalid or expired token."
+    //
+    // An earlier version of this did exactly that: slept for retry_after and
+    // presented the same dead token again. It could only ever fail twice and
+    // call it a flap. What actually helps is refreshing first — and where there
+    // is no refresh token, nothing helps and the user must re-authorise, which
+    // the error should say rather than leave to be inferred.
+    if (got.status === 401 && attempt === 1) {
+      // Force a refresh rather than going through getAccessToken(), which only
+      // refreshes an EXPIRED token. A 401 says the token is invalid now, and a
+      // token can be invalid well before its stated expiry — trusting the
+      // stored expiry here would decline to refresh precisely when the server
+      // has just told us it must.
+      const { loadToken, refreshAccessToken } = await import("./todoist-oauth.js");
+      const current = loadToken();
+      const clientId = process.env.TODOIST_CLIENT_ID;
+      const clientSecret = process.env.TODOIST_CLIENT_SECRET;
+      if (current?.refresh_token && clientId && clientSecret) {
+        try {
+          const refreshed = await refreshAccessToken(clientId, clientSecret, current, fetchImpl);
+          if (refreshed.access_token !== token.access_token) {
+            return setTaskLabel(taskId, label, present, fetchImpl, 2);
+          }
+        } catch { /* fall through to the message below */ }
+      }
+      throw new Error(
+        `task lookup failed with 401 — the Todoist token is invalid or expired and ` +
+        `${current?.refresh_token ? "could not be refreshed" : "cannot be refreshed (no refresh token on file)"}. ` +
+        "Run `aibroker todoist auth`.",
+      );
     }
-    throw new Error(`task lookup failed with ${got.status}${retryAfter ? ` (retry_after ${retryAfter}s)` : ""}`);
+    throw new Error(`task lookup failed with ${got.status}: ${body.slice(0, 120)}`);
   }
   const current = JSON.parse(await got.text()) as { labels?: unknown[] };
   const labels = Array.isArray(current.labels) ? current.labels.map(String) : [];

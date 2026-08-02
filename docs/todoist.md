@@ -132,9 +132,16 @@ aibroker todoist status
 ```
 
 ```
-Authorised 2026-08-01T15:40:29.589Z
-Scope: data:delete,data:read_write
+Authorised 2026-08-02T12:49:42.948Z
+Scope: data:read_write
+Expires: 2026-08-02T13:49:42.949Z (54 min)
+Refresh: automatic — refreshed on demand before it expires
+Live check: OK — the token works right now.
 ```
+
+**The live check is the point.** Reading the stored file answers "did we ever authorise", not "does it work" — and for twenty hours this command reported `Authorised` while every call returned `401`. The one command you would run to diagnose a lapsed grant said everything was fine.
+
+`401` with `error_code 477` means the token is invalid or expired. If the app has **refresh tokens disabled**, Todoist issues tokens with no refresh path and no `expires_in`, and the only remedy when one dies is re-authorising by hand — which is why a grant appeared to lapse twice in twenty hours. Enable refresh tokens on the app in the App Management console and the daemon renews them itself.
 
 The attempt is good for 15 minutes and for exactly one callback. A callback with no pending authorisation behind it is refused *before* the client secret is spent.
 
@@ -355,7 +362,7 @@ Everything else about completion is unchanged. Ticking off a one-off task, or a 
 
 **Creating a trigger does not fire it.** A recurring, labelled task filed into an ingress project is a *definition* — adding a crontab line does not run the job. It runs when its reminder fires, or when you tick it. Without that rule, filing a click-to-run task dispatches it once on creation and again on the first tick: one intent, two runs, half a second apart.
 
-**A failed claim is recorded, not just logged.** The claim write can fail — Todoist returns `401` with a `retry_after` of a few seconds in bursts — and when it does the dispatch still proceeds, because refusing to run the work because a label write failed is the worse trade. But the outcome is audited either way (`todoist-claim: claimed` / `failed`), since a successful claim and a failed one were otherwise indistinguishable from outside: the label is simply absent, and an unclaimed dispatch is exactly what a poller reads as a fresh request. One retry is made when the response carries a `retry_after`, which covers a flap without turning the hint into a lock.
+**A failed claim is recorded, not just logged.** The claim write can fail — a `401` means the token is invalid or expired — and when it does the dispatch still proceeds, because refusing to run the work because a label write failed is the worse trade. But the outcome is audited either way (`todoist-claim: claimed` / `failed`), since a successful claim and a failed one were otherwise indistinguishable from outside: the label is simply absent, and an unclaimed dispatch is exactly what a poller reads as a fresh request. On a `401` the token is refreshed and the write retried once. Todoist's guidance is explicit — *"do not wait and retry the same invalid or expired token"* — so the `retry_after` in the body is backoff metadata, not an invitation to present the same credential again. Where there is no refresh token, nothing helps and the error says to re-authorise.
 
 **Whichever path dispatches also claims the task.** The webhook adds `pai-running` before dispatching and removes it again if the dispatch never landed. Honouring another runner's claim is only half an interlock — a path that dispatches and leaves the task unclaimed lets the next poller see an advanced due date with nothing on it, conclude the box was ticked, and run the same work again.
 

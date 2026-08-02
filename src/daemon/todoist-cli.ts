@@ -71,7 +71,36 @@ export async function runTodoist(args: string[]): Promise<void> {
           ? "Refresh: automatic — refreshed on demand before it expires"
           : "Refresh: NONE ON FILE — this token will stop working and cannot renew itself");
       } else {
-        console.log("Expires: no expiry reported (legacy long-lived token)");
+        console.log("Expires: no expiry reported — this app has refresh tokens DISABLED.");
+        console.log("Todoist issues such tokens without a refresh path, so when one stops working");
+        console.log("the only remedy is re-authorising. Enable refresh tokens on the app in the");
+        console.log("App Management console to stop this recurring.");
+      }
+
+      // The whole point of a status command is to answer "does it work", and
+      // reading a file cannot answer that. This one reported "Authorised" for
+      // twenty hours while every call 401'd — the one command you would run to
+      // diagnose a lapsed grant said everything was fine.
+      process.stdout.write("Live check: ");
+      try {
+        const auth = { authorization: `${token.token_type} ${token.access_token}` };
+        const res = await fetch("https://api.todoist.com/api/v1/projects", { headers: auth });
+        if (res.ok) {
+          console.log("OK — the token works right now.");
+        } else {
+          const body = await res.text();
+          console.log(`FAILING — ${res.status}.`);
+          if (res.status === 401) {
+            console.log("  401 with error_code 477 means the token is invalid or expired.");
+            console.log("  Do not retry it; run `aibroker todoist auth`.");
+          } else {
+            console.log(`  ${body.slice(0, 160)}`);
+          }
+          process.exitCode = 1;
+        }
+      } catch (e) {
+        console.log(`could not reach Todoist — ${e instanceof Error ? e.message : String(e)}`);
+        process.exitCode = 1;
       }
       break;
     }
