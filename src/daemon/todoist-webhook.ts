@@ -592,8 +592,24 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
       // restart. A project created and granted while you are using the system
       // has to work immediately, or the grant is indistinguishable from a
       // project that routes nowhere.
-      const { applyGrants } = await import("./todoist-ingress.js");
-      const live = applyGrants(cfg);
+      const { applyGrants, expandThroughSubtree } = await import("./todoist-ingress.js");
+      let live = applyGrants(cfg);
+
+      // A sub-project is a folder, not a second owner. Before this, organising
+      // tasks into "Jobs Matthias / Executive Search" moved them outside the
+      // allowlist and every one was refused — silently, and precisely when
+      // someone tidied up. Only ancestors granted WITH a subtree flag apply, so
+      // nothing becomes an ingress that nobody granted.
+      const eventProject = String(event.event_data?.project_id ?? "");
+      if (eventProject && !live.ingressProjectIds.has(eventProject)) {
+        try {
+          const { projectTree, ancestorsOf } = await import("./todoist-projects.js");
+          const tree = await projectTree();
+          live = expandThroughSubtree(live, eventProject, ancestorsOf(eventProject, tree));
+        } catch (err) {
+          log(`todoist-webhook: subtree lookup failed — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       const decision = route(
         event,
         live,
