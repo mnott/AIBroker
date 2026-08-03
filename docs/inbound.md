@@ -50,12 +50,12 @@ nobody notices.
 ## Creating a route
 
 ```bash
-aibroker todoist inbound add mail Home --mode message \
+aibroker inbound add mail Home --mode message \
   --fields subject,from.address,snippet \
   --note "Gmail arrival: triage, then hand on to the right session"
 ```
 
-The secret is printed **once**. `inbound list` never shows it again — printing
+The secret is printed **once**. `aibroker inbound list` never shows it again — printing
 credentials on a listing command puts them into whatever scrollback, screen
 share or terminal recording happens to be running. To rotate, create the route
 again with the same name.
@@ -110,15 +110,71 @@ phone. A route without one is best-effort, and should be treated as such.
 
 ---
 
-## Worked example — mail
+## Feeding a route from a polling source
 
-The interesting flow is two hops, and it is the reason the payload may not name
-a session:
+Most sources cannot call a webhook. The pattern for those — and the trap in it —
+is worth stating once, because getting it wrong floods whatever is downstream.
 
-1. Gmail arrival hits `/hook/mail` and is delivered to the `Home` session as data.
-2. `Home` reads it and decides. A job posting is handed to `jobs-matthias` with
-   `aibroker_send_to_session`; an invoice goes somewhere else; most mail is
-   noted and dropped.
+Keep the "already sent" marker **on the item**, not in a timestamp:
 
-The classification is done by a session with your context and your rules, not by
-a rule in someone else's cloud — and every hop is in the audit trail.
+```javascript
+// Gmail via Apps Script. The label is the marker.
+const QUERY = 'is:unread -label:aibroker-sent';
+const MAX_PER_RUN = 20;
+
+function forward() {
+  const sent = GmailApp.getUserLabelByName('aibroker-sent')
+            || GmailApp.createLabel('aibroker-sent');
+
+  for (const thread of GmailApp.search(QUERY, 0, MAX_PER_RUN)) {
+    const res = UrlFetchApp.fetch(HOOK, { /* … */ muteHttpExceptions: true });
+    if (res.getResponseCode() !== 202) return;   // leave unmarked; retry next run
+    thread.addLabel(sent);                        // mark ONLY after a 202
+  }
+}
+```
+
+Three things are load-bearing:
+
+**The marker lives on the item.** A single `lastRun` timestamp skips anything
+arriving out of order and cannot survive a run that dies halfway. A label is
+idempotent, visible in Gmail, and reversible — remove it to force a resend.
+
+**Mark only after a confirmed 202, and stop the run on anything else.** Marking
+an unsent item loses it permanently; carrying on through an outage burns the
+rest of the batch against a dead endpoint.
+
+**Cap the batch.** On 2026-08-03 a run with no cap and a broken marker forwarded
+five months of mail in one burst — 91 tasks filed before the rate limit stopped
+it. A cap turns a backlog into several quiet runs.
+
+> **Gmail specifics that cost an afternoon.** `newer_than:` takes `d`/`m`/`y`
+> only — `5m` means five *months*, not minutes, and there is no minute
+> granularity. Deep links should use `?authuser=<email>`, never `/u/0/` (which
+> is positional and means a different mailbox on a different machine), and
+> `#all/<threadId>` rather than `#inbox/`, which breaks once a thread is
+> archived.
+
+---
+
+## Which sources belong here
+
+A route earns its keep when the event is **rare**, **already meaningful**
+(someone upstream decided it matters), **timely** (knowing now beats knowing
+later), and **survivable if missed** while the machine is off.
+
+Good fits: a server reporting a stuck queue or a failed cron; an app you own
+raising an unhandled error or a form submission; a domain approaching expiry; a
+human replying to something you sent.
+
+**A bad fit, learned the hard way: undifferentiated mail.** "A message arrived"
+is not a decision anyone made — it fails *rare* and *already meaningful*, and
+the hard part was never latency but classification. Routing a whole inbox
+through here on 2026-08-03 put twenty messages into a working session before the
+route was pulled. Where the deciding has not happened yet, a scheduled sweep is
+the right tool; a channel is for events that are already alerts.
+
+If classification really is needed, use two hops: the event reaches a **dedicated
+triage session** — never a session doing other work — and that session forwards
+what matters with `aibroker_send_to_session`. Judgement stays somewhere with
+context and rules, and every hop is in the audit trail.

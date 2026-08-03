@@ -7,7 +7,7 @@ AIBroker is a standalone daemon that acts as the central hub for AI message rout
 AIBroker is the **runtime**. Adapters (Whazaa for WhatsApp, Telex for Telegram) are thin transport plugins that cannot function without it. The daemon owns:
 
 - The hub IPC socket at `/tmp/aibroker.sock`
-- The PAILot WebSocket gateway on port 8765
+- The PAILot MQTT broker on port 8765 (aedes, in-process)
 - All slash commands (`/ss`, `/s`, `/h`, `/cc`, etc.)
 - Session management (visual iTerm2 tabs + headless API sessions)
 - The TTS pipeline (Kokoro) and STT pipeline (Whisper)
@@ -37,6 +37,14 @@ Messages are sent to explicit addresses. The registry fans them out. Plugins joi
 - [Architecture](./architecture.md) — System overview, component diagram, design principles
 - [Protocol](./protocol.md) — AIBP message envelope, types, addressing, wire format
 - [Routing](./routing.md) — How messages flow from source to destination
+- [Channels](./channels.md) — **Start here for anything inbound.** The model Todoist, PAILot, the HTTP endpoint and the messenger adapters all share: who the addressee is, why the payload never names it, delivery modes, catch-up, loop safety
+
+### Inbound Channels
+
+- [Todoist](./todoist.md) — File work from a phone or watch; ingress grants, triggers, the comment mirror
+- [Inbound routes](./inbound.md) — `POST /hook/<route>`: anything that speaks HTTP reaching a session
+- [Mailbox](./mailbox.md) — The durable per-session queue, confirmed delivery, the drain hook
+- [Audit trail](./audit.md) — What happened, who caused it, and what was refused
 
 ### Plugin System
 
@@ -52,7 +60,7 @@ Messages are sent to explicit addresses. The registry fans them out. Plugins joi
 
 ### Transport Layers
 
-- [PAILot](./pailot.md) — Mobile app WebSocket gateway, voice pipeline, session management
+- [PAILot](./pailot.md) — Mobile app over MQTT, APNs push, voice pipeline, session management
 - [Mesh](./mesh.md) — Multi-machine bridge networking
 
 ### Voice & Media
@@ -61,8 +69,10 @@ Messages are sent to explicit addresses. The registry fans them out. Plugins joi
 
 ### Developer Reference
 
-- [Use Cases](./use-cases.md) — Complete message flow diagrams for 10 scenarios
+- [Use Cases](./use-cases.md) — Complete message flow diagrams for 14 scenarios, including Todoist ingress, inbound routes, the comment mirror and session-to-session hand-off
 - [Development](./development.md) — Setup, build, test, conventions, patterns
+- [Backends](./backends.md) — Adding an AI backend
+- [Creating an adapter](./create-adapter.md) — Scaffolding a new transport adapter
 - [Configuration](./configuration.md) — All config files, env vars, launchd
 
 ## Quick Start
@@ -80,8 +90,20 @@ node dist/daemon/cli.js status
 
 The daemon registers adapters automatically when they start. Adapters find the hub at `/tmp/aibroker.sock`. The MCP server starts as a subprocess of Claude Code via `~/.claude.json`.
 
-## Current Version
+## Current version
 
-**v0.6.1** — AIBP protocol routing layer active. All PAILot messages route through the AIBP registry. iTerm2 is a registered terminal plugin. Cross-session messaging and mesh networking are implemented.
+**v0.26.0** — AIBP routing layer active; iTerm2 and tmux are registered terminal
+plugins. PAILot runs over an in-process MQTT broker with APNs push. Todoist is a
+full inbound channel with ingress grants, triggers and a bidirectional comment
+mirror. A generic HTTP endpoint (`/hook/<route>`) lets any external system reach
+a session. Cross-session messaging is durable through the mailbox, and every
+cross-boundary action is audited.
+
+## Keeping this honest
+
+Docs drift, and silently wrong documentation is worse than none — on 2026-08-03
+thirteen files still described PAILot as a WebSocket gateway, five months after
+it moved to MQTT. If you change a transport, a port, a topic or a delivery
+guarantee, grep `docs/` for the old fact before you finish. Diagrams count.
 
 See [Notes/TODO.md](../Notes/TODO.md) for what is implemented vs. what is planned.

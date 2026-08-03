@@ -126,7 +126,7 @@ AIBROKER_WHISPER_MODEL=small
 # Replicate API key (for image generation)
 REPLICATE_API_KEY=r8_...
 
-# PAILot WebSocket port (default: 8765)
+# PAILot MQTT broker port (default: 8765)
 PAILOT_PORT=8765
 
 # Enable verbose PAILot debug logging
@@ -145,7 +145,7 @@ Variables that control AIBroker behavior at startup:
 | `AIBROKER_WHISPER_MODEL` | `"small"` | Whisper model size (`tiny`, `base`, `small`, `medium`, `large`) |
 | `MSGBRIDGE_WHISPER_MODEL` | — | Legacy alias for Whisper model |
 | `WHAZAA_WHISPER_MODEL` | — | Legacy alias for Whisper model |
-| `PAILOT_PORT` | `8765` | PAILot WebSocket gateway port |
+| `PAILOT_PORT` | `8765` | PAILot MQTT broker port (`MQTT_PORT` takes precedence) |
 | `PAILOT_DEBUG` | — | Set to `1` for verbose WS debug logging to `/tmp/pailot-ws-debug.log` |
 
 ## MCP Server Configuration
@@ -231,12 +231,12 @@ Messages are written to `pending.json` after every `addToOutbox()` call. The fil
 
 ## Debug Logging
 
-Set `PAILOT_DEBUG=1` in `~/.aibroker/env` for verbose PAILot WebSocket logging:
+Set `PAILOT_DEBUG=1` in `~/.aibroker/env` for verbose PAILot logging:
 
 ```
 /tmp/pailot-ws-debug.log
 ```
 
-Logs include every raw WebSocket message (truncated to 200 chars), voice message receipt, audio file paths and byte counts.
+Logs include every raw inbound MQTT payload (truncated to 200 chars), voice message receipt, audio file paths and byte counts. The log path `/tmp/pailot-ws-debug.log` is historical — the transport is MQTT.
 
 Hub daemon logs go to stdout/stderr (captured by launchd at `/tmp/aibroker.log`).

@@ -1,29 +1,77 @@
 # PAILot Gateway
 
-PAILot is a native iOS app that connects to the AIBroker hub via WebSocket. The gateway (`src/adapters/pailot/gateway.ts`) handles all PAILot connections on port 8765.
+PAILot is a Flutter app (iOS and iPadOS) that reaches the AIBroker hub over
+**MQTT**. The in-process broker is [aedes](https://github.com/moscajs/aedes),
+started by the daemon and listening on port **8765**.
+
+> **This replaced a WebSocket gateway.** `startWsGateway` still exists in
+> `src/adapters/pailot/gateway.ts` and is deliberately **not called** — the call
+> site is commented out in `src/daemon/index.ts`. Documentation written before
+> the migration describes `ws://host:8765` and a socket per client; that is no
+> longer how anything works. The gateway module survives because it still owns
+> the broadcast/encode helpers (`broadcastText`, `broadcastVoice`,
+> `broadcastImage`), which now publish to MQTT topics instead of sockets.
 
 ## Connection
 
 ```
-PAILot iOS App ──────── WebSocket ──────── ws://[mac-ip]:8765
-                           (ws)
+PAILot (Flutter)  ──── MQTT ────  mqtt://<mac-ip>:8765
+                                  mqtts:// when TLS credentials are configured
 ```
 
-Port is configurable via the `PAILOT_PORT` environment variable (default: `8765`).
+Port comes from `MQTT_PORT`, falling back to `PAILOT_PORT`, default `8765`. The
+daemon also advertises itself over Bonjour as `_mqtt._tcp` under the name
+`AIBroker`, so the app can find the Mac without a hardcoded address.
 
-Upon connection, the gateway immediately sends:
+Clients connect with `cleanSession=true`. Nothing is retained on the broker for
+an absent client — offline delivery is handled above the transport by the
+message queue and `catch_up` (see [Offline delivery](#offline-delivery)), not by
+MQTT persistence.
 
-```json
-{ "type": "text", "content": "Connected to PAILot gateway." }
-```
+## Topics
 
-The app then sends a `sync` command to establish session state and drain any buffered messages.
+| Topic | Direction | Carries |
+|---|---|---|
+| `pailot/out` | hub → app | text, voice, image, typing, screenshot, transcript |
+| `pailot/status` | hub → app | daemon status and version |
+| `pailot/sessions` | hub → app | the session list |
+| `pailot/control/out` | hub → app | control replies (e.g. debug state) |
+| `pailot/control/in` | app → hub | control requests |
+| `pailot/device/token` | app → hub | the APNs device token |
+
+Everything the app *says* — text, voice, commands — arrives on `pailot/control/in`
+or as an inbound publish handled by `setMqttInboundHandler`; everything the hub
+says goes out on `pailot/out` with the payload shapes documented below.
+
+> **aedes 1.0.x caveat, and it bites.** `broker.publish()` does not deliver to
+> MQTT protocol clients — only to in-process subscribers. The hub therefore
+> publishes through a loopback client rather than the broker object. A change
+> that "simplifies" this back to `broker.publish()` will look correct, log
+> success, and deliver nothing.
+
+## Push notifications
+
+Delivery over MQTT reaches a connected app. A backgrounded or closed app is
+reached by **APNs** (`src/apns/client.ts`), configured with `APNS_KEY_PATH`,
+`APNS_KEY_ID`, `APNS_TEAM_ID`, and `APNS_PRODUCTION` to choose the production
+host rather than sandbox. Device tokens arrive on `pailot/device/token` and are
+stored in `~/.aibroker/apns-tokens.json`.
+
+Two things worth knowing before debugging a "missing" notification:
+
+- **iOS suppresses the banner while the app is in the foreground.** A push that
+  logs `delivery: 2/2 succeeded` with the app open produces no banner and lands
+  in the conversation instead. This is not a fault.
+- **Sandbox and production tokens are not interchangeable.** A token minted by a
+  development build is rejected by the production host with `BadDeviceToken`,
+  and the client removes it on that error. Flipping `APNS_PRODUCTION` against
+  the wrong build silently empties the token store.
 
 ## Message Format
 
-All WebSocket messages are JSON objects. Every message has a `type` field.
+All payloads are JSON objects with a `type` field. These shapes are unchanged from the WebSocket era — only the transport beneath them changed.
 
-### Inbound (App → Gateway)
+### Inbound (app → hub, on `pailot/control/in`)
 
 #### Heartbeat
 
@@ -387,21 +435,17 @@ The 3-second batch window handles voice dictation in multiple chunks (common on 
 Whisper binary location: `WHISPER_BIN` (from `src/adapters/kokoro/media.ts`)
 Whisper model: `WHISPER_MODEL` (from `src/adapters/kokoro/media.ts`)
 
-## Client Liveness Tracking
+## Client liveness
 
-iOS can keep a WebSocket connection "open" while the app is backgrounded. `ws.send()` succeeds but the app never processes the data.
+iOS suspends a backgrounded app's TCP socket without closing it, so the broker
+can still count a client that will never process what it receives. Connection
+state is a poor proxy for reachability: `getMqttClientCount()` reports what is
+*attached*, not what is *awake*.
 
-The gateway uses a liveness threshold to avoid sending to dead connections:
-
-```typescript
-const CLIENT_ALIVE_THRESHOLD = 90_000; // 90 seconds
-```
-
-A client is "alive" if:
-- `ws.readyState === WebSocket.OPEN`
-- Last activity (connect, message, or pong) was within 90s
-
-The 30-second heartbeat ping from the app maintains liveness. Messages are only broadcast to alive clients.
+This matters mainly when reading logs. A push recorded alongside `clientCount=2`
+reached two attached clients, at least one of which may have been asleep — which
+is why APNs is a second path rather than a fallback, and why "the message was
+sent" and "the person saw it" are different claims throughout this system.
 
 ## Outbox Buffering
 
@@ -456,7 +500,7 @@ sequenceDiagram
 
     Note over A: App reconnects
 
-    A->>G: WebSocket connect
+    A->>G: MQTT connect (cleanSession)
     G->>A: "Connected to PAILot gateway."
     A->>G: command: sync { activeSessionId }
     G->>A: sessions list
@@ -489,7 +533,7 @@ This ensures Claude's reply goes to the same session the user was viewing when t
 
 ## AIBP Integration
 
-The gateway is the bridge between WebSocket clients and the AIBP routing fabric.
+The gateway is the bridge between MQTT clients and the AIBP routing fabric.
 
 **Inbound (App → AIBP):**
 
@@ -514,7 +558,7 @@ aibpBridge.registerMobile("pailot", (aibpMsg) => {
 
 ## Debug Logging
 
-Set `PAILOT_DEBUG=1` to enable verbose debug logging to `/tmp/pailot-ws-debug.log`. This logs:
-- Every raw WebSocket message (truncated)
+Set `PAILOT_DEBUG=1` to enable verbose debug logging to `/tmp/pailot-ws-debug.log (name is historical)`. This logs:
+- Every raw inbound MQTT payload (truncated)
 - Voice message receipt and base64 length
 - Audio file save path and byte count

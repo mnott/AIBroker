@@ -13,7 +13,7 @@ import { authorizeUrl, beginAuth, loadToken } from "./todoist-oauth.js";
 const DEFAULT_SCOPE = "data:read_write";
 
 function usage(): void {
-  console.log("Usage: aibroker todoist <auth|status|ingress|inbound>");
+  console.log("Usage: aibroker todoist <auth|status|ingress>");
   console.log("");
   console.log("  auth [--scope <scopes>]        Authorise this account so webhooks are delivered");
   console.log("  status                         Show whether an authorisation is on file");
@@ -22,12 +22,6 @@ function usage(): void {
   console.log("      --subtree                  ...and every project nested under it");
   console.log("  ingress remove <id>            Revoke a grant");
   console.log("");
-  console.log("  inbound list                   Generic inbound routes (POST /hook/<name>)");
-  console.log("  inbound add <name> <owner>     Create a route and print its secret ONCE");
-  console.log("      --mode message|task        message → the session's mailbox; task → Todoist (default)");
-  console.log("      --fields a,b.c             Lift only these payload fields into the message");
-  console.log("      --note \"...\"               What sends here, for the next reader");
-  console.log("  inbound remove <name>          Delete a route");
   console.log("");
   console.log(`Default scope: ${DEFAULT_SCOPE}. Add data:delete only if the bridge should remove tasks.`);
   console.log("");
@@ -153,71 +147,6 @@ export async function runTodoist(args: string[]): Promise<void> {
       }
 
       console.error(`Unknown ingress action: ${action}`);
-      process.exit(1);
-      break;
-    }
-
-    case "inbound": {
-      const { listRoutes, addRoute, removeRoute } = await import("./inbound.js");
-      const [action, name, owner] = rest;
-
-      if (!action || action === "list") {
-        const routes = listRoutes();
-        if (routes.length === 0) {
-          console.log("No inbound routes. Create one with: aibroker todoist inbound add <name> <session>");
-          break;
-        }
-        const host = process.env.TODOIST_PUBLIC_HOST ?? "<your-public-host>";
-        for (const r of routes) {
-          console.log(`  POST https://${host}/hook/${r.name}`);
-          console.log(`       → ${r.owner} (${r.mode})${r.enabled === false ? "  [disabled]" : ""}`);
-          if (r.fields?.length) console.log(`       fields: ${r.fields.join(", ")}`);
-          if (r.note) console.log(`       ${r.note}`);
-          console.log(`       since ${r.createdAt.slice(0, 10)}`);
-        }
-        // The secret is never printed again. Printing it on `list` would put
-        // every route's credential into whatever scrollback, screen share or
-        // terminal recording happens to be running.
-        console.log("\nSecrets are shown only when a route is created. Recreate a route to rotate it.");
-        break;
-      }
-
-      if (action === "add") {
-        if (!name || !owner) {
-          console.error("Usage: aibroker todoist inbound add <name> <session> [--mode message|task] [--fields a,b] [--note \"...\"]");
-          process.exit(1);
-        }
-        const modeIdx = rest.indexOf("--mode");
-        const fieldsIdx = rest.indexOf("--fields");
-        const noteIdx = rest.indexOf("--note");
-        const mode = modeIdx !== -1 ? rest[modeIdx + 1] : undefined;
-        if (mode && mode !== "message" && mode !== "task") {
-          console.error(`Unknown mode "${mode}" — use message or task.`);
-          process.exit(1);
-        }
-        const r = addRoute(name, {
-          owner,
-          mode: mode as "message" | "task" | undefined,
-          fields: fieldsIdx !== -1 ? rest[fieldsIdx + 1].split(",").map((x) => x.trim()).filter(Boolean) : undefined,
-          note: noteIdx !== -1 ? rest[noteIdx + 1] : undefined,
-        });
-        const host = process.env.TODOIST_PUBLIC_HOST ?? "<your-public-host>";
-        console.log(`Route created.\n`);
-        console.log(`  URL     POST https://${host}/hook/${r.name}`);
-        console.log(`  Header  x-aibroker-token: ${r.secret}`);
-        console.log(`  Owner   ${r.owner} (${r.mode})`);
-        console.log(`\nThis is the only time the secret is shown. Anything holding it can reach`);
-        console.log(`${r.owner} — treat it like a password, and recreate the route to rotate it.`);
-        break;
-      }
-
-      if (action === "remove") {
-        if (!name) { console.error("Usage: aibroker todoist inbound remove <name>"); process.exit(1); }
-        console.log(removeRoute(name) ? `Removed /hook/${name}.` : `No route named ${name}.`);
-        break;
-      }
-
-      console.error(`Unknown inbound action: ${action}`);
       process.exit(1);
       break;
     }

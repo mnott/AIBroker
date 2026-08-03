@@ -118,7 +118,7 @@ Hub health overview.
 {
   "ok": true,
   "result": {
-    "version": "0.6.0",
+    "version": "0.26.0",
     "adapters": ["whazaa", "telex"],
     "activeSessions": 2,
     "activeSession": "My Project",
@@ -626,7 +626,7 @@ Query the full state of the AIBP registry.
 
 #### `pailot_send`
 
-Send text or voice to the PAILot mobile app via the WebSocket gateway.
+Send text or voice to the PAILot mobile app over MQTT (topic `pailot/out`), with an APNs push in parallel.
 
 ```json
 // Text message

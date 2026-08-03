@@ -26,7 +26,7 @@ AIBroker is a macOS-resident daemon that acts as the central routing hub for AI-
 │  └────────────────────────────────────────────────────┘    │
 │                                                             │
 │  ┌────────────────────────────────────────────────────┐    │
-│  │         PAILot WebSocket Gateway (:8765)           │    │
+│  │           PAILot MQTT Broker (:8765)               │    │
 │  └────────────────────────────────────────────────────┘    │
 └──────────────┬──────────────────────────────────────────────┘
                │ IPC (Unix sockets)
@@ -69,7 +69,7 @@ The daemon (`src/daemon/index.ts`) is the entry point. It starts all subsystems 
 - Registers PAILot as a `mobile` plugin in AIBP
 - Registers the hub's session handler as a `hub` plugin
 - Registers iTerm2 as a `terminal` plugin
-- Starts the PAILot WebSocket gateway on port 8765
+- Starts the PAILot MQTT broker (aedes) on port 8765
 - Auto-discovers running adapters (Whazaa, Telex) via their sockets
 - Starts the `HybridSessionManager` and `APIBackend`
 - Loads persisted state (session registry, voice config)
@@ -102,7 +102,7 @@ Maintains a flat list of sessions that can be either `api` (headless Claude subp
 
 ### PAILot Gateway (src/adapters/pailot/gateway.ts)
 
-WebSocket server on port 8765. Handles PAILot iOS app connections: structured commands (sync, switch, rename, nav, screenshot), text messages, voice messages (M4A audio → Whisper transcription → AIBP routing), and image uploads. Maintains a per-session outbox for offline clients. Broadcasts to alive clients only (90-second liveness threshold).
+In-process aedes MQTT broker on port 8765, advertised over Bonjour as `_mqtt._tcp`. Handles PAILot app traffic: structured commands (sync, switch, rename, nav, screenshot), text, voice (M4A → Whisper → AIBP routing) and images. Publishes to `pailot/out`, `pailot/status`, `pailot/sessions` and `pailot/control/out`; receives on `pailot/control/in` and `pailot/device/token`. A persistent queue buffers for absent clients, drained by `catch_up` on reconnect, and APNs reaches the app when it is not connected at all.
 
 ### MCP Server (src/mcp/index.ts)
 
@@ -122,7 +122,7 @@ In-memory cache of AI-parsed session summaries, keyed by iTerm2 session ID. Supp
 User speaks into PAILot
         │
         ▼
-PAILot WS Gateway (gateway.ts)
+PAILot MQTT broker (mqtt-broker.ts) + gateway helpers (gateway.ts)
         │ M4A audio bytes
         ▼
 Whisper transcription
@@ -163,7 +163,7 @@ AIBP Registry route() → delivers to mobile:pailot plugin
 PAILot plugin callback → broadcastText()
         │
         ▼
-WebSocket broadcast to alive clients → PAILot app displays message
+Published to `pailot/out` → PAILot app displays message; APNs push in parallel
 ```
 
 ## Design Principles
@@ -186,7 +186,7 @@ The hub command handler never calls transport-specific functions. It receives a 
 
 ### Outbox for Offline Tolerance
 
-Both the AIBP registry (for plugin channels) and the PAILot gateway (for WebSocket clients) maintain outboxes that buffer messages when the recipient is offline. Messages are drained when the plugin reconnects or the client sends a `sync` command.
+Both the AIBP registry (for plugin channels) and the PAILot path (for the app) buffer messages when the recipient is absent. PAILot's queue lives on disk at `~/.aibroker/pailot-queue.json` — MQTT is connected with `cleanSession=true`, so nothing is retained by the broker and offline delivery is handled above the transport. Messages drain when the plugin reconnects or the app sends `catch_up`.
 
 ### launchd for Process Management
 
