@@ -497,6 +497,77 @@ function readBody(req: IncomingMessage, limit = 1_000_000): Promise<Buffer> {
   });
 }
 
+/**
+ * Serve one generic inbound route.
+ *
+ * Refusals are deliberately uniform and terse: an unknown route and a wrong
+ * secret both answer 404, so the endpoint cannot be used to enumerate which
+ * routes exist. Every refusal is audited, because the interesting fact about a
+ * probe is that it happened, and nothing else here would record it.
+ */
+async function handleInbound(
+  name: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const {
+    findRoute, secretMatches, rateLimited, deliverInbound, TOKEN_HEADER, MAX_BODY,
+  } = await import("./inbound.js");
+
+  const route = findRoute(name);
+  const presented = req.headers[TOKEN_HEADER] as string | undefined;
+
+  if (!route || route.enabled === false || !secretMatches(presented, route.secret)) {
+    audit({
+      action: "inbound", actor: "external", target: `hook:${name}`,
+      outcome: "refused",
+      reason: !route ? "no such route" : route.enabled === false ? "route disabled" : "bad or missing token",
+    });
+    res.writeHead(404).end();
+    return;
+  }
+
+  if (rateLimited(route.name)) {
+    audit({ action: "inbound", actor: "external", target: `hook:${route.name}`, outcome: "refused", reason: "rate limited" });
+    res.writeHead(429).end();
+    return;
+  }
+
+  let raw: Buffer;
+  try {
+    raw = await readBody(req, MAX_BODY);
+  } catch {
+    audit({ action: "inbound", actor: "external", target: `hook:${route.name}`, outcome: "refused", reason: "payload too large" });
+    res.writeHead(413).end();
+    return;
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw.toString("utf-8"));
+  } catch {
+    audit({ action: "inbound", actor: "external", target: `hook:${route.name}`, outcome: "refused", reason: "body is not JSON" });
+    res.writeHead(400).end();
+    return;
+  }
+
+  // Acknowledge before delivering. Typing into a session can take fifteen
+  // seconds; a sender that times out and retries would deliver the same event
+  // twice, and nothing downstream could tell the copies apart.
+  res.writeHead(202, { "content-type": "application/json" }).end('{"accepted":true}');
+
+  const result = await deliverInbound(route, payload);
+  audit({
+    action: "inbound", actor: `hook:${route.name}`, target: `session:${route.owner}`,
+    outcome: result.ok ? "delivered" : "failed",
+    reason: result.detail,
+  });
+  log(`inbound: /hook/${route.name} → ${route.owner}: ${result.detail}`);
+}
+
+/** Mirrors inbound.ts — kept local so this module has no load-time dependency on it. */
+const HOOK_PREFIX = "/hook/";
+
 export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Server {
   const seen = new SeenSet();
 
@@ -517,6 +588,16 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
       }
 
       if (req.method !== "POST") { res.writeHead(405).end(); return; }
+
+      // Generic inbound routes share this listener because they share the one
+      // thing that is hard to get: a public HTTPS endpoint. Handled before the
+      // Todoist path check so a route can never be mistaken for a webhook and
+      // fail HMAC verification instead of authenticating on its own terms.
+      if (reqPath.startsWith(HOOK_PREFIX)) {
+        await handleInbound(reqPath.slice(HOOK_PREFIX.length), req, res);
+        return;
+      }
+
       if (reqPath !== cfg.path) { res.writeHead(404).end(); return; }
 
       let raw: Buffer;
@@ -606,6 +687,32 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
             outcome: "ignored", reason, meta: { event: event.event_name, taskId: parentId },
           });
           log(`todoist-webhook: ${reason}`);
+          return;
+        }
+      }
+
+      // A comment written on a MIRROR entry is meant for the real task.
+      //
+      // The mirror is where the reader's attention is, so replying there rather
+      // than on the source is the natural mistake — and Todoist has no way to
+      // deep-link an individual comment that would make the source easier to
+      // reach. Carry it across instead of losing it in a project nothing reads.
+      // Checked before routing: the mirror project is deliberately NOT an
+      // ingress project, so routing would refuse this and say nothing useful.
+      if (event.event_name === "note:added") {
+        const { mirrorProjectId, mirrorBack } = await import("./todoist-mirror.js");
+        const mirror = mirrorProjectId();
+        if (mirror && String(event.event_data?.project_id ?? "") === mirror) {
+          const r = await mirrorBack({
+            taskId: String(event.event_data?.id ?? ""),
+            text: String((event.event_data as { content?: string })?.content ?? ""),
+            projectId: mirror,
+          });
+          audit({
+            action: "webhook", actor: "todoist", target: "aibroker",
+            outcome: r.carried ? "carried-back" : "ignored",
+            reason: r.reason ?? "comment on a mirror entry carried to its source task",
+          });
           return;
         }
       }

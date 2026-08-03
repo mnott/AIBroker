@@ -313,3 +313,35 @@ export async function fetchTaskDue(
     return undefined;
   }
 }
+
+/**
+ * The task's title and web link, for a notification that identifies itself.
+ *
+ * A push saying "a reply was posted" is only marginally better than silence
+ * when the tree holds hundreds of tasks: knowing something happened without
+ * knowing where still means hunting. The url is what Todoist's own clients
+ * open, so the notification is one tap from the conversation it announces.
+ *
+ * Never throws — a notification that cannot name its task still beats none.
+ */
+export async function fetchTaskBrief(
+  taskId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ title?: string; url?: string; projectId?: string }> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return {};
+    const res = await fetchImpl(`https://api.todoist.com/api/v1/tasks/${encodeURIComponent(taskId)}`, {
+      headers: { authorization: `${token.token_type} ${token.access_token}` },
+    });
+    if (!res.ok) return {};
+    const t = JSON.parse(await res.text()) as { content?: string; url?: string; project_id?: string };
+    return {
+      title: t.content,
+      url: t.url ?? `https://app.todoist.com/app/task/${taskId}`,
+      projectId: t.project_id,
+    };
+  } catch {
+    return {};
+  }
+}

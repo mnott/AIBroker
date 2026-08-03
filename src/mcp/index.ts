@@ -507,8 +507,36 @@ server.tool(
   },
   async ({ taskId, text, release }) => {
     try {
-      const r = await hub.call_raw("todoist_reply", { taskId, text, release });
+      const r = await hub.call_raw("todoist_reply", { taskId, text, release, sessionId: getSessionId() });
       return ok(`Replied on task ${(r as any).taskId ?? taskId}`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "todoist_mirror",
+  "Run the Todoist comment mirror now: every comment added since the last pass becomes a task in the mirror project, grouped into an auto-created section named after the project it came from, linking back to the conversation. Sections this tool created are removed again once their items are all dealt with. The daemon also runs this every five minutes — call it to force a pass immediately after replying. Requires TODOIST_MIRROR_PROJECT in ~/.aibroker/env.",
+  {},
+  async () => {
+    try {
+      const r = await hub.call_raw("todoist_mirror", {}) as any;
+      return ok(`Mirrored ${r.mirrored}, sections +${r.sectionsCreated}/-${r.sectionsRemoved}${r.skipped ? `, ${r.skipped} deferred to the next pass` : ""}`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "todoist_inbox",
+  "Which Todoist tasks have new comments since you last looked. Answers the question Todoist itself cannot: it does not notify an account about its own activity, and every comment a session writes is written as the account owner, so replies land invisibly in a tree of hundreds of tasks. Reads the activity log in one request, groups comments by task, and returns each task's title, newest comment and a direct link. Pass markSeen:true only when the human has actually been shown the digest — it advances the read marker, and advancing it unseen loses the backlog. Pass push:true to send it to the PAILot app.",
+  {
+    since: z.string().optional().describe("ISO timestamp to look back from, e.g. '2026-08-01T00:00:00Z'. Defaults to the stored read marker; pass this to look further back WITHOUT disturbing that marker."),
+    markSeen: z.boolean().optional().describe("Advance the read marker to the newest comment in this digest. Only set once the human has seen it."),
+    push: z.boolean().optional().describe("Also send the digest to the PAILot app as a message."),
+  },
+  async ({ since, markSeen, push }) => {
+    try {
+      const r = await hub.call_raw("todoist_inbox", { since, markSeen, push, sessionId: getSessionId() }) as any;
+      return ok(r.text ?? "(no digest)");
     } catch (e) { return err(e); }
   },
 );

@@ -227,6 +227,29 @@ export async function refreshAccessToken(
  * Every caller should go through this rather than `loadToken()`: an hour is
  * short enough that "it worked when I tested it" proves nothing.
  */
+/**
+ * The refresh in flight, if any.
+ *
+ * Todoist ROTATES refresh tokens and treats a second use of one as an attack:
+ * presenting a spent refresh token returns `invalid_grant — refresh token reuse
+ * detected` and REVOKES THE ENTIRE GRANT, not just that token. Re-authorising is
+ * then the only way back, and it needs a human at a browser.
+ *
+ * Which makes concurrent refresh a loaded gun. Several callers — the webhook
+ * dispatcher, the comment mirror's timer, a session replying — routinely ask for
+ * a token in the same moment. If the token has just expired they each see it
+ * expired, each fire a refresh with the same stored refresh token, the first
+ * rotates it, and every straggler presents a spent one. The grant dies.
+ *
+ * That is not hypothetical: it happened on 2026-08-03 at 13:50, minutes after
+ * the five-minute mirror timer was added and while the daemon was being
+ * restarted repeatedly. Everything Todoist stopped working and the only symptom
+ * was 401s.
+ *
+ * So: one refresh at a time, and everyone else waits for its result.
+ */
+let refreshing: Promise<StoredToken> | undefined;
+
 export async function getAccessToken(fetchImpl: typeof fetch = fetch): Promise<StoredToken | null> {
   const t = loadToken();
   if (!t) return null;
@@ -239,7 +262,17 @@ export async function getAccessToken(fetchImpl: typeof fetch = fetch): Promise<S
     return t;
   }
   try {
-    return await refreshAccessToken(clientId, clientSecret, t, fetchImpl);
+    if (!refreshing) {
+      // Re-read inside the guard: a refresh that completed while we were
+      // deciding has already written a fresh token to disk, and refreshing the
+      // one we loaded a moment ago would spend a token that is already spent.
+      refreshing = (async () => {
+        const current = loadToken() ?? t;
+        if (!isExpired(current)) return current;
+        return refreshAccessToken(clientId, clientSecret, current, fetchImpl);
+      })().finally(() => { refreshing = undefined; });
+    }
+    return await refreshing;
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
     log(`todoist-oauth: refresh failed — ${reason}`);

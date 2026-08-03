@@ -311,6 +311,30 @@ export async function startDaemon(options?: {
     if (evicted > 0) log(`[hub] pruned ${evicted} stale image context(s)`);
   }, 5 * 60 * 1000).unref();
 
+  // Comment mirroring is driven by the write, not by a poll: `todoist_reply`
+  // files the mirror entry itself, because we know the comment at the moment we
+  // create it. Todoist stays silent only about the account's OWN activity, and
+  // the bridge writes as the account — so the comments that need mirroring are
+  // exactly the ones we produce. Everyone else's, Todoist already notifies for.
+  //
+  // The activity-log sweep survives as an OPT-IN reconciliation for people who
+  // also want comments written from other clients mirrored. Off by default: a
+  // poll nobody asked for is a five-minute delay and a token refresh storm, both
+  // of which this system has now demonstrated.
+  {
+    const minutes = Number(process.env.TODOIST_MIRROR_POLL_MINUTES ?? "0");
+    if (Number.isFinite(minutes) && minutes > 0) {
+      const runMirror = () => {
+        void import("./todoist-mirror.js")
+          .then((m) => (m.mirrorProjectId() ? m.syncMirror() : undefined))
+          .catch((e) => log(`todoist-mirror: sync failed — ${e instanceof Error ? e.message : String(e)}`));
+      };
+      setTimeout(runMirror, 20_000).unref();
+      setInterval(runMirror, minutes * 60 * 1000).unref();
+      log(`todoist-mirror: reconciliation sweep every ${minutes} min (TODOIST_MIRROR_POLL_MINUTES)`);
+    }
+  }
+
   // Auto-discover adapters that were already running before the hub (re)started.
   // Probe well-known socket paths and register any that respond to "ping".
   // Also register them as AIBP transport plugins.
