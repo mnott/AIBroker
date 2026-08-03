@@ -14,6 +14,18 @@ Install AIBroker and your Claude Code sessions become reachable from anywhere. A
 - **Telegram** — Same experience, different app. Text and voice both work.
 - **PAILot** (iOS app) — Native companion app with session switching, voice messages, typing indicators, and message history.
 
+### Delegate Work from Todoist
+
+File a task in Todoist — from your phone, your watch, or the web — and the AI
+session that owns that project picks it up, does the work, and answers in the
+comments. Reply from the comments and it goes back to the same session.
+
+No new app, no new habit: you delegate to it the way you delegate to a
+colleague, and because the work happens on a task you can see what it is doing,
+what it decided, and say no before anything happens.
+
+[What it feels like](docs/task-manager-as-interface.md) · [Setup and security model](docs/todoist.md)
+
 ### Manage Sessions Remotely
 
 - "Show me all sessions" — see every running Claude Code session
@@ -155,13 +167,19 @@ Every probe of an idle session does inject a message that stays in that session'
 ### 7. File work from your phone or watch (optional)
 
 ```bash
-tailscale funnel --bg --https=8443 http://127.0.0.1:8766
+tailscale funnel --bg --https=443 --set-path=/todoist http://127.0.0.1:8766/todoist
 ```
+
+> **Port 443, and no port in the callback URL.** Todoist *silently* refuses any
+> webhook URL carrying a port: the form accepts it, activation appears to do
+> nothing, and the status stays *Not configured* forever with no error anywhere.
+> `--https=8443` will look like it worked and never deliver a single event.
 
 Add a task in Todoist and it reaches the session that owns it — no polling, because Todoist pushes. Set a **reminder** rather than a due date to schedule work: `reminder:fired` is a webhook event, a task merely becoming due is not.
 
 This is an execution ingress, so it is narrow by construction: every request must carry a valid HMAC signature, only explicitly allowlisted projects can reach a session, and an empty allowlist accepts nothing rather than everything. Todoist's Inbox cannot be shared, which is what makes quick capture from a watch safe.
 
+What it feels like to use: **[docs/task-manager-as-interface.md](docs/task-manager-as-interface.md)**.
 Full setup, routing rules and the security model: **[docs/todoist.md](docs/todoist.md)**.
 
 ### 8. Audit what one session did to another
@@ -425,7 +443,13 @@ Addressing is explicit: `hub:machine-b/session:abc` routes through the bridge to
 | [mcp-tools.md](docs/mcp-tools.md) | All 42 MCP tools with parameters |
 | [adapters.md](docs/adapters.md) | Adapter development guide |
 | [pailot.md](docs/pailot.md) | PAILot iOS app integration |
-| [todoist.md](docs/todoist.md) | Todoist inbound channel: webhook setup, routing, security model |
+| [task-manager-as-interface.md](docs/task-manager-as-interface.md) | Todoist as the front door to AI: what it feels like, what it will not do |
+| [todoist.md](docs/todoist.md) | Todoist inbound channel: webhook setup, routing, security model, the comment mirror |
+| [channels.md](docs/channels.md) | The model every inbound path shares — read first for anything inbound |
+| [inbound.md](docs/inbound.md) | Generic `POST /hook/<route>` endpoint |
+| [outbound.md](docs/outbound.md) | Acting in external systems through a platform's own actions |
+| [mailbox.md](docs/mailbox.md) | Durable per-session queue and confirmed delivery |
+| [audit.md](docs/audit.md) | What is recorded, and how to read it |
 | [mesh.md](docs/mesh.md) | Multi-machine mesh networking |
 | [ipc.md](docs/ipc.md) | IPC protocol and message format |
 | [tts-stt.md](docs/tts-stt.md) | Voice pipeline details |
