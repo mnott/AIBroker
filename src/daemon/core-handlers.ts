@@ -1271,6 +1271,67 @@ export function registerCoreHandlers(
     }
   });
 
+  /**
+   * todoist_inbox — which tasks have new comments.
+   *
+   * The per-reply push answers "did something just happen". This answers the
+   * question that actually costs time: across a tree of hundreds of tasks,
+   * which ones are waiting for you. Todoist will not answer it — it does not
+   * notify an account about its own activity, and the bridge comments as you.
+   *
+   * `markSeen` is opt-in so building a digest never silently consumes the
+   * backlog, and `push` sends it to the phone so it can be asked for from
+   * anywhere.
+   */
+  /**
+   * todoist_mirror — run the comment mirror now.
+   *
+   * The daemon runs it on a timer; this exists so a session can force a pass
+   * after replying, and so the result is inspectable rather than only visible
+   * as a side effect in Todoist.
+   */
+  server.on("todoist_mirror", async () => {
+    try {
+      const { syncMirror, mirrorProjectId } = await import("./todoist-mirror.js");
+      if (!mirrorProjectId()) {
+        return { ok: false, error: "TODOIST_MIRROR_PROJECT is not set in ~/.aibroker/env — mirroring is off" };
+      }
+      const r = await syncMirror();
+      return { ok: true, result: { ...r } };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  server.on("todoist_inbox", async (req) => {
+    const { since, markSeen: commit, push, sessionId: inboxCaller } = (req.params ?? {}) as {
+      since?: string; markSeen?: boolean; push?: boolean; sessionId?: string;
+    };
+    try {
+      const { buildInbox, formatInbox, markSeen: setSeen } = await import("./todoist-inbox.js");
+      const inbox = await buildInbox({ since });
+      const text = formatInbox(inbox);
+
+      if (commit && inbox.newest) setSeen(inbox.newest);
+
+      if (push) {
+        try {
+          // Address the caller's own thread. An empty id falls through to
+          // "whichever session last spoke to PAILot", which is how the first
+          // digest landed in another session's conversation and read, to the
+          // person waiting for it, exactly like nothing had been sent.
+          const bridge = getAibpBridge();
+          const target = inboxCaller || lastRoutedSessionId || activeItermSessionId || "";
+          bridge?.routeToMobile(target, text, "TEXT");
+        } catch { /* the digest is still returned to the caller */ }
+      }
+
+      return { ok: true, result: { text, entries: inbox.entries, truncated: inbox.truncated, since: inbox.since, newest: inbox.newest } };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
   server.on("todoist_reply", async (req) => {
     const { taskId, text, release } = req.params as { taskId?: string; text?: string; release?: boolean };
     if (!taskId) return { ok: false, error: "taskId is required" };
@@ -1301,6 +1362,38 @@ export function registerCoreHandlers(
           log(`todoist-reply: refused to release ${taskId} — ${verdict.reason}`);
         }
       }
+      // Push a notice to the phone. A comment posted on a task in a tree of
+      // hundreds is invisible until someone opens that exact task — which is
+      // the same silence as never answering. The reply is the event worth
+      // knowing about, so it is announced rather than left to be found.
+      try {
+        const bridge = getAibpBridge();
+        if (bridge) {
+          // Address the replying session's own thread. An empty id falls
+          // through to "whichever session last spoke to PAILot", which puts the
+          // notice in a conversation the reader is not looking at — delivered,
+          // and indistinguishable from never sent.
+          const target = (req.params as { sessionId?: string }).sessionId
+            || lastRoutedSessionId || activeItermSessionId || "";
+          const { fetchTaskBrief } = await import("./todoist-reply.js");
+          const brief = await fetchTaskBrief(taskId);
+          const first = text.trim().split("\n").find((l) => l.trim()) ?? "";
+          const head = brief.title ? `💬 ${brief.title}` : "💬 Reply posted on a task";
+          const link = brief.url ? `\n${brief.url}` : "";
+          bridge.routeToMobile(target, `${head}\n${first.slice(0, 240)}${link}`, "TEXT");
+        }
+      } catch { /* a missing notification must not fail the reply itself */ }
+
+      // Mirror this reply directly. We wrote it, so we already know everything
+      // the mirror needs — asking Todoist to tell us about our own comment was
+      // a round trip to learn what we already knew, and it put a five-minute
+      // delay on the one case somebody is actually watching. Failures are
+      // queued inside and retried on the next write, so this is not a
+      // best-effort downgrade from polling.
+      void import("./todoist-mirror.js")
+        .then((m) => m.mirrorComment({ taskId, commentId: r.commentId, text }))
+        .catch(() => { /* queued inside; nothing useful to do here */ });
+
       return { ok: true, result: { taskId: r.taskId, commentId: r.commentId, released, releaseRefused } };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };

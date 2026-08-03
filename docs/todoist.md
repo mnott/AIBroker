@@ -90,6 +90,8 @@ Any of these work, since the receiver only needs a proxy that terminates TLS and
 
 ## 2. Create the Todoist app
 
+> **Once created, this app is load-bearing — do not delete it.** It is the only thing that makes Todoist an inbound channel: the daemon authenticates as it, its webhook carries every `[Task]` work order, and its client secret signs every delivery. The App Management console gives no hint of this, because the app does nothing *visible* — it looks exactly like an experiment somebody started and abandoned. On 2026-08-03 it was nearly deleted for that reason. Deleting it silently ends every phone-to-session route until the whole of section 2 is redone and the account re-authorised.
+
 In Todoist: **Settings → Integrations → App Management → Add new integration**.
 
 1. Name it (Todoist's brand rules forbid "Todoist" as the primary name — e.g. `AIBroker Bridge`).
