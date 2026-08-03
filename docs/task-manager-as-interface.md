@@ -64,7 +64,7 @@ Good fits:
 
 Poor fits:
 
-- Rapid back-and-forth. That's what chat is for; use chat. But in practice, even chatting away in the comments works pretty well. It's maybe a preference at which point you go to a real chat like using PAILot (which gives you speach-to-text-to-speach).
+- Rapid back-and-forth. That's what chat is for; use chat. But in practice, even chatting away in the comments works pretty well. It's maybe a preference at which point you go to a real chat like using PAILot (which gives you speech-to-text-to-speech).
 - Work with no obvious owner — it has to know which context to use. But you can use Catch-all type of projects and just ask within that task to route it to another project. You can even ask to have a Todoist Project created for you for a session that you happen to run at the moment.
 
 ---
