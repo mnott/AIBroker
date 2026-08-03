@@ -162,6 +162,12 @@ switch (command) {
     break;
   }
 
+  case "outbound": {
+    const { runOutbound } = await import("./outbound-cli.js");
+    await runOutbound(rest);
+    break;
+  }
+
   case "create-adapter": {
     // Parse arguments: name, --display-name <Name>, --output <dir>
     const adapterName = rest.find((a) => !a.startsWith("--"));

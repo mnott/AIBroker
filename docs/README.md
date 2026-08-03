@@ -45,6 +45,7 @@ Messages are sent to explicit addresses. The registry fans them out. Plugins joi
 - [Inbound routes](./inbound.md) — `POST /hook/<route>`: anything that speaks HTTP reaching a session
 - [Mailbox](./mailbox.md) — The durable per-session queue, confirmed delivery, the drain hook
 - [Audit trail](./audit.md) — What happened, who caused it, and what was refused
+- [Outbound](./outbound.md) — Acting in Stripe, HubSpot, Salesforce and the rest through a platform's own actions, with no connector written here
 
 ### Plugin System
 

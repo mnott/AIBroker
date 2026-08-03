@@ -1290,6 +1290,30 @@ export function registerCoreHandlers(
    * after replying, and so the result is inspectable rather than only visible
    * as a side effect in Todoist.
    */
+  /**
+   * outbound_call — a session acting in a system we have no connector for.
+   *
+   * The session decides; an automation platform's own actions do it. We never
+   * hold the vendor credential and never maintain the connector, which is the
+   * one thing those platforms are genuinely good at.
+   */
+  server.on("outbound_call", async (req) => {
+    const { target, action, params } = (req.params ?? {}) as {
+      target?: string; action?: string; params?: Record<string, unknown>;
+    };
+    if (!target) return { ok: false, error: "target is required" };
+    if (!action) return { ok: false, error: "action is required" };
+    try {
+      const { callOutbound } = await import("./outbound.js");
+      const r = await callOutbound(target, action, params ?? {}, callerLabel(req));
+      return r.ok
+        ? { ok: true, result: { status: r.status ?? 0, body: r.body ?? "" } }
+        : { ok: false, error: r.error ?? `call failed with ${r.status}` };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
   server.on("todoist_mirror", async () => {
     try {
       const { syncMirror, mirrorProjectId } = await import("./todoist-mirror.js");

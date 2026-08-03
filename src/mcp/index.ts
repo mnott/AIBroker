@@ -514,6 +514,22 @@ server.tool(
 );
 
 server.tool(
+  "aibroker_outbound",
+  "Act in an external business system through a registered automation-platform webhook — Stripe, HubSpot, Salesforce, Shopify, Slack, Jira and so on — WITHOUT any connector being written here. You decide what should happen; the platform's own action library does it. Targets are registered at the terminal with `aibroker outbound add` and cannot be invented by a caller; every call is audited with its parameters. Use this after you have gathered context and, where the action has consequences (money, external messages, deletions), after the human has approved it.",
+  {
+    target: z.string().min(1).describe("Registered target name, e.g. 'ops'. List them with `aibroker outbound list`."),
+    action: z.string().min(1).describe("What the receiving workflow should do, e.g. 'refund', 'create-ticket'. Agreed with whoever built that workflow."),
+    params: z.record(z.string(), z.any()).optional().describe("Action parameters, e.g. { orderId, amount, reason }. Everything specific goes here — the envelope stays fixed."),
+  },
+  async ({ target, action, params }) => {
+    try {
+      const r = await hub.call_raw("outbound_call", { target, action, params }) as any;
+      return ok(`${target}.${action} → ${r.status}${r.body ? `\n${String(r.body).slice(0, 500)}` : ""}`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
   "todoist_mirror",
   "Run the Todoist comment mirror now: every comment added since the last pass becomes a task in the mirror project, grouped into an auto-created section named after the project it came from, linking back to the conversation. Sections this tool created are removed again once their items are all dealt with. The daemon also runs this every five minutes — call it to force a pass immediately after replying. Requires TODOIST_MIRROR_PROJECT in ~/.aibroker/env.",
   {},
