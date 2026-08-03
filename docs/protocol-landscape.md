@@ -74,7 +74,7 @@ Messages carry session context. The protocol knows which Claude Code session a m
 AIBP routes between fundamentally different plugin types in a single protocol:
 - WhatsApp/Telegram transports
 - iTerm2 terminal sessions
-- Mobile WebSocket clients (PAILot)
+- Mobile MQTT clients (PAILot)
 - MCP tool servers
 - Remote hubs (mesh)
 

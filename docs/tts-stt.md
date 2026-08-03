@@ -127,7 +127,7 @@ OGG Opus buffer
 ffmpeg -c:a aac -b:a 128k  →  M4A (AAC) buffer
       │
       ▼
-base64-encoded M4A in WebSocket JSON
+base64-encoded M4A in the MQTT payload
 ```
 
 The conversion happens inside the PAILot gateway before sending. See [pailot.md](./pailot.md) for the full outbound message format.
@@ -186,7 +186,7 @@ PAILot sends voice messages as base64 M4A. The gateway:
 
 1. Saves the audio to `/tmp/pailot-voice-{ts}-{uuid}.m4a`
 2. Calls `transcribeAudio(path, "[PAILot:voice]")`
-3. Broadcasts a `transcript` WebSocket message back to the app (voice bubble update)
+3. Publishes a `transcript` message to `pailot/out` (voice bubble update)
 4. Buffers transcripts in a 3-second window (`BATCH_WINDOW_MS=3000`)
 5. After 3 seconds of silence, combines all buffered transcripts and routes via AIBP
 6. Cleans up temp files

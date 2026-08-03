@@ -8,7 +8,7 @@ AIBroker/
 │   ├── adapters/
 │   │   ├── iterm/        — iTerm2 AppleScript integration (sessions, keystrokes, screenshots)
 │   │   ├── kokoro/       — TTS (tts.ts) and STT/media (media.ts)
-│   │   ├── pailot/       — PAILot WebSocket gateway
+│   │   ├── pailot/       — PAILot MQTT broker + gateway helpers
 │   │   └── session/      — Claude API session backend (api.ts → src/backend/)
 │   ├── aibp/             — AIBP routing protocol (types, registry, bridge, envelope)
 │   ├── backend/          — APIBackend: headless Claude subprocess sessions
@@ -214,7 +214,7 @@ Enable verbose logging: `PAILOT_DEBUG=1` in `~/.aibroker/env`
 Log file: `/tmp/pailot-ws-debug.log`
 
 Logged events:
-- Every raw WebSocket message (truncated to 200 chars)
+- Every raw inbound MQTT payload (truncated to 200 chars)
 - Voice message receipt and base64 audio length
 - Audio file save paths and byte counts
 
@@ -250,7 +250,7 @@ echo '{"id":"1","sessionId":"test","method":"health","params":{}}' | nc -U /tmp/
 ## Version and Package
 
 Package name: `aibroker` (public, unscoped npm)
-Current version: `0.6.0`
+Current version: see `package.json` — do not restate it here; a version copied into prose is a version that goes stale.
 
 The version is in `package.json`. Update it before publishing. Both Whazaa and Telex pin to `aibroker@^0.1.0` or similar — check their `package.json` files before bumping a major version.
 

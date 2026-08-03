@@ -258,7 +258,7 @@ sequenceDiagram
     participant H as SessionHandler
     participant I as iTerm2
 
-    P->>G: WebSocket text message
+    P->>G: MQTT publish (text)
     G->>B: routeFromMobile(sessionId, text)
     B->>R: route(TEXT, src=mobile:pailot, dst=session:UUID)
     R->>H: fanOut → deliver to hub:session-handler
@@ -305,7 +305,7 @@ sequenceDiagram
 
     Note over P: PAILot reconnects
 
-    P->>G: WebSocket connect
+    P->>G: MQTT connect (cleanSession)
     G->>P: "Connected to PAILot gateway."
     P->>G: command: sync {activeSessionId}
     G->>OB: drainOutbox(ws)

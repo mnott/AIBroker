@@ -75,7 +75,7 @@ Hub health overview: version, registered adapters, session count, adapter health
 ```json
 // Example response
 {
-  "version": "0.6.0",
+  "version": "0.26.0",
   "adapters": ["whazaa", "telex"],
   "activeSessions": 2,
   "activeSession": "My Project",
@@ -685,7 +685,7 @@ Restart the Telex Telegram watcher service.
 
 ## pailot_* Tools (3 tools) — Direct Hub Calls
 
-These tools call the hub directly (not via `adapter_call`) since PAILot is served by the hub WebSocket gateway rather than an external adapter. They include the MCP's resolved session ID so replies route to the correct PAILot client.
+These tools call the hub directly (not via `adapter_call`) since PAILot is served by the hub's own MQTT broker rather than an external adapter. They include the MCP's resolved session ID so replies route to the session the app is looking at — an omitted or empty session id falls through to whichever session last spoke to PAILot, which is rarely what the caller meant.
 
 ### `pailot_send`
 
@@ -744,6 +744,6 @@ Drain the queue of incoming PAILot messages.
 
 - [ipc.md](./ipc.md) — IPC wire protocol and hub handler reference
 - [adapters.md](./adapters.md) — Adapter architecture and `adapter_call` proxy
-- [pailot.md](./pailot.md) — PAILot gateway and WebSocket protocol
+- [pailot.md](./pailot.md) — PAILot gateway, MQTT topics and APNs
 - [tts-stt.md](./tts-stt.md) — Kokoro TTS and Whisper STT pipeline
 - [sessions.md](./sessions.md) — Session orchestration with `session_content` / `cache_status`

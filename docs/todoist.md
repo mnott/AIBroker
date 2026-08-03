@@ -467,3 +467,72 @@ Removing `TODOIST_CLIENT_SECRET` from `~/.aibroker/env` and restarting stops the
 - **Attachments** are not consumed yet. Todoist supports images on comments, so photograph-a-business-card is possible, but the receiver currently forwards task title and description only.
 - **Comment-back** is not implemented. When an agent writes progress notes onto a task, prefix them with 🤖 so the receiver ignores its own echo, and subscribe to `note:added` only once that is in place.
 - **Bodies are recorded in full** in the audit trail, including anything a task contains. If you file secrets into a task, they are on disk in `~/.aibroker/audit.jsonl`.
+
+---
+
+## The comment mirror
+
+Todoist never notifies an account about its own activity, and the bridge writes
+every comment **as you**. So a session's reply lands on one task somewhere in a
+tree of hundreds and is, from the outside, indistinguishable from nothing having
+happened. Everyone else's comments Todoist already tells you about; the ones it
+stays silent on are exactly the ones you want.
+
+Set a destination project and mirroring is on:
+
+```bash
+# ~/.aibroker/env
+TODOIST_MIRROR_PROJECT=<project id>     # unset = off
+```
+
+The project **must not be an ingress project**, or mirror entries would be
+dispatched to sessions as work.
+
+### What it does
+
+When a session answers with `todoist_reply`, the reply is filed immediately as a
+task in the mirror project:
+
+- **Section** named after the source project's full path (`Claude 🤖 / Home`),
+  created if missing and removed again once its items are all dealt with
+- **Task** titled `💬 <source task title>`, due today so it surfaces where the
+  count you actually look at comes from
+- **Description** carries an excerpt and a link back to the real task
+- **First comment** carries the full text, prefixed `🤖`
+
+### It is driven by the write, not a poll
+
+We know the comment at the moment we create it, so asking Todoist to tell us
+about our own comment was a round trip to learn what we already knew — and it
+put a five-minute delay on the one case somebody is watching. Failures are
+queued in `~/.aibroker/todoist-mirror.json` and retried on the next write, so
+removing the poll did not reintroduce silent loss.
+
+An activity-log sweep survives as **opt-in**, for anyone who also wants comments
+written from other Todoist clients mirrored:
+
+```bash
+TODOIST_MIRROR_POLL_MINUTES=5           # default 0 = off
+```
+
+### Replying inside the mirror works
+
+Todoist offers no way to deep-link an individual comment, so "jump to the real
+task to reply" is advice nobody will follow. Instead, an **unmarked** comment
+written on a mirror entry is carried back to the source task and reaches the
+owning session as `[Task:comment]`.
+
+The `🤖` mark is what makes this safe. The mirror's own copy of a reply is
+marked, so the carry-back path ignores it; unmarked, it would post a verbatim
+duplicate onto the conversation it came from — which is exactly what happened
+the first time it ran.
+
+### Forcing a pass
+
+```bash
+# MCP
+todoist_mirror
+```
+
+See [channels.md](./channels.md) for the model this shares with the other
+inbound paths.

@@ -80,7 +80,7 @@ A user sends a message from the PAILot iOS app. The hub routes it to Claude, and
 ```mermaid
 sequenceDiagram
     participant App as PAILot App
-    participant GW as WS Gateway (Hub)
+    participant GW as MQTT Broker (Hub)
     participant AIBP as AIBP Registry
     participant CC as Claude Code (iTerm2)
     participant MCP as MCP Server
@@ -98,7 +98,7 @@ sequenceDiagram
 
 **Key points:**
 - PAILot messages flow through the AIBP routing fabric, not through adapter IPC
-- The `sessionId` in the WebSocket message routes the reply back to the correct session
+- The `sessionId` in the payload routes the reply back to the correct session
 - `pailot_send` and `pailot_tts` in the MCP are direct hub calls, not `adapter_call` proxies
 
 ---
@@ -110,7 +110,7 @@ The user dictates a voice note in the PAILot app. Claude replies with a spoken v
 ```mermaid
 sequenceDiagram
     participant App as PAILot App
-    participant GW as WS Gateway
+    participant GW as MQTT Broker
     participant Whisper as Whisper CLI
     participant AIBP as AIBP Registry
     participant CC as Claude Code
@@ -221,7 +221,7 @@ The user creates a new Claude Code session from the PAILot app.
 ```mermaid
 sequenceDiagram
     participant App as PAILot App
-    participant GW as WS Gateway
+    participant GW as MQTT Broker
     participant Hub as Hub Daemon
     participant HybMgr as HybridSessionManager
     participant iTerm as iTerm2
@@ -250,16 +250,16 @@ Claude responds while the PAILot app is backgrounded. Messages are buffered and 
 ```mermaid
 sequenceDiagram
     participant App as PAILot App
-    participant GW as WS Gateway
-    participant Outbox as Outbox (disk)
+    participant GW as MQTT Broker
+    participant Q as Queue (~/.aibroker/pailot-queue.json)
     participant CC as Claude Code
 
     Note over App: App backgrounded — no alive WS clients
 
     CC->>GW: (via AIBP) "Build complete. Tests: 42 passed."
     GW->>GW: isAlive(client) → false (last activity > 90s ago)
-    GW->>Outbox: addToOutbox({ type: "text", content: "Build complete...", sessionId })
-    Outbox->>Outbox: Write to ~/.aibroker/outbox/pending.json
+    GW->>Q: addToOutbox({ type: "text", content: "Build complete...", sessionId })
+    Q->>Q: Write to ~/.aibroker/outbox/pending.json
 
     Note over App: App comes to foreground
 
@@ -270,7 +270,7 @@ sequenceDiagram
     GW->>App: WS: { type: "sessions", sessions: [...] }
     GW->>App: WS: { type: "text", content: "📬 While you were away: 1 text message(s)" }
     GW->>App: WS: { type: "text", content: "Build complete. Tests: 42 passed.", sessionId: "ABC123" }
-    Outbox->>Outbox: Clear all entries, delete pending.json
+    Q->>Q: Clear all entries, delete pending.json
 ```
 
 **Key points:**
@@ -288,7 +288,7 @@ The user is on a mobile device connected to Hub A (local Mac), sending messages 
 ```mermaid
 sequenceDiagram
     participant App as PAILot App
-    participant GA as Gateway (Hub A)
+    participant GA as MQTT (Hub A)
     participant BA as AibpBridge (Hub A)
     participant RA as Registry (Hub A)
     participant Bridge as Bridge Plugin (hub-b)
@@ -350,3 +350,142 @@ sequenceDiagram
 - `deliverViaApi()` handles the conversation turn and delivers responses through `CommandContext`
 - The `claudeSessionId` from the SDK is saved to `sessions.json` for conversation resume across daemon restarts
 - `APIBackend.formatStatus()` returns text for `/ss` instead of triggering a screenshot
+
+---
+
+## 11. Todoist task filed from a phone → a session executes it
+
+The channel that turns a task typed on a watch into work done on the Mac.
+
+```mermaid
+sequenceDiagram
+    participant U as You (phone / watch)
+    participant TD as Todoist
+    participant WH as Webhook receiver (:8766)
+    participant IN as Ingress grants
+    participant D as Dispatch
+    participant CC as Claude Code session
+
+    U->>TD: File a task in "Claude 🤖 / AIBroker"
+    TD->>WH: POST /todoist  (item:added, HMAC-signed)
+    WH->>WH: Verify signature; reject unsigned
+    WH->>IN: Is this project granted? Who owns it?
+    IN-->>WH: owner = aibroker
+    WH->>D: submitAndConfirm(session, "[Task] …")
+    D->>CC: Type into the prompt, watch it leave the input line
+    CC-->>D: confirmed
+    D->>WH: audit: delivered
+    Note over CC: Session acts, then answers with todoist_reply
+```
+
+**Why each guard exists.** The signature check is the security boundary — Todoist
+documents that the initiator "may be a collaborator from a shared project", so an
+unsigned or unverified request is a stranger with a path to your machine. The
+ingress grant is the second: a task only becomes an instruction if its project
+was explicitly granted. Both refusals are audited; silence would be
+indistinguishable from nothing having been sent.
+
+See [todoist.md](./todoist.md) and [channels.md](./channels.md).
+
+---
+
+## 12. An external system raises an event → a session hears about it
+
+The generic door. Anything that speaks HTTP, without writing an adapter.
+
+```mermaid
+sequenceDiagram
+    participant SRC as External source (server, app, platform)
+    participant HK as /hook/&lt;route&gt; (:8766)
+    participant RT as Route table
+    participant MB as Session mailbox
+    participant CC as Claude Code session
+
+    SRC->>HK: POST + x-aibroker-token
+    HK->>RT: Known route? Secret correct? Under rate limit?
+    Note over HK,RT: Unknown route and wrong secret<br/>both answer 404 — no enumeration
+    RT-->>HK: route → owner session, mode
+    HK-->>SRC: 202 accepted (before delivery, so a slow<br/>delivery is never retried into a duplicate)
+    alt mode = task
+        HK->>CC: File a Todoist task; a human sees it first
+    else mode = message
+        HK->>MB: Deposit, then type into the session
+        MB->>CC: Drained on the next prompt if the session was busy
+    end
+    HK->>HK: audit: delivered / refused, with the reason
+```
+
+**The route names the session; the payload never does.** If a caller could choose
+the target, whoever holds the URL would choose which session runs with your
+rights. Name routes after their **source** (`monster`, `glidr`), not a topic —
+a topic name smuggles a classification decision into the transport layer.
+
+See [inbound.md](./inbound.md).
+
+---
+
+## 13. A session answers a task → the answer becomes findable
+
+Todoist never notifies an account about its own activity, and the bridge writes
+as the account owner. Without this path, a reply lands invisibly on one task in
+a tree of hundreds.
+
+```mermaid
+sequenceDiagram
+    participant CC as Claude Code session
+    participant TR as todoist_reply
+    participant TD as Todoist
+    participant MR as Comment mirror
+    participant MP as 📬 Comments project
+    participant U as You
+
+    CC->>TR: Answer on task 6hCG…
+    TR->>TD: POST comment (prefixed 🤖)
+    TR->>MR: mirrorComment(taskId, text)
+    Note over MR: Direct — no polling. We wrote it,<br/>so nothing needs rediscovering.
+    MR->>MP: Ensure section named after the source project
+    MR->>MP: Task = 💬 title, excerpt + link; full text as a marked comment
+    U->>MP: Reads it there, replies on the mirror entry
+    MP->>MR: note:added (unmarked = the human's)
+    MR->>TD: Carry the comment back to the real task
+    TD->>CC: Arrives as [Task:comment]
+```
+
+**Marks are the loop guard.** Agent-written comments carry `🤖` and are ignored on
+the way in. The mirror's own copy of the reply is marked for exactly this reason:
+unmarked, the carry-back path reads it as the human's and posts a verbatim
+duplicate onto the conversation it came from.
+
+**Failures queue rather than drop.** A mirror write that fails is retried on the
+next reply, so removing the poll did not reintroduce silent loss.
+
+---
+
+## 14. One session hands work to another
+
+```mermaid
+sequenceDiagram
+    participant A as Session A
+    participant HUB as Hub
+    participant MB as Session B's mailbox
+    participant B as Session B
+
+    A->>HUB: aibroker_send_to_session("B", text)
+    HUB->>HUB: Refuse if B's terminal is a shell —<br/>a shell would EXECUTE the text
+    HUB->>MB: Deposit (structured, recoverable)
+    HUB->>B: submitAndConfirm, retries = 1
+    alt B is idle
+        B-->>HUB: confirmed → delivered: true
+    else B is mid-turn
+        HUB-->>A: delivered: false, queued: true
+        B->>MB: UserPromptSubmit hook drains it on B's next prompt
+    end
+```
+
+**`ok: true` is not "they have seen it".** The typed copy is best-effort; the
+mailbox is the durable path. Thirty-five real messages sat undrained across five
+sessions before the drain hook existed, the oldest for a day.
+
+**Retries default to 1.** A redelivered message is a duplicate nobody downstream
+can distinguish from two real events — one message was once delivered three
+times for exactly this reason.

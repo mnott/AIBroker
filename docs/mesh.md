@@ -151,7 +151,7 @@ The `src` is prefixed with the remote hub identifier so local plugins on Hub B k
 ```mermaid
 sequenceDiagram
     participant P as PAILot App
-    participant GA as Gateway (Hub A)
+    participant GA as MQTT (Hub A)
     participant BA as AibpBridge (Hub A)
     participant RA as Registry (Hub A)
     participant BRG as Bridge Plugin
