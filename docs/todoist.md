@@ -13,7 +13,7 @@ watch / phone / web
                                                   the owning Claude session
 ```
 
-Every step is recorded in [the audit trail](../README.md#7-audit-what-one-session-did-to-another).
+Every step is recorded in [the audit trail](./audit.md).
 
 ---
 

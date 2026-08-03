@@ -41,6 +41,7 @@ Messages are sent to explicit addresses. The registry fans them out. Plugins joi
 
 ### Inbound Channels
 
+- [Task manager as interface](./task-manager-as-interface.md) — **Start here if you want the idea, not the setup.** What it feels like to delegate to an AI from Todoist, and what it deliberately will not do
 - [Todoist](./todoist.md) — File work from a phone or watch; ingress grants, triggers, the comment mirror
 - [Inbound routes](./inbound.md) — `POST /hook/<route>`: anything that speaks HTTP reaching a session
 - [Mailbox](./mailbox.md) — The durable per-session queue, confirmed delivery, the drain hook
