@@ -285,6 +285,31 @@ function ago(iso?: string): string {
  * Merge the currently-open sessions into the manifest. Never removes anything.
  * Returns null when the live set could not be determined (nothing was written).
  */
+/**
+ * The name this directory is already known by, when there is exactly one.
+ *
+ * A live session carries a `paiName` only if session-names.json has an entry
+ * for its CURRENT iTerm UUID. A fresh tab, a session not yet `/Name`d, or one
+ * whose name was recorded under an older UUID all arrive nameless — and the
+ * snapshot used to invent `basename(cwd)` for them. That invention does not
+ * stay local: restore relaunches with `--name <invented>` and a `/Name
+ * <invented>` prompt, which writes it back into session-names.json, so the
+ * guess becomes the truth. "Jobs Matthias" became "09 - Job Search" this way on
+ * 2026-08-04, and paperfull/Paperfull the same way before it.
+ *
+ * The manifest already knows what the user calls this directory. Asking it
+ * first costs nothing and keeps a transient UUID gap from renaming a session.
+ *
+ * Only an UNAMBIGUOUS answer counts. Several sessions legitimately share a
+ * directory — Home and Solar both live in $HOME — and picking one of them
+ * would misattribute rather than merely guess. Where the manifest cannot say,
+ * the basename is still the fallback.
+ */
+function knownNameForCwd(entries: Entry[], cwd: string): string | null {
+  const matches = entries.filter((e) => e.cwd === cwd && !e.pinned);
+  return matches.length === 1 ? matches[0].name : null;
+}
+
 async function doSnapshot(): Promise<{ merged: Entry[]; seen: number } | null> {
   const sessions = await liveSessions();
   if (sessions === null) {
@@ -292,6 +317,7 @@ async function doSnapshot(): Promise<{ merged: Entry[]; seen: number } | null> {
     return null;
   }
 
+  const known = readManifest().entries;
   const ttys = ttyMap();
   const now = new Date().toISOString();
   const fresh: Entry[] = [];
@@ -301,10 +327,11 @@ async function doSnapshot(): Promise<{ merged: Entry[]; seen: number } | null> {
     if (!tty) continue;
     const cwd = cwdForTty(tty);
     if (!cwd) continue;
-    fresh.push({ name: s.paiName || basename(cwd), cwd, lastSeen: now, addedAt: now });
+    const name = s.paiName || knownNameForCwd(known, cwd) || basename(cwd);
+    fresh.push({ name, cwd, lastSeen: now, addedAt: now });
   }
 
-  const merged = mergeEntries(readManifest().entries, fresh, now);
+  const merged = mergeEntries(known, fresh, now);
   writeManifest(merged);
   return { merged, seen: sessions.filter((s) => s.kind === "claude").length };
 }

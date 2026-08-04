@@ -552,3 +552,51 @@ test("our own pai-running write does not look like a routing change", () => {
   );
   assert.equal(d.act, false);
 });
+
+// ---------------------------------------------------------------------------
+// Regression — 2026-08-04: the scheduler's own progress marker came back as work
+// ---------------------------------------------------------------------------
+
+/** A comment event, as Todoist delivers `note:added`. */
+const noteAdded = (text: string): TodoistEvent => ({
+  event_name: "note:added",
+  triggered_at: "2026-08-04T07:42:38.0Z",
+  initiator: { email: "owner@example.com", id: "1" },
+  event_data: {
+    id: "note-1",
+    item_id: "task-1",
+    content: text,
+    project_id: OWNED,
+  },
+} as TodoistEvent);
+
+test("the task bus progress marker is not a work order", () => {
+  // Exactly what PAI's poller posted at 07:42:19, which AIBroker mirrored back
+  // at 07:42:38 and dispatched — spawning a second session for a task that was
+  // already running.
+  const d = route(
+    noteAdded("**RUNNING** — started 2026-08-04 07:41 UTC, jobs-grazyna. Disappears when it finishes."),
+    cfg,
+  );
+  assert.equal(d.act, false);
+});
+
+test("the progress marker is ignored once it carries the agent mark too", () => {
+  const d = route(
+    noteAdded(`${AGENT_MARK} **RUNNING** — started 2026-08-04 07:41 UTC, jobs-grazyna.`),
+    cfg,
+  );
+  assert.equal(d.act, false);
+});
+
+test("a human comment mentioning RUNNING is still mirrored", () => {
+  // Mirroring human comments is the feature. The guard anchors at the start of
+  // the comment precisely so it cannot eat one.
+  const d = route(noteAdded("is this still **RUNNING**? I need the list today"), cfg);
+  assert.equal(d.act, true);
+});
+
+test("an ordinary human comment is still mirrored", () => {
+  const d = route(noteAdded("please include the Zurich postings too"), cfg);
+  assert.equal(d.act, true);
+});

@@ -320,6 +320,21 @@ export function route(
     return { act: false, reason: "agent-authored content, ignored to avoid an echo loop" };
   }
 
+  // Belt and braces for the task bus's own progress marker.
+  //
+  // AGENT_MARK is the contract, and PAI's poller now writes it. But the two
+  // repos version independently, and on 2026-08-04 an older poller posted
+  // "**RUNNING** — started …" WITHOUT the mark: the comment mirror carried the
+  // scheduler's own status line back as a work order and spawned a second
+  // session for a task already running, 19 seconds after the first.
+  //
+  // Matched only at the START of a comment, so this cannot swallow a human
+  // follow-up that happens to mention the word — mirroring human comments is
+  // the feature, and it stays untouched.
+  if (isEcho && /^\*\*RUNNING\*\*\s*—/.test(content.trimStart())) {
+    return { act: false, reason: "task-bus progress marker, not a work order" };
+  }
+
   const ACTIONABLE = new Set(["item:added", "item:completed", "reminder:fired", "note:added"]);
 
   // The create-then-classify case: a task is filed first and labelled second,

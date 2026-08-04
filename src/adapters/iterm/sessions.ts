@@ -88,6 +88,40 @@ export function setItermBadge(itermSessionId: string, text: string): void {
   }
 }
 
+/**
+ * Bring a session to the front by its iTerm2 unique ID.
+ *
+ * Returns false when no session carries that ID — which is the answer a caller
+ * needs in order to fall back to relaunching, rather than reporting a dead
+ * session as an unexplained failure.
+ */
+export function revealItermSession(itermSessionId: string): boolean {
+  try {
+    const result = execSync(
+      `osascript -e 'tell application "iTerm2"
+        repeat with w in windows
+          repeat with t in tabs of w
+            repeat with s in sessions of t
+              if (unique ID of s) is "${itermSessionId.replace(/"/g, "")}" then
+                select w
+                select t
+                select s
+                activate
+                return "ok"
+              end if
+            end repeat
+          end repeat
+        end repeat
+        return "no"
+      end tell'`,
+      { timeout: 5000, encoding: "utf8", shell: "/bin/bash" },
+    ).trim();
+    return result === "ok";
+  } catch {
+    return false;
+  }
+}
+
 export function getItermSessionVar(itermSessionId: string): string | null {
   try {
     const script = withSessionAppleScript(
