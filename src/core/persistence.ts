@@ -223,6 +223,41 @@ export function setPersistentSessionName(itermSessionId: string, name: string): 
 }
 
 /**
+ * Drop names whose session no longer exists.
+ *
+ * This map is keyed by session id and has never been garbage-collected: on
+ * 2026-08-04 it held 96 entries, most of them ids belonging to terminals closed
+ * days earlier, including four separate dead ids all answering to "PAI". That
+ * is not merely untidy. `lookupPersistentName` resolves by durable id as well
+ * as primary id, so a stale entry is a live session's opportunity to answer to
+ * the wrong name — and answering to the wrong name is how `pai <Project>`
+ * reached the wrong terminal.
+ *
+ * `liveIds` must be the CURRENT set. The guard below is the whole safety of
+ * this function: called with an empty set — iTerm not running, an enumeration
+ * that failed, a daemon starting before the terminal — "no session is live"
+ * reads identically to "every session ended", and pruning would erase every
+ * name the user has ever assigned. So an empty set prunes nothing.
+ *
+ * Returns the number of entries removed, for the caller to log.
+ */
+export function pruneSessionNames(liveIds: Iterable<string>): number {
+  const live = new Set(liveIds);
+  if (live.size === 0) return 0;
+
+  const store = loadSessionNames();
+  let removed = 0;
+  for (const id of Object.keys(store)) {
+    if (!live.has(id)) {
+      delete store[id];
+      removed += 1;
+    }
+  }
+  if (removed > 0) saveSessionNames();
+  return removed;
+}
+
+/**
  * Get the user-chosen persistent name for an iTerm2 session, or undefined.
  */
 export function getPersistentSessionName(itermSessionId: string): string | undefined {

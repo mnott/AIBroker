@@ -21,6 +21,9 @@ import {
   DEFAULT_VOICE_CONFIG,
   loadSessionRegistry,
   saveSessionRegistry,
+  setPersistentSessionName,
+  getAllPersistentSessionNames,
+  pruneSessionNames,
 } from "../src/core/persistence.js";
 import { sessionRegistry, setVoiceConfig } from "../src/core/state.js";
 
@@ -157,4 +160,50 @@ test("fixing the file and re-reading it unblocks saving", () => {
   const written = JSON.parse(readFileSync(p, "utf-8")) as { voiceMode: boolean };
   assert.equal(written.voiceMode, true, "saving must work again");
   rmSync(dir, { recursive: true, force: true });
+});
+
+// ── session-names.json garbage collection ───────────────────────────────────
+//
+// The map is keyed by session id and was never collected: on 2026-08-04 it held
+// 96 entries, mostly ids of terminals closed days earlier, including four dead
+// ids all answering to "PAI". `lookupPersistentName` resolves by durable id as
+// well as primary id, so a stale entry is a live session's chance to answer to
+// somebody else's name.
+
+test("pruning drops names whose session is gone and keeps the live ones", () => {
+  tmp();
+  setPersistentSessionName("LIVE-1", "AIBroker");
+  setPersistentSessionName("DEAD-1", "PAI");
+  setPersistentSessionName("DEAD-2", "PAI");
+  setPersistentSessionName("LIVE-2", "Home");
+
+  const removed = pruneSessionNames(["LIVE-1", "LIVE-2"]);
+
+  assert.equal(removed, 2);
+  const names = getAllPersistentSessionNames();
+  assert.deepEqual(Object.keys(names).sort(), ["LIVE-1", "LIVE-2"]);
+  assert.equal(names["LIVE-1"], "AIBroker");
+});
+
+test("an empty live set prunes NOTHING", () => {
+  // The guard that makes this safe to call from a periodic job. iTerm not
+  // running, a failed enumeration and a daemon starting before the terminal all
+  // report zero live sessions, and they read identically to "every session
+  // ended" — so acting on it would erase every name the user ever assigned.
+  tmp();
+  setPersistentSessionName("A", "AIBroker");
+  setPersistentSessionName("B", "Home");
+
+  assert.equal(pruneSessionNames([]), 0);
+  assert.deepEqual(Object.keys(getAllPersistentSessionNames()).sort(), ["A", "B"]);
+});
+
+test("pruning nothing does not rewrite the file", () => {
+  const dir = tmp();
+  setPersistentSessionName("LIVE", "AIBroker");
+  const p = join(dir, "session-names.json");
+  const before = readFileSync(p, "utf-8");
+
+  assert.equal(pruneSessionNames(["LIVE"]), 0);
+  assert.equal(readFileSync(p, "utf-8"), before);
 });

@@ -28,7 +28,7 @@
  * them sends whoever reads the result looking in the wrong place.
  */
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { snapshotAllSessions } from "../transport/sync-facade.js";
@@ -493,8 +493,46 @@ export async function dispatch(
 function writeWorkOrder(label: string, body: string): string {
   const dir = join(homedir(), ".aibroker", "work-orders");
   mkdirSync(dir, { recursive: true });
+  pruneWorkOrders(dir);
   const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "task";
   const path = join(dir, `${slug}-${Date.now()}.md`);
   writeFileSync(path, body.endsWith("\n") ? body : `${body}\n`, "utf8");
   return path;
+}
+
+/** How long a staged work order is kept before it is assumed abandoned. */
+const WORK_ORDER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Drop work orders old enough that nobody is coming back for them.
+ *
+ * The receiving session is told to delete its own order, and a healthy dispatch
+ * does. Nothing deletes the others: a dispatch that fails after staging, a
+ * session killed mid-run, a tab closed before it read the file. Each leaves a
+ * copy of a work order — which is a copy of task content — sitting in the home
+ * directory indefinitely.
+ *
+ * Swept on write rather than on a timer: the only moment this directory is
+ * certainly in use is when something is being added to it, and a sweep that
+ * needs its own schedule is one more thing that can stop running silently.
+ *
+ * A week, because the point is to bound the pile, not to race the reader. An
+ * order still unread after seven days is not about to be read.
+ */
+function pruneWorkOrders(dir: string): void {
+  try {
+    const cutoff = Date.now() - WORK_ORDER_TTL_MS;
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".md")) continue;
+      const p = join(dir, name);
+      try {
+        if (statSync(p).mtimeMs < cutoff) unlinkSync(p);
+      } catch {
+        /* vanished under us, or not ours to remove — either way, skip it */
+      }
+    }
+  } catch {
+    // Housekeeping must never cost a dispatch. A directory that cannot be read
+    // is a reason to skip the sweep, not to fail the work order.
+  }
 }
