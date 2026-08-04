@@ -37,6 +37,7 @@ import { createHash } from "node:crypto";
 import { WatcherClient } from "../ipc/client.js";
 import { captureSession, typeIntoSession } from "../transport/sync-facade.js";
 import { DAEMON_SOCKET_PATH } from "./index.js";
+import { pruneSessionNames } from "../core/persistence.js";
 
 const HOME = homedir();
 const AIBROKER_DIR = join(HOME, ".aibroker");
@@ -329,6 +330,19 @@ async function doSnapshot(): Promise<{ merged: Entry[]; seen: number } | null> {
     if (!cwd) continue;
     const name = s.paiName || knownNameForCwd(known, cwd) || basename(cwd);
     fresh.push({ name, cwd, lastSeen: now, addedAt: now });
+  }
+
+  // Garbage-collect the name store while we have an authoritative live set.
+  //
+  // This is the only routine that both runs regularly and knows every open
+  // session, which makes it the only honest place to decide a name is dead.
+  // pruneSessionNames refuses to act on an empty set, so a failed enumeration
+  // costs nothing rather than erasing every name the user has assigned.
+  try {
+    const dropped = pruneSessionNames(sessions.map((s) => s.sessionId));
+    if (dropped > 0) console.error(`Pruned ${dropped} stale session name(s).`);
+  } catch {
+    // Housekeeping must never cost the snapshot — the restore list is the point.
   }
 
   const merged = mergeEntries(known, fresh, now);
