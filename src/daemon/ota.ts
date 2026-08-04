@@ -28,6 +28,21 @@ const COMPOSE_FILE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "
 const ENV_FILE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "docker", ".env");
 
 function composeExec(args: string[]): void {
+  // Say so plainly when the build context is not on disk. `files` in
+  // package.json whitelists what ships, and `docker` was not on that list, so
+  // every npm install of aibroker carried an `ota` command that could not
+  // possibly work — docker compose would fail on a missing file with a message
+  // about paths rather than about packaging. Found by unpacking the published
+  // tarball rather than by reading the working copy, where it is invisible.
+  if (!existsSync(COMPOSE_FILE)) {
+    console.error(
+      `OTA build context missing: ${COMPOSE_FILE}\n` +
+        `  This installation of aibroker did not ship docker/. Run \`aibroker ota\`\n` +
+        `  from a git checkout, or reinstall a version that includes it (>= 0.31.1).`
+    );
+    process.exit(1);
+  }
+
   const result = spawnSync(
     "docker",
     ["compose", "-f", COMPOSE_FILE, ...args],
