@@ -82,6 +82,33 @@ function setupTailscaleServe(): void {
   }
 }
 
+/**
+ * Remove the Serve mappings that `up` created.
+ *
+ * `down` used to stop the container and leave these behind, which matters
+ * because this hub is used in bursts: fire it up, publish a build, tear it
+ * down. Between bursts the tailnet kept advertising /install/ and /api/ on
+ * :8443 with nothing behind them — and before the port fix they pointed at
+ * 8765, so what answered was the PAILot MQTT broker rather than a 502.
+ *
+ * Each mapping is removed independently; `off` on a path that is already gone
+ * is an error we do not care about, so failures are reported and not fatal.
+ */
+function teardownTailscaleServe(): void {
+  const cmds = [
+    `tailscale serve --https=8443 --set-path=/install/ off`,
+    `tailscale serve --https=8443 --set-path=/api/ off`,
+  ];
+  for (const cmd of cmds) {
+    console.log(`+ ${cmd}`);
+    try {
+      execSync(cmd, { stdio: "inherit" });
+    } catch (e) {
+      console.warn(`tailscale serve may already be cleared: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+}
+
 export async function runOta(args: string[]): Promise<void> {
   const [sub, ...rest] = args;
 
@@ -98,6 +125,7 @@ export async function runOta(args: string[]): Promise<void> {
 
     case "down": {
       composeExec(["down"]);
+      teardownTailscaleServe();
       break;
     }
 
@@ -124,9 +152,14 @@ export async function runOta(args: string[]): Promise<void> {
       break;
     }
 
+    case "teardown-serve": {
+      teardownTailscaleServe();
+      break;
+    }
+
     default:
       console.error(`Unknown ota subcommand: ${sub ?? "(none)"}`);
-      console.error("Usage: aibroker ota [up|down|status|logs|setup-serve]");
+      console.error("Usage: aibroker ota [up|down|status|logs|setup-serve|teardown-serve]");
       process.exit(1);
   }
 }

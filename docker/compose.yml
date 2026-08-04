@@ -4,7 +4,12 @@ services:
       context: ./ota
       dockerfile: Dockerfile
     container_name: aibroker-ota
-    restart: unless-stopped
+    # "no", not "unless-stopped". This hub is on-demand: it exists so a PAILot
+    # build can reach a device while its owner is away — fire it up, publish,
+    # tear it down. "unless-stopped" brought it back on every Docker start, so
+    # a service wanted a few times a year was competing for a port at every
+    # boot, against a daemon carrying live traffic.
+    restart: "no"
     # 8767 — 8765 belongs to the daemon's PAILot MQTT broker, which is
     # launchd-managed and therefore always holds it first.
     ports:

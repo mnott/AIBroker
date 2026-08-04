@@ -3,6 +3,14 @@
 A lightweight Express service that ships iOS IPAs and Android APKs over Tailscale.
 Any app (PAILot, Glidr, future apps) is one tool-call away from "installable on your device from anywhere on Tailscale".
 
+**This hub is on-demand, and deliberately not running.** It exists for the case
+where a build has to reach a device you are not holding — you are travelling and
+PAILot on the phone needs an upgrade. The cycle is `aibroker ota up`, publish,
+`aibroker ota down`, and `down` now clears the Tailscale Serve mappings as well
+as stopping the container, so nothing is advertised on the tailnet between uses.
+`restart: "no"` in compose.yml is part of that: it must not come back by itself
+at boot.
+
 ## What it is
 
 `aibroker-ota` is a Docker container that:
@@ -119,9 +127,10 @@ Only `meta.json` files need backing up.
 ## Misc commands
 
 ```bash
-aibroker ota down          # stop container
+aibroker ota down          # stop container AND clear Tailscale Serve mappings
 aibroker ota status        # docker ps + tailscale serve status
 aibroker ota logs          # container logs
 aibroker ota logs -f       # follow logs
 aibroker ota setup-serve   # re-configure Tailscale Serve without restarting container
+aibroker ota teardown-serve # clear the Serve mappings without stopping the container
 ```
