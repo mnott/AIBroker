@@ -44,7 +44,7 @@ ${RULE}
 
 /** A bare shell — the tab exists but Claude has not drawn anything yet. */
 const SHELL = `Last login: Fri Jul 31 22:43:48 on ttys012
-i052341 in HKP9MJXWJY in ~/dev/ai/Whazaa
+user in hostname in ~/dev/ai/Whazaa
 Fri 31 | 22:43:49 ➜ `;
 
 // ── readiness ───────────────────────────────────────────────────────────────

@@ -4,8 +4,8 @@
  * There were three. `dispatch` compared PAI project names against session
  * labels exactly; `send_to_session` did a ranked substring search; PAILot was
  * handed an id and never resolved anything. Different rules, different edge
- * cases, each fixed on its own — so `jobs-matthias` failed to match a session
- * named `Jobs Matthias` in the first while the second would have found it, and
+ * cases, each fixed on its own — so `task-bus` failed to match a session
+ * named `Task Bus` in the first while the second would have found it, and
  * the miss did not fail, it spawned a duplicate tab with none of the context.
  *
  * Matching is ranked rather than first-past-the-post, and two properties are

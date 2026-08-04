@@ -77,7 +77,7 @@ export function inputBoxLines(frame: string): string[] {
  * and the preamble interleave, and so does anything the user types.
  *
  * Observed 2026-08-04: a spawned session received its Todoist work order while
- * `/Name Jobs Grazyna` and `go` were both still queued in the box.
+ * `/Name Voice Notes` and `go` were both still queued in the box.
  *
  * Emptiness — not idleness. A busy session with an empty box queues typed input
  * correctly and must still count as ready, which is what the original comment

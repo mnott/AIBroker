@@ -575,7 +575,7 @@ test("the task bus progress marker is not a work order", () => {
   // at 07:42:38 and dispatched — spawning a second session for a task that was
   // already running.
   const d = route(
-    noteAdded("**RUNNING** — started 2026-08-04 07:41 UTC, jobs-grazyna. Disappears when it finishes."),
+    noteAdded("**RUNNING** — started 2026-08-04 07:41 UTC, voice-notes. Disappears when it finishes."),
     cfg,
   );
   assert.equal(d.act, false);
@@ -583,7 +583,7 @@ test("the task bus progress marker is not a work order", () => {
 
 test("the progress marker is ignored once it carries the agent mark too", () => {
   const d = route(
-    noteAdded(`${AGENT_MARK} **RUNNING** — started 2026-08-04 07:41 UTC, jobs-grazyna.`),
+    noteAdded(`${AGENT_MARK} **RUNNING** — started 2026-08-04 07:41 UTC, voice-notes.`),
     cfg,
   );
   assert.equal(d.act, false);

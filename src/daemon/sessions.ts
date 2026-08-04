@@ -182,7 +182,7 @@ function hash(s: string): string { return createHash("sha1").update(s).digest("h
  * Merge identity for an entry.
  *
  * NOT cwd alone. Several distinct sessions legitimately share a directory —
- * "Home" and "Solar" both live in $HOME, "Jobs Matthias" has numbered siblings —
+ * "Home" and "Solar" both live in $HOME, "Task Bus" has numbered siblings —
  * and keying on cwd silently collapses them, so restore reopens one and drops
  * the rest. Losing a session is worse than the cost of this choice: renaming a
  * session leaves its old name behind as a twin, which `prune` ages out and
@@ -295,7 +295,7 @@ function ago(iso?: string): string {
  * snapshot used to invent `basename(cwd)` for them. That invention does not
  * stay local: restore relaunches with `--name <invented>` and a `/Name
  * <invented>` prompt, which writes it back into session-names.json, so the
- * guess becomes the truth. "Jobs Matthias" became "09 - Job Search" this way on
+ * guess becomes the truth. "Task Bus" became "09 - Notes" this way on
  * 2026-08-04, and paperfull/Paperfull the same way before it.
  *
  * The manifest already knows what the user calls this directory. Asking it

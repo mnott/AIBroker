@@ -335,9 +335,9 @@ test("an unrelated session is not matched", () => {
 });
 
 test("a substring is not a match", () => {
-  // "Jobs Matthias 2" must not satisfy a dispatch aimed at "Jobs Matthias".
-  const p = project({ displayName: "Jobs Matthias", names: ["jobs-matthias"] });
-  assert.equal(findSessionForProject(p, live("Jobs Matthias 2")), null);
+  // "Task Bus 2" must not satisfy a dispatch aimed at "Task Bus".
+  const p = project({ displayName: "Task Bus", names: ["task-bus"] });
+  assert.equal(findSessionForProject(p, live("Task Bus 2")), null);
 });
 
 test("the persistent PAI name wins over the raw session name", () => {
@@ -348,47 +348,47 @@ test("the persistent PAI name wins over the raw session name", () => {
 
 // ── separators are not significant ──────────────────────────────────────────
 //
-// A real miss on 2026-08-01: the alias is `jobs-matthias`, the session is named
-// `Jobs Matthias`, and they did not match. A miss here does not fail — it
+// A real miss on 2026-08-01: the alias is `task-bus`, the session is named
+// `Task Bus`, and they did not match. A miss here does not fail — it
 // SPAWNS. A live session holding the whole conversation was passed over and a
 // fresh tab opened in the right directory with none of the context, which looks
 // like success from every angle except the one that matters.
 
 test("a hyphenated alias matches a human-named session", () => {
   const project = {
-    name: "jobs-matthias", names: ["jobs-matthias"],
-    slug: "09-job-search", displayName: "09 - Job Search",
+    name: "task-bus", names: ["task-bus"],
+    slug: "09-voice-notes", displayName: "09 - Voice Notes",
   } as unknown as Parameters<typeof findSessionForProject>[0];
 
   const found = findSessionForProject(project, [
-    { id: "s-1", name: "✳ Jobs Matthias (node)", paiName: "Jobs Matthias" },
+    { id: "s-1", name: "✳ Task Bus (node)", paiName: "Task Bus" },
   ]);
   assert.equal(found?.id, "s-1");
 });
 
 test("underscores and doubled spaces fold the same way", () => {
   const project = {
-    name: "jobs_matthias", names: ["jobs_matthias"], slug: "x", displayName: "x",
+    name: "task_bus", names: ["task_bus"], slug: "x", displayName: "x",
   } as unknown as Parameters<typeof findSessionForProject>[0];
 
   assert.equal(findSessionForProject(project, [
-    { id: "s-2", name: "t", paiName: "Jobs  Matthias" },
+    { id: "s-2", name: "t", paiName: "Task  Bus" },
   ])?.id, "s-2");
 });
 
 test("folding separators does not make different projects collide", () => {
   const project = {
-    name: "jobs-grazyna", names: ["jobs-grazyna"], slug: "x", displayName: "x",
+    name: "voice-notes", names: ["voice-notes"], slug: "x", displayName: "x",
   } as unknown as Parameters<typeof findSessionForProject>[0];
 
   assert.equal(findSessionForProject(project, [
-    { id: "s-3", name: "t", paiName: "Jobs Matthias" },
+    { id: "s-3", name: "t", paiName: "Task Bus" },
   ]), null);
 });
 
 // ── a busy session is not an unreachable one ────────────────────────────────
 //
-// Reported live on 2026-08-01 from the Jobs Matthias session: dispatch returned
+// Reported live on 2026-08-01 from the Task Bus session: dispatch returned
 // unreachable ("never reacted") and the message had in fact arrived THREE
 // times. Claude Code queues typed input while a turn runs and does not read it
 // until the turn ends, so silence is the ordinary state of a session that is

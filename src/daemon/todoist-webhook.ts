@@ -743,7 +743,7 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
       let live = applyGrants(cfg);
 
       // A sub-project is a folder, not a second owner. Before this, organising
-      // tasks into "Jobs Matthias / Executive Search" moved them outside the
+      // tasks into "Task Bus / Archive" moved them outside the
       // allowlist and every one was refused — silently, and precisely when
       // someone tidied up. Only ancestors granted WITH a subtree flag apply, so
       // nothing becomes an ingress that nobody granted.

@@ -279,6 +279,19 @@ export async function startDaemon(options?: {
   // is the thing that notices the difference.
   startMailboxWatch();
 
+  // Keep the Todoist token valid here, in the daemon, because the daemon is the
+  // one process that is always up. Every other holder of this responsibility is
+  // occasional: a CLI invocation, an MCP shim loaded once per session, a reply
+  // path that only refreshes after a 401 has already failed. Todoist issues
+  // one-hour tokens, so "refresh when someone needs it" means the token is
+  // expired for most of the day — measured 8.4 hours expired on 2026-08-04.
+  if (process.env.TODOIST_CLIENT_ID && process.env.TODOIST_CLIENT_SECRET) {
+    const { startTokenKeeper } = await import("./todoist-oauth.js");
+    startTokenKeeper();
+  } else {
+    log("todoist-oauth: keeper not started — TODOIST_CLIENT_ID/SECRET not set");
+  }
+
   startTodoistWebhook({
     deliver: async (project, body, opts) => {
       const { dispatch } = await import("./dispatch.js");

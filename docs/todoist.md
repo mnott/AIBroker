@@ -176,7 +176,7 @@ Effective on the next webhook, no restart. Every change is recorded in the audit
 
 **Deleting the project revokes its grant automatically.** A grant outliving the thing it points at reads as though access is still open — and if the id were ever reused, it silently would be. The boundary only ever shrinks on its own.
 
-**Sub-projects are folders, not owners** — but only if you say so. A project nested under an allowed one is *not* automatically allowed: organising tasks into `Jobs Matthias / Executive Search 🎯` moves them outside the allowlist and every one is refused, silently, precisely when someone tidies up.
+**Sub-projects are folders, not owners** — but only if you say so. A project nested under an allowed one is *not* automatically allowed: organising tasks into `Task Bus / Archive 🎯` moves them outside the allowlist and every one is refused, silently, precisely when someone tidies up.
 
 ```bash
 aibroker todoist ingress add <rootId>=<owner> --subtree
@@ -184,7 +184,7 @@ aibroker todoist ingress add <rootId>=<owner> --subtree
 
 grants the project **and every project nested under it, at any depth**, each inheriting the root's owner. A folder is not a second owner.
 
-**A granted root often has no owner** — `Claude 🤖` is a container, not a session — and its children are named after the sessions they serve: `Home`, `SL`, `Whazaa`. In that case a child takes **its own name** as its owner, matched against running sessions and configured aliases with separators folded, so `Jobs Matthias` resolves to `jobs-matthias`. An ancestor that *does* name an owner still wins, because `Executive Search 🎯` under `Jobs Matthias` belongs to jobs-matthias rather than to a session of its own. A name matching nothing leaves the owner unset and the ordinary rules apply — inventing an owner from an unrecognised name would be worse than falling through.
+**A granted root often has no owner** — `Claude 🤖` is a container, not a session — and its children are named after the sessions they serve: `Home`, `SL`, `Whazaa`. In that case a child takes **its own name** as its owner, matched against running sessions and configured aliases with separators folded, so `Task Bus` resolves to `task-bus`. An ancestor that *does* name an owner still wins, because `Archive 🎯` under `Task Bus` belongs to task-bus rather than to a session of its own. A name matching nothing leaves the owner unset and the ordinary rules apply — inventing an owner from an unrecognised name would be worse than falling through.
 
 Names are read from the project tree **by id**. Todoist's project search returns nothing for names containing emoji, so anything resolving a project by name would report one that plainly exists as absent.
 
@@ -192,7 +192,7 @@ Still opt-in, and the residual risk is worth stating plainly: a project shared w
 
 Without `--subtree`, a grant covers exactly one project, which is the old behaviour and remains the right default for anything shared.
 
-Resolution keys on **project id, never on name**. Todoist's project search returns nothing for names containing emoji — `Executive Search 🎯` is invisible to a name query — so a resolver that fell back to matching names would report "no such project" for one that plainly exists.
+Resolution keys on **project id, never on name**. Todoist's project search returns nothing for names containing emoji — `Archive 🎯` is invisible to a name query — so a resolver that fell back to matching names would report "no such project" for one that plainly exists.
 
 **Owner names must be dispatchable.** An owner is a curated PAI alias, not merely the title of a running tab. A grant pointing at a name dispatch cannot resolve looks perfectly configured and routes nowhere; the audit says `unlaunchable`, which is the only sign you get.
 
@@ -422,11 +422,11 @@ Due dates still fire nothing. If you want a task to come back to you, give it a 
 
 ### Do not create a project you already have
 
-A session knows itself by its alias, `jobs-matthias`. The project a human made for it is called `Jobs Matthias`. A session comparing those literally finds nothing and creates a second project; work then splits across two lists and the human watches the wrong one.
+A session knows itself by its alias, `task-bus`. The project a human made for it is called `Task Bus`. A session comparing those literally finds nothing and creates a second project; work then splits across two lists and the human watches the wrong one.
 
 ```
-todoist_ingress(action: "resolve", owner: "jobs-matthias")
-→ { found: true, projectId: "…", projectName: "Claude 🤖/Jobs Matthias" }
+todoist_ingress(action: "resolve", owner: "task-bus")
+→ { found: true, projectId: "…", projectName: "Claude 🤖/Task Bus" }
 ```
 
 Resolve before creating. Owner matching folds separators, so every written form of the name finds the same project.

@@ -35,8 +35,8 @@ export interface IngressGrant {
    * Does this grant cover the project's descendants?
    *
    * Opt-in per grant, deliberately. A sub-project is a folder, not a second
-   * owner: someone organising their work into "Jobs Matthias / Executive
-   * Search" has not made a decision about execution ingress, and before this
+   * owner: someone organising their work into "Task Bus / Archive" has not
+   * made a decision about execution ingress, and before this
    * existed those tasks were refused with "not an ingress project" — silently,
    * and exactly when they tidied up.
    *
@@ -76,8 +76,8 @@ export function listGrants(): IngressGrant[] {
 /**
  * Which project belongs to this session.
  *
- * Exists because a session knows itself by its alias — `jobs-matthias` — while
- * the project a human made for it is called `Jobs Matthias`. Asked to file a
+ * Exists because a session knows itself by its alias — `task-bus` — while
+ * the project a human made for it is called `Task Bus`. Asked to file a
  * task "in my project", a session that compares those literally finds nothing
  * and creates a second project named after the alias. Two projects then look
  * like one, work lands in whichever the session picked, and the human watches
@@ -205,7 +205,7 @@ export function expandThroughSubtree(
  * A project named after a session belongs to it.
  *
  * Separator-folded for the same reason session matching is: an alias is written
- * `jobs-matthias` and a human names the folder `Jobs Matthias`.
+ * `task-bus` and a human names the folder `Task Bus`.
  */
 function ownerFromName(self?: { name?: string; known?: Iterable<string> }): string | undefined {
   if (!self?.name || !self.known) return undefined;

@@ -244,7 +244,7 @@ export function readAudit(q: AuditQuery = {}): AuditEvent[] {
     // returning [] made the two byte-identical to every caller. PAI shipped the
     // same shape in its Postgres search on 2026-08-04: a dead container made
     // memory_search answer "No results found", another session believed it, and
-    // told Matthias a fact that was not true. Nothing in the response could have
+    // told the user a fact that was not true. Nothing in the response could have
     // revealed it. An unreadable log is louder than a quiet lie.
     throw new Error(
       `Audit log exists but could not be read: ${AUDIT_FILE}\n` +

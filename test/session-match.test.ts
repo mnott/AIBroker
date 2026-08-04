@@ -2,7 +2,7 @@
  * test/session-match.test.ts — one resolver, three former behaviours.
  *
  * There used to be three ways to decide which session a name meant, each fixed
- * on its own. `jobs-matthias` failed to match a session called `Jobs Matthias`
+ * on its own. `task-bus` failed to match a session called `Task Bus`
  * in dispatch while send_to_session would have found it — and in dispatch a
  * miss does not fail, it spawns a duplicate tab with none of the context.
  */
@@ -11,20 +11,20 @@ import assert from "node:assert/strict";
 import { matchSession, normaliseLabel, labelOf } from "../src/core/session-match.js";
 
 const sessions = [
-  { id: "s-claude", name: "✳ Jobs Matthias (node)", paiName: "Jobs Matthias" },
-  { id: "s-other", name: "✳ Jobs Grazyna (node)", paiName: "Jobs Grazyna" },
+  { id: "s-claude", name: "✳ Task Bus (node)", paiName: "Task Bus" },
+  { id: "s-other", name: "✳ Voice Notes (node)", paiName: "Voice Notes" },
   { id: "s-shell", name: "~/dev/ai/clickr (-zsh)", paiName: null },
   { id: "s-clickr", name: "✳ Clickr (node)", paiName: "Clickr" },
 ];
 
 test("separators fold, so an alias finds a human-named session", () => {
-  const hit = matchSession(["jobs-matthias"], sessions);
+  const hit = matchSession(["task-bus"], sessions);
   assert.equal(hit?.session.id, "s-claude");
   assert.equal(hit?.kind, "normalised");
 });
 
 test("an exact match is reported as exact", () => {
-  assert.equal(matchSession(["Jobs Matthias"], sessions)?.kind, "exact");
+  assert.equal(matchSession(["Task Bus"], sessions)?.kind, "exact");
 });
 
 test("substring is off by default", () => {
@@ -55,15 +55,15 @@ test("no reference matches nothing rather than the first session", () => {
 });
 
 test("distinct names do not collide once separators fold", () => {
-  assert.equal(matchSession(["jobs-grazyna"], sessions)?.session.id, "s-other");
+  assert.equal(matchSession(["voice-notes"], sessions)?.session.id, "s-other");
 });
 
 test("normaliseLabel folds every separator to one space", () => {
-  assert.equal(normaliseLabel("Jobs__Matthias"), "jobs matthias");
-  assert.equal(normaliseLabel("  09 - Job   Search "), "09 job search");
+  assert.equal(normaliseLabel("Task__Bus"), "task bus");
+  assert.equal(normaliseLabel("  09 - Voice   Notes "), "09 voice notes");
 });
 
 test("labelOf prefers the persistent name over the tab title", () => {
-  assert.equal(labelOf(sessions[0]), "Jobs Matthias");
+  assert.equal(labelOf(sessions[0]), "Task Bus");
   assert.equal(labelOf(sessions[2]), "~/dev/ai/clickr (-zsh)");
 });

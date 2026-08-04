@@ -191,7 +191,7 @@ export interface LiveSession { id: string; name: string; paiName: string | null 
  *
  * But "the box is drawn" was too weak. The preamble is typed into that box and
  * sits there unsubmitted while it is drawn, so a dispatcher that fired on the
- * first drawn box appended its work order to `/Name Jobs Grazyna` and `go` —
+ * first drawn box appended its work order to `/Name Voice Notes` and `go` —
  * three inputs racing in one box, with the user's own typing landing in the
  * middle of it. Reported live on 2026-08-04.
  *

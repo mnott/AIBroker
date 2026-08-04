@@ -16,7 +16,7 @@
  *   "aibroker": {
  *     "type": "stdio",
  *     "command": "node",
- *     "args": ["/Users/i052341/dev/ai/AIBroker/dist/mcp/index.js"]
+ *     "args": ["/path/to/AIBroker/dist/mcp/index.js"]
  *   }
  */
 
@@ -515,7 +515,7 @@ server.tool(
 
 server.tool(
   "todoist_ingress",
-  "List, resolve or change which Todoist projects may reach a session. BEFORE creating any Todoist project for a session, call action:\"resolve\" with that session's owner name — a project almost certainly already exists under a human-readable name (`Jobs Matthias`) that will not match the alias you know yourself by (`jobs-matthias`), and creating a second one splits the work so the user watches the wrong list. A task filed into an allowed project becomes an instruction a session runs with the user's full rights, so granting is a security boundary: grant deliberately, never speculatively, and tell the user what you granted. Takes effect immediately — no daemon restart. Every change is recorded in the audit trail.",
+  "List, resolve or change which Todoist projects may reach a session. BEFORE creating any Todoist project for a session, call action:\"resolve\" with that session's owner name — a project almost certainly already exists under a human-readable name (`Task Bus`) that will not match the alias you know yourself by (`task-bus`), and creating a second one splits the work so the user watches the wrong list. A task filed into an allowed project becomes an instruction a session runs with the user's full rights, so granting is a security boundary: grant deliberately, never speculatively, and tell the user what you granted. Takes effect immediately — no daemon restart. Every change is recorded in the audit trail.",
   {
     action: z.enum(["list", "resolve", "add", "remove"]).describe("list (default), resolve (find the project for an owner), add, or remove"),
     projectId: z.string().optional().describe("Todoist project id. Required for add and remove."),

@@ -42,16 +42,16 @@ const EXITED = `❯ Status probe from the AIBroker scheduler. Reply with one sho
 ${RULE} coogle ──
 ❯
 [1]  + 65928 suspended (tty input)  ${RULE}
-i052341 in  HKP9MJXWJY in …coogle on 🌿 main is 📦 v0.2.23 via 🥟 v1.3.5
+user in  hostname in …coogle on 🌿 main is 📦 v0.2.23 via 🥟 v1.3.5
 ✦ Sat 01 | 13:17:08 ️ ➜ Post-test check: one word reply please — ok?
 zsh: no matches found: ok?
-i052341 in  HKP9MJXWJY in …coogle on 🌿 main is 📦 v0.2.23 via 🥟 v1.3.5
+user in  hostname in …coogle on 🌿 main is 📦 v0.2.23 via 🥟 v1.3.5
 ✦ Sat 01 | 13:17:09 ️ ❌1 ✗
-i052341 in  HKP9MJXWJY in …coogle on 🌿 main is 📦 v0.2.23 via 🥟 v1.3.5
+user in  hostname in …coogle on 🌿 main is 📦 v0.2.23 via 🥟 v1.3.5
 ✦ Sat 01 | 13:17:09 ️ ➜`;
 
 /** A plain shell that never ran Claude. */
-const SHELL = `i052341 in HKP9MJXWJY in ~/dev/ai/coogle
+const SHELL = `user in hostname in ~/dev/ai/coogle
 Sat 01 | 13:18:02 ️ ➜`;
 
 test("a live Claude prompt is ready", () => {

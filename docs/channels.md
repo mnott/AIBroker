@@ -20,8 +20,8 @@ session with a working directory, a project and a person behind it. Routing is
 the act of turning "an event happened" into "this session should know".
 
 Sessions are matched by name through one resolver, `core/session-match.ts`,
-which folds whitespace, hyphens and underscores. `jobs-matthias`,
-`Jobs Matthias` and `jobs_matthias` are the same session; that is deliberate,
+which folds whitespace, hyphens and underscores. `task-bus`,
+`Task Bus` and `task_bus` are the same session; that is deliberate,
 because humans name projects one way and configuration files another.
 
 ## 2. The channel decides the addressee. The payload never does.

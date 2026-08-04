@@ -98,7 +98,7 @@ test("a corrupt voice config is not replaced by the defaults", () => {
   const dir = tmp();
   reset();
   const p = join(dir, "voice-config.json");
-  const original = '{"defaultVoice":"af_nicole","personas":{"Matthias":"bm_daniel"} TRUNCATED';
+  const original = '{"defaultVoice":"af_nicole","personas":{"Narrator":"bm_daniel"} TRUNCATED';
   writeFileSync(p, original);
 
   const merged = loadVoiceConfig();
@@ -113,17 +113,17 @@ test("a readable voice config round-trips", () => {
   const dir = tmp();
   reset();
   const p = join(dir, "voice-config.json");
-  writeFileSync(p, JSON.stringify({ defaultVoice: "af_nicole", personas: { Matthias: "bm_daniel" } }));
+  writeFileSync(p, JSON.stringify({ defaultVoice: "af_nicole", personas: { Narrator: "bm_daniel" } }));
 
   const merged = loadVoiceConfig();
   assert.equal(merged.defaultVoice, "af_nicole");
-  assert.equal(merged.personas.Matthias, "bm_daniel", "custom personas survive the merge");
+  assert.equal(merged.personas.Narrator, "bm_daniel", "custom personas survive the merge");
   assert.equal(merged.personas.Fable, DEFAULT_VOICE_CONFIG.personas.Fable, "defaults still fill in");
 
   saveVoiceConfig({ ...merged, voiceMode: true });
   const written = JSON.parse(readFileSync(p, "utf-8")) as { voiceMode: boolean; personas: Record<string, string> };
   assert.equal(written.voiceMode, true);
-  assert.equal(written.personas.Matthias, "bm_daniel");
+  assert.equal(written.personas.Narrator, "bm_daniel");
   rmSync(dir, { recursive: true, force: true });
 });
 

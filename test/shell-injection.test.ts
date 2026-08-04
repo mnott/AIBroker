@@ -41,11 +41,11 @@ ${RULE} Clickr ──
 ❯
 ${RULE}
   👋 PAI CC 2.1.220 🧠 Opus 5
-i052341 in HKP9MJXWJY in …clickr on 🌿 main
+user in hostname in …clickr on 🌿 main
 ✦ Sat 01 | 13:40:11 ️ ➜`;
 
 /** A shell that never ran Claude. */
-const SHELL = `i052341 in HKP9MJXWJY in ~/dev/ai/clickr
+const SHELL = `user in hostname in ~/dev/ai/clickr
 ✦ Sat 01 | 13:40:02 ️ ➜`;
 
 test("a live Claude prompt accepts writes", () => {

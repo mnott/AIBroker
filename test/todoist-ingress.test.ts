@@ -105,63 +105,63 @@ test("revoking is idempotent, so a repeated delete event is harmless", () => {
 // ── finding the project you already have ────────────────────────────────────
 
 test("an owner resolves to its project, separators folded", () => {
-  // A session knows itself as `jobs-matthias`; the human made `Jobs Matthias`.
+  // A session knows itself as `task-bus`; the human made `Task Bus`.
   // Comparing those literally is how a second project gets created and the
   // work splits across two lists.
-  grantIngress("p-jobs", { owner: "jobs-matthias", projectName: "Jobs Matthias" });
-  assert.equal(projectForOwner("jobs-matthias")?.projectId, "p-jobs");
-  assert.equal(projectForOwner("Jobs Matthias")?.projectId, "p-jobs");
-  assert.equal(projectForOwner("JOBS_MATTHIAS")?.projectId, "p-jobs");
+  grantIngress("p-jobs", { owner: "task-bus", projectName: "Task Bus" });
+  assert.equal(projectForOwner("task-bus")?.projectId, "p-jobs");
+  assert.equal(projectForOwner("Task Bus")?.projectId, "p-jobs");
+  assert.equal(projectForOwner("TASK_BUS")?.projectId, "p-jobs");
 });
 
 test("an unknown owner resolves to nothing rather than a near match", () => {
   // Returning the wrong project would be worse than returning none: the caller
   // would file into it confidently.
-  assert.equal(projectForOwner("jobs-grazyna"), undefined);
+  assert.equal(projectForOwner("voice-notes"), undefined);
 });
 
 
 // ── folders are not owners ──────────────────────────────────────────────────
 //
-// Matthias nested "Executive Search 🎯" under "Jobs Matthias". Eighteen tasks
+// The user nested "Archive 🎯" under "Task Bus". Eighteen tasks
 // moved out of the allowlist by being tidied up, and every one was refused with
 // "not an ingress project" — silently, and precisely when someone organised
 // their work. A sub-project is a folder; ownership belongs to the granted root.
 
 const tree = new Map([
   ["root", { id: "root", name: "Claude 🤖" }],
-  ["jobs", { id: "jobs", name: "Jobs Matthias", parentId: "root" }],
-  ["exec", { id: "exec", name: "Executive Search 🎯", parentId: "jobs" }],
+  ["jobs", { id: "jobs", name: "Task Bus", parentId: "root" }],
+  ["exec", { id: "exec", name: "Archive 🎯", parentId: "jobs" }],
   ["deep", { id: "deep", name: "Deeper", parentId: "exec" }],
   ["other", { id: "other", name: "Somewhere else" }],
 ]);
 
 test("a child of a subtree grant is allowed and inherits its owner", () => {
-  grantIngress("jobs", { owner: "jobs-matthias", subtree: true });
+  grantIngress("jobs", { owner: "task-bus", subtree: true });
   const live = expandThroughSubtree(base, "exec", ancestorsOf("exec", tree));
   assert.ok(live.ingressProjectIds.has("exec"));
-  assert.equal(live.projectOwners.get("exec"), "jobs-matthias");
+  assert.equal(live.projectOwners.get("exec"), "task-bus");
 });
 
 test("inheritance reaches any depth, not just direct children", () => {
   // The PAI bug was root-plus-one-level. A grandchild was never even queried.
-  grantIngress("jobs", { owner: "jobs-matthias", subtree: true });
+  grantIngress("jobs", { owner: "task-bus", subtree: true });
   const live = expandThroughSubtree(base, "deep", ancestorsOf("deep", tree));
   assert.ok(live.ingressProjectIds.has("deep"));
-  assert.equal(live.projectOwners.get("deep"), "jobs-matthias");
+  assert.equal(live.projectOwners.get("deep"), "task-bus");
 });
 
 test("a grant WITHOUT subtree does not cover its children", () => {
   // Subtree is opt-in. Nothing becomes an ingress that nobody granted.
   clearGrants();
-  grantIngress("jobs", { owner: "jobs-matthias" });
+  grantIngress("jobs", { owner: "task-bus" });
   const live = expandThroughSubtree(base, "exec", ancestorsOf("exec", tree));
   assert.equal(live.ingressProjectIds.has("exec"), false);
 });
 
 test("a project outside every granted tree stays refused", () => {
   clearGrants();
-  grantIngress("jobs", { owner: "jobs-matthias", subtree: true });
+  grantIngress("jobs", { owner: "task-bus", subtree: true });
   const live = expandThroughSubtree(base, "other", ancestorsOf("other", tree));
   assert.equal(live.ingressProjectIds.has("other"), false);
 });
@@ -190,7 +190,7 @@ test("ancestorsOf survives a cycle rather than hanging", () => {
 // and falls to the default owner. Three such projects were created in one
 // afternoon and all were silently unreachable.
 
-const KNOWN_OWNERS = ["home", "sl", "whazaa", "jobs-matthias"];
+const KNOWN_OWNERS = ["home", "sl", "whazaa", "task-bus"];
 
 test("a child of an ownerless granted root takes its own name as owner", () => {
   clearGrants();
@@ -201,19 +201,19 @@ test("a child of an ownerless granted root takes its own name as owner", () => {
 });
 
 test("the granting ancestor's owner still wins over the name", () => {
-  // "Executive Search 🎯" under "Jobs Matthias" belongs to jobs-matthias, not to
-  // a session called Executive Search — a folder is not a second owner.
+  // "Archive 🎯" under "Task Bus" belongs to task-bus, not to
+  // a session called Archive — a folder is not a second owner.
   clearGrants();
-  grantIngress("jobs", { owner: "jobs-matthias", subtree: true });
-  const live = expandThroughSubtree(base, "exec-id", ["jobs"], { name: "Executive Search 🎯", known: KNOWN_OWNERS });
-  assert.equal(live.projectOwners.get("exec-id"), "jobs-matthias");
+  grantIngress("jobs", { owner: "task-bus", subtree: true });
+  const live = expandThroughSubtree(base, "exec-id", ["jobs"], { name: "Archive 🎯", known: KNOWN_OWNERS });
+  assert.equal(live.projectOwners.get("exec-id"), "task-bus");
 });
 
 test("name matching folds separators", () => {
   clearGrants();
   grantIngress("root", { subtree: true });
-  const live = expandThroughSubtree(base, "jm-id", ["root"], { name: "Jobs Matthias", known: KNOWN_OWNERS });
-  assert.equal(live.projectOwners.get("jm-id"), "jobs-matthias");
+  const live = expandThroughSubtree(base, "jm-id", ["root"], { name: "Task Bus", known: KNOWN_OWNERS });
+  assert.equal(live.projectOwners.get("jm-id"), "task-bus");
 });
 
 test("a name matching nothing leaves the owner unset, not guessed", () => {

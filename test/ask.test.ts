@@ -19,10 +19,10 @@ import type { TerminalIO } from "../src/daemon/terminal-screen.js";
 const RULE = "─".repeat(60);
 
 const project = (over: Partial<PaiProject> = {}): PaiProject => ({
-  name: "jobs-matthias",
-  names: ["jobs-matthias"],
-  slug: "jobs-matthias",
-  displayName: "Jobs Matthias",
+  name: "task-bus",
+  names: ["task-bus"],
+  slug: "task-bus",
+  displayName: "Task Bus",
   rootPath: "/jobs",
   sessionCount: 0,
   lastActive: "",
@@ -33,7 +33,7 @@ const live = (label: string) => [{ id: "S1", name: label, paiName: label }];
 
 /** An idle Claude prompt showing `transcript` above an empty input box. */
 const screen = (transcript: string) =>
-  `${transcript}\n${RULE} Jobs Matthias ──\n❯\n${RULE}\n  👋 PAI CC 2.1.220`;
+  `${transcript}\n${RULE} Task Bus ──\n❯\n${RULE}\n  👋 PAI CC 2.1.220`;
 
 /**
  * A scripted terminal. Frames advance one per poll; the last repeats, which is
@@ -54,14 +54,14 @@ function fake(frames: string[], onSend?: (t: string) => string[]) {
 }
 
 function deps(io: TerminalIO, over: Partial<AskDeps> = {}): AskDeps {
-  return { resolve: async () => project(), sessions: () => live("Jobs Matthias"), io, ...over };
+  return { resolve: async () => project(), sessions: () => live("Task Bus"), io, ...over };
 }
 
 // ── outcomes ────────────────────────────────────────────────────────────────
 
 test("no live session -> absent, and nothing is spawned", async () => {
   const f = fake([screen("idle")]);
-  const r = await ask("jobs-matthias", "status?", {}, deps(f.io, { sessions: () => [] }));
+  const r = await ask("task-bus", "status?", {}, deps(f.io, { sessions: () => [] }));
   assert.equal(r.state, "absent");
   assert.equal(r.replied, false);
   assert.equal(r.session, "");
@@ -80,10 +80,10 @@ test("a busy session is reported ALIVE without being interrupted", async () => {
   // The case that makes a three-outcome contract unsafe: mid-turn work is
   // indistinguishable from wedged unless checked before asking.
   const f = fake([screen("working… 1"), screen("working… 2"), screen("working… 3")]);
-  const r = await ask("jobs-matthias", "status?", {}, deps(f.io));
+  const r = await ask("task-bus", "status?", {}, deps(f.io));
   assert.equal(r.state, "busy");
   assert.equal(r.replied, false);
-  assert.equal(r.session, "Jobs Matthias");
+  assert.equal(r.session, "Task Bus");
   assert.equal(f.sent().length, 0, "a working session must not be charged tokens for a probe");
   assert.match(r.reason!, /evidence of life/);
 });
@@ -97,7 +97,7 @@ test("an idle session is asked, and its answer is returned", async () => {
     screen(`❯ ${q}\n\n⏺ still sweeping, ~10 min left`),
     screen(`❯ ${q}\n\n⏺ still sweeping, ~10 min left`),
   ]);
-  const r = await ask("jobs-matthias", "status?", {}, deps(f.io));
+  const r = await ask("task-bus", "status?", {}, deps(f.io));
   assert.equal(r.state, "replied");
   assert.equal(r.replied, true);
   assert.equal(r.reply, "still sweeping, ~10 min left");
@@ -106,23 +106,23 @@ test("an idle session is asked, and its answer is returned", async () => {
 
 test("an idle session that never answers -> silent", async () => {
   const f = fake([screen("x")], (q) => [screen(`❯ ${q}`)]);
-  const r = await ask("jobs-matthias", "status?", { timeoutMs: 8_000 }, deps(f.io));
+  const r = await ask("task-bus", "status?", { timeoutMs: 8_000 }, deps(f.io));
   assert.equal(r.state, "silent");
   assert.equal(r.replied, false);
 });
 
 test("a session that never accepts the question -> silent, not replied", async () => {
   // Question sits unsubmitted in the input box forever.
-  const f = fake([screen("x")], (q) => [`${RULE} Jobs Matthias ──\n❯ ${q}\n${RULE}`]);
-  const r = await ask("jobs-matthias", "status?", { timeoutMs: 20_000 }, deps(f.io));
+  const f = fake([screen("x")], (q) => [`${RULE} Task Bus ──\n❯ ${q}\n${RULE}`]);
+  const r = await ask("task-bus", "status?", { timeoutMs: 20_000 }, deps(f.io));
   assert.equal(r.state, "silent");
   assert.match(r.reason!, /never accepted/);
 });
 
 test("a session sitting at a shell prompt -> silent, and is not asked", async () => {
-  const shell = "i052341 in ~/jobs\nFri 31 | 22:43:49 ➜ ";
+  const shell = "user in ~/work\nFri 31 | 22:43:49 ➜ ";
   const f = fake([shell, shell, shell]);
-  const r = await ask("jobs-matthias", "status?", {}, deps(f.io));
+  const r = await ask("task-bus", "status?", {}, deps(f.io));
   assert.equal(r.state, "silent");
   assert.match(r.reason!, /not showing a Claude prompt/);
   assert.equal(f.sent().length, 0);
