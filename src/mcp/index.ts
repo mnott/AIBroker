@@ -25,6 +25,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { execSync } from "node:child_process";
 import { WatcherClient } from "../ipc/client.js";
+import { OTA_PORT } from "../daemon/ota.js";
 
 const DAEMON_SOCKET = "/tmp/aibroker.sock";
 
@@ -1074,7 +1075,7 @@ server.tool(
       const result = exec(
         [
           "curl", "-sf", "-X", "POST",
-          "http://127.0.0.1:8765/api/apps",
+          `http://127.0.0.1:${OTA_PORT}/api/apps`,
           "-F", `slug=${slug}`,
           "-F", `name=${name}`,
           "-F", `bundleId=${bundleId}`,
