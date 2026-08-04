@@ -28,6 +28,9 @@
  * them sends whoever reads the result looking in the wrong place.
  */
 
+import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { snapshotAllSessions } from "../transport/sync-facade.js";
 import {
   findCuratedPaiProject,
@@ -43,6 +46,7 @@ import {
   flatten,
   inputBoxLines,
   isClaudeReady,
+  isInputBoxEmpty,
   hasBeenSubmitted,
   realIO,
   sleep,
@@ -103,7 +107,7 @@ export interface DispatchDeps {
   resolve: (name: string) => Promise<PaiProject | undefined>;
   sessions: () => { id: string; name: string; paiName: string | null }[];
   deliver: (sessionId: string, body: string, timeoutMs: number, io?: TerminalIO, retries?: number) => Promise<AckResult>;
-  launch: (project: PaiProject) => Promise<{ itermSessionId: string }>;
+  launch: (project: PaiProject, opts?: { initialPrompt?: string }) => Promise<{ itermSessionId: string }>;
   waitReady: (sessionId: string, timeoutMs: number) => Promise<boolean>;
   /** Read a session's screen, to confirm Claude still owns the tty. */
   capture: (sessionId: string) => string | null;
@@ -183,7 +187,17 @@ export interface LiveSession { id: string; name: string; paiName: string | null 
  * `/Name … go` preamble and stays busy for minutes; waiting for the screen to
  * settle times out on a session that is perfectly healthy — which is exactly
  * what the first version did. Claude Code queues typed input while it works, so
- * the real gate is whether the input box has been drawn yet.
+ * idleness is the wrong gate.
+ *
+ * But "the box is drawn" was too weak. The preamble is typed into that box and
+ * sits there unsubmitted while it is drawn, so a dispatcher that fired on the
+ * first drawn box appended its work order to `/Name Jobs Grazyna` and `go` —
+ * three inputs racing in one box, with the user's own typing landing in the
+ * middle of it. Reported live on 2026-08-04.
+ *
+ * The gate is therefore drawn AND empty: the preamble has been submitted and
+ * the box is free. A busy session still qualifies, which preserves the point of
+ * the paragraph above.
  */
 export async function waitForReady(
   sessionId: string,
@@ -195,7 +209,7 @@ export async function waitForReady(
     await io.sleep(READY_POLL_MS);
     const frame = io.capture(sessionId);
     if (frame === null) continue;
-    if (isClaudeReady(frame)) return true;
+    if (isClaudeReady(frame) && isInputBoxEmpty(frame)) return true;
   }
   return false;
 }
@@ -391,9 +405,37 @@ export async function dispatch(
     };
   }
 
+  // Hand the work order over IN the launch, not by typing afterwards.
+  //
+  // See the long note in pai-projects.ts: a freshly launched session holds its
+  // `/Name … go` preamble as queued prompts that are not rendered anywhere, so
+  // "the session looks ready" is true for ~8 seconds before those prompts run.
+  // Typing into that window interleaves the work order with the rename and the
+  // resume. The queue is ordered and nothing else writes to it, so passing the
+  // order as the second queued prompt is race-free by construction.
+  //
+  // Via a file because the queue separator is a newline: a multi-line body
+  // passed inline would arrive as several unrelated prompts. One line pointing
+  // at the body keeps the body arbitrarily long and the instruction atomic.
+  let orderPath: string;
+  try {
+    orderPath = writeWorkOrder(label, body);
+  } catch (err) {
+    return {
+      outcome: "unreachable",
+      project: label,
+      session: "",
+      reason: `Could not stage the work order: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
   let itermSessionId: string;
   try {
-    ({ itermSessionId } = await deps.launch(project));
+    ({ itermSessionId } = await deps.launch(project, {
+      initialPrompt:
+        `${opts.prefix ?? TASK_PREFIX} Your work order is in ${orderPath} — read that file and carry it out. ` +
+        `It was written for this session only; delete it once you have read it.`,
+    }));
   } catch (err) {
     return {
       outcome: "unreachable",
@@ -422,30 +464,37 @@ export async function dispatch(
     };
   }
 
-  // Booting can eat the whole budget. Say so, rather than attempting a delivery
-  // with no time left and blaming the session for not answering.
-  if (left() <= 0) {
-    return {
-      outcome: "unreachable",
-      project: label,
-      session: label,
-      reason:
-        `Launched a session in ${project.rootPath} and it came up, but the ` +
-        `${Math.round((budgetMs ?? 0) / 1000)}s budget was spent getting there, ` +
-        `leaving none to deliver in. Raise the timeout.`,
-    };
-  }
+  // No budget check here any more, and its absence is the point.
+  //
+  // While the work order was TYPED after boot, a boot that ate the budget left
+  // nothing to deliver in, and `unreachable` was the honest answer. Now the
+  // order is queued by the launch itself, so once the tab exists the work is
+  // handed over whether or not the clock ran out. Reporting failure at this
+  // point would tell PAI to retry something that is already going to run — the
+  // duplicate-dispatch failure, reintroduced from the other side.
+  //
+  // A slow boot is now a slow boot, not a lost task.
 
-  const res = await deps.deliver(itermSessionId, body, deliverTimeoutMs());
-  if (res === "ok") {
-    return { outcome: "spawned", project: label, session: label, reason: "" };
-  }
-  // Deliberately NOT "spawned": the tab exists but the work order never landed,
-  // and reporting success here is how a task silently disappears.
-  return {
-    outcome: "unreachable",
-    project: label,
-    session: label,
-    reason: `Spawned a session but ${ackReason(res)}.`,
-  };
+  // No delivery step: the order was queued by the launch and Claude Code runs
+  // its queue in order. Readiness above is now a LIVENESS check — did a Claude
+  // actually come up in that tab — rather than permission to start typing.
+  log(`dispatch: "${label}" came up; work order was queued at launch (${orderPath})`);
+  return { outcome: "spawned", project: label, session: label, reason: "" };
+}
+
+/**
+ * Stage a work order on disk for a session that is about to be launched.
+ *
+ * Under ~/.aibroker so it survives nothing in particular — it is meant to be
+ * short-lived, and the receiving session is told to delete it. Named after the
+ * project and the clock so two dispatches for one project cannot overwrite each
+ * other mid-launch.
+ */
+function writeWorkOrder(label: string, body: string): string {
+  const dir = join(homedir(), ".aibroker", "work-orders");
+  mkdirSync(dir, { recursive: true });
+  const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "task";
+  const path = join(dir, `${slug}-${Date.now()}.md`);
+  writeFileSync(path, body.endsWith("\n") ? body : `${body}\n`, "utf8");
+  return path;
 }

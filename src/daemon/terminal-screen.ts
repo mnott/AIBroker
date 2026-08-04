@@ -15,6 +15,7 @@ export {
   SHELL_PROMPT,
   flatten,
   isClaudeReady,
+  isInputBoxEmpty,
   inputBoxLines,
   inputBoxStart,
   hasBeenSubmitted,

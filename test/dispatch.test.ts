@@ -7,6 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync, rmSync } from "node:fs";
 import {
   dispatch,
   findSessionForProject,
@@ -96,15 +97,41 @@ test("spawned tab that never comes up -> unreachable, NOT spawned", async () => 
   assert.match(r.reason, /did not become ready/);
 });
 
-test("spawned tab that comes up but never accepts the message -> unreachable", async () => {
-  // The failure that would otherwise be a green `spawned` with nothing delivered.
-  const r = await dispatch("whazaa", "x", {}, deps({
-    launch: async () => ({ itermSessionId: "NEW" }),
+test("a spawned session is never typed into — the order rides the launch", async () => {
+  // Measured 2026-08-04: a freshly launched session holds its `/Name … go`
+  // preamble as QUEUED PROMPTS, which are rendered nowhere. From t~6s the input
+  // box looks empty and every readiness check passes, while the preamble stays
+  // pending until t~14s. Typing the work order into that window interleaved it
+  // with the rename and the resume — twice, in front of the user.
+  //
+  // So the spawn path hands the order over IN the launch and types nothing.
+  // There is no window left to lose it in.
+  let initialPrompt = "";
+  const r = await dispatch("whazaa", "the actual work", {}, deps({
+    launch: async (_p, o) => { initialPrompt = o?.initialPrompt ?? ""; return { itermSessionId: "NEW" }; },
     waitReady: async () => true,
-    deliver: async () => "no-ack",
+    deliver: async () => { throw new Error("spawning must not type into the session"); },
   }));
-  assert.equal(r.outcome, "unreachable");
-  assert.match(r.reason, /never reacted/);
+  assert.equal(r.outcome, "spawned");
+  assert.ok(initialPrompt.includes(TASK_PREFIX), "the queued prompt must carry the routing prefix");
+  assert.ok(/work-orders\/.*\.md/.test(initialPrompt), `expected a work-order path, got: ${initialPrompt}`);
+  assert.ok(!initialPrompt.includes("\n"), "a newline would split it into two queued prompts");
+});
+
+test("the staged work order holds the body verbatim", async () => {
+  const nasty = 'run `npm test`\n\n- a\n- b';
+  let initialPrompt = "";
+  await dispatch("whazaa", nasty, {}, deps({
+    launch: async (_p, o) => { initialPrompt = o?.initialPrompt ?? ""; return { itermSessionId: "NEW" }; },
+    waitReady: async () => true,
+    deliver: async () => { throw new Error("spawning must not type into the session"); },
+  }));
+  const m = initialPrompt.match(/(\/[^\s]*work-orders\/[^\s]+\.md)/);
+  assert.ok(m, `no work-order path in: ${initialPrompt}`);
+  const staged = readFileSync(m[1], "utf8");
+  assert.ok(staged.startsWith(TASK_PREFIX), "the file must carry the prefix");
+  assert.ok(staged.includes(nasty), "the body must survive verbatim, newlines and all");
+  rmSync(m[1], { force: true });
 });
 
 test("a live session that does not react in time -> queued, not unreachable", async () => {
@@ -169,50 +196,51 @@ function timed(over: Partial<DispatchDeps> = {}) {
   return { deps: d, spend: (ms: number) => { clock += ms; }, elapsed: () => clock };
 }
 
-test("spawn wait and delivery share the budget, never sum past it", async () => {
+test("readiness gets the budget, and nothing is delivered afterwards", async () => {
+  // The budget used to be split between booting and typing. There is no typing
+  // stage any more, so the whole allowance belongs to waiting for the session
+  // to come up.
   let readyGot = 0;
-  let deliverGot = 0;
   const t = timed();
   t.deps.sessions = () => [];
   t.deps.launch = async () => ({ itermSessionId: "NEW" });
-  // Readiness returns as soon as the input box appears — here after 10s of its
-  // 60s allowance — so the rest of the budget must carry over to delivery.
   t.deps.waitReady = async (_id, ms) => { readyGot = ms; t.spend(10_000); return true; };
-  t.deps.deliver = async (_id, _b, ms) => { deliverGot = ms; return "ok"; };
+  t.deps.deliver = async () => { throw new Error("spawning must not type into the session"); };
 
   const r = await dispatch("whazaa", "x", { budgetMs: 60_000 }, t.deps);
 
   assert.equal(r.outcome, "spawned");
   assert.ok(readyGot <= 60_000, `readiness got ${readyGot}ms of a 60s budget`);
-  assert.equal(deliverGot, 50_000, "delivery gets what booting did not use");
-  assert.ok(
-    t.elapsed() + deliverGot <= 60_000,
-    `worst case ${t.elapsed() + deliverGot}ms exceeds the 60s budget`,
-  );
 });
 
-test("a slow boot leaves delivery a smaller slice, not a fresh one", async () => {
-  let deliverGot = 0;
+test("a slow boot is a slow boot, not a lost task", async () => {
+  // Once the tab exists the order is already queued in it, so a boot that ate
+  // the budget must NOT report failure: PAI would retry work that is about to
+  // run, which is the duplicate-dispatch bug arriving from the other direction.
   const t = timed();
   t.deps.sessions = () => [];
   t.deps.launch = async () => ({ itermSessionId: "NEW" });
-  t.deps.waitReady = async () => { t.spend(50_000); return true; }; // boot ate 50 of 60
-  t.deps.deliver = async (_id, _b, ms) => { deliverGot = ms; return "ok"; };
+  t.deps.waitReady = async () => { t.spend(59_000); return true; };
+  t.deps.deliver = async () => { throw new Error("spawning must not type into the session"); };
 
-  await dispatch("whazaa", "x", { budgetMs: 60_000 }, t.deps);
-  assert.equal(deliverGot, 10_000, "delivery should get only the remaining 10s");
+  const r = await dispatch("whazaa", "x", { budgetMs: 60_000 }, t.deps);
+  assert.equal(r.outcome, "spawned");
 });
 
-test("a boot that eats the whole budget is reported, not blamed on the session", async () => {
+test("even a fully spent budget reports spawned, because the order is already queued", async () => {
+  // This asserted `unreachable` while the work order was typed after boot: with
+  // no time left to type, nothing had been handed over and failure was honest.
+  // The order now rides the launch, so by the time the budget matters the
+  // session already has it. Reporting failure would earn a retry and a second
+  // session doing the same job.
   const t = timed();
   t.deps.sessions = () => [];
   t.deps.launch = async () => ({ itermSessionId: "NEW" });
   t.deps.waitReady = async () => { t.spend(60_000); return true; };
-  t.deps.deliver = async () => { throw new Error("must not deliver with no budget left"); };
+  t.deps.deliver = async () => { throw new Error("spawning must not type into the session"); };
 
   const r = await dispatch("whazaa", "x", { budgetMs: 60_000 }, t.deps);
-  assert.equal(r.outcome, "unreachable");
-  assert.match(r.reason, /budget was spent/);
+  assert.equal(r.outcome, "spawned");
 });
 
 test("an exhausted budget launches NOTHING, rather than a tab it cannot use", async () => {

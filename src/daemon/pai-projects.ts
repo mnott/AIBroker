@@ -12,10 +12,23 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { log } from "../core/log.js";
 import { createClaudeSession } from "../adapters/iterm/sessions.js";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * The restore manifest, read directly rather than through daemon/sessions.ts.
+ *
+ * sessions.ts owns this file and is the only writer; it is imported here by
+ * path instead of by module because sessions.ts pulls in daemon/index.js, and
+ * daemon/index → core-handlers → pai-projects closes an import cycle. A
+ * six-line read is the cheaper of the two couplings.
+ */
+const RESTORE_MANIFEST = join(homedir(), ".aibroker", "session-restore.json");
 
 // ── Types ──
 
@@ -228,10 +241,105 @@ export async function launchPaiProject(
  * are three "Glidr" rows at three different paths. Once resolution has picked
  * a row, that row is what gets launched.
  */
+/**
+ * Where a session of this name was last actually seen running, if it still exists.
+ *
+ * PAI's project registry records where a project was DECLARED to live; the
+ * restore manifest records where its sessions were OBSERVED to live. Renaming a
+ * directory goes unnoticed by the first and is picked up within five minutes by
+ * the second, so when the declared path is gone the manifest is the natural
+ * place to look for what it became.
+ */
+function lastSeenCwdForName(name: string): string | null {
+  try {
+    if (!existsSync(RESTORE_MANIFEST)) return null;
+    const raw = JSON.parse(readFileSync(RESTORE_MANIFEST, "utf-8")) as unknown;
+    const entries = (Array.isArray(raw) ? raw : (raw as { entries?: unknown }).entries) as
+      | Array<{ name?: string; cwd?: string }>
+      | undefined;
+    if (!Array.isArray(entries)) return null;
+    const hit = entries.find(
+      (e) => e?.name === name && typeof e.cwd === "string" && existsSync(e.cwd),
+    );
+    return hit?.cwd ?? null;
+  } catch {
+    // The manifest is a hint, not a dependency. A bad one must not turn a
+    // clear "directory is gone" error into an unrelated parse failure.
+    return null;
+  }
+}
+
+/**
+ * A launch that cannot succeed no matter how often it is retried.
+ *
+ * Carries `permanent` so the caller — and PAI's task poller across the IPC
+ * boundary — can tell "this will never work" from "this did not work yet" and
+ * park the task instead of re-dispatching it every fifteen minutes forever.
+ */
+export class ProjectRootMissingError extends Error {
+  readonly code = "project_root_missing";
+  readonly permanent = true;
+  constructor(
+    readonly projectName: string,
+    readonly rootPath: string,
+  ) {
+    super(
+      `PAI project "${projectName}" points at "${rootPath}", which does not exist, ` +
+        `and no session of that name has been seen in a directory that does. ` +
+        `Run \`pai project health\` to find where it went, then ` +
+        `\`pai project move <slug> <new-path>\` to make the registry agree.`,
+    );
+    this.name = "ProjectRootMissingError";
+  }
+}
+
 export async function launchResolvedPaiProject(
   project: PaiProject,
+  opts: {
+    /**
+     * What the session should do instead of resuming.
+     *
+     * Queued as the second initial-prompt line, so it runs immediately after
+     * `/Name` and before anything else can reach the session. MUST be a single
+     * line: Claude Code splits the initial-prompt argument on newlines and
+     * treats each as a separate queued prompt, so an embedded newline silently
+     * fragments the instruction into several.
+     */
+    initialPrompt?: string;
+  } = {},
 ): Promise<{ itermSessionId: string; sessionId: string }> {
   const name = project.name;
+
+  // Never type a `cd` into a terminal without knowing it can succeed.
+  //
+  // The command below is handed to a fresh iTerm2 tab as one `cd … && claude …`
+  // string. If the `cd` fails the tab stays open on a bare shell, `claude` never
+  // runs, and the readiness probe waits out its full 90s before reporting the
+  // session "unreachable" — indistinguishable, from the outside, from a slow
+  // start. On 2026-08-04 a renamed directory turned that into a terminal window
+  // every fifteen minutes for nine hours.
+  //
+  // When the declared path is gone, the restore manifest is asked where the
+  // session actually ran. That is not a guess: the 5-minute snapshot writes it
+  // from observation, so it is the one record that follows a directory when it
+  // is renamed. Launching from it recovers automatically, which is the whole
+  // point — but the registry stays stale until somebody fixes it, so the log
+  // says exactly what to run. Silent divergence is what produced this bug.
+  let rootPath = project.rootPath;
+  if (!rootPath || !existsSync(rootPath)) {
+    const observed = lastSeenCwdForName(project.displayName || name);
+    if (!observed) {
+      const err = new ProjectRootMissingError(name, rootPath);
+      log(`pai-projects: refusing to launch "${name}" — ${err.message}`);
+      throw err;
+    }
+    log(
+      `pai-projects: "${name}" is registered at "${rootPath}", which is gone; ` +
+        `launching from the last observed directory "${observed}" instead. ` +
+        `Make it permanent with: pai project move ${project.slug} ${JSON.stringify(observed)}`,
+    );
+    rootPath = observed;
+  }
 
   // Get effective config (project overrides global defaults)
   const effective = await getEffectiveConfig(name) ?? project.sessionConfig ?? {};
@@ -244,15 +352,33 @@ export async function launchResolvedPaiProject(
   for (const [key, value] of Object.entries(env)) {
     parts.push(`export ${key}=${shellEscape(value)}`);
   }
-  parts.push(`cd ${shellEscape(project.rootPath)}`);
+  parts.push(`cd ${shellEscape(rootPath)}`);
   // Replicate PAI's launch: `--name` sets the session label, and the single
-  // initial-prompt arg `$'/Name <name>\ngo'` advance-enters the /Name skill
-  // (tab + /resume label) then `go` — deterministic, no timing.
+  // initial-prompt arg `$'/Name <name>\n<next>'` advance-enters the /Name skill
+  // (tab + /resume label) and then does one more thing.
+  //
+  // That second line is normally `go` — resume from TODO.md. A caller with work
+  // to hand over replaces it, and that replacement is the whole point:
+  //
+  // Claude Code holds initial-prompt lines as QUEUED PROMPTS, and a queued
+  // prompt is not on the screen anywhere. Measured 2026-08-04: from t≈6s the
+  // input box renders empty and every readiness check passes, while `/Name` and
+  // `go` sit invisibly pending until t≈14s. A dispatcher that waited for
+  // "ready" and then TYPED its work order landed it inside that window, so the
+  // task, the rename and the resume all raced in one input. No amount of screen
+  // reading can close that gap — the state is not rendered.
+  //
+  // Putting the work order in the launch removes the race by construction
+  // rather than by timing: the queue is ordered, nothing else types, and there
+  // is no window to lose.
   const label = project.displayName || project.name;
   const ansiC = label.replace(/'/g, "");
+  // Single line only — see `initialPrompt` above. Newlines are what separate
+  // queued prompts, so one embedded here would split the instruction in two.
+  const next = (opts.initialPrompt ?? "go").replace(/[\r\n]+/g, " ").replace(/'/g, "");
   // Double backslash — collapsed to `\n` by AppleScript, then to a real newline
-  // by zsh's $'...', so "/Name <name>" and "go" are two queued inputs.
-  const prompt = `$'/Name ${ansiC}\\\\ngo'`;
+  // by zsh's $'...', so the two lines arrive as two queued inputs.
+  const prompt = `$'/Name ${ansiC}\\\\n${next}'`;
   const claudeFlags = flags.includes("--dangerously-skip-permissions")
     ? flags
     : `--dangerously-skip-permissions ${flags}`.trim();
@@ -263,7 +389,7 @@ export async function launchResolvedPaiProject(
 
   log(
     `pai-projects: launching visual session for "${project.name}" ` +
-    `in "${project.rootPath}" (command: ${command})`,
+    `in "${rootPath}" (command: ${command})`,
   );
 
   // Open new iTerm2 tab and run the command

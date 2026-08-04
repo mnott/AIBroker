@@ -40,7 +40,7 @@ import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessi
 import { matchSession } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
-import { setItermSessionVar, setItermTabName, setItermBadge } from "../adapters/iterm/sessions.js";
+import { setItermSessionVar, setItermTabName, setItermBadge, revealItermSession } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -138,6 +138,27 @@ export function registerCoreHandlers(
 
   server.on("switch", async (req) => {
     const { target } = req.params as { target: string | number };
+
+    // An iTerm2 unique ID is not an index, and must not be parsed as one.
+    //
+    // `parseInt("53ECB67D-7616-…")` is 53, so a UUID target used to be handed
+    // to switchToIndex() as position 53 in `manager.listSessions()` — an array
+    // nothing populates (see the `sessions` handler above). The result was a
+    // flat "Session 53ECB67D-… not found" for every UUID ever passed, which
+    // read as a stale session and was in fact a handler that had never
+    // supported the argument. `pai <name>` sends exactly this.
+    if (typeof target === "string" && !/^\d+$/.test(target.trim())) {
+      const revealed = revealItermSession(target.trim());
+      if (!revealed) {
+        return {
+          ok: false,
+          error: `No live iTerm2 session with id ${target}`,
+          result: { switched: false, gone: true },
+        };
+      }
+      return { ok: true, result: { switched: true, sessionId: target.trim() } };
+    }
+
     const index = typeof target === "number" ? target : parseInt(String(target), 10);
     const session = manager.switchToIndex(index);
     if (!session) return { ok: false, error: `Session ${target} not found` };
