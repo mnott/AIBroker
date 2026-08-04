@@ -265,6 +265,6 @@ The development repo (`~/dev/ai/AIBroker`) and the cloud-synced repo (`~/Daten/C
 
 From `MEMORY.md`:
 ```
-Dev repo:   /Users/i052341/dev/ai/AIBroker     (builds, git ops)
-Cloud repo: /Users/i052341/Daten/Cloud/Development/ai/AIBroker  (synced)
+Dev repo:   ~/dev/ai/AIBroker                  (builds, git ops)
+Cloud repo: ~/Cloud/Development/ai/AIBroker    (synced)
 ```

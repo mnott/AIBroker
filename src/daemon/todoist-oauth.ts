@@ -178,6 +178,94 @@ export function isExpired(t: StoredToken, now: number = Date.now()): boolean {
   return Date.parse(t.expires_at) - REFRESH_MARGIN_MS <= now;
 }
 
+// ---------------------------------------------------------------------------
+// Token keeper
+// ---------------------------------------------------------------------------
+
+/** Never sleep longer than this, so a legacy or clock-skewed token still gets looked at. */
+const KEEPER_MAX_SLEEP_MS = 15 * 60_000;
+/** Never spin faster than this, whatever the arithmetic says. */
+const KEEPER_MIN_SLEEP_MS = 30_000;
+/** Not authorised yet, or refresh is failing — check back at this pace. */
+const KEEPER_IDLE_SLEEP_MS = 5 * 60_000;
+
+let keeperTimer: NodeJS.Timeout | undefined;
+
+/**
+ * Keep the stored token valid, ahead of anyone needing it.
+ *
+ * `getAccessToken()` refreshes correctly, but ONLY when something asks for a
+ * token — and nothing asks on a schedule. Todoist issues one-hour access
+ * tokens, so between outbound operations the stored token spends most of its
+ * life expired. Measured 2026-08-04: obtained 10:26 local, expired 11:26, and
+ * still expired at 19:51 — 8.4 hours, across a whole day of use, because the
+ * daemon started at 11:40 and nothing outbound happened to trigger a refresh.
+ *
+ * An expired token is not merely a delayed failure. It makes every outbound
+ * Todoist call fail its first attempt and depend on a 401 retry path, and it
+ * leaves the account authorisation looking stale exactly when something needs
+ * it to be healthy. The fix is not another call site remembering to refresh —
+ * that is the same mistake four times over today. It is one owner of the
+ * problem, running on a timer.
+ *
+ * Sleeps until shortly before expiry rather than polling on a fixed interval,
+ * so a healthy token costs one refresh per hour and nothing else.
+ */
+export function startTokenKeeper(fetchImpl: typeof fetch = fetch): () => void {
+  let stopped = false;
+
+  const arm = (ms: number) => {
+    if (stopped) return;
+    keeperTimer = setTimeout(tick, Math.max(KEEPER_MIN_SLEEP_MS, Math.min(ms, KEEPER_MAX_SLEEP_MS)));
+    keeperTimer.unref?.(); // never hold the process open
+  };
+
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const before = loadToken();
+      if (!before) {
+        log("todoist-oauth: keeper — not authorised yet, will check again");
+        return arm(KEEPER_IDLE_SLEEP_MS);
+      }
+
+      const after = await getAccessToken(fetchImpl);
+      if (!after) return arm(KEEPER_IDLE_SLEEP_MS);
+
+      if (after.access_token !== before.access_token) {
+        log(`todoist-oauth: keeper refreshed the access token, now valid until ${after.expires_at ?? "(no expiry)"}`);
+      }
+
+      if (!after.expires_at) {
+        // Legacy long-lived token: nothing to renew, but keep looking in case
+        // it is replaced by a modern one.
+        return arm(KEEPER_MAX_SLEEP_MS);
+      }
+
+      const untilRefresh = Date.parse(after.expires_at) - REFRESH_MARGIN_MS - Date.now();
+      if (untilRefresh <= 0) {
+        // Still expired after a refresh attempt — the grant is probably gone.
+        // Say so plainly; this is the state that needs a human, and silence
+        // here is what let it sit expired for a day.
+        log("todoist-oauth: keeper — token is STILL expired after a refresh attempt. " +
+            "The grant may have been revoked. Run `aibroker todoist auth`.");
+        return arm(KEEPER_IDLE_SLEEP_MS);
+      }
+      arm(untilRefresh);
+    } catch (e) {
+      log(`todoist-oauth: keeper tick failed — ${e instanceof Error ? e.message : String(e)}`);
+      arm(KEEPER_IDLE_SLEEP_MS);
+    }
+  };
+
+  void tick(); // refresh at startup, not at first use
+  return () => {
+    stopped = true;
+    if (keeperTimer) clearTimeout(keeperTimer);
+    keeperTimer = undefined;
+  };
+}
+
 /**
  * Trade the refresh token for a new access token.
  *

@@ -12,7 +12,7 @@
  * the 401 bursts that cost two claims on 2026-08-01.
  *
  * Everything here keys on ID, never on name. Todoist's project search returns
- * nothing for names containing emoji, so "Executive Search 🎯" is invisible to a
+ * nothing for names containing emoji, so "Archive 🎯" is invisible to a
  * name query — a resolver that fell back to matching names would silently find
  * no project and report it as absent rather than unsearchable.
  */

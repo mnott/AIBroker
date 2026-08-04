@@ -198,14 +198,14 @@ test("a task created by a session is marked, so it cannot dispatch back", async 
 test("a marked task is dropped by routing, closing the loop", () => {
   const cfg: WebhookConfig = {
     secret: "s", port: 1, bind: "127.0.0.1", path: "/todoist", oauthPath: "/oauth",
-    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "jobs-matthias"]]),
+    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "task-bus"]]),
     defaultOwner: "broker",
   };
   const echo: TodoistEvent = {
     event_name: "item:added",
     event_data: { id: "t-1", content: `${AGENT_MARK} ZZ due probe`, project_id: "p-1", labels: [] },
   };
-  const d = route(echo, cfg, ["jobs-matthias"]);
+  const d = route(echo, cfg, ["task-bus"]);
   assert.equal(d.act, false);
   assert.match((d as { reason: string }).reason, /echo loop/);
 });
@@ -225,30 +225,30 @@ test("an agent-authored task still fires its reminder", () => {
   // the job-sweep trigger the moment it was marked.
   const cfg: WebhookConfig = {
     secret: "s", port: 1, bind: "127.0.0.1", path: "/todoist", oauthPath: "/oauth",
-    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "jobs-matthias"]]),
+    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "task-bus"]]),
     defaultOwner: "broker",
   };
   const fired: TodoistEvent = {
     event_name: "reminder:fired",
     event_data: { id: "t-9", content: `${AGENT_MARK} Job sweep — run it and mail me the list`, project_id: "p-1", labels: [] },
   };
-  const d = route(fired, cfg, ["jobs-matthias"]);
+  const d = route(fired, cfg, ["task-bus"]);
   assert.equal(d.act, true, "a scheduled trigger must survive the echo guard");
-  assert.equal(d.act && d.project, "jobs-matthias");
+  assert.equal(d.act && d.project, "task-bus");
 });
 
 test("the same task's creation is still suppressed", () => {
   // Only the write that bounces back instantly is dropped.
   const cfg: WebhookConfig = {
     secret: "s", port: 1, bind: "127.0.0.1", path: "/todoist", oauthPath: "/oauth",
-    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "jobs-matthias"]]),
+    ingressProjectIds: new Set(["p-1"]), projectOwners: new Map([["p-1", "task-bus"]]),
     defaultOwner: "broker",
   };
   const created: TodoistEvent = {
     event_name: "item:added",
     event_data: { id: "t-9", content: `${AGENT_MARK} Job sweep — run it and mail me the list`, project_id: "p-1", labels: [] },
   };
-  assert.equal(route(created, cfg, ["jobs-matthias"]).act, false);
+  assert.equal(route(created, cfg, ["task-bus"]).act, false);
 });
 
 // ── a claim that flaps ──────────────────────────────────────────────────────
