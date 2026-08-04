@@ -229,7 +229,9 @@ export interface AuditQuery {
 }
 
 export function readAudit(q: AuditQuery = {}): AuditEvent[] {
+  // No file at all genuinely means no events, and [] is the honest answer.
   if (!existsSync(AUDIT_FILE)) return [];
+
   let events: AuditEvent[];
   try {
     events = readFileSync(AUDIT_FILE, "utf-8")
@@ -237,8 +239,18 @@ export function readAudit(q: AuditQuery = {}): AuditEvent[] {
       .filter((l) => l.trim().length > 0)
       .map((l) => { try { return JSON.parse(l) as AuditEvent; } catch { return null; } })
       .filter((e): e is AuditEvent => e !== null);
-  } catch {
-    return [];
+  } catch (e) {
+    // A file that EXISTS and cannot be read is not an empty audit log, and
+    // returning [] made the two byte-identical to every caller. PAI shipped the
+    // same shape in its Postgres search on 2026-08-04: a dead container made
+    // memory_search answer "No results found", another session believed it, and
+    // told Matthias a fact that was not true. Nothing in the response could have
+    // revealed it. An unreadable log is louder than a quiet lie.
+    throw new Error(
+      `Audit log exists but could not be read: ${AUDIT_FILE}\n` +
+        `  This is NOT an empty audit log — the file is there and unreadable.\n` +
+        `  ${e instanceof Error ? e.message : String(e)}`
+    );
   }
 
   if (q.trace) {
