@@ -24,10 +24,57 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { execSync } from "node:child_process";
+import { statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { WatcherClient } from "../ipc/client.js";
 import { OTA_PORT } from "../daemon/ota.js";
 
 const DAEMON_SOCKET = "/tmp/aibroker.sock";
+
+// ── Self vintage ──
+//
+// An MCP server is loaded once, when its Claude Code session starts, and there
+// is one per session. Publishing a fix does not put it in force: on 2026-08-04
+// the OTA port moved off 8765 and every live session went on calling
+// `ota_publish` against the MQTT broker, because each shim had been loaded hours
+// earlier. Nothing in any response could have revealed it — a stale shim looks
+// exactly like a current one, and the person who CAN fix it (by restarting the
+// session) is the one who cannot see the problem.
+//
+// So the shim reports its own age. The mtime is captured at load and compared
+// against the file on disk at call time; if disk is newer, this process is
+// running code that is no longer what is installed.
+const SELF_PATH = fileURLToPath(import.meta.url);
+const LOADED_AT = new Date().toISOString();
+const LOADED_MTIME_MS = (() => {
+  try { return statSync(SELF_PATH).mtimeMs; } catch { return undefined; }
+})();
+
+function selfVintage(): Record<string, unknown> {
+  let onDiskMtimeMs: number | undefined;
+  try { onDiskMtimeMs = statSync(SELF_PATH).mtimeMs; } catch { /* unreadable — reported below */ }
+
+  const stale =
+    LOADED_MTIME_MS !== undefined &&
+    onDiskMtimeMs !== undefined &&
+    onDiskMtimeMs > LOADED_MTIME_MS;
+
+  return {
+    path: SELF_PATH,
+    loadedAt: LOADED_AT,
+    bundleBuiltAtLoad: LOADED_MTIME_MS ? new Date(LOADED_MTIME_MS).toISOString() : "unknown",
+    bundleOnDiskNow: onDiskMtimeMs ? new Date(onDiskMtimeMs).toISOString() : "unknown",
+    stale,
+    ...(stale
+      ? {
+          warning:
+            "This MCP server is running code OLDER than what is installed. " +
+            "A published fix is not in force in this session until it is restarted. " +
+            "Restart the Claude Code session to load the current build.",
+        }
+      : {}),
+  };
+}
 
 const hub = new WatcherClient(DAEMON_SOCKET);
 
@@ -229,10 +276,12 @@ const server = new McpServer(
 // Hub-Level Tools (aibroker_*)
 // ═══════════════════════════════════════════════════════════════════════════
 
-server.tool("aibroker_status", "Hub health: version, adapters, sessions, adapter health", {}, async () => {
+server.tool("aibroker_status", "Hub health: version, adapters, sessions, adapter health, and this MCP shim's own vintage", {}, async () => {
   try {
     const r = await hub.call_raw("status", {});
-    return ok(JSON.stringify(r, null, 2));
+    // The daemon's health says nothing about THIS process's age, and the two
+    // can disagree by hours. Report both from the one call anyone already makes.
+    return ok(JSON.stringify({ ...(r as object), mcp: selfVintage() }, null, 2));
   } catch (e) { return err(e); }
 });
 
