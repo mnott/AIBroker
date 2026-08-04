@@ -30,7 +30,7 @@ After `up`, your install URLs are at `https://<tailscale-hostname>/install/<slug
 iPhone (Safari)
   → https://<tailscale-hostname>/install/pailot/  (HTTPS, Tailscale Serve)
   → Tailscale Serve (local proxy)
-  → http://127.0.0.1:8765/install/pailot/  (aibroker-ota container)
+  → http://127.0.0.1:8767/install/pailot/  (aibroker-ota container)
   → itms-services:// install link
   → iOS fetches manifest.plist
   → iOS downloads .ipa and installs
@@ -48,7 +48,7 @@ Tailscale Serve injects the `Tailscale-User-Login` header for requests from tail
 The container trusts this header (`TRUST_HEADER=true`) because it only binds to `127.0.0.1`.
 
 **Known assumption / security caveat:** Local processes on the host Mac can craft arbitrary
-`Tailscale-User-Login` headers when connecting to `127.0.0.1:8765` directly.
+`Tailscale-User-Login` headers when connecting to `127.0.0.1:8767` directly.
 The threat model is remote attackers, not local root. If you need stronger local isolation,
 set `AIBROKER_OTA_PUBLISHERS=` to empty (disabling the allowlist check, accepting any tailnet user)
 or run behind a stricter proxy.

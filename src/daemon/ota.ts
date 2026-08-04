@@ -11,6 +11,19 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
+/**
+ * Where the OTA container listens. Must match docker/compose.yml and
+ * docker/ota/src/server.ts.
+ *
+ * The daemon already owns the two ports below it, so neither is available:
+ *   8765  PAILot MQTT broker      (adapters/pailot/mqtt-broker.ts)
+ *   8766  Todoist webhook server  (daemon/todoist-webhook.ts)
+ * Both are bound by the launchd-managed daemon, which therefore always wins a
+ * race against a container. 8767 was verified free — `lsof -nP -iTCP:8760-8790`
+ * shows only the two above — before it was chosen. Check again before moving it.
+ */
+export const OTA_PORT = 8767;
+
 const COMPOSE_FILE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "docker", "compose.yml");
 const ENV_FILE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "docker", ".env");
 
@@ -49,9 +62,15 @@ function setupTailscaleServe(): void {
   // refuses a URL with a port in it. Funnel is a property of the whole port:
   // anything routed on 443 is public. The OTA hub serves app binaries and an
   // upload API, so it stays on a tailnet-only port of its own.
+  //
+  // The upstream is 8767, not 8765. 8765 is the daemon's PAILot MQTT broker,
+  // and these two mappings used to point at it — so every request Tailscale
+  // forwarded on /install/ and /api/ reached an MQTT listener instead of this
+  // server. Nothing surfaced it because the container could not bind that port
+  // either, so there was never a working case to compare against.
   const cmds = [
-    "tailscale serve --bg --https=8443 --set-path=/install/ http://127.0.0.1:8765/install/",
-    "tailscale serve --bg --https=8443 --set-path=/api/ http://127.0.0.1:8765/api/",
+    `tailscale serve --bg --https=8443 --set-path=/install/ http://127.0.0.1:${OTA_PORT}/install/`,
+    `tailscale serve --bg --https=8443 --set-path=/api/ http://127.0.0.1:${OTA_PORT}/api/`,
   ];
   for (const cmd of cmds) {
     console.log(`+ ${cmd}`);

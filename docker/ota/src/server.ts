@@ -155,7 +155,23 @@ app.get("/install/:slug/:file", (req: Request, res: Response) => {
   createReadStream(filePath).pipe(res);
 });
 
-const PORT = 8765;
+// 8767, not 8765, and not 8766 either.
+//
+// This server used to claim 8765, which the AIBroker daemon's PAILot MQTT
+// broker binds. The daemon is launchd-managed, so it always won the race: the
+// container could not bind, `ota_publish` POSTed to a port that speaks MQTT and
+// got nothing back, and the Tailscale Serve mappings for /install/ and /api/
+// forwarded to the broker. Nothing surfaced any of it, because there was never
+// a working case to compare against.
+//
+// 8766 is not the fix — that is the daemon's Todoist webhook, and moving here
+// only swaps one silent collision for another (it answers 405 to a GET, which
+// looks enough like a live server to fool a quick check). The daemon owns 8765
+// and 8766; 8767 was confirmed unused before being chosen.
+//
+// PORT stays overridable so the container, compose and a bare
+// `node dist/server.js` cannot drift apart.
+const PORT = Number(process.env.PORT ?? 8767);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`aibroker-ota listening on :${PORT}`);
 });

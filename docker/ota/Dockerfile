@@ -13,5 +13,5 @@ FROM node:22-alpine
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
-EXPOSE 8765
+EXPOSE 8767
 CMD ["node", "/app/dist/server.js"]
