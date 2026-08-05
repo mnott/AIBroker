@@ -278,6 +278,7 @@ export function startFunnelWatchdog(opts: {
   const heal = opts.heal ?? (() => reconnect(bin));
   const state = initialState();
   let stopped = false;
+  let watching = false;
   let timer: NodeJS.Timeout | undefined;
 
   const arm = (ms: number) => {
@@ -298,6 +299,15 @@ export function startFunnelWatchdog(opts: {
 
       const results = await probe(hostname);
       const verdict = classify(results);
+
+      if (!watching) {
+        // Say once that this is running. A watchdog whose healthy path is
+        // silent is indistinguishable from one that never started — which is
+        // the same invisibility it exists to fix.
+        watching = true;
+        log(`funnel-watchdog: watching public ingress across ${results.length} relay(s), ` +
+            `every ${Math.round(HEALTHY_INTERVAL_MS / 1000)}s — currently ${verdict}`);
+      }
       const decision = decide(state, verdict, Date.now());
 
       if (verdict === "down" && !state.announced) {
