@@ -46,11 +46,22 @@ import { audit } from "./audit.js";
 /** Public resolvers, tried in order. The local one cannot be trusted here. */
 const PUBLIC_RESOLVERS = ["1.1.1.1", "8.8.8.8"];
 
-/** Where `tailscale` might live. The daemon's PATH under launchd is minimal. */
+/**
+ * Where `tailscale` might live, best first. The daemon's PATH under launchd is
+ * minimal, so these are absolute.
+ *
+ * ORDER MATTERS, and not for the reason it usually does. The macOS app ships a
+ * single binary that behaves as the GUI or as the CLI, and invoking it inside
+ * the bundle from a background process answers "The Tailscale GUI failed to
+ * start" — on stdout, with exit status 0, so it reads as success and parses as
+ * nothing. The `/usr/local/bin` wrapper the app installs does work from there.
+ * Prefer it; the bundle stays as a last resort for a machine that has no
+ * wrapper.
+ */
 const TAILSCALE_CANDIDATES = [
-  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
   "/usr/local/bin/tailscale",
   "/opt/homebrew/bin/tailscale",
+  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
 ];
 
 const HEALTHY_INTERVAL_MS = 5 * 60_000;
@@ -171,6 +182,10 @@ export function tailscaleBinary(): string | undefined {
 
 export interface CliResult { ok: boolean; stdout?: string; error?: string; }
 
+function firstLine(s?: string): string {
+  return (s ?? "").trim().split("\n")[0].slice(0, 160) || "(no output)";
+}
+
 /**
  * Run the client, and report failure rather than swallowing it.
  *
@@ -213,7 +228,9 @@ export function funnelHostname(bin = tailscaleBinary()): CliResult & { hostname?
       ? { ok: true, hostname: name.replace(/\.$/, "") }
       : { ok: false, error: "client reported no DNS name" };
   } catch {
-    return { ok: false, error: "could not parse status output" };
+    // Quote what it actually said: this is where a client that "succeeded"
+    // while printing an error message gets caught.
+    return { ok: false, error: `unparseable status output — ${firstLine(r.stdout)}` };
   }
 }
 
@@ -228,7 +245,7 @@ export function funnelConfigured(bin = tailscaleBinary()): CliResult & { configu
     const cfg = JSON.parse(r.stdout ?? "");
     return { ok: true, configured: Boolean(cfg?.AllowFunnel && Object.keys(cfg.AllowFunnel).length > 0) };
   } catch {
-    return { ok: false, error: "could not parse serve output" };
+    return { ok: false, error: `unparseable serve output — ${firstLine(r.stdout)}` };
   }
 }
 
