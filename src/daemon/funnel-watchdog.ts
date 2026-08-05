@@ -169,32 +169,66 @@ export function tailscaleBinary(): string | undefined {
   return TAILSCALE_CANDIDATES.find((p) => existsSync(p));
 }
 
+export interface CliResult { ok: boolean; stdout?: string; error?: string; }
+
+/**
+ * Run the client, and report failure rather than swallowing it.
+ *
+ * The macOS app's CLI is not always usable from a background process: it wants
+ * to talk to the GUI app and answers "The Tailscale GUI failed to start" when
+ * it cannot. The first version of this file treated that error as "no funnel
+ * configured", so the watchdog returned quietly and looked exactly like a
+ * watchdog that was working — the precise failure it exists to prevent.
+ */
+export function runTailscale(bin: string, args: string[]): CliResult {
+  try {
+    const stdout = execFileSync(bin, args, { encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "pipe"] });
+    return { ok: true, stdout };
+  } catch (e) {
+    const err = e as { stderr?: Buffer | string; message?: string };
+    const text = (typeof err.stderr === "string" ? err.stderr : err.stderr?.toString()) || err.message || "unknown error";
+    return { ok: false, error: text.trim().split("\n")[0] };
+  }
+}
+
 /**
  * The node's funnel hostname, read from the client rather than configured.
  *
  * Hard-coding it would put one machine's name in the source and go stale the
  * first time the node is renamed.
  */
-export function funnelHostname(bin = tailscaleBinary()): string | undefined {
-  if (!bin) return undefined;
+export function funnelHostname(bin = tailscaleBinary()): CliResult & { hostname?: string } {
+  // An explicit override keeps the probe running where the client cannot be
+  // queried. Watching is worth having on its own: it is what turns a silent
+  // outage into a log line, even when this process cannot pull the lever.
+  const override = process.env.AIBROKER_FUNNEL_HOST;
+  if (override) return { ok: true, hostname: override };
+  if (!bin) return { ok: false, error: "no tailscale binary" };
+
+  const r = runTailscale(bin, ["status", "--json"]);
+  if (!r.ok) return r;
   try {
-    const raw = execFileSync(bin, ["status", "--json"], { encoding: "utf8", timeout: 10_000 });
-    const name = JSON.parse(raw)?.Self?.DNSName;
-    return typeof name === "string" && name ? name.replace(/\.$/, "") : undefined;
+    const name = JSON.parse(r.stdout ?? "")?.Self?.DNSName;
+    return typeof name === "string" && name
+      ? { ok: true, hostname: name.replace(/\.$/, "") }
+      : { ok: false, error: "client reported no DNS name" };
   } catch {
-    return undefined;
+    return { ok: false, error: "could not parse status output" };
   }
 }
 
 /** Is a funnel even configured? Nothing to watch when it is not. */
-export function funnelConfigured(bin = tailscaleBinary()): boolean {
-  if (!bin) return false;
+export function funnelConfigured(bin = tailscaleBinary()): CliResult & { configured?: boolean } {
+  if (process.env.AIBROKER_FUNNEL_HOST) return { ok: true, configured: true };
+  if (!bin) return { ok: false, error: "no tailscale binary" };
+
+  const r = runTailscale(bin, ["serve", "status", "--json"]);
+  if (!r.ok) return r;
   try {
-    const raw = execFileSync(bin, ["serve", "status", "--json"], { encoding: "utf8", timeout: 10_000 });
-    const cfg = JSON.parse(raw);
-    return Boolean(cfg?.AllowFunnel && Object.keys(cfg.AllowFunnel).length > 0);
+    const cfg = JSON.parse(r.stdout ?? "");
+    return { ok: true, configured: Boolean(cfg?.AllowFunnel && Object.keys(cfg.AllowFunnel).length > 0) };
   } catch {
-    return false;
+    return { ok: false, error: "could not parse serve output" };
   }
 }
 
@@ -279,6 +313,7 @@ export function startFunnelWatchdog(opts: {
   const state = initialState();
   let stopped = false;
   let watching = false;
+  let cliComplained = false;
   let timer: NodeJS.Timeout | undefined;
 
   const arm = (ms: number) => {
@@ -290,12 +325,37 @@ export function startFunnelWatchdog(opts: {
   const tick = async () => {
     if (stopped) return;
     try {
-      const hostname = opts.hostname ?? funnelHostname(bin);
-      if (!hostname || !funnelConfigured(bin)) {
+      let hostname = opts.hostname;
+      if (!hostname) {
+        const found = funnelHostname(bin);
+        if (!found.ok) {
+          // Cannot ask the client. Say it once — quietly returning here is what
+          // made the first version of this watchdog indistinguishable from a
+          // working one.
+          if (!cliComplained) {
+            cliComplained = true;
+            log(`funnel-watchdog: cannot query the Tailscale client — ${found.error}. ` +
+                "Set AIBROKER_FUNNEL_HOST to watch anyway (healing still needs the client).");
+          }
+          return arm(HEALTHY_INTERVAL_MS);
+        }
+        hostname = found.hostname;
+      }
+
+      const cfg = funnelConfigured(bin);
+      if (!cfg.ok) {
+        if (!cliComplained) {
+          cliComplained = true;
+          log(`funnel-watchdog: cannot read the serve config — ${cfg.error}`);
+        }
+        return arm(HEALTHY_INTERVAL_MS);
+      }
+      if (!hostname || !cfg.configured) {
         // No funnel to watch. Not an error — the OTA hub and the webhook are
         // both optional — so check again later rather than giving up for good.
         return arm(HEALTHY_INTERVAL_MS);
       }
+      cliComplained = false;
 
       const results = await probe(hostname);
       const verdict = classify(results);
