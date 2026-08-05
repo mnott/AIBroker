@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classify, decide, initialState } from "../src/daemon/funnel-watchdog.js";
+import { classify, decide, initialState, funnelHostname, funnelConfigured } from "../src/daemon/funnel-watchdog.js";
 
 const OPTS = { failuresBeforeHeal: 3, healCooldownMs: 900_000, healthyIntervalMs: 300_000, suspectIntervalMs: 30_000 };
 
@@ -101,6 +101,37 @@ test("after the cooldown it may try once more", () => {
   s.consecutiveDown = 2;
   const d = decide(s, "down", 1_000 + 900_001, OPTS);
   assert.equal(d.action, "heal");
+});
+
+// ── when the client cannot be asked ──────────────────────────────────────────
+
+test("an explicit host lets the watch run without the client", () => {
+  // The macOS client is not always reachable from a background process. Watching
+  // is worth having on its own — it is what turns a silent outage into a log
+  // line — even where this process cannot pull the lever.
+  const before = process.env.AIBROKER_FUNNEL_HOST;
+  process.env.AIBROKER_FUNNEL_HOST = "node.example.ts.net";
+  try {
+    const h = funnelHostname(undefined);
+    assert.equal(h.ok, true);
+    assert.equal(h.hostname, "node.example.ts.net");
+    assert.equal(funnelConfigured(undefined).configured, true);
+  } finally {
+    if (before === undefined) delete process.env.AIBROKER_FUNNEL_HOST;
+    else process.env.AIBROKER_FUNNEL_HOST = before;
+  }
+});
+
+test("a missing client is reported, not read as an absent funnel", () => {
+  const before = process.env.AIBROKER_FUNNEL_HOST;
+  delete process.env.AIBROKER_FUNNEL_HOST;
+  try {
+    const h = funnelHostname(""); // stands in for a machine with no client
+    assert.equal(h.ok, false, "unable to ask is not the same as nothing to watch");
+    assert.match(h.error ?? "", /binary/);
+  } finally {
+    if (before !== undefined) process.env.AIBROKER_FUNNEL_HOST = before;
+  }
 });
 
 test("a long healthy stretch cannot accumulate into a bounce", () => {
