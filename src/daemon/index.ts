@@ -292,6 +292,16 @@ export async function startDaemon(options?: {
     log("todoist-oauth: keeper not started — TODOIST_CLIENT_ID/SECRET not set");
   }
 
+  // A token that refreshes itself is no use if nothing can reach us. Funnel
+  // has twice reported itself healthy while refusing every connection from the
+  // internet, and both times the outage was found by a human noticing a
+  // message that never arrived. The watchdog probes from outside and, only on
+  // repeated proof, reconnects the node.
+  if (process.env.AIBROKER_FUNNEL_WATCHDOG !== "0") {
+    const { startFunnelWatchdog } = await import("./funnel-watchdog.js");
+    startFunnelWatchdog();
+  }
+
   startTodoistWebhook({
     deliver: async (project, body, opts) => {
       const { dispatch } = await import("./dispatch.js");

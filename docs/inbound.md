@@ -110,6 +110,30 @@ phone. A route without one is best-effort, and should be treated as such.
 
 ---
 
+## When the funnel lies
+
+Tailscale Funnel can report itself healthy while refusing every connection from
+the internet: `funnel status` prints "Funnel on", the serve config is intact,
+the node is Online, and the ingress relays reset every connection. Twice now the
+outage was found only when a human noticed a message that never arrived.
+
+Do not trust a local check. The tailnet resolver answers the funnel hostname
+with the node's own `100.x` address, so a `curl` on that machine is answered by
+the same daemon that would answer a real request — a green that means nothing.
+The only honest probe resolves the hostname through a **public** resolver,
+connects to the ingress address, and sets SNI by hand.
+
+`funnel-watchdog.ts` does that every five minutes and, on three consecutive
+failures, reconnects the node — which is what clears the state. It is
+deliberately reluctant: one relay answering counts as up, an inconclusive probe
+resets the streak rather than building toward a bounce, and a cooldown keeps a
+fault it cannot fix from becoming a reconnect loop. A reconnect drops live
+tailnet connections for a moment, so it happens on proof or not at all.
+
+Set `AIBROKER_FUNNEL_WATCHDOG=0` to turn it off.
+
+---
+
 ## Feeding a route from a polling source
 
 Most sources cannot call a webhook. The pattern for those — and the trap in it —
