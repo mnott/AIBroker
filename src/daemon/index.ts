@@ -10,6 +10,7 @@ import { homedir, tmpdir } from "node:os";
 import { unlinkSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { setLogPrefix, log } from "../core/log.js";
+import { extForMime } from "../core/mime.js";
 import { loadEnvFile } from "../core/env.js";
 import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
@@ -483,7 +484,10 @@ export async function startDaemon(options?: {
         const att = attachments[i];
         const buf = Buffer.from(att.data, "base64");
         const mime = (att.mimeType ?? "application/octet-stream").toLowerCase();
-        const ext = mime.includes("png") ? "png" : mime.includes("pdf") ? "pdf" : mime.includes("image") ? "jpg" : "bin";
+        // Ask the shared table rather than re-deciding here. The chain that
+        // used to be written out — png, else pdf, else any image is a jpg, else
+        // "bin" — turned every video into an unplayable .bin.
+        const ext = extForMime(mime);
         const name = att.fileName ?? `attachment_${i + 1}.${ext}`;
         const filePath = join(tmpdir(), `pailot-${Date.now()}-${randomUUID().slice(0, 8)}-${name}`);
         writeFileSync(filePath, buf);
