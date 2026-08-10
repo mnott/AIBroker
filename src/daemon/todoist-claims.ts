@@ -57,6 +57,12 @@ export const CLAIM_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 /** Used only when the next occurrence is unknown — comfortably past PAI's default. */
 export const CLAIM_FALLBACK_AGE_MS = 12 * 60 * 60 * 1000;
 
+/**
+ * A ceiling on the occurrence rule. Nothing here recurs less often than daily,
+ * so a claim older than a day is stale whatever the due date says.
+ */
+export const CLAIM_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 interface ClaimRecord {
   claimedAt: string;
   /** Next occurrence, when the payload carried one. */
@@ -105,13 +111,27 @@ export function listClaims(): Array<{ taskId: string; claimedAt: string; nextDue
  * The next occurrence, less a small margin, so the claim is gone before the
  * trigger it would block. With no known occurrence, a flat twelve hours —
  * chosen to clear an adaptive poller's default rather than to be right.
+ *
+ * THE OCCURRENCE CAN ITSELF BE WRONG, so it needs a ceiling. Ticking a
+ * recurring task by hand consumes the occurrence already scheduled, and Todoist
+ * advances the due date past it: a manual run in the afternoon of a daily
+ * routine moves the next occurrence to the day after tomorrow. Following that
+ * date alone kept a claim alive 39 hours — straight across a scheduled run it
+ * then suppressed, which is the silence this module exists to end, produced by
+ * the module's own arithmetic.
+ *
+ * A day is the ceiling because nothing here recurs less often than daily, so
+ * past that the claim cannot still be describing a live run. It stays behind an
+ * adaptive poller for anything expected under a couple of hours, which is every
+ * routine this actually guards; a genuinely day-long run would need its own
+ * answer, and does not exist yet.
  */
 export function claimDeadline(c: { claimedAt: string; nextDue?: string }): number {
   const claimed = Date.parse(c.claimedAt);
   const floor = claimed + CLAIM_MIN_AGE_MS;
   const due = c.nextDue ? Date.parse(c.nextDue) : NaN;
   const deadline = Number.isFinite(due)
-    ? due - CLAIM_DEADLINE_MARGIN_MS
+    ? Math.min(due - CLAIM_DEADLINE_MARGIN_MS, claimed + CLAIM_MAX_AGE_MS)
     : claimed + CLAIM_FALLBACK_AGE_MS;
   // A run is allowed to be slow even when the next occurrence is close.
   return Math.max(deadline, floor);

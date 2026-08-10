@@ -48,6 +48,16 @@ test("the deadline is the next occurrence, not a fixed duration", () => {
   assert.ok(hours > 23 && hours < 24, `deadline at ${hours}h should sit just inside the next run`);
 });
 
+test("a due date pushed past tomorrow does not extend the claim to match", () => {
+  // Ticking a daily routine by hand consumes the scheduled occurrence, so
+  // Todoist advances the due date to the day after tomorrow. Trusting that date
+  // alone kept one claim alive 39 hours, straight across a scheduled run it
+  // then suppressed.
+  const manual = { claimedAt: new Date().toISOString(), nextDue: inHours(39) };
+  const hours = (claimDeadline(manual) - Date.now()) / 3600_000;
+  assert.ok(hours <= 24.01, `deadline at ${hours}h must not reach into the next scheduled run`);
+});
+
 test("a claim never survives into the run it would block", () => {
   // Past the next occurrence the trigger arrives and the claim suppresses it,
   // which is the silence again.

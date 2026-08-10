@@ -669,17 +669,31 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         // Still not actionable as work; fall through to be recorded as ignored.
       }
 
-      // A comment carries item_id and its own text and nothing else — no
-      // project, no labels — so the boundary cannot be evaluated until the
-      // parent task is resolved. Do it before routing, and let a failed lookup
-      // drop the event rather than route it against a missing project, which
-      // the allowlist would refuse anyway but for the wrong reason.
-      if (event.event_name === "note:added" && !event.event_data?.project_id) {
+      // A REMINDER carries even less than a comment: it describes the reminder,
+      // not the task — item_id, a due date, who to notify. No project, no
+      // labels, no content.
+      //
+      // That is why every reminder this receiver ever saw was refused with
+      // "project ? is not an ingress project" — including reminders on tasks
+      // squarely inside the allowlist. And since a due date pushes NOTHING and
+      // scheduling here is expressed as a reminder, the entire "it also runs on
+      // its own when it comes due" path was dead from the start: silent, and
+      // indistinguishable from a schedule that simply had not come round yet.
+      //
+      // The resolution is the one already used for comments, so it is written
+      // as one: look the task up by item_id and evaluate the boundary against
+      // the real thing.
+      const needsParent =
+        (event.event_name === "note:added" || event.event_name === "reminder:fired") &&
+        !event.event_data?.project_id;
+      if (needsParent) {
+        const isReminder = event.event_name === "reminder:fired";
+        const kind = isReminder ? "reminder" : "comment";
         const parentId = String(event.event_data?.item_id ?? "");
         if (!parentId) {
           audit({
             action: "webhook", actor: "todoist", target: "aibroker", outcome: "ignored",
-            reason: "comment carries no item_id", meta: { event: event.event_name },
+            reason: `${kind} carries no item_id`, meta: { event: event.event_name },
           });
           return;
         }
@@ -691,12 +705,16 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
             id: parentId,
             project_id: parent.projectId,
             labels: parent.labels,
-            // Answer on the task, about the task: the comment is the
-            // instruction, the title is the context it makes sense in.
-            description: parent.content ? `(comment on "${parent.content}")` : "",
+            // A reminder has no text of its own, and routing needs some: the
+            // task IS the instruction here, so its title is the content. A
+            // comment brings its own text and keeps it — the title is only the
+            // context that text makes sense in.
+            ...(isReminder
+              ? { content: parent.content }
+              : { description: parent.content ? `(comment on "${parent.content}")` : "" }),
           };
         } catch (err) {
-          const reason = `could not resolve the task a comment belongs to — ${err instanceof Error ? err.message : String(err)}`;
+          const reason = `could not resolve the task a ${kind} belongs to — ${err instanceof Error ? err.message : String(err)}`;
           audit({
             action: "webhook", actor: "todoist", target: "aibroker",
             outcome: "ignored", reason, meta: { event: event.event_name, taskId: parentId },
