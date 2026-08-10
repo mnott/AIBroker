@@ -222,20 +222,54 @@ export function getSessionList(): Array<{
 
 // ── Session Creation ──
 
-export function createClaudeSession(command = "claude"): string | null {
-  try {
-    const script = `tell application "iTerm2"
-  tell current window
-    set newTab to (create tab with default profile)
-    tell newTab
+/**
+ * AppleScript that lands on a usable session, whatever state the app is in.
+ *
+ * `current window` is not always there. With the screen locked no window is
+ * key, and an app launched by the AppleScript itself has none at all — both
+ * answer `missing value`, and `create tab` on that fails with -1728, which the
+ * caller could only report as "failed to create a tab". A scheduled run then
+ * dies for the sole reason that nobody happened to be looking at the machine.
+ *
+ * So: the frontmost window if there is one, otherwise any window, otherwise a
+ * new window — which arrives with a session already in it, so there is nothing
+ * to create inside it.
+ */
+function openSessionScript(command: string): string {
+  const write = command ? `write text "${command.replace(/"/g, '\\"')}"` : "";
+  return `tell application "iTerm2"
+  set targetWindow to missing value
+  try
+    set targetWindow to current window
+  end try
+  if targetWindow is missing value and (count of windows) > 0 then
+    set targetWindow to item 1 of windows
+  end if
+  if targetWindow is missing value then
+    set targetWindow to (create window with default profile)
+    tell targetWindow
       tell current session
-        write text "${command.replace(/"/g, '\\"')}"
+        ${write}
         return id
       end tell
     end tell
-  end tell
+  else
+    tell targetWindow
+      set newTab to (create tab with default profile)
+      tell newTab
+        tell current session
+          ${write}
+          return id
+        end tell
+      end tell
+    end tell
+  end if
 end tell`;
-    return runAppleScript(script) ?? null;
+}
+
+export function createClaudeSession(command = "claude"): string | null {
+  try {
+    return runAppleScript(openSessionScript(command)) ?? null;
   } catch (err) {
     log("Failed to create session:", String(err));
     return null;
@@ -244,21 +278,7 @@ end tell`;
 
 export function createTerminalTab(command?: string): string | null {
   try {
-    const writeCmd = command
-      ? `write text "${command.replace(/"/g, '\\"')}"`
-      : "";
-    const script = `tell application "iTerm2"
-  tell current window
-    set newTab to (create tab with default profile)
-    tell newTab
-      tell current session
-        ${writeCmd}
-        return id
-      end tell
-    end tell
-  end tell
-end tell`;
-    return runAppleScript(script) ?? null;
+    return runAppleScript(openSessionScript(command ?? "")) ?? null;
   } catch (err) {
     log("Failed to create terminal tab:", String(err));
     return null;

@@ -77,6 +77,41 @@ test("garbage in the signature header does not throw", () => {
 
 // ── the boundary ────────────────────────────────────────────────────────────
 
+// ── reminders, the only thing that pushes on a schedule ─────────────────────
+
+test("a raw reminder is refused, because it describes the reminder and not the task", () => {
+  // Todoist sends item_id, a due date and who to notify — no project, no
+  // labels, no content. Every reminder this receiver ever saw was refused as
+  // "project ? is not an ingress project", INCLUDING reminders on tasks inside
+  // the allowlist. Since a due date pushes nothing, that silently killed the
+  // whole "runs on its own when it comes due" path.
+  const raw = {
+    event_name: "reminder:fired",
+    triggered_at: "2026-08-01T16:00:00.0Z",
+    initiator: { email: "owner@example.com", id: "1" },
+    event_data: { id: "rem-1", item_id: "task-1" },
+  } as unknown as TodoistEvent;
+  const d = route(raw, cfg);
+  assert.equal(d.act, false);
+  assert.match(d.reason ?? "", /not an ingress project/);
+});
+
+test("a reminder resolved against its task routes like any other work", () => {
+  // What the receiver back-fills before routing: the parent's project, its
+  // labels, and its title as the content — a reminder has no text of its own
+  // and routing needs some.
+  const resolved = task({
+    id: "task-1",
+    content: "Job sweep — run it and mail me the list",
+    project_id: INGRESS,
+    labels: ["pai:whazaa"],
+  });
+  resolved.event_name = "reminder:fired";
+  const d = route(resolved, cfg);
+  assert.equal(d.act, true, "a scheduled trigger must reach its session");
+  assert.equal(d.project, "whazaa");
+});
+
 test("a task in the ingress project with an owner label is acted on", () => {
   const d = route(task(), cfg);
   assert.equal(d.act, true);
