@@ -45,6 +45,39 @@ describe("message-queue", () => {
     flushQueue();
   });
 
+  describe("size limits", () => {
+    // A count is not a size. The queue held 500 messages and 194 MB of them —
+    // three videos at 29.7 MB each — and replaying that to a reconnecting phone
+    // is what killed the app.
+    it("stores an oversized message without its attachment, keeping the message", () => {
+      loadQueue(100);
+      const big = "x".repeat(2 * 1024 * 1024);
+      const seq = enqueue("s-1", "image", { imageBase64: big, caption: "a video", mimeType: "video/mp4" });
+      const stored = getAfter(seq - 1).find((m) => m.seq === seq);
+      assert.ok(stored, "the message is still queued");
+      assert.equal(stored?.payload.imageBase64, undefined, "the bulk is gone");
+      assert.match(String(stored?.payload.caption), /a video/, "the caption survives");
+      assert.match(String(stored?.payload.caption), /too large/, "and says what happened");
+    });
+
+    it("does not touch a message that fits", () => {
+      loadQueue(100);
+      const seq = enqueue("s-1", "image", { imageBase64: "small", caption: "thumb" });
+      const stored = getAfter(seq - 1).find((m) => m.seq === seq);
+      assert.equal(stored?.payload.imageBase64, "small");
+    });
+
+    it("drops the oldest messages to stay inside the byte budget", () => {
+      loadQueue(1000, 300 * 1024);
+      for (let i = 0; i < 12; i++) enqueue("s-1", "text", { content: "y".repeat(60 * 1024) });
+      const all = getAfter(0);
+      const bytes = all.reduce((n, m) => n + JSON.stringify(m).length, 0);
+      assert.ok(bytes <= 300 * 1024, `queue is ${bytes} bytes, over budget`);
+      assert.ok(all.length < 12, "older messages were dropped");
+      assert.equal(all[all.length - 1].payload.content?.toString().length, 60 * 1024, "the newest survives intact");
+    });
+  });
+
   describe("isContentType", () => {
     it("returns true for text, voice, image", () => {
       assert.ok(isContentType("text"));

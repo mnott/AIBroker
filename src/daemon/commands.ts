@@ -9,7 +9,9 @@
  * single command handler shared by all adapters.
  */
 
-import { basename } from "node:path";
+import { basename, resolve as resolvePath } from "node:path";
+import { homedir } from "node:os";
+import { existsSync, statSync } from "node:fs";
 
 import {
   sessionRegistry,
@@ -302,9 +304,36 @@ end tell`);
 
   // ── Relocate (new visual session) ──
 
+  /**
+   * Resolve a path argument the way a person means it.
+   *
+   * `~` is expanded by the SHELL, not by us — so `/n ~` used to open a tab in
+   * the home directory while naming the session `basename("~")`, which is the
+   * literal string `~`. The tab was real and the row in the session list was
+   * nonsense, presented exactly like a good one.
+   *
+   * Returns null when the argument is not a directory that exists, so a typo
+   * is refused rather than half-executed.
+   */
+  function resolveTargetPath(raw: string): string | null {
+    let p = raw.trim().replace(/^['"]|['"]$/g, "");
+    if (!p) return null;
+    if (p === "~") p = homedir();
+    else if (p.startsWith("~/")) p = `${homedir()}/${p.slice(2)}`;
+    p = resolvePath(p);
+    try {
+      if (!existsSync(p) || !statSync(p).isDirectory()) return null;
+    } catch {
+      return null;
+    }
+    return p;
+  }
+
   function handleRelocate(targetPath: string): string | null {
     const command = `claude --dangerously-skip-permissions`;
-    const newId = createClaudeSession(`cd ${targetPath} && ${command}`);
+    // Quoted: this reaches a shell, and a path with a space in it is ordinary.
+    const quoted = `'${targetPath.replace(/'/g, "'\\''")}'`;
+    const newId = createClaudeSession(`cd ${quoted} && ${command}`);
     return newId;
   }
 
@@ -372,8 +401,14 @@ end tell`);
     // --- /n <path> (aliases: /nv, /new, /relocate) — new visual session ---
     const relocateMatch = trimmedText.match(/^\/(?:n|nv|new|relocate)\s+(.+)$/);
     if (relocateMatch) {
-      const targetPath = relocateMatch[1].trim();
-      if (targetPath) {
+      const targetPath = resolveTargetPath(relocateMatch[1]);
+      if (!targetPath) {
+        const raw = relocateMatch[1].trim();
+        log(`/n: refused "${raw}" — not an existing directory`);
+        ctx.reply(`Not a directory: ${raw}`).catch(() => {});
+        return;
+      }
+      {
         const newSessionId = handleRelocate(targetPath);
         if (newSessionId) {
           const name = basename(targetPath);
@@ -386,8 +421,6 @@ end tell`);
         }
         return;
       }
-      log("/n: no path provided");
-      return;
     }
 
     // --- /sessions (aliases: /s) — list sessions ---

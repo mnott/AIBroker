@@ -36,6 +36,39 @@ TypeScript compiles to `dist/`. Entry points:
 - `dist/daemon/index.js` — Hub daemon
 - `dist/mcp/index.js` — Unified MCP server
 
+### Two entry points means two reloads
+
+Building is not deploying, and restarting the daemon only deploys half of it:
+
+| Changed code in | In force after |
+|---|---|
+| `dist/daemon/**` | `launchctl kickstart -k gui/$(id -u)/com.aibroker.daemon` |
+| `dist/mcp/**` | restarting **each Claude Code session** |
+
+Node reads a module once, at process start. Every session runs its **own** MCP
+server, started when that session started, so a session opened days ago is still
+executing the build from days ago no matter how many times the daemon is
+restarted. Anything computed in a tool handler — a MIME lookup, an argument
+check, a path — lives there.
+
+This is an easy way to conclude a fix did not work when it did: the obvious
+instruction after a fix is "restart the daemon", the test is then run from an
+existing session, and the old behaviour comes back.
+
+Do not reason about it from process ids. `aibroker_status` reports the shim's
+own vintage and says so plainly:
+
+```json
+"mcp": {
+  "loadedAt": "…", "bundleBuiltAtLoad": "…", "bundleOnDiskNow": "…",
+  "stale": true,
+  "warning": "This MCP server is running code OLDER than what is installed…"
+}
+```
+
+A `stale: true` session cannot give a truthful answer about an MCP-layer fix —
+neither a pass nor a fail. Test from a session started after the build.
+
 ## Test
 
 ```bash

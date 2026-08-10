@@ -59,20 +59,16 @@ import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
 import { getAllPersistentSessionNames, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
+import { discoverLiveSessions, isClaudeRelated } from "../../core/session-discovery.js";
 
 /**
  * Enrich snapshots with paiName from the persistent JSON store.
- * snapshotAllSessions() always returns paiName=null since v0.7.10;
- * the authoritative source is ~/.aibroker/session-names.json.
+ *
+ * Now an alias for the shared discovery in core: this used to be one of two
+ * implementations, and the copy the channel commands could not reach is how a
+ * WhatsApp session list came to disagree with the MCP one.
  */
-function enrichedSnapshots(): ReturnType<typeof snapshotAllSessions> {
-  const snaps = snapshotAllSessions();
-  const persistentNames = getAllPersistentSessionNames();
-  for (const snap of snaps) {
-    snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
-  }
-  return snaps;
-}
+const enrichedSnapshots = discoverLiveSessions;
 
 const WS_PORT = parseInt(process.env.PAILOT_PORT ?? "8765", 10);
 
@@ -189,11 +185,40 @@ function handleCatchUp(ws: WebSocket, args?: Record<string, unknown>): void {
     return;
   }
 
-  log(`[PAILot] catch_up: replaying ${missed.length} messages (client lastSeq=${lastSeq}, server seq=${currentSeq})`);
+  // A ceiling on what one client can be handed at once.
+  //
+  // A fresh install asks from seq 0, so "everything you missed" is the entire
+  // buffer. That is how a phone was handed 117 MB in one reply, wrote it to its
+  // local store, and was killed by the watchdog on the next launch — twice,
+  // because reinstalling asks from 0 again. The queue is byte-bounded now, but
+  // this must hold on its own: a limit that only works because another limit
+  // works is not a limit.
+  //
+  // Newest first when trimming. If we cannot send everything, the recent end is
+  // the part that keeps the conversation coherent.
+  const CATCH_UP_MAX_BYTES = 4 * 1024 * 1024;
+  const payloads: unknown[] = [];
+  let bytes = 0;
+  let skipped = 0;
+  for (let i = missed.length - 1; i >= 0; i--) {
+    const p = missed[i].payload;
+    const size = JSON.stringify(p)?.length ?? 0;
+    if (bytes + size > CATCH_UP_MAX_BYTES && payloads.length > 0) { skipped = i + 1; break; }
+    payloads.unshift(p);
+    bytes += size;
+  }
+  if (skipped > 0) {
+    log(`[PAILot] catch_up: withheld ${skipped} older message(s) — over ${Math.round(CATCH_UP_MAX_BYTES / 1048576)} MB`);
+  }
+
+  log(`[PAILot] catch_up: replaying ${payloads.length} messages, ${Math.round(bytes / 1024)} KB (client lastSeq=${lastSeq}, server seq=${currentSeq})`);
   sendTo(ws, {
     type: "catch_up",
-    messages: missed.map(e => e.payload),
+    messages: payloads,
     serverSeq: currentSeq,
+    // Say when the reply is partial, so "that is all there was" and "that is all
+    // you are getting" are not the same silence.
+    ...(skipped > 0 ? { truncated: true, withheld: skipped } : {}),
   });
 }
 
@@ -223,13 +248,8 @@ export function setScreenshotHandler(handler: (source?: "whatsapp" | "pailot", s
  * A session qualifies if it has paiName, name contains "claude",
  * or is not at shell prompt (has a process running — likely Claude).
  */
-function isClaudeRelated(snap: ReturnType<typeof snapshotAllSessions>[0]): boolean {
-  if (snap.paiName) return true;
-  const name = (snap.tabTitle ?? snap.name).toLowerCase();
-  if (name.includes("claude")) return true;
-  if (!snap.atPrompt) return true;
-  return false;
-}
+// isClaudeRelated now lives in core/session-discovery.js — see the import above.
+// It was duplicated here, which is half of why two session lists could differ.
 
 /** Detect which iTerm2 session is currently focused and sync the hybrid manager to it.
  *  If the client passes activeSessionId, preserve that selection instead of
@@ -1301,8 +1321,8 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
     let sessionName = "PAI";
     if (resolvedSession) {
       // Try hybrid manager first; if empty, scan iTerm directly for session name
-      if (hybridManager && hybridManager.listSessions().length > 0) {
-        const match = hybridManager.listSessions().find(s => s.backendSessionId.startsWith(resolvedSession) || resolvedSession.startsWith(s.backendSessionId));
+      if (hybridManager && hybridManager.knownSessions().length > 0) {
+        const match = hybridManager.knownSessions().find(s => s.backendSessionId.startsWith(resolvedSession) || resolvedSession.startsWith(s.backendSessionId));
         if (match) sessionName = match.name;
       } else {
         // Fallback: scan iTerm tabs for the session name
@@ -1387,8 +1407,8 @@ export async function broadcastVoice(
   if (transcript) {
     let voiceSessionName = "PAI";
     if (resolvedSession) {
-      if (hybridManager && hybridManager.listSessions().length > 0) {
-        const match = hybridManager.listSessions().find(s => s.backendSessionId.startsWith(resolvedSession) || resolvedSession.startsWith(s.backendSessionId));
+      if (hybridManager && hybridManager.knownSessions().length > 0) {
+        const match = hybridManager.knownSessions().find(s => s.backendSessionId.startsWith(resolvedSession) || resolvedSession.startsWith(s.backendSessionId));
         if (match) voiceSessionName = match.name;
       } else {
         const snaps = enrichedSnapshots();

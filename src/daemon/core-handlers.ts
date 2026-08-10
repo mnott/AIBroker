@@ -41,6 +41,7 @@ import { matchSession } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, revealItermSession } from "../adapters/iterm/sessions.js";
+import { discoverLiveSessions } from "../core/session-discovery.js";
 import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -115,14 +116,14 @@ export function registerCoreHandlers(
   });
 
   server.on("sessions", async (_req) => {
-    // Use snapshotAllSessions() — the same iTerm2 source that session_content uses —
-    // to enumerate live sessions without pulling scrollback content.
-    // manager.listSessions() is always empty (nothing populates the internal registry).
-    const snapshots = snapshotAllSessions();
-    // Merge paiName from the persistent store (faster + more reliable than iTerm variables).
-    const persistentNames = getAllPersistentSessionNames();
+    // The shared discovery, which is also what the hybrid manager syncs from,
+    // so this tool and the channel commands cannot report different machines.
+    // The note that used to sit here — "manager.listSessions() is always empty
+    // (nothing populates the internal registry)" — described the defect and
+    // routed around it; the registry now populates itself.
+    const snapshots = discoverLiveSessions();
     const sessions = snapshots.map((s, i) => {
-      const paiName = lookupPersistentName(persistentNames, s.id, s.aibrokerId);
+      const paiName = s.paiName;
       return {
         index: i + 1,
         sessionId: s.id,

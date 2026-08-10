@@ -11,6 +11,7 @@ import { unlinkSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { setLogPrefix, log } from "../core/log.js";
 import { extForMime } from "../core/mime.js";
+import { discoverLiveSessions, isClaudeRelated } from "../core/session-discovery.js";
 import { loadEnvFile } from "../core/env.js";
 import { setAppDir } from "../core/persistence.js";
 import { IpcServer } from "../ipc/server.js";
@@ -102,6 +103,9 @@ export async function startDaemon(options?: {
     skipDefaultSession: true,
   });
   const manager = new HybridSessionManager(apiBackend);
+  // The session list a channel shows and the one the MCP tool returns must come
+  // from the same place, or they disagree and only one of them is believed.
+  manager.setDiscovery(() => discoverLiveSessions().filter(isClaudeRelated));
   setHybridManager(manager);
   router.setDefaultBackend(apiBackend);
 
@@ -419,7 +423,12 @@ export async function startDaemon(options?: {
     // bridge, where the lower transports silently fall back to the active
     // session — landing the message in the wrong tab. Refuse to route, push a
     // fresh session list, and tell the user.
-    const knownSession = manager.listSessions().some(s => s.backendSessionId === routeSession);
+    // This runs on every inbound message, so ask the registry first and only
+    // pay for a live enumeration when the id looks unknown — rejecting a
+    // session that does exist is the expensive mistake here, not the lookup.
+    const known = (list: { backendSessionId: string }[]) =>
+      list.some(s => s.backendSessionId === routeSession);
+    const knownSession = known(manager.knownSessions()) || known(manager.listSessions());
     if (!knownSession) {
       log(`[MQTT→Hub] Rejecting ${type} — sessionId=${routeSession.slice(0, 8)} is stale (no matching session). Refreshing client list.`);
       mqttPublishControl({ type: "session_not_found", sessionId: routeSession });
