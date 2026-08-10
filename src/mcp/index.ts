@@ -1043,20 +1043,12 @@ server.tool(
       const ext = extname(filePath).toLowerCase();
       // Determine if it's an image or a generic file
       const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"];
-      const mimeMap: Record<string, string> = {
-        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-        ".svg": "image/svg+xml", ".pdf": "application/pdf",
-        ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".txt": "text/plain", ".csv": "text/csv", ".json": "application/json",
-        ".md": "text/markdown", ".html": "text/html", ".htm": "text/html",
-        ".xml": "application/xml", ".yaml": "text/yaml", ".yml": "text/yaml",
-        ".ts": "text/plain", ".js": "text/plain", ".py": "text/plain",
-        ".sh": "text/plain", ".dart": "text/plain", ".swift": "text/plain",
-        ".zip": "application/zip", ".gz": "application/gzip",
-      };
-      const mimeType = mimeMap[ext] ?? "application/octet-stream";
+      // The shared table, not a local copy of it. The copy that used to live
+      // here listed images, documents and source files and no video at all, so
+      // an mp4 resolved to application/octet-stream and reached the phone as a
+      // file it could not play.
+      const { lookupMime } = await import("../core/mime.js");
+      const mimeType = lookupMime(ext);
       const sessionId = getSessionId();
       if (imageExts.includes(ext)) {
         await hub.call_raw("pailot_send", { imageBase64: b64, caption: caption ?? filePath.split("/").pop(), mimeType, sessionId });

@@ -7,7 +7,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { lookupMime, MIME_MAP } from "../src/core/mime.js";
+import { lookupMime, extForMime, MIME_MAP } from "../src/core/mime.js";
 
 describe("lookupMime", () => {
   it("looks up common document types", () => {
@@ -55,6 +55,39 @@ describe("lookupMime", () => {
     assert.equal(lookupMime(".xyz"), "application/octet-stream");
     assert.equal(lookupMime(".unknown"), "application/octet-stream");
     assert.equal(lookupMime("nope"), "application/octet-stream");
+  });
+});
+
+describe("extForMime", () => {
+  it("names a video what it is", () => {
+    // The failure this exists to stop: a video saved as `.bin`, which arrives
+    // on a phone unplayable until renamed by hand.
+    assert.equal(extForMime("video/mp4"), "mp4");
+    assert.equal(extForMime("video/quicktime"), "mov");
+  });
+
+  it("round-trips every type the table accepts", () => {
+    // Anything this codebase is willing to SEND it must also be able to NAME.
+    // Both places that answered this question locally listed a few types they
+    // had thought of and called the rest "bin".
+    for (const [ext, mime] of Object.entries(MIME_MAP)) {
+      const back = extForMime(mime);
+      assert.equal(lookupMime(back), mime, `${ext} -> ${mime} -> .${back} did not come back`);
+    }
+  });
+
+  it("ignores parameters and case", () => {
+    assert.equal(extForMime("VIDEO/MP4"), "mp4");
+    assert.equal(extForMime("text/plain; charset=utf-8"), "txt");
+  });
+
+  it("takes a self-naming subtype for a type it does not carry", () => {
+    assert.equal(extForMime("image/heic"), "heic");
+  });
+
+  it("falls back to bin only when nothing else is honest", () => {
+    assert.equal(extForMime("application/octet-stream"), "bin");
+    assert.equal(extForMime(""), "bin");
   });
 });
 
