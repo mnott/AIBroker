@@ -19,6 +19,32 @@ const QUEUE_DIR = join(homedir(), ".aibroker");
 const QUEUE_FILE = join(QUEUE_DIR, "pailot-queue.json");
 const DEFAULT_MAX_SIZE = 500;
 
+/**
+ * A byte ceiling, because a count is not a size.
+ *
+ * The queue held 500 messages and 194 MB of them: three videos at 29.7 MB each,
+ * base64, plus a month of screenshots. A client reconnecting asked for
+ * everything it had missed, got all of it, wrote it to its own store, and was
+ * killed by the watchdog on the next launch trying to parse it.
+ *
+ * Counting messages bounds nothing when one message can be tens of megabytes.
+ */
+const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The point past which an attachment is not worth replaying.
+ *
+ * A queue exists so a client that was offline for a while does not lose the
+ * thread. Text is what carries the thread; a 30 MB video is not something a
+ * reconnecting phone needs handed to it unasked, and it is what breaks the
+ * phone when it does. Big payloads are dropped and the caption says so, which
+ * leaves the conversation readable and the attachment retrievable on request.
+ */
+const MAX_PAYLOAD_BYTES = 256 * 1024;
+
+/** Fields that carry bulk. Dropping them leaves the message and its context. */
+const BULK_FIELDS = ["imageBase64", "audioBase64", "data"] as const;
+
 /** Content types that get persisted to the queue. */
 const CONTENT_TYPES = new Set(["text", "voice", "image"]);
 
@@ -40,14 +66,16 @@ interface QueueState {
 let nextSeq = 1;
 let messages: QueuedMessage[] = [];
 let maxSize = DEFAULT_MAX_SIZE;
+let maxBytes = DEFAULT_MAX_BYTES;
 let dirty = false;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
 // --- Persistence ---
 
 /** Load the queue from disk. Call once at daemon startup. */
-export function loadQueue(maxMessages?: number): void {
+export function loadQueue(maxMessages?: number, maxQueueBytes?: number): void {
   if (maxMessages) maxSize = maxMessages;
+  if (maxQueueBytes) maxBytes = maxQueueBytes;
 
   try {
     mkdirSync(QUEUE_DIR, { recursive: true });
@@ -60,6 +88,10 @@ export function loadQueue(maxMessages?: number): void {
     if (Array.isArray(state.messages)) {
       // Trim to maxSize on load (queue file could have been edited)
       messages = state.messages.slice(-maxSize);
+      // And to the byte budget: a queue written before this limit existed, or
+      // edited by hand, must not survive a restart intact and be replayed.
+      messages = messages.map(shrinkIfHuge);
+      trimToByteBudget();
     }
 
     log(`[MQ] loaded ${messages.length} messages, nextSeq=${nextSeq}`);
@@ -131,15 +163,65 @@ export function enqueue(sessionId: string, type: string, payload: Record<string,
     ts: Date.now(),
   };
 
-  messages.push(entry);
+  messages.push(shrinkIfHuge(entry));
 
   // Trim circular buffer
   if (messages.length > maxSize) {
     messages = messages.slice(-maxSize);
   }
+  trimToByteBudget();
 
   scheduleSave();
   return seq;
+}
+
+/** Size of an entry as it would be stored and replayed. */
+function entryBytes(m: QueuedMessage): number {
+  try {
+    return JSON.stringify(m).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Strip the bulk from an oversized entry, keeping the message itself.
+ *
+ * Done at ENQUEUE, not at replay: a payload nobody can be handed is not worth
+ * carrying on disk either, and stripping once is cheaper than deciding again
+ * for every client that reconnects.
+ */
+function shrinkIfHuge(m: QueuedMessage): QueuedMessage {
+  if (entryBytes(m) <= MAX_PAYLOAD_BYTES) return m;
+  const payload = { ...m.payload };
+  let dropped = false;
+  for (const f of BULK_FIELDS) {
+    if (payload[f]) { delete payload[f]; dropped = true; }
+  }
+  if (!dropped) return m;
+  const caption = typeof payload.caption === "string" ? payload.caption : "";
+  payload.caption = `${caption}${caption ? " " : ""}[attachment too large to replay — ask for it again if you need it]`;
+  log(`[MQ] seq=${m.seq} exceeded ${Math.round(MAX_PAYLOAD_BYTES / 1024)} KB — stored without its attachment`);
+  return { ...m, payload };
+}
+
+/**
+ * Drop the oldest messages until the queue fits its byte budget.
+ *
+ * Oldest first, because the queue's purpose is recent continuity: a client
+ * that has been away long enough to need the far end of the buffer has lost
+ * the thread regardless.
+ */
+function trimToByteBudget(): void {
+  let total = messages.reduce((n, m) => n + entryBytes(m), 0);
+  if (total <= maxBytes) return;
+  let dropped = 0;
+  while (messages.length > 1 && total > maxBytes) {
+    total -= entryBytes(messages[0]);
+    messages.shift();
+    dropped++;
+  }
+  log(`[MQ] byte budget exceeded — dropped ${dropped} oldest message(s), now ${Math.round(total / 1024)} KB`);
 }
 
 /**

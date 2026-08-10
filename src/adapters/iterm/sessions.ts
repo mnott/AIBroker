@@ -234,9 +234,34 @@ export function getSessionList(): Array<{
  * So: the frontmost window if there is one, otherwise any window, otherwise a
  * new window — which arrives with a session already in it, so there is nothing
  * to create inside it.
+ *
+ * `create tab` CAN ALSO ANSWER `missing value` on a window that genuinely
+ * exists — a hotkey window, or one whose profile will not host another tab.
+ * The original guard covered the window and then dereferenced the tab
+ * unchecked, so that case failed with the very error the guard was added to
+ * prevent, one level down: `Can't get current session of missing value`
+ * (-1728), thrown at `tell newTab`.
+ *
+ * Measured cost, 2026-08-07 to 2026-08-11: 471 failed launches for one project
+ * and 193 for another. Three strikes park a task, so both daily sweeps and an
+ * application task stopped running entirely and stayed parked for four days.
+ *
+ * A window that cannot take a tab is not a reason to fail — a new window is
+ * always available and always arrives with a session in it. So the tab result
+ * is now checked, and falls back to the same new-window path the no-window
+ * case already used.
  */
 function openSessionScript(command: string): string {
   const write = command ? `write text "${command.replace(/"/g, '\\"')}"` : "";
+  // One place to describe "a brand-new window, which comes with a session".
+  const viaNewWindow = `set targetWindow to (create window with default profile)
+    if targetWindow is missing value then error "iTerm2 would not create a window" number -1728
+    tell targetWindow
+      tell current session
+        ${write}
+        return id
+      end tell
+    end tell`;
   return `tell application "iTerm2"
   set targetWindow to missing value
   try
@@ -246,23 +271,24 @@ function openSessionScript(command: string): string {
     set targetWindow to item 1 of windows
   end if
   if targetWindow is missing value then
-    set targetWindow to (create window with default profile)
-    tell targetWindow
-      tell current session
-        ${write}
-        return id
-      end tell
-    end tell
+    ${viaNewWindow}
   else
-    tell targetWindow
-      set newTab to (create tab with default profile)
+    set newTab to missing value
+    try
+      tell targetWindow
+        set newTab to (create tab with default profile)
+      end tell
+    end try
+    if newTab is missing value then
+      ${viaNewWindow}
+    else
       tell newTab
         tell current session
           ${write}
           return id
         end tell
       end tell
-    end tell
+    end if
   end if
 end tell`;
 }
