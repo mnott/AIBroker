@@ -20,6 +20,7 @@ const tab = (id: string, name: string) => ({ id, name, paiName: name, tabTitle: 
 
 test("a list is discovered, not waited for", () => {
   const m = new HybridSessionManager(backend);
+  m.setCoalesceWindow(0);
   m.setDiscovery(() => [tab("t-1", "Home"), tab("t-2", "AIBroker")]);
   // Nothing has registered anything. Before the fix this said "No sessions."
   const out = m.formatSessionList();
@@ -30,6 +31,7 @@ test("a list is discovered, not waited for", () => {
 
 test("looking and finding nothing is reported as nothing", () => {
   const m = new HybridSessionManager(backend);
+  m.setCoalesceWindow(0);
   m.setDiscovery(() => []);
   assert.equal(m.formatSessionList(), "No sessions.");
 });
@@ -38,6 +40,7 @@ test("being unable to look is NOT reported as nothing", () => {
   // The distinction the whole evening turned on: "none" and "could not tell"
   // must not share a sentence.
   const m = new HybridSessionManager(backend);
+  m.setCoalesceWindow(0);
   m.setDiscovery(() => { throw new Error("AppleScript timed out"); });
   const out = m.formatSessionList();
   assert.notEqual(out, "No sessions.");
@@ -46,6 +49,7 @@ test("being unable to look is NOT reported as nothing", () => {
 
 test("a stale list is labelled stale rather than passed off as current", () => {
   const m = new HybridSessionManager(backend);
+  m.setCoalesceWindow(0);
   let fail = false;
   m.setDiscovery(() => {
     if (fail) throw new Error("iTerm went away");
@@ -62,6 +66,7 @@ test("a tab that has gone is dropped once we have actually looked", () => {
   // The other half: an honest empty must prune, or a dead row survives looking
   // like a live one.
   const m = new HybridSessionManager(backend);
+  m.setCoalesceWindow(0);
   let live = [tab("t-1", "Home"), tab("t-2", "AIBroker")];
   m.setDiscovery(() => live);
   assert.equal(m.listSessions().length, 2);
@@ -76,6 +81,7 @@ test("the hot-path read does not go out and look", () => {
   // Delivery paths call this per message. An enumeration there would put a
   // terminal round trip in the middle of sending every notification.
   const m = new HybridSessionManager(backend);
+  m.setCoalesceWindow(0);
   let calls = 0;
   m.setDiscovery(() => { calls++; return [tab("t-1", "Home")]; });
   m.knownSessions();
@@ -89,6 +95,7 @@ test("discovery does not steal the selection", () => {
   // registerVisualSession moves the active session to whatever it just added.
   // Discovery adds things constantly; it is not a choice by the user.
   const m = new HybridSessionManager(backend);
+  m.setCoalesceWindow(0);
   let live = [tab("t-1", "Home")];
   m.setDiscovery(() => live);
   m.listSessions();
