@@ -14,6 +14,15 @@ import type { APIBackend } from "../backend/api.js";
 import { log } from "./log.js";
 import { activeItermSessionId } from "./state.js";
 
+/**
+ * How long one enumeration is reused for.
+ *
+ * Short enough that no answer a person reads is meaningfully out of date;
+ * long enough that a client reconnect storm cannot turn a blocking terminal
+ * query into the daemon's whole capacity.
+ */
+const SYNC_COALESCE_MS = 3_000;
+
 export type SessionKind = "api" | "visual";
 
 export interface HybridSession {
@@ -40,6 +49,9 @@ export class HybridSessionManager {
   private discover?: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null }>;
   /** True when the last attempt to look could not complete, so the list is last-known. */
   private lastDiscoveryFailed = false;
+  /** When discovery last ran, so a burst of readers costs one enumeration. */
+  private lastSyncAt = 0;
+  private coalesceMs = SYNC_COALESCE_MS;
 
   constructor(apiBackend: APIBackend) {
     this.apiBackend = apiBackend;
@@ -51,6 +63,18 @@ export class HybridSessionManager {
    */
   setDiscovery(fn: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null }>): void {
     this.discover = fn;
+  }
+
+  /**
+   * Change how long one enumeration is reused for.
+   *
+   * Exists so tests can assert the two properties separately: that a burst
+   * costs one enumeration, and that a fresh look reflects what changed. With a
+   * fixed window the second is only observable by waiting, which makes the
+   * suite slow and the failure mode ambiguous.
+   */
+  setCoalesceWindow(ms: number): void {
+    this.coalesceMs = ms;
   }
 
   // ── Session creation ──
@@ -235,6 +259,21 @@ export class HybridSessionManager {
    */
   private syncFromLive(): void {
     if (!this.discover) return;
+    // COALESCE. Discovery is a blocking AppleScript round trip — measured at
+    // 1.26 s on this machine — and Node has one thread. A mobile client that
+    // reconnects every two seconds asks for the list on every connect, so each
+    // reconnect stalled the whole daemon for seconds: heartbeats from other
+    // adapters timed out, their re-registrations queued behind the same lock,
+    // and the phone's own connection dropped because nothing could service it,
+    // which made it reconnect again. The hub spent fifteen seconds at a time
+    // unable to answer anything.
+    //
+    // A short reuse window, not a cache with a lifetime: it exists to make a
+    // BURST cost one enumeration, and it is deliberately shorter than a human
+    // can act, so no user-visible answer is stale by more than a moment.
+    const now = Date.now();
+    if (now - this.lastSyncAt < this.coalesceMs) return;
+    this.lastSyncAt = now;
     let live: Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null }>;
     try {
       live = this.discover();
