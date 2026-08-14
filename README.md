@@ -449,6 +449,7 @@ Addressing is explicit: `hub:machine-b/session:abc` routes through the bridge to
 | [inbound.md](docs/inbound.md) | Generic `POST /hook/<route>` endpoint |
 | [outbound.md](docs/outbound.md) | Acting in external systems through a platform's own actions |
 | [mailbox.md](docs/mailbox.md) | Durable per-session queue and confirmed delivery |
+| [session-watchdog.md](docs/session-watchdog.md) | Keeping a long autonomous session running: one goal at a time, context rollover, and the failures that shaped it |
 | [audit.md](docs/audit.md) | What is recorded, and how to read it |
 | [mesh.md](docs/mesh.md) | Multi-machine mesh networking |
 | [ipc.md](docs/ipc.md) | IPC protocol and message format |
