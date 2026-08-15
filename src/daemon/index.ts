@@ -273,6 +273,13 @@ export async function startDaemon(options?: {
   // IPC server on the hub socket
   const ipcServer = new IpcServer(socketPath);
   registerCoreHandlers(ipcServer, adapterRegistry, apiBackend, manager);
+
+  // Cross-machine pairing. Registers the verbs; the listener itself only comes
+  // up if somebody has configured one, so this is inert on a lone machine.
+  {
+    const { registerPeerHandlers } = await import("./peer-handlers.js");
+    registerPeerHandlers(ipcServer);
+  }
   ipcServer.start();
   adapterRegistry.startHealthPolling();
 
@@ -305,6 +312,14 @@ export async function startDaemon(options?: {
   if (process.env.AIBROKER_FUNNEL_WATCHDOG !== "0") {
     const { startFunnelWatchdog } = await import("./funnel-watchdog.js");
     startFunnelWatchdog();
+  }
+
+  // Managed sessions survive a daemon restart: the records are on disk, so a
+  // session being kept working does not quietly stop being kept working
+  // because the hub was restarted underneath it.
+  {
+    const { startManagerLoop } = await import("./manage.js");
+    startManagerLoop();
   }
 
   startTodoistWebhook({

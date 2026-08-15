@@ -128,6 +128,20 @@ the pointer is stale and the next send is work already finished.
 Have the session append one line per finished item to a done file, and advance on
 that. It is the same act as finishing rather than a second act it might forget.
 
+**Count the lines; do not increment on them.** Advancing the pointer when an item
+is sent *and* again when its done line appears counts one item twice, and the
+queue silently skips the item in between — the watchdog says item four while the
+session, correctly, expects three. One completed line means one completed item,
+so the number of lines IS the number of items behind you. Take the larger of the
+pointer and the line count, so a stalled item is not re-sent forever while the
+session's own record stays authoritative.
+
+**One writer per file.** If the session's context file and the watchdog's queue
+live in the same document, a sync that rewrites a section will silently no-op the
+day the other party changes a heading. Give the queue its own file, written only
+by the watchdog and rendered from the queue it actually sends. Two copies of one
+list disagree within the hour; a rendering cannot.
+
 ## Say something while idle
 
 A watcher that is silent when healthy cannot be told from one that has died. Log
@@ -147,6 +161,35 @@ is to go quiet has not kept anything running.
 Stop the watchdog before arming a session by hand. Otherwise a scheduled re-arm
 overwrites what was just typed, and the session ends up on the wrong item with no
 sign of why.
+
+## How this broke
+
+Read this section first if you are building one. A pattern is written down at the
+moment it is believed to work — peak conviction, minimum evidence — and everything
+learned afterwards arrives when the document is already finished. So the failure
+modes are systematically the part that never gets added, and a pattern write-up
+without this section should be read as incomplete rather than as having had none.
+Each of these cost hours after the description above was already written.
+
+- **The pointer double-counted.** Advanced on send AND on the done line, so one
+  item counted twice and the queue silently skipped the one in between. The
+  watchdog said item four while the session, correctly, expected three.
+- **A sync silently no-op'd.** The queue lived in the session's own context file;
+  the session rewrote it with a slightly different heading, the section match
+  stopped finding anything, and the rewrite reported success while changing
+  nothing for an hour.
+- **The re-arm condition starved.** "No goal AND quiet for 75 s" never fired,
+  because a session with no goal is still busy — answering messages, writing
+  notes — and each of those moved the transcript and reset the quiet timer. No
+  goal is already the answer; the grace period exists only to avoid arming in the
+  middle of the turn that ended the last one.
+- **Typed is not sent.** The goal went into the input line and stayed there, in vi
+  normal mode, with the watchdog reporting a successful re-arm. Confirm the
+  submission separately from the typing.
+- **A context rollover deleted a load-bearing file** and repeated ten times,
+  because its cooldown was set in memory and never persisted. It stays disabled
+  here: a path that has never run is not a path with no bugs, it is a path with no
+  observations.
 
 ## Reference implementation
 

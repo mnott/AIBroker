@@ -12,6 +12,7 @@ import type { IpcRequest, IpcResponse } from "../types/ipc.js";
 import { log } from "../core/log.js";
 import { sessionRegistry, clientQueues } from "../core/state.js";
 import { aibrokerIdForPane } from "../transport/sync-facade.js";
+import { loadPeering, rejectWildcard, tokenMatches } from "./peering.js";
 
 export type IpcHandler = (
   req: IpcRequest,
@@ -19,6 +20,13 @@ export type IpcHandler = (
 
 export class IpcServer {
   private server: Server | null = null;
+  /**
+   * The peer listener, if peering is configured. A second server object rather
+   * than a second address on the first, because the two have different trust:
+   * the unix socket is protected by file permissions and everything on it is
+   * already local, while this one must authenticate every request.
+   */
+  private peerServer: Server | null = null;
   private readonly handlers = new Map<string, IpcHandler>();
   private readonly socketPath: string;
 
@@ -87,6 +95,78 @@ export class IpcServer {
     this.server.on("error", (err) => {
       log(`IPC server error: ${err}`);
     });
+
+    this.startPeerListener();
+  }
+
+  /**
+   * The cross-machine door. Closed unless somebody configured it.
+   *
+   * Everything that makes this safe is here rather than spread out: no default
+   * port, no wildcard bind, and a secret checked on every single request before
+   * the method is even looked up. A caller that reached the port has proved
+   * nothing except that it reached the port.
+   */
+  private startPeerListener(): void {
+    let cfg;
+    try {
+      cfg = loadPeering().listen;
+    } catch {
+      return;
+    }
+    if (!cfg?.port || !cfg.host || !cfg.token) return;
+
+    const refusal = rejectWildcard(cfg.host);
+    if (refusal) {
+      log(`[peer] NOT listening: ${refusal}`);
+      return;
+    }
+
+    this.peerServer = createServer((socket: Socket) => {
+      let buffer = "";
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString();
+        const nl = buffer.indexOf("\n");
+        if (nl === -1) return;
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+
+        const deny = (error: string) => {
+          socket.write(JSON.stringify({ id: "unknown", ok: false, error } satisfies IpcResponse) + "\n");
+          socket.end();
+        };
+
+        let req: IpcRequest & { peerToken?: unknown };
+        try {
+          req = JSON.parse(line);
+        } catch {
+          return deny("Invalid JSON");
+        }
+
+        // Authenticate BEFORE dispatch, and say as little as possible about why.
+        // A caller learning which half of the credential was wrong is a caller
+        // being helped to guess.
+        if (!tokenMatches(req.peerToken, cfg.token)) {
+          log(`[peer] rejected an unauthenticated request from ${socket.remoteAddress ?? "?"}`);
+          return deny("not paired with this hub");
+        }
+
+        this.dispatch(req)
+          .then((resp) => { socket.write(JSON.stringify(resp) + "\n"); socket.end(); })
+          .catch((err) => {
+            socket.write(JSON.stringify({ id: req.id, ok: false, error: err instanceof Error ? err.message : String(err) }) + "\n");
+            socket.end();
+          });
+      });
+      socket.on("error", () => { /* a peer that hangs up is not an event */ });
+    });
+
+    this.peerServer.listen(cfg.port, cfg.host, () => {
+      log(`[peer] listening on ${cfg.host}:${cfg.port} — paired hubs only`);
+    });
+    this.peerServer.on("error", (err) => {
+      log(`[peer] listener error: ${err}`);
+    });
   }
 
   /**
@@ -94,6 +174,7 @@ export class IpcServer {
    */
   stop(): void {
     this.server?.close();
+    this.peerServer?.close();
     if (existsSync(this.socketPath)) {
       try { unlinkSync(this.socketPath); } catch { /* ignore */ }
     }

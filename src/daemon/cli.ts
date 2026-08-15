@@ -191,6 +191,86 @@ switch (command) {
     break;
   }
 
+  /**
+   * manage — talk to the manager for a session, from ANY shell.
+   *
+   * NOT from inside the managed session's input box. That box cannot carry a
+   * control channel: while the session is busy the terminal queues what you
+   * type, so nothing reaches a hook until the current turn ends — which is
+   * exactly when you most want to ask. Both observations came from watching it
+   * rather than reasoning about it. So the channel is a separate shell: another
+   * pane, another window, a key binding, anything that is not the input line of
+   * the session you are trying to interrupt.
+   *
+   *   aibroker manage <session>                 what is going on
+   *   aibroker manage <session> <objective>     start, or send an instruction
+   *   aibroker manage <session> off             stop
+   */
+  case "peer":
+  case "fleet": {
+    const { runPeer } = await import("./peer-cli.js");
+    // `aibroker fleet` is the same thing people will actually type, so it is
+    // the same command rather than a second one to keep in step.
+    await runPeer(command === "fleet" ? ["fleet", ...rest] : rest);
+    break;
+  }
+
+  case "manage": {
+    // The session is optional when there is an obvious one: run from a pane,
+    // the terminal's own id is in the environment and naming it again is
+    // ceremony. Naming one is how you reach a DIFFERENT session — which is the
+    // case that matters, since a busy session cannot answer for itself.
+    const here = (process.env.ITERM_SESSION_ID ?? "").split(":").pop() ?? "";
+    const first = args[1];
+    const KEYWORDS = new Set(["", "status", "state", "what", "info", "show", "off", "stop", "pause", "resume", "now", "help", "?"]);
+    // A leading dash is never a session name. Without this, `manage --help`
+    // was read as "the session called --help" and answered "no live session
+    // matches" — a true statement about a question nobody asked.
+    const isKeyword = (s: string | undefined) =>
+      s === undefined || s.startsWith("-") || KEYWORDS.has(s.toLowerCase());
+
+    /**
+     * BOTH ORDERS WORK, because both get typed.
+     *
+     * `manage <session> status` is the documented one and `manage status
+     * <session>` is what a person writes when the verb is on their mind. The
+     * second used to resolve to whatever pane the command ran in and turn the
+     * rest into an objective — so `aibroker manage status CaseLeaf` created a
+     * manager on a shell with the objective "status CaseLeaf". Accepting both
+     * removes the trap rather than documenting around it.
+     */
+    let session: string;
+    let rest: string[];
+    if (!isKeyword(first)) {
+      session = first!;
+      rest = args.slice(2);
+    } else if (isKeyword(first) && args[2] !== undefined && !isKeyword(args[2])) {
+      session = args[2];
+      rest = [first!, ...args.slice(3)];
+    } else {
+      session = here;
+      rest = args.slice(1);
+    }
+
+    if (!session) {
+      console.log("usage: aibroker manage [session] [objective | question | off | pause | resume | now | help]");
+      console.log("       the session may be omitted when run inside one.");
+      process.exit(1);
+    }
+    const client = new WatcherClient(DAEMON_SOCKET_PATH);
+    try {
+      const raw = (await client.call_raw("manage", {
+        session,
+        arg: rest.join(" "),
+      })) as { message?: string };
+      console.log(raw?.message ?? "(no answer)");
+    } catch (e) {
+      console.error(`manage failed: ${(e as Error).message}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
+
   case "help":
   case "--help":
   case "-h":
