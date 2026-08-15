@@ -20,6 +20,12 @@ import { activeItermSessionId } from "./state.js";
  * Short enough that no answer a person reads is meaningfully out of date;
  * long enough that a client reconnect storm cannot turn a blocking terminal
  * query into the daemon's whole capacity.
+ *
+ * This window is not a precaution — it is the fix for a live stall. Discovery
+ * on every message put a 1.26 s blocking terminal query on per-message paths;
+ * under normal traffic that exhausted the daemon and callers timed out at 15 s.
+ * Removing the coalescing restores that, and it will look like dead weight
+ * until it does, because the cost is invisible at one request at a time.
  */
 const SYNC_COALESCE_MS = 3_000;
 

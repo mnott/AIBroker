@@ -227,7 +227,37 @@ export function registerCoreHandlers(
    * Returns immediately with the hub uptime. No side effects.
    */
   server.on("ping", async (_req) => {
-    return { ok: true, result: { pong: true, uptime: process.uptime() } };
+    // Machine facts ride along with the cheapest, most-called verb there is.
+    // A separate "capabilities" call would be one more thing to remember to ask
+    // and one more thing to go stale between asking and using; this way anything
+    // that can reach a hub already knows what that hub can do.
+    const { machineFacts } = await import("./machine.js");
+    return { ok: true, result: { pong: true, uptime: process.uptime(), machine: machineFacts() } };
+  });
+
+  /**
+   * where — the state of a checkout on this machine.
+   *
+   * Asked by a lead who wants to know how a machine is getting on without
+   * interrupting the agent doing the work. Reports; never controls. The point of
+   * giving each machine its own branch is that it proceeds without permission,
+   * and what comes back is only enough to decide whether to go and look.
+   */
+  server.on("where", async (req) => {
+    const { repo } = req.params as { repo?: string };
+    const { machineFacts, branchState } = await import("./machine.js");
+    const facts = machineFacts();
+    const root = repo ?? facts.workRoot;
+    if (!root) {
+      return {
+        ok: true,
+        result: {
+          machine: facts,
+          note: "no repository given and no work root configured here (set AIBROKER_WORK_ROOT)",
+        },
+      };
+    }
+    return { ok: true, result: { machine: facts, checkout: branchState(root) } };
   });
 
   // ── TTS / Voice Pipeline ──
@@ -889,6 +919,25 @@ export function registerCoreHandlers(
     const { target, message } = req.params as { target?: string; message?: string };
     if (!target) return { ok: false, error: "target is required" };
     if (!message) return { ok: false, error: "message is required" };
+
+    /**
+     * `peer/session` goes to that machine, everything else stays here.
+     *
+     * The check is one line at the top rather than a branch woven through the
+     * resolution below, because the remote case is not a variant of the local
+     * one — it is the same request asked of a different hub. Anything more
+     * clever would mean every future change to session resolution had to be
+     * made twice and would eventually be made once.
+     */
+    {
+      const { forwardToPeer } = await import("./peer-handlers.js");
+      const forwarded = await forwardToPeer(target, "send_to_session", { message });
+      if (forwarded) {
+        return forwarded.ok
+          ? { ok: true, result: forwarded.result ?? { sent: true } }
+          : { ok: false, error: forwarded.error ?? "the peer refused it" };
+      }
+    }
 
     const snapshots = snapshotAllSessions();
     // Enrich with persistent names so target-by-name matches a renamed session
@@ -1676,5 +1725,23 @@ export function registerCoreHandlers(
     const { getTraces } = await import("./trace-log.js");
     const traces = getTraces();
     return { ok: true, result: { traces, count: traces.length } };
+  });
+
+  /**
+   * manage — start, steer or stop the manager for one session.
+   *
+   * Reached from a session by `/manage …`, which a prompt hook turns into this
+   * call before the model ever sees it. That path matters: the point of the
+   * whole arrangement is that instructing the manager never has to wait for
+   * anything to be idle, so this must not depend on a session's turn.
+   */
+  server.on("manage", async (req) => {
+    const { session, arg } = req.params as { session?: string; arg?: string };
+    if (!session) return { ok: false, error: "session is required" };
+    const { handleManage } = await import("./manage.js");
+    const r = await handleManage(session, arg ?? "");
+    return r.ok
+      ? { ok: true, result: { message: r.message, managed: r.managed ?? false } }
+      : { ok: false, error: r.message };
   });
 }

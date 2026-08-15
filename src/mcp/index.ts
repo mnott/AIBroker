@@ -306,6 +306,55 @@ server.tool("aibroker_sessions", "List Claude sessions managed by the hub", {}, 
   } catch (e) { return err(e); }
 });
 
+/**
+ * aibroker_manage — the interpreted half of the manager's control surface.
+ *
+ * The fast half is a prompt hook that recognises `/manage`, `/manage off` and
+ * `/manage status` and answers without spending a turn. It deliberately does
+ * NOT try to recognise everything: matching intent by keyword list is a proxy
+ * for understanding the sentence, and it failed on the first phrasing nobody
+ * had thought of. So anything the hook cannot classify falls through to here,
+ * where a model reads it — which costs nothing extra, because the message that
+ * arrived mid-turn had already invoked one.
+ *
+ * Use this when the operator says something about keeping a session working, or
+ * asks what one is doing: "what's going on with CaseLeaf", "keep it on the
+ * tests until I'm back", "stop managing that". Turn the sentence into an
+ * action; do not ask them to rephrase it as a command.
+ */
+server.tool(
+  "aibroker_manage",
+  "Start, steer, inspect or stop the manager that keeps a session working on a standing objective. Use for 'what is X doing', 'keep X working on Y', 'stop managing X'.",
+  {
+    session: z.string().describe("Session name or id — the session being managed, not the caller"),
+    action: z
+      .enum(["status", "start", "instruct", "off", "pause", "resume", "now"])
+      .describe("status = report; start = set the standing objective; instruct = one-shot note carried into the next arming; off = stop"),
+    text: z
+      .string()
+      .optional()
+      .describe("The objective for start, or the instruction for instruct. Ignored otherwise."),
+  },
+  async ({ session, action, text }) => {
+    // The daemon takes one string and decides; keep that as the single place
+    // the grammar lives, so this tool and the hook cannot drift apart.
+    const arg =
+      action === "status" ? "" :
+      action === "off" ? "off" :
+      action === "pause" ? "pause" :
+      action === "resume" ? "resume" :
+      action === "now" ? "now" :
+      (text ?? "");
+    if ((action === "start" || action === "instruct") && !text) {
+      return err(new Error(`${action} needs the text to use`));
+    }
+    try {
+      const r = (await hub.call_raw("manage", { session, arg })) as { message?: string };
+      return ok(r?.message ?? "(no answer)");
+    } catch (e) { return err(e); }
+  },
+);
+
 server.tool(
   "aibroker_switch",
   "Switch the active Claude session",
