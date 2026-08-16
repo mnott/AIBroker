@@ -28,6 +28,9 @@ import { log } from "../core/log.js";
 import { readSessionContent } from "./session-content.js";
 import { typeIntoSession } from "../transport/sync-facade.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
+import { hasPailotClients } from "../adapters/pailot/gateway.js";
+import { getAibpBridge } from "../core/state.js";
+import { listDialogs, answerDialog } from "./dialogs.js";
 
 const STATE_FILE = join(homedir(), ".aibroker", "managers.json");
 
@@ -68,6 +71,125 @@ const GOAL_MAX_AGE_MS = 45 * 60_000;
  */
 const GOAL_ACTIVE = /\/goal\s+active/i;
 
+/**
+ * Where a session is asked to hand over, as a share of its context.
+ *
+ * NOT where it dies — where it should stop and write down what it knows while
+ * it still can. A session at the wall cannot compose a handover, because
+ * composing one is exactly the sort of work it no longer has room for. The
+ * margin has to be big enough to write in.
+ *
+ * Deliberately conservative. Rolling over early costs one cycle of re-reading a
+ * file; rolling over late costs everything the session had not written down,
+ * and that loss is silent — the successor does not know what it was not told.
+ */
+const HANDOVER_AT = 0.82;
+
+/**
+ * How long the manager waits for the handover before giving up on it.
+ *
+ * A rollover that hangs is worse than no rollover: the session is paused, not
+ * working, and nobody is told. If the handover does not arrive the manager says
+ * so and leaves the session alone rather than clearing it — clearing a session
+ * that failed to write its handover destroys precisely what the rollover
+ * existed to preserve.
+ */
+const HANDOVER_GRACE_MS = 6 * 60_000;
+
+/**
+ * How long a managed session may show no change at all before it is armed.
+ *
+ * Chosen well above any turn that is merely slow — builds, long test runs and
+ * an agent thinking hard all move the screen inside this — so that firing means
+ * something is actually wrong rather than something is taking a while. The
+ * penalty for firing early is one queued prompt; the penalty for firing late is
+ * measured in hours of a session sitting at an empty prompt, so the number
+ * leans towards firing.
+ */
+const STUCK_AFTER_MS = 12 * 60_000;
+
+/**
+ * The startup banner, which is the pane's only POSITIVE evidence of a clear.
+ *
+ * The first version of this test asked the opposite question — whether the
+ * goal's words had left the screen — and that was wrong in a way worth
+ * recording, because it looked obviously right. A pane scrolls. The words of a
+ * goal set an hour ago are gone from it during any long turn, so their absence
+ * is the normal condition of a working session, not the signature of a cleared
+ * one. It declared every rollover complete the moment the clear was typed.
+ *
+ * A banner is drawn on exactly two occasions: the session starting, and the
+ * session being cleared. Inside the window where a clear has just been typed,
+ * only the second is possible.
+ */
+const CLEARED_BANNER = /Claude Code v\d/;
+
+/**
+ * How long a clear may stay unaccounted for before the guard lets go.
+ *
+ * The guard exists so a second clear is never typed while one is outstanding,
+ * and that is right. But it was released by exactly one event — seeing a clear
+ * land — and an event that may never happen is not a release, it is a lock: an
+ * operator who deletes the queued clear, or a terminal that drops it, leaves
+ * the session unable to roll over again for the rest of its life. That is a
+ * worse failure than the one being prevented, and quieter.
+ *
+ * The interval is long because it is a backstop, not a retry. Nothing here
+ * hurries: a rollover still has to earn its way back by writing a handover
+ * first, which takes minutes and cannot be faked.
+ */
+const CLEAR_PENDING_MAX_MS = 30 * 60_000;
+
+/**
+ * How long before a session that has handed over is asked to do it again.
+ *
+ * Needed only because the handover no longer ends in a clear. The context that
+ * triggered the request stays high afterwards — that is the point, the session
+ * keeps its context and keeps working — so without a cooldown the threshold
+ * re-qualifies it on the very next tick and it is interrupted every twenty
+ * seconds to write the same file.
+ *
+ * A session that keeps its handover current as it works, which is the habit
+ * this encourages, will usually have nothing to add when re-asked. The
+ * interval is set for the case where it does.
+ */
+const HANDOVER_REASK_MS = 30 * 60_000;
+
+/**
+ * How much NEW work may accumulate before the handover is asked for again.
+ *
+ * A time cooldown alone left the gap this closes. The handover is written at
+ * the threshold and the session then keeps working to the wall — on a 1M
+ * window that is nearly 200k tokens of thinking that the file does not
+ * describe, and it is exactly the stretch compaction throws away. The document
+ * meant to survive compaction was reliably stale by the moment it was needed.
+ *
+ * Measured in context growth rather than minutes because that is what the risk
+ * is actually made of: an idle hour costs nothing, and twenty minutes of hard
+ * work costs everything not written down.
+ */
+const HANDOVER_REASK_K = 120;
+
+/**
+ * A floor under re-asking, so growth cannot trigger a stream of requests.
+ *
+ * Writing a handover itself consumes context, so without this a session near
+ * the wall could be asked again almost immediately on the strength of the
+ * growth its own last handover caused.
+ */
+const HANDOVER_MIN_GAP_MS = 8 * 60_000;
+
+/**
+ * Input the terminal is holding rather than running.
+ *
+ * A `/clear` typed into a session that is mid-turn does not execute; it waits,
+ * and the terminal says so. Seeing this means the clear has NOT landed however
+ * fresh the rest of the screen looks, so it vetoes the banner test — a banner
+ * still on screen from a session's own start would otherwise be read as proof
+ * of a clear that is still sitting in the queue.
+ */
+const QUEUED_INPUT = /queued message/i;
+
 /** Verdicts that mean the session has run out of goal and said so. */
 const OUT_OF_GOAL = [
   /goal could not be achieved/i,
@@ -89,6 +211,54 @@ export interface ManagedSession {
   lastChangeAt: number;
   lastHash: string;
   paused: boolean;
+  /**
+   * The file the session hands over in — a TEMPLATE, not a fixed path.
+   *
+   * `{date}`, `{yyyy}`, `{mm}` and `{dd}` are expanded when the file is used
+   * rather than when it is set, because a session that runs for days outlives
+   * the day it was started on. A literal date written into the path was right
+   * for one evening and then quietly wrong: the request kept naming yesterday's
+   * file, and the drift grows by a day every day.
+   */
+  handoverFile?: string;
+  /** The path actually asked for, so a date rolling over mid-episode cannot
+   *  make the change check compare two different files. */
+  handoverAskedPath?: string;
+  /**
+   * Clear the session after the handover, rather than leaving it to compact.
+   * OFF unless asked for — see the rollover block for what changed this.
+   */
+  clearAfterHandover?: boolean;
+  /** When a handover was last obtained, so it is not demanded every tick. */
+  handoverDoneAt?: number;
+  /** The context reading when it was obtained, so "how much work since" is
+   *  answerable — a handover ages by work done, not by the clock. */
+  handoverDoneK?: number;
+  /** When a handover was asked for, so a silent session can be given up on. */
+  handoverAskedAt?: number;
+  /** What that file looked like when asked, so "changed" is measured not claimed. */
+  handoverWas?: string;
+  /** When a clear was typed, so it is never typed twice WITHIN one rollover. */
+  clearTypedAt?: number;
+  /**
+   * When a clear was typed that has never been seen to land — ACROSS rollovers.
+   *
+   * The per-rollover guard was not enough and the gap was ugly: a session whose
+   * context stays high keeps qualifying for rollover, so each new attempt typed
+   * its own clear, and a session in a turn long enough to execute none of them
+   * accumulated a queue of them. They would then all fire in sequence, the
+   * first against the session they were meant for and the rest against whatever
+   * fresh session had started since — which is the exact "wipe the session that
+   * just started" failure the single-clear rule existed to prevent, reached by
+   * going around it rather than through it.
+   *
+   * So the invariant is stronger than "one clear per rollover": at most one
+   * unconfirmed clear per session, ever, and no new rollover may begin while
+   * one is outstanding.
+   */
+  clearPendingSince?: number;
+  /** Context before the clear, so "it landed" is measured against something. */
+  contextAtClear?: number;
   /** The pane, so the process and thence the checkout can be found again. */
   tty?: string;
   /** Screen work forbidden — the operator has the machine. Survives re-arming. */
@@ -226,6 +396,129 @@ function mirrorToRepo(m: ManagedSession): void {
   }
 }
 
+/**
+ * A cheap fingerprint of a file, or "" if it is not there.
+ *
+ * Size and modification time rather than a hash: this runs every twenty seconds
+ * against a file that may be hundreds of kilobytes, and the question is only
+ * "did it change", which those two answer without reading anything. An absent
+ * file fingerprints as empty so that CREATING one counts as a change — the
+ * first handover a session ever writes is exactly the case a naive comparison
+ * would miss.
+ */
+function fileFingerprint(path: string): string {
+  try {
+    const s = statSync(path);
+    return `${s.size}:${Math.round(s.mtimeMs)}`;
+  } catch {
+    return "";
+  }
+}
+
+/** This session's context in thousands of tokens, from its own transcript. */
+function contextK(m: ManagedSession): number | null {
+  const tty = m.tty ?? snapshotTty(m.sessionId);
+  const pid = tty ? processReading(tty).pid : null;
+  return pid ? transcriptReading(pid).contextK : null;
+}
+
+/**
+ * Close a rollover out, however it ended, and guarantee an arming follows.
+ *
+ * EVERY exit from a rollover goes through here, which is the point. When the
+ * clearing of this state and the scheduling of the next arming are separate
+ * acts at separate call sites, some branch eventually does the first without
+ * the second — and that branch leaves a cleared session sitting at an empty
+ * prompt, reporting "working", for as long as the ordinary arming rules take to
+ * notice. Binding the two together makes that combination unwriteable.
+ *
+ * `lastRearmAt = 0` is the sentinel that says arm on the next tick regardless
+ * of the on-screen goal marker. That is not a shortcut: after a clear the
+ * marker is a leftover from a screen that no longer exists, so the one signal
+ * that would hold the arming back is also the one signal guaranteed to be
+ * stale.
+ */
+function endRollover(m: ManagedSession): void {
+  delete m.handoverAskedAt;
+  delete m.handoverWas;
+  delete m.clearTypedAt;
+  delete m.contextAtClear;
+  // clearPendingSince deliberately survives: it records a clear that is still
+  // out there somewhere, and forgetting it is what let a second one be typed.
+  m.lastRearmAt = 0;
+}
+
+/** A clear was seen to land. Forget it, and let rollovers happen again. */
+function clearLanded(m: ManagedSession): void {
+  delete m.clearPendingSince;
+  endRollover(m);
+}
+
+/**
+ * Is there text sitting unsent in the session's prompt?
+ *
+ * TYPING ON TOP OF IT DESTROYS IT. The manager pastes into the same input line
+ * a person types into, and it sends a backspace first to escape vi normal
+ * mode — so an objective armed over half-typed text eats a character of that
+ * text and then runs the two together as one prompt. The operator's sentence
+ * and the standing objective arrive merged and mangled, and neither does what
+ * it meant to.
+ *
+ * This never bit while nobody was at the keyboard, which is exactly the kind of
+ * assumption that holds until an operator sits down at seven in the morning and
+ * starts a sentence.
+ *
+ * The live input line is the one enclosed by the terminal's rules at the foot
+ * of the pane, not the `❯` lines further up — those are scrollback, commands
+ * that already ran. So the rule immediately above it is what identifies it.
+ */
+export function promptHasUnsentText(content: string): boolean {
+  const lines = content.split("\n");
+  for (let i = 1; i < lines.length; i++) {
+    const isRuleAbove = /^\s*[─—-]{10,}\s*$/.test(lines[i - 1]);
+    if (!isRuleAbove) continue;
+    const m = lines[i].match(/^\s*❯\s*(.*)$/);
+    if (!m) continue;
+    const typed = m[1].trim();
+    // The terminal's own hint about held input is not the operator's text.
+    if (!typed || /^press up to edit/i.test(typed)) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Expand the date tokens in a handover path, against the clock right now.
+ *
+ * Deliberately resolved at the moment of use. A managed session is meant to
+ * outlive the day it started on, so any date fixed at the moment the path was
+ * SET is a date that will be wrong by morning — and wrong in the quietest way,
+ * since the file it names still exists and still opens.
+ *
+ * Exported for the tests, which is also where the accepted tokens are pinned.
+ */
+export function resolveHandoverPath(template: string, at: Date = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  const yyyy = String(at.getFullYear());
+  const mm = p(at.getMonth() + 1);
+  const dd = p(at.getDate());
+  return template
+    .replace(/\{date\}/gi, `${yyyy}-${mm}-${dd}`)
+    .replace(/\{yyyy\}/gi, yyyy)
+    .replace(/\{mm\}/gi, mm)
+    .replace(/\{dd\}/gi, dd);
+}
+
+/** Did the handover actually land? Read the file; do not believe the session. */
+function handoverChanged(m: ManagedSession): boolean {
+  // The path asked for, not the template resolved afresh: if the clock crossed
+  // midnight between the request and this check, resolving again would compare
+  // a file nobody was asked to write against a fingerprint taken from another.
+  const path = m.handoverAskedPath ?? (m.handoverFile ? resolveHandoverPath(m.handoverFile) : undefined);
+  if (!path) return false;
+  return fileFingerprint(path) !== (m.handoverWas ?? "");
+}
+
 /** The pane device for a session, captured once at start. */
 function snapshotTty(sessionId: string): string | undefined {
   return discoverLiveSessions().find((s) => s.id === sessionId)?.tty;
@@ -270,6 +563,121 @@ function note(m: ManagedSession, what: string): void {
   m.history.push({ at, what });
   if (m.history.length > 40) m.history = m.history.slice(-40);
   log(`[manage:${m.name}] ${what}`);
+}
+
+/**
+ * Tell the operator something happened, wherever they are.
+ *
+ * Goes out unconditionally, because the normal path already does the right
+ * thing with an absent phone: it pushes over APNs and queues for catch-up. An
+ * alert is a MESSAGE — a rollover, a dead session — and a message is still
+ * worth reading an hour after it was sent, which is precisely what the queue is
+ * for. Gating this on a live connection would mean the events worth waking
+ * someone for are the ones only delivered when they were already watching.
+ *
+ * Failure is swallowed on purpose. The manager's job is keeping a session
+ * working; it must not stop doing that because a notification did not go out.
+ */
+function alertOperator(text: string): void {
+  try {
+    getAibpBridge()?.routeToMobile("", text, "TEXT");
+  } catch (e) {
+    log(`[manage] could not reach the phone — ${(e as Error).message}`);
+  }
+}
+
+/**
+ * The periodic reading — sent only if someone is actually looking.
+ *
+ * The opposite call from an alert, for the opposite kind of content. "Armed
+ * twice, 400k context" is worth knowing at the time and worth nothing four
+ * hours later, so queueing it would mean picking the phone up to a stack of
+ * expired weather reports with the one that mattered somewhere inside. No app
+ * connected, no report, and nothing kept to deliver later.
+ */
+function reportToOperator(text: string): void {
+  if (!hasPailotClients()) return;
+  alertOperator(text);
+}
+
+/**
+ * A note that is ALSO worth a buzz on the phone.
+ *
+ * The line between this and `note` is who caused the event. Anything the
+ * operator just did — set an objective, take the screen back, start managing —
+ * is recorded and not sent, because telling someone what they themselves just
+ * typed is how a notification channel teaches its reader to ignore it. What
+ * gets sent is what the MANAGER decided on its own while nobody was watching:
+ * a rollover, a session that died, a goal that would not land.
+ *
+ * Routine armings are not here. They are real, and frequent, and belong in the
+ * periodic report where they arrive as a count instead of sixteen buzzes.
+ */
+function notify(m: ManagedSession, what: string): void {
+  note(m, what);
+  alertOperator(`${m.name} — ${what}`);
+}
+
+/**
+ * How often the operator hears from the manager when nothing is wrong.
+ *
+ * Long, because the report competes with the alerts for the same attention: a
+ * channel that speaks every few minutes about nothing is one whose alerts get
+ * swiped away unread. Half an hour is roughly "next time you glance at it".
+ */
+const REPORT_EVERY_MS = 30 * 60_000;
+
+/** When the operator was last told the state of things. */
+let lastReportAt = 0;
+
+/**
+ * Armings since the last report, per session. NOT persisted, on purpose — the
+ * count answers "how much has the manager had to intervene lately", and a
+ * figure carried across a daemon restart would answer a different question
+ * while looking like that one.
+ */
+const armingsSinceReport = new Map<string, number>();
+
+/**
+ * The periodic reading: what every managed session is doing, in one message.
+ *
+ * One message for all of them rather than one each, because the useful thing on
+ * a phone is a page you take in at a glance, and armings across several
+ * sessions are the same event happening in several places.
+ */
+function reportIfDue(now: number): void {
+  const managed = Object.values(state);
+  // Nothing is being managed, so there is nothing to report and the clock is
+  // held at now — otherwise a report would be overdue the moment one starts.
+  if (managed.length === 0) {
+    lastReportAt = now;
+    return;
+  }
+  // First tick after a restart. Start the clock rather than reporting, so
+  // restarting the daemon is not itself a reason for the phone to buzz.
+  if (lastReportAt === 0) {
+    lastReportAt = now;
+    return;
+  }
+  if (now - lastReportAt < REPORT_EVERY_MS) return;
+  lastReportAt = now;
+
+  const mins = Math.round(REPORT_EVERY_MS / 60_000);
+  const lines = managed.map((m) => {
+    const armings = armingsSinceReport.get(m.sessionId) ?? 0;
+    armingsSinceReport.set(m.sessionId, 0);
+    const k = contextK(m);
+    const quietFor = Math.round((now - m.lastChangeAt) / 60_000);
+    const doing = m.paused ? "paused" : quietFor >= 2 ? `quiet for ${quietFor} min` : "working";
+    const last = m.history.at(-1);
+    return (
+      `• ${m.name} — ${doing}` +
+      (k !== null ? `, ${k}k context` : "") +
+      `, ${armings} arming${armings === 1 ? "" : "s"} in ${mins} min` +
+      (last ? `\n  last: ${last.what.slice(0, 110)}` : "")
+    );
+  });
+  reportToOperator(`Manager report\n${lines.join("\n")}`);
 }
 
 /**
@@ -544,6 +952,39 @@ function paneReading(content: string): string {
   return `  ${parts.join(" · ")}${doing ? `\n  doing: ${doing.trim().slice(0, 110)}` : ""}`;
 }
 
+/**
+ * Collapse text to a single line, for anything about to be TYPED at a prompt.
+ *
+ * At a prompt a newline is the submit key, so a multi-line objective does not
+ * arrive as a long goal — it arrives as a short one, followed by its own
+ * remainder as a second, contextless prompt, and the session acts on both. The
+ * damage is silent: what was sent looks right in the state file and wrong only
+ * on screen.
+ *
+ * Applied at the point text becomes keystrokes rather than at each point text
+ * is set, so it covers every route in — shell heredoc, MCP call, appended
+ * text, operator notes — including the ones added later.
+ */
+export function oneLine(text: string): string {
+  return text.replace(/\s*[\r\n]+\s*/g, " ").trim();
+}
+
+/**
+ * When a change to the objective actually reaches the session.
+ *
+ * Printed because the answer is "not yet", and that has already been misread as
+ * the change having failed. Editing an objective types nothing at the session;
+ * it changes what the NEXT arming says, and arming waits for the session to
+ * stop. Saying so costs one line and removes the whole question.
+ */
+function landsWhen(m: ManagedSession): string {
+  if (m.paused) return "  The manager is paused — nothing is armed until you resume it.";
+  return (
+    "  This changes what the next arming says; it types nothing now.\n" +
+    "  The next arming comes when the session stops — or immediately, with `now`."
+  );
+}
+
 /** The text actually typed at the session. Short goal, context by reference. */
 function goalText(m: ManagedSession): string {
   const extra = m.pending.length ? ` OPERATOR, since you were last armed: ${m.pending.join(" ")}` : "";
@@ -554,7 +995,7 @@ function goalText(m: ManagedSession): string {
   const hands = m.noScreen
     ? " THE OPERATOR HAS THE SCREEN: do no screen or pointer work at all, and do not ask for it. Everything else continues as normal. Where something would need checking on screen, write down what would need checking instead of checking it."
     : "";
-  return `/goal ${m.objective}${hands}${extra}`;
+  return oneLine(`/goal ${m.objective}${hands}${extra}`);
 }
 
 /**
@@ -610,7 +1051,24 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   }
   if (live.atPrompt) {
     m.paused = true;
-    note(m, "PAUSED — that pane is at a shell prompt, so the session has exited. Not typing a goal into a shell. `resume` once it is back.");
+    notify(m, "PAUSED — that pane is at a shell prompt, so the session has exited. Not typing a goal into a shell. `resume` once it is back.");
+    return false;
+  }
+
+  /**
+   * NEVER TYPE OVER SOMEBODY MID-SENTENCE.
+   *
+   * Checked here, immediately before the keystrokes, rather than anywhere
+   * earlier — the operator may have started typing during the seconds this
+   * function spent deciding, and a check made further upstream would be
+   * answering a question about a screen that has since changed.
+   *
+   * Not armed and retried, deliberately: a half-written sentence is a person
+   * thinking, and the manager can afford to wait for anyone. It comes back on
+   * the next tick and every tick after.
+   */
+  if (promptHasUnsentText(readPane(m.sessionId))) {
+    note(m, `the operator has unsent text in the prompt — not typing over it (${reason})`);
     return false;
   }
 
@@ -626,12 +1084,13 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
       m.lastRearmAt = Date.now();
       const carried = m.pending.length;
       m.pending = [];
+      armingsSinceReport.set(m.sessionId, (armingsSinceReport.get(m.sessionId) ?? 0) + 1);
       note(m, `armed: ${reason}${carried ? ` (carrying ${carried} operator instruction${carried > 1 ? "s" : ""})` : ""}`);
       return true;
     }
   }
 
-  note(m, `typed but the objective's own words never appeared — treating as NOT armed (${reason})`);
+  notify(m, `typed but the objective's own words never appeared — treating as NOT armed (${reason})`);
   return false;
 }
 
@@ -652,18 +1111,95 @@ function reasonToArm(m: ManagedSession, content: string, now: number): string | 
 
   if (!marker && quietFor > NO_GOAL_GRACE_MS) return `no goal armed (idle ${Math.round(quietFor / 1000)}s)`;
 
-  // The ceiling. Without it a stale marker strands the loop indefinitely while
-  // every log line reads healthy — which is what a stalled loop looks like from
-  // outside, and is why this exists rather than trusting the marker.
-  if (armedFor > GOAL_MAX_AGE_MS) {
-    return `armed ${minutesSince(m.lastRearmAt, now)} with no sign of a new goal — assuming it lapsed`;
+  /**
+   * The ceiling — but only over a session that has gone quiet.
+   *
+   * It exists because the on-screen marker lingers after a goal is met, so a
+   * session that finished long ago can look armed forever. What it must not do
+   * is fire over a session that is plainly still working, and it did: a
+   * six-hour turn crosses the ceiling every forty-five minutes, so the standing
+   * objective was re-typed into a session far past the point it describes.
+   *
+   * That is not the harmless duplicate it first appears. An objective is
+   * usually written as a starting instruction — go through all of X, sort them,
+   * begin — and delivering it to a session deep in the work reads as an
+   * instruction to start over. The manager's own recovery mechanism becomes the
+   * thing that undoes the work.
+   *
+   * A moving pane is direct evidence the session is engaged, and evidence beats
+   * the inference drawn from a timer. So the ceiling now needs both: the goal
+   * looks old AND nothing is happening.
+   */
+  if (armedFor > GOAL_MAX_AGE_MS && quietFor > NO_GOAL_GRACE_MS) {
+    return `armed ${minutesSince(m.lastRearmAt, now)} with no sign of a new goal, and quiet for ${Math.round(quietFor / 1000)}s — assuming it lapsed`;
   }
   return null;
+}
+
+/**
+ * A file whose modification time proves the manager loop is still turning.
+ *
+ * The process being alive is NOT the same claim, and only the weaker one is
+ * observable from outside: a wedged loop inside a healthy process satisfies
+ * launchd, answers the socket, and manages nothing. Whatever supervises this
+ * from outside needs a fact that only a completed tick can produce, so each
+ * tick stamps one.
+ *
+ * Written every tick rather than on change, because "nothing changed" is a
+ * normal and frequent outcome here — a heartbeat that stops during quiet
+ * periods reports the healthy case as a failure.
+ */
+const HEARTBEAT_FILE = join(homedir(), ".aibroker", "manage-heartbeat");
+
+function beat(): void {
+  try {
+    writeFileSync(HEARTBEAT_FILE, String(Date.now()));
+  } catch {
+    // A heartbeat that cannot be written must not take the manager down with
+    // it; the supervisor treats silence as a stall, which is the safe reading.
+  }
+}
+
+/**
+ * Look for blocking modals, but not on every tick.
+ *
+ * The check costs an AppleScript round trip, and the machine running these
+ * sessions is often the machine they are driving — the same contention that
+ * makes a pane read slow. Once a minute is far faster than a person noticing,
+ * and cheap enough to leave running forever.
+ */
+const DIALOG_EVERY_TICKS = 3;
+let tickCount = 0;
+
+function answerBlockingDialogs(): void {
+  if (Object.keys(state).length === 0) return;
+  for (const d of listDialogs()) {
+    const pressed = answerDialog(d);
+    if (pressed) {
+      log(`[dialogs] pressed "${pressed}" on ${d.process} — ${d.title}`);
+      alertOperator(`A system dialog was blocking work — pressed "${pressed}" on ${d.process}${d.title ? ` (${d.title})` : ""}.`);
+    } else {
+      // Unrecognised prompt: say so and leave it. A dialog nobody can answer
+      // safely still needs somebody told, or it blocks the night in silence.
+      alertOperator(
+        `A dialog from ${d.process} is on screen and I will not answer it — buttons: ${d.buttons.join(", ") || "none readable"}${d.title ? ` — "${d.title}"` : ""}.`,
+      );
+    }
+  }
 }
 
 async function tick(): Promise<void> {
   const now = Date.now();
   let dirty = false;
+  beat();
+
+  if (++tickCount % DIALOG_EVERY_TICKS === 0) {
+    try {
+      answerBlockingDialogs();
+    } catch (e) {
+      log(`[dialogs] check failed — ${(e as Error).message}`);
+    }
+  }
 
   for (const m of Object.values(state)) {
     const content = readPane(m.sessionId);
@@ -678,6 +1214,34 @@ async function tick(): Promise<void> {
     if (h !== m.lastHash) {
       m.lastHash = h;
       m.lastChangeAt = now;
+      dirty = true;
+    }
+
+    /**
+     * THE BACKSTOP: a managed session whose screen has not moved in a long time.
+     *
+     * Every specific fault above is a fault somebody already thought of. This
+     * one is for the faults nobody has thought of yet, and it is deliberately
+     * ignorant of causes: it does not care whether a rollover misfired, a goal
+     * failed to land, a clear ate the prompt, or something new. It knows only
+     * that a session under management has shown no sign of life for a long
+     * time, which is never a state worth preserving.
+     *
+     * Arming is the response because arming is the cheap direction to be wrong
+     * in. Against a genuinely busy session it queues one prompt behind a long
+     * turn, costing nothing; against a dead one it is the whole recovery. The
+     * asymmetry is the argument — and it is why this fires on a signal as crude
+     * as "nothing changed", which no more precise test would improve on.
+     */
+    if (!m.paused && !m.handoverAskedAt && now - m.lastChangeAt > STUCK_AFTER_MS) {
+      notify(
+        m,
+        `nothing has moved on that screen for ${minutesSince(m.lastChangeAt, now)} — arming, because a managed session is never meant to be still this long`,
+      );
+      // Counted as a change so a session that stays stuck is not re-armed every
+      // tick: this is a recovery, and a recovery that repeats is a loop.
+      m.lastChangeAt = now;
+      m.lastRearmAt = 0;
       dirty = true;
     }
 
@@ -699,8 +1263,261 @@ async function tick(): Promise<void> {
           ? "The time you had the screen for is up — my controls. The operator may be back at the machine, so stop screen and pointer work now, write down how far you got and what still needs checking on screen, and carry on with everything that does not need it."
           : "your controls. The screen is yours again — the operator's hold has expired. You may resume visual work where your notes left it.",
       );
-      note(m, m.noScreen ? "timed grant expired — screen work stopped" : "timed hold expired — screen work permitted again");
+      notify(m, m.noScreen ? "timed grant expired — screen work stopped" : "timed hold expired — screen work permitted again");
       dirty = true;
+    }
+
+    /**
+     * A clear that was typed earlier, landing late.
+     *
+     * Kept OUTSIDE the rollover block because that block is no longer running
+     * by the time this usually happens: the rollover gave up waiting, the
+     * session stayed in its turn for another half hour, and the clear finally
+     * executed with nothing left watching for it. Without this, the pending
+     * flag would never be lifted and the session could never roll over again —
+     * a safety catch that, having done its job once, quietly became a lock.
+     */
+    if (m.clearPendingSince && !m.clearTypedAt) {
+      if (CLEARED_BANNER.test(content) && !QUEUED_INPUT.test(content)) {
+        notify(m, `the clear typed ${minutesSince(m.clearPendingSince, now)} ago has landed — arming the fresh session`);
+        clearLanded(m);
+        dirty = true;
+      }
+    }
+
+    /**
+     * ROLLING OVER BEFORE THE WALL.
+     *
+     * A session that fills its context does not degrade gracefully; it starts
+     * losing the thread while still appearing to work, which is the worst of
+     * both — it is producing output nobody should trust. So at a threshold it
+     * is asked to write down what it knows, and only once that is ON DISK is it
+     * cleared and re-armed.
+     *
+     * THE ORDER IS THE WHOLE DESIGN, and the previous attempt at this got it
+     * wrong: it cleared first and deleted the very file it was meant to
+     * preserve. Nothing here deletes anything, the handover is verified by
+     * reading the file back rather than by the session saying it wrote one, and
+     * a session that does not produce a handover is left alone rather than
+     * cleared. Losing a cycle is recoverable; clearing an unrecorded session is
+     * not.
+     */
+    if (!m.paused && m.handoverAskedAt) {
+      const wrote = handoverChanged(m);
+      if (wrote && !m.clearAfterHandover) {
+        /**
+         * HANDOVER WRITTEN, AND THAT IS THE WHOLE JOB.
+         *
+         * Clearing used to follow automatically and it was the wrong half of
+         * the idea. A clear cannot execute while a turn is running, and a
+         * session working towards a goal does not end its turn — so the clear
+         * waited in the input queue, and every fresh attempt added another,
+         * until a queue of them stood ready to fire in sequence against
+         * whatever sessions happened to exist by then.
+         *
+         * Meanwhile the thing it was protecting against turned out to be
+         * handled: the terminal compacts by itself at the limit and the
+         * session carries on working through it. What compaction costs is
+         * detail, and detail is exactly what the handover has already written
+         * to disk. So the valuable half runs and the dangerous half does not,
+         * unless somebody asks for it by name.
+         */
+        notify(m, "handover written — leaving the session to compact on its own rather than clearing it");
+        m.handoverDoneAt = now;
+        m.handoverDoneK = contextK(m) ?? undefined;
+        delete m.handoverAskedAt;
+        delete m.handoverWas;
+        delete m.handoverAskedPath;
+        dirty = true;
+        continue;
+      }
+      if (wrote) {
+        /**
+         * A CLEAR CANNOT LAND WHILE A GOAL IS ARMED.
+         *
+         * Observed rather than reasoned: the goal enforcement blocks the turn
+         * from ending, the terminal will not read queued input until the turn
+         * ends, and so `/clear` sits in the input line indefinitely while the
+         * session repeats that it has nothing to add. The blocker does give up
+         * after several attempts, which is why this waits rather than retries.
+         *
+         * TYPING IT AGAIN IS THE WRONG MOVE and the tempting one: a second
+         * `/clear` queues behind the first and fires afterwards, against the
+         * FRESH context — wiping the very session that just started. So this
+         * types once, then watches the context figure, which is the artefact.
+         */
+        if (!m.clearTypedAt) {
+          if (m.clearPendingSince && now - m.clearPendingSince < CLEAR_PENDING_MAX_MS) {
+            // An earlier clear is still unaccounted for. Typing another would
+            // put two in a queue that fires against two different sessions.
+            notify(
+              m,
+              `a clear typed ${minutesSince(m.clearPendingSince, now)} ago has still not landed — not typing another, and not rolling over again until it does`,
+            );
+            endRollover(m);
+            dirty = true;
+            continue;
+          }
+          notify(m, "handover written — asking it to clear");
+          typeIntoSession(m.sessionId, "/clear");
+          m.clearTypedAt = now;
+          m.clearPendingSince = now;
+          m.contextAtClear = contextK(m) ?? undefined;
+          dirty = true;
+          continue;
+        }
+
+        /**
+         * DID THE CLEAR LAND? ASK THE SCREEN, NOT ONLY THE NUMBER.
+         *
+         * The context figure was the sole test and it failed in the one way
+         * that mattered: `contextK` can return null — the pane's pid, and
+         * thence its transcript, is not always resolvable — and a null at the
+         * moment the clear was typed leaves `contextAtClear` undefined, which
+         * makes the drop test unsatisfiable FOREVER AFTER. Not flaky: a
+         * rollover begun during that blind moment could never be seen to
+         * finish, however cleanly it did.
+         *
+         * So the pane corroborates, via the startup banner — see
+         * CLEARED_BANNER for why that particular mark and not the more obvious
+         * one. Either witness alone is enough; neither is trusted to be
+         * available.
+         */
+        /**
+         * THE BANNER IS THE PROOF. THE NUMBER IS ONLY THE DETAIL.
+         *
+         * A falling context figure was the original test and it cannot do the
+         * job, because a clear is not the only thing that empties a context:
+         * the terminal compacts on its own near the limit, and compaction
+         * produces exactly the same collapse in the same figure. Believing it
+         * would mean declaring a clear that never happened, dropping the guard
+         * that stops another being typed, and arming a session that is still
+         * mid-turn with clears queued behind it.
+         *
+         * Compaction redraws no banner. Only starting and clearing do, and
+         * inside this window only clearing is possible — so the banner alone
+         * decides, and the number is reported beside it because it is useful
+         * to read, not because it is being trusted.
+         */
+        const nowK = contextK(m);
+        const fell = m.contextAtClear !== undefined && nowK !== null && nowK < m.contextAtClear / 2;
+        if (CLEARED_BANNER.test(content) && !QUEUED_INPUT.test(content)) {
+          notify(
+            m,
+            fell
+              ? `cleared — fresh session on the pane, context fell from ${m.contextAtClear}k to ${nowK}k; re-arming`
+              : "cleared — the pane is showing a fresh session; re-arming",
+          );
+          clearLanded(m);
+          dirty = true;
+          continue;
+        }
+
+        if (now - m.clearTypedAt > HANDOVER_GRACE_MS) {
+          /**
+           * GIVING UP ON THE ROLLOVER IS NOT GIVING UP ON THE SESSION.
+           *
+           * This is where eight hours went. The branch was right to refuse a
+           * SECOND clear — that would fire against a fresh context and wipe
+           * it — but it also declined to arm, and those are different acts. It
+           * then left `lastRearmAt` untouched, so ordinary arming stayed
+           * blocked behind the stale on-screen goal marker until the 45-minute
+           * ceiling expired. A cleared session sat at an empty prompt for the
+           * whole of it, reading as "working" the entire time.
+           *
+           * Arming is safe under BOTH readings of an ambiguous outcome. If the
+           * clear did land, arming is exactly what the fresh session needs. If
+           * it did not, arming re-states the objective to a session that still
+           * has its context, which costs one prompt. There is no reading in
+           * which doing nothing is the better move, so this no longer does
+           * nothing.
+           */
+          notify(
+            m,
+            "the clear was typed and could not be confirmed — NOT typing a second one, " +
+              "but arming anyway: an armed session is safe whether or not the clear landed",
+          );
+          endRollover(m);
+          dirty = true;
+        }
+        continue;
+      }
+      if (now - m.handoverAskedAt > HANDOVER_GRACE_MS) {
+        notify(m, "asked for a handover and did not get one — NOT clearing, the session keeps its context");
+        delete m.handoverAskedAt;
+        delete m.handoverWas;
+        dirty = true;
+      }
+      // Still waiting. Do not arm anything on top of a session that is writing.
+      continue;
+    }
+
+    // No new rollover while a clear is still unaccounted for. Context stays
+    // high precisely because the clear has not landed, so without this the
+    // threshold re-qualifies the session every tick and the rollover machinery
+    // runs in a circle, each lap adding another clear to the queue.
+    if (!m.paused && !m.handoverAskedAt && !m.clearPendingSince && m.handoverFile) {
+      // The pane is resolved here rather than carried in from elsewhere in the
+      // tick, so this block does not depend on the order of what precedes it.
+      const tty = m.tty ?? snapshotTty(m.sessionId);
+      const pid = tty ? processReading(tty).pid : null;
+      const t = pid ? transcriptReading(pid) : null;
+      const used = t?.contextK ?? null;
+
+      /**
+       * TWO WAYS TO BECOME DUE, because a handover goes out of date two ways.
+       *
+       * By the clock, which is the ordinary case. And by work done since the
+       * last one, which is the case that mattered and was missing: a session
+       * asked at the threshold keeps working to the wall, and everything it
+       * learns in that stretch is absent from the file precisely when
+       * compaction discards it. The second trigger keeps the document current
+       * with the work rather than with the hour.
+       */
+      const sinceLast = now - (m.handoverDoneAt ?? 0);
+      const grownBy = used !== null && m.handoverDoneK !== undefined ? used - m.handoverDoneK : null;
+      const dueByTime = sinceLast > HANDOVER_REASK_MS;
+      const dueByWork = grownBy !== null && grownBy >= HANDOVER_REASK_K && sinceLast > HANDOVER_MIN_GAP_MS;
+
+      // 1M is the window these sessions run in; treat anything else as unknown
+      // rather than guessing, because a wrong denominator rolls over a session
+      // that had plenty of room left.
+      if ((dueByTime || dueByWork) && used !== null && used / 1000 >= HANDOVER_AT) {
+        const askedPath = resolveHandoverPath(m.handoverFile);
+        m.handoverAskedAt = now;
+        m.handoverAskedPath = askedPath;
+        m.handoverWas = fileFingerprint(askedPath);
+        // A dated handover starts empty each day, and an empty one is worse
+        // than none: it reads as authoritative and says nothing. So the
+        // instruction carries the rule for that case rather than assuming the
+        // session will think of it at the moment it is running out of room.
+        const carry = existsSync(askedPath)
+          ? ""
+          : `That file does not exist yet — start it by carrying forward from the most recent handover beside it whatever still matters, especially anything written nowhere else. `;
+        // A top-up reads differently from a first request: the session has
+        // already written one and needs to know this is about the work SINCE,
+        // not a repeat it can satisfy by confirming the file is still there.
+        const topUp = dueByWork && !dueByTime && grownBy !== null;
+        typeIntoSession(
+          m.sessionId,
+          (topUp
+            ? `Bring your handover up to date — you are at ${used}k tokens, ${grownBy}k of work since you last wrote it, and the terminal will compact before long. Everything you have learned in that stretch is currently written nowhere but this context, which is the part compaction takes. `
+            : `Write your handover now — you are at ${used}k tokens and the terminal will compact before long. `) +
+            `Update ${askedPath}. ${carry}Three things: where the current item stands, what you would do next and why, ` +
+            `and — the irreplaceable part — anything you know that is written nowhere else. Commit it. ` +
+            (m.clearAfterHandover
+              ? `You will be cleared once that file has changed on disk, and not before.`
+              : `Then carry straight on with the work; you are not being cleared. And keep that file current as you go — anything you work out after writing it is at risk until it is on disk.`),
+        );
+        notify(
+          m,
+          topUp
+            ? `at ${used}k tokens, ${grownBy}k of new work since the last one — asked to bring the handover up to date`
+            : `at ${used}k tokens — asked for a handover${m.clearAfterHandover ? " before rolling over" : " before it compacts"}`,
+        );
+        dirty = true;
+        continue;
+      }
     }
 
     if (now - m.lastRearmAt < REARM_COOLDOWN_MS) continue;
@@ -713,6 +1530,9 @@ async function tick(): Promise<void> {
   }
 
   if (dirty) saveState(state);
+  // Last, so the report describes the state this tick left behind rather than
+  // the one it found.
+  reportIfDue(now);
 }
 
 export function startManagerLoop(): void {
@@ -793,8 +1613,15 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `  hands on|off for 8 hours | 30m\n` +
         `                same, but it reverts by itself — a permission that ends\n` +
         `                only when somebody remembers outlives its reason\n` +
+        `  handover <path> [clear]\n` +
+        `                where this session writes what it knows. At 82% context it\n` +
+        `                is asked to update that file, then carries on — the terminal\n` +
+        `                compacts by itself and the file is what survives it. Add\n` +
+        `                "clear" to also clear the session (queues, in a long turn)\n` +
         `  set <text>    REPLACE the standing objective. Plain text on a running\n` +
         `                manager is a one-shot note; this changes what it re-arms\n` +
+        `  add <text>    EXTEND the standing objective. Say it to the session\n` +
+        `                instead and the next arming forgets it\n` +
         `  now           arm immediately, whatever the signals say\n` +
         `  pause         stop arming, keep the objective\n` +
         `  resume        start arming again\n` +
@@ -828,7 +1655,14 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
   if (!arg || ASKING.has(word)) {
     if (!existing) return { ok: true, message: `${name} is not being managed. /manage <objective> to start.`, managed: false };
     const last = existing.history.slice(-4).map((h) => `  ${h.at.slice(11)} ${h.what}`).join("\n");
-    const age = Math.round((Date.now() - existing.lastRearmAt) / 60000);
+    // 0 is the sentinel for "arm on the next tick", not a timestamp. Subtracting
+    // from it prints the age of the epoch — a seven-digit number, in the one
+    // window where somebody is watching this line to see whether an arming
+    // happened. Say what the state actually is instead.
+    const armed =
+      existing.lastRearmAt === 0
+        ? "arming on the next tick"
+        : `last armed ${minutesSince(existing.lastRearmAt, Date.now())} ago`;
     const idle = Math.round((Date.now() - existing.lastChangeAt) / 1000);
     // Two separate things, kept separate: what the manager has DONE, and what
     // the session appears to be doing. Running them together is how a record of
@@ -841,7 +1675,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `objective: ${existing.objective}\n` +
         `\nright now:\n` +
         liveReading(sessionId, idle) +
-        `\n\nthe manager: last armed ${age} min ago` +
+        `\n\nthe manager: ${armed}` +
         (existing.pending.length ? `, ${existing.pending.length} instruction(s) waiting to go out` : "") +
         (last ? `\n${last}` : ""),
     };
@@ -871,8 +1705,38 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
       ok: true,
       managed: true,
       message:
-        `objective replaced for ${name}.\n  was: ${before.slice(0, 80)}${before.length > 80 ? "…" : ""}\n  now: ${existing.objective.slice(0, 80)}${existing.objective.length > 80 ? "…" : ""}` +
+        `objective replaced for ${name}.\n  was: ${before.slice(0, 80)}${before.length > 80 ? "…" : ""}\n  now: ${existing.objective.slice(0, 80)}${existing.objective.length > 80 ? "…" : ""}\n` +
+        landsWhen(existing) +
         (dropped ? `\n  ${dropped} pending instruction(s) dropped — they were written against the old objective.` : ""),
+    };
+  }
+
+  /**
+   * add — EXTEND the standing objective instead of replacing it.
+   *
+   * The alternative is to say it to the session directly, and for anything whose
+   * result lands on disk that works fine. It fails for anything meant to steer
+   * the work, and fails silently: the objective is re-typed at every arming, so
+   * the session is periodically returned to a description of the job that never
+   * mentioned the thing you added. Rewriting the whole objective to append one
+   * sentence is the workaround this exists to remove, and a costly one, since
+   * retyping something long is how a constraint gets dropped by accident.
+   *
+   * Joined with a space rather than a paragraph break because this text is typed
+   * at a prompt, where a newline submits — see goalText.
+   */
+  const addMatch = arg.match(/^(?:add|also|append|extend)\s+([\s\S]+)$/i);
+  if (addMatch && existing) {
+    const extra = addMatch[1].trim();
+    existing.objective = `${existing.objective} Also: ${extra}`;
+    note(existing, `objective extended: ${extra.slice(0, 80)}`);
+    saveState(state);
+    return {
+      ok: true,
+      managed: true,
+      message:
+        `objective extended for ${name}.\n  added: ${extra}\n` +
+        landsWhen(existing),
     };
   }
 
@@ -962,6 +1826,84 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
     };
   }
 
+  /**
+   * handover <path> — where this session writes what it knows.
+   *
+   * Rollover is OFF until this is set, deliberately. Clearing a session that has
+   * nowhere to write is destroying it, and a default guess at a path would be a
+   * guess about somebody's project conventions with an unrecoverable failure
+   * mode. Naming the file is the act of consenting to be rolled over.
+   */
+  /**
+   * `handover <path> [clear]` — where to write, and whether to clear after.
+   *
+   * The trailing word is what makes clearing opt-in. It reads as an
+   * afterthought and is the opposite: without it this asks a session to record
+   * what it knows and then leaves it alone, which is the behaviour that has
+   * actually held up. With it, the session is also cleared — worth having for a
+   * session that idles between items, and worth refusing to do by default for
+   * one that works in long turns, where the clear cannot execute and merely
+   * queues.
+   */
+  const handoverMatch = arg.match(/^handover\s+(.+)$/i);
+  if (handoverMatch && existing) {
+    const rest = handoverMatch[1].trim();
+    const wantsClear = /\s+clear$/i.test(rest);
+    const path = rest.replace(/\s+clear$/i, "").trim();
+    const previous = existing.handoverFile;
+    existing.handoverFile = path;
+    existing.clearAfterHandover = wantsClear;
+    delete existing.handoverDoneAt;
+    delete existing.handoverDoneK;
+    delete existing.handoverAskedPath;
+    const resolved = resolveHandoverPath(path);
+
+    /**
+     * Tell the session its target moved, now rather than at the next threshold.
+     *
+     * A session that maintains its handover as it works — which is the habit
+     * worth having — keeps writing to whatever path it last heard. Left
+     * uninformed it goes on updating a file nobody will read again, and the
+     * change looks like it worked right up until the moment somebody needs the
+     * file. The guard against typing over half-written input applies here as it
+     * does everywhere else; if it declines, the next request carries the path
+     * anyway, so nothing is lost by staying out of the way.
+     */
+    if (previous && previous !== path && !promptHasUnsentText(readPane(sessionId))) {
+      typeIntoSession(
+        sessionId,
+        `Your handover file has moved: write it to ${resolved} from now on, not ${resolveHandoverPath(previous)}. ` +
+          (existsSync(resolved)
+            ? `Keep it current as you work.`
+            : `It does not exist yet — start it by carrying forward whatever still matters from the old one, especially anything written nowhere else, and keep it current as you work.`),
+      );
+    }
+    note(
+      existing,
+      `handover file set to ${path} — asked for at ${Math.round(HANDOVER_AT * 100)}% context${wantsClear ? ", then cleared" : ", no clear"}`,
+    );
+    saveState(state);
+    return {
+      ok: true,
+      managed: true,
+      message:
+        `${name} will be asked to hand over at ${Math.round(HANDOVER_AT * 100)}% of its context, into ${path}.\n` +
+        (resolved === path
+          ? ""
+          : `  Today that resolves to ${resolved}; the date is worked out each time it is asked for, not now.\n`) +
+        (wantsClear
+          ? `  It is then cleared, once that file has changed on disk and not before.\n` +
+            `  Note: a clear cannot run while a turn is in progress — for a session that works in\n` +
+            `  long turns it will queue rather than take effect. Prefer the default there.`
+          : `  It is NOT cleared — it keeps its context and carries on, and the terminal compacts\n` +
+            `  when it needs to. The handover is what makes that compaction cheap.\n` +
+            `  Add the word "clear" after the path if you want the old behaviour.`) +
+        (existsSync(resolved)
+          ? ""
+          : `\n  NOTE: ${resolved} does not exist yet. It counts as changed when first written, and the\n  request will tell the session to carry forward what still matters from the most recent one beside it.`),
+    };
+  }
+
   if (word === "pause" || word === "resume") {
     if (!existing) return { ok: false, message: `${name} is not being managed` };
     existing.paused = word === "pause";
@@ -973,10 +1915,10 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
     /**
      * REFUSE TO MANAGE ANYTHING THAT IS NOT A SESSION.
      *
-     * `aibroker manage status CaseLeaf` — keyword first, session second —
+     * `aibroker manage status <session>` — keyword first, session second —
      * resolved to the plain shell the command was typed in, and the remainder
      * became an objective: a manager was created for a `-zsh` pane, silently,
-     * with the objective "status CaseLeaf". Nothing would ever have come of it
+     * with the objective "status <session>". Nothing would ever have come of it
      * except goals typed at a shell prompt.
      *
      * The arm path already refuses a bare shell. That is too late: by then a
