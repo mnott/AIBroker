@@ -108,6 +108,23 @@ export function getMqttClientCount(): number {
   return connectedClients.size;
 }
 
+/**
+ * How many of those are actually the app, rather than the hub talking to itself.
+ *
+ * The hub keeps a loopback client on its own broker, so the raw count is never
+ * zero and "is anyone connected" answered with it is always yes. Anything that
+ * decides whether to bother a human must ask THIS instead.
+ *
+ * An allowlist rather than "not the loopback": the id prefix is already how a
+ * real app client is recognised elsewhere here, and a denylist would silently
+ * start counting the next internal client somebody adds.
+ */
+export function getMqttAppClientCount(): number {
+  let n = 0;
+  for (const id of connectedClients) if (id.startsWith("pailot")) n++;
+  return n;
+}
+
 /** Dedup set for inbound messages from app clients. */
 const seenInboundIds = new Set<string>();
 const SEEN_MAX = 500;

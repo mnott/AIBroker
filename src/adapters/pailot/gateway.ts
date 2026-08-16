@@ -54,6 +54,7 @@ import {
   mqttPublishControl,
   isMqttRunning,
   getMqttClientCount,
+  getMqttAppClientCount,
 } from "./mqtt-broker.js";
 import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
@@ -1459,10 +1460,21 @@ export function broadcastStatus(status: string): void {
 }
 
 /**
- * Returns true if any PAILot clients are connected.
+ * Returns true if any PAILot clients are connected, by EITHER transport.
+ *
+ * Counting only the WebSocket set was right when that was the only way in, and
+ * became wrong without changing: the app moved to MQTT, so a phone sitting
+ * connected registers in `connectedClients` over there and not in `clients`
+ * here. The failure mode is quiet in the worst way — a caller asking "is anyone
+ * listening" is told no, and correctly declines to send, so what goes missing is
+ * a message nobody ever sees not being sent.
+ *
+ * App clients only. The hub holds a loopback client on its own broker, so the
+ * raw MQTT count is never zero and using it here would answer yes forever —
+ * turning a gate into a piece of scenery.
  */
 export function hasPailotClients(): boolean {
-  return clients.size > 0;
+  return clients.size > 0 || getMqttAppClientCount() > 0;
 }
 
 /**
