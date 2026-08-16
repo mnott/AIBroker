@@ -1,54 +1,73 @@
 /**
- * Never type over somebody mid-sentence.
+ * Reading the input line — for the record, not for a decision.
  *
- * The manager pastes into the same input line a person types into, and sends a
- * backspace first to escape vi normal mode — so arming over half-typed text
- * eats a character of it and runs the two together as one prompt. This test
- * pins the detector that prevents it, in both directions: a false negative
- * mangles the operator's sentence, a false positive stops the session ever
- * being armed again. The second is the quieter failure, so the empty-prompt
- * cases matter as much as the occupied ones.
+ * This once blocked arming: if anything sat unsent in the prompt, the manager
+ * stood back rather than run its goal into a half-typed sentence. The terminal
+ * defeated it. Claude Code offers a greyed-out SUGGESTION on that same line,
+ * accepted with Tab, and no colour survives a pane capture — so a suggestion
+ * read as somebody mid-sentence, and a suggestion never finishes being typed.
+ * The refusal never lifted and a session sat idle with work outstanding.
+ *
+ * The reading is kept because it explains a goal that arrives welded to
+ * somebody's half-sentence, and it decides nothing. These tests pin what it
+ * reports, and above all that it finds the LIVE line rather than scrollback —
+ * a wrong answer here now costs a confusing log entry instead of a stall.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { promptHasUnsentText } from "../src/daemon/manage.js";
+import { promptUnsentText, promptHasUnsentText } from "../src/daemon/manage.js";
 
 const RULE = "──────────────────────────────────────────────────────────────────";
+const TITLED_RULE = "─────────────────────────────────────────────── Example ──";
 
-/** A pane as it reads while the session works, with an empty input line. */
-function pane(inputLine: string, scrollback = ""): string {
+/** A pane as it reads while the session works, with the given input line. */
+function pane(inputLine: string, scrollback = "", rule = RULE): string {
   return [
     scrollback,
     "✻ Cerebrating… (19m 0s · ↓ 30.8k tokens)",
-    RULE,
+    rule,
     inputLine,
     RULE,
     "  👋 PAI CC 2.1.220 🧠 Opus 5 (1M context) in 📁 Example",
   ].join("\n");
 }
 
-test("an empty prompt is free to type into", () => {
+test("an empty prompt reports nothing", () => {
+  assert.equal(promptUnsentText(pane("❯  ")), null);
   assert.equal(promptHasUnsentText(pane("❯  ")), false);
 });
 
-test("a half-typed sentence blocks arming", () => {
-  assert.equal(promptHasUnsentText(pane("❯ keep going with the rotated OCR, the origin is")), true);
+test("text on the line is reported verbatim", () => {
+  assert.equal(
+    promptUnsentText(pane("❯ do the member route for the bar names")),
+    "do the member route for the bar names",
+  );
 });
 
-test("the terminal's own queued-input hint is not the operator's text", () => {
-  assert.equal(promptHasUnsentText(pane("❯ Press up to edit queued messages")), false);
+test("a rule carrying a title still frames the input line", () => {
+  // The box is drawn with the session's name in the border; the line beneath
+  // it is still the live prompt, and missing that was why the reading failed.
+  assert.equal(promptUnsentText(pane("❯ keep going", "", TITLED_RULE)), "keep going");
 });
 
-test("commands already run are scrollback, not unsent input", () => {
-  // The `❯ /clear` lines sit above the rules; only the enclosed line is live.
-  const scrollback = ["  ❯ /clear", "  ❯ /clear", "  ❯ /goal do the thing"].join("\n");
-  assert.equal(promptHasUnsentText(pane("❯  ", scrollback)), false);
+test("the terminal's own queued-input hint is not operator text", () => {
+  assert.equal(promptUnsentText(pane("❯ Press up to edit queued messages")), null);
 });
 
-test("a prompt holding only whitespace counts as empty", () => {
-  assert.equal(promptHasUnsentText(pane("❯      ")), false);
+test("commands already run are scrollback, not the live line", () => {
+  const scrollback = ["  ❯ /clear", "  ❯ /goal do the thing"].join("\n");
+  assert.equal(promptUnsentText(pane("❯  ", scrollback)), null);
+});
+
+test("a prompt holding only whitespace reports nothing", () => {
+  assert.equal(promptUnsentText(pane("❯      ")), null);
 });
 
 test("no prompt box at all — nothing is claimed", () => {
-  assert.equal(promptHasUnsentText("just some output\nand more output"), false);
+  assert.equal(promptUnsentText("just some output\nand more output"), null);
+});
+
+test("prose beginning with a dash is not mistaken for the box rule", () => {
+  const notARule = ["- a bullet point about something", "❯ not the live line"].join("\n");
+  assert.equal(promptUnsentText(notARule), null);
 });

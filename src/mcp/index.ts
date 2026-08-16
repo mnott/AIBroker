@@ -318,7 +318,7 @@ server.tool("aibroker_sessions", "List Claude sessions managed by the hub", {}, 
  * arrived mid-turn had already invoked one.
  *
  * Use this when the operator says something about keeping a session working, or
- * asks what one is doing: "what's going on with CaseLeaf", "keep it on the
+ * asks what one is doing: "what's going on with the build session", "keep it on the
  * tests until I'm back", "stop managing that". Turn the sentence into an
  * action; do not ask them to rephrase it as a command.
  */
