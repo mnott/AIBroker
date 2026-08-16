@@ -39,3 +39,6 @@ test_noise.*
 # Obsidian vault metadata (wikilink index files)
 _index.md
 .playwright-mcp
+
+# Manager session mirrors — runtime state, never published
+.aibroker/

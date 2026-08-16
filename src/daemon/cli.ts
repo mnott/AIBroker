@@ -235,8 +235,8 @@ switch (command) {
      * `manage <session> status` is the documented one and `manage status
      * <session>` is what a person writes when the verb is on their mind. The
      * second used to resolve to whatever pane the command ran in and turn the
-     * rest into an objective — so `aibroker manage status CaseLeaf` created a
-     * manager on a shell with the objective "status CaseLeaf". Accepting both
+     * rest into an objective — so `aibroker manage status <session>` created a
+     * manager on a shell with the objective "status <session>". Accepting both
      * removes the trap rather than documenting around it.
      */
     let session: string;

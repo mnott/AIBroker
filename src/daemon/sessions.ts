@@ -295,8 +295,8 @@ function ago(iso?: string): string {
  * snapshot used to invent `basename(cwd)` for them. That invention does not
  * stay local: restore relaunches with `--name <invented>` and a `/Name
  * <invented>` prompt, which writes it back into session-names.json, so the
- * guess becomes the truth. "Task Bus" became "09 - Notes" this way on
- * 2026-08-04, and paperfull/Paperfull the same way before it.
+ * guess becomes the truth. A session named for its purpose became the name of
+ * the directory it happened to be sitting in this way, twice.
  *
  * The manifest already knows what the user calls this directory. Asking it
  * first costs nothing and keeps a transient UUID gap from renaming a session.

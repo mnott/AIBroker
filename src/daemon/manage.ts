@@ -52,6 +52,17 @@ const NO_GOAL_GRACE_MS = 30_000;
 const REARM_COOLDOWN_MS = 90_000;
 
 /**
+ * How many times a goal may be typed without confirmation before giving up.
+ *
+ * Small on purpose. Each attempt is a whole objective pasted into the session's
+ * input; against a busy session those queue rather than run, and a queue of
+ * goals fires in sequence later against whatever state exists by then. Three is
+ * enough to ride out a slow screen read and few enough that the queue stays
+ * harmless if none of them landed.
+ */
+const ARM_ATTEMPTS = 3;
+
+/**
  * How long an armed goal is believed before the manager stops waiting for it.
  *
  * Not a timeout on the work. A ceiling on the manager's willingness to sit on a
@@ -179,6 +190,7 @@ const HANDOVER_REASK_K = 120;
  */
 const HANDOVER_MIN_GAP_MS = 8 * 60_000;
 
+
 /**
  * Input the terminal is holding rather than running.
  *
@@ -229,6 +241,8 @@ export interface ManagedSession {
    * OFF unless asked for — see the rollover block for what changed this.
    */
   clearAfterHandover?: boolean;
+  /** Consecutive armings typed but never seen to land. Bounded — see ARM_ATTEMPTS. */
+  armFails?: number;
   /** When a handover was last obtained, so it is not demanded every tick. */
   handoverDoneAt?: number;
   /** The context reading when it was obtained, so "how much work since" is
@@ -472,19 +486,26 @@ function clearLanded(m: ManagedSession): void {
  * of the pane, not the `❯` lines further up — those are scrollback, commands
  * that already ran. So the rule immediately above it is what identifies it.
  */
-export function promptHasUnsentText(content: string): boolean {
+export function promptUnsentText(content: string): string | null {
   const lines = content.split("\n");
   for (let i = 1; i < lines.length; i++) {
-    const isRuleAbove = /^\s*[─—-]{10,}\s*$/.test(lines[i - 1]);
+    // The rule may carry a title — "──── Name ──" — so match its start, not
+    // the whole line. Requiring the run of box-drawing characters up front
+    // keeps this from matching prose that happens to begin with a dash.
+    const isRuleAbove = /^\s*[─—-]{10,}/.test(lines[i - 1]);
     if (!isRuleAbove) continue;
     const m = lines[i].match(/^\s*❯\s*(.*)$/);
     if (!m) continue;
     const typed = m[1].trim();
     // The terminal's own hint about held input is not the operator's text.
     if (!typed || /^press up to edit/i.test(typed)) continue;
-    return true;
+    return typed;
   }
-  return false;
+  return null;
+}
+
+export function promptHasUnsentText(content: string): boolean {
+  return promptUnsentText(content) !== null;
 }
 
 /**
@@ -1056,21 +1077,24 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   }
 
   /**
-   * NEVER TYPE OVER SOMEBODY MID-SENTENCE.
+   * TEXT ON THE INPUT LINE IS NOTED, NEVER OBEYED.
    *
-   * Checked here, immediately before the keystrokes, rather than anywhere
-   * earlier — the operator may have started typing during the seconds this
-   * function spent deciding, and a check made further upstream would be
-   * answering a question about a screen that has since changed.
+   * This used to refuse to arm while anything sat unsent in the prompt, to
+   * avoid running the manager's goal into a half-typed sentence. The intention
+   * was right and the mechanism could not support it: the terminal offers a
+   * greyed-out SUGGESTION on that same line, accepted with Tab, and in a
+   * captured pane no colour survives to tell the two apart. So a suggestion
+   * read as somebody mid-sentence, and since a suggestion never finishes being
+   * typed, the refusal never lifted. A session sat idle with its goal spent and
+   * its work unfinished while every log line reported the guard working.
    *
-   * Not armed and retried, deliberately: a half-written sentence is a person
-   * thinking, and the manager can afford to wait for anyone. It comes back on
-   * the next tick and every tick after.
+   * Arming is the one thing that must not be blocked by a signal this weak. A
+   * stalled agent is certain and unbounded; running into somebody's half-typed
+   * line is occasional and costs one prompt they can retype. So the reading is
+   * kept — it is worth having in the record when a goal arrives mangled — and
+   * it decides nothing.
    */
-  if (promptHasUnsentText(readPane(m.sessionId))) {
-    note(m, `the operator has unsent text in the prompt — not typing over it (${reason})`);
-    return false;
-  }
+  const onLine = promptUnsentText(readPane(m.sessionId));
 
   if (!typeIntoSession(m.sessionId, text)) {
     note(m, `could not type into the session (${reason}) — will retry`);
@@ -1085,7 +1109,13 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
       const carried = m.pending.length;
       m.pending = [];
       armingsSinceReport.set(m.sessionId, (armingsSinceReport.get(m.sessionId) ?? 0) + 1);
-      note(m, `armed: ${reason}${carried ? ` (carrying ${carried} operator instruction${carried > 1 ? "s" : ""})` : ""}`);
+      note(
+        m,
+        `armed: ${reason}${carried ? ` (carrying ${carried} operator instruction${carried > 1 ? "s" : ""})` : ""}` +
+          // Recorded because it is the one thing that explains a goal arriving
+          // with somebody's half-sentence welded to the front of it.
+          (onLine ? ` — the input line held "${onLine.slice(0, 60)}" when this went in` : ""),
+      );
       return true;
     }
   }
@@ -1525,8 +1555,39 @@ async function tick(): Promise<void> {
     const reason = reasonToArm(m, content, now);
     if (!reason) continue;
 
-    await arm(m, reason);
+    /**
+     * A GOAL THAT CANNOT BE CONFIRMED IS NOT RETRIED FOREVER.
+     *
+     * Arming types the objective and then reads it back off the pane; when the
+     * read fails the attempt is honestly recorded as not armed, and the
+     * arm-now sentinel stays set so the next tick tries again. That is right
+     * once and wrong indefinitely: a session busy in a long turn queues the
+     * text instead of showing it, so the read keeps failing while every
+     * attempt adds another copy of the goal to its input queue. Three of them
+     * waiting to fire in sequence is the same fault the clears had, reached by
+     * a different road.
+     *
+     * So the retries are counted and stopped. Backing off restores the
+     * ordinary rules — the session is still managed, and the next genuine
+     * lapse arms it — and the operator is told, because a manager that has
+     * given up on delivering a goal is the one thing it must never do quietly.
+     */
+    const armed = await arm(m, reason);
     dirty = true;
+    if (armed) {
+      m.armFails = 0;
+      continue;
+    }
+    m.armFails = (m.armFails ?? 0) + 1;
+    if (m.armFails >= ARM_ATTEMPTS) {
+      m.armFails = 0;
+      m.lastRearmAt = now;
+      notify(
+        m,
+        `typed the goal ${ARM_ATTEMPTS} times without being able to confirm it landed — stopping, so it is not queued again. ` +
+          `The session is usually mid-turn when this happens; it stays managed and will arm at the next real lapse.`,
+      );
+    }
   }
 
   if (dirty) saveState(state);
@@ -1865,11 +1926,11 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
      * worth having — keeps writing to whatever path it last heard. Left
      * uninformed it goes on updating a file nobody will read again, and the
      * change looks like it worked right up until the moment somebody needs the
-     * file. The guard against typing over half-written input applies here as it
-     * does everywhere else; if it declines, the next request carries the path
-     * anyway, so nothing is lost by staying out of the way.
+     * file. Sent unconditionally: it is one line, it is only sent when the path
+     * actually changed, and withholding it to protect whatever might be on the
+     * input line trades a certain wrong file for a possible retyped sentence.
      */
-    if (previous && previous !== path && !promptHasUnsentText(readPane(sessionId))) {
+    if (previous && previous !== path) {
       typeIntoSession(
         sessionId,
         `Your handover file has moved: write it to ${resolved} from now on, not ${resolveHandoverPath(previous)}. ` +

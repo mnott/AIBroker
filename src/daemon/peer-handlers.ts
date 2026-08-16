@@ -3,7 +3,7 @@
  *
  * The whole cross-machine surface is four verbs a person types once and then
  * forgets: invite, join, list, forget. Everything after that is ordinary — a
- * session on the guest appears in listings as `guest/CaseLeaf` and takes
+ * session on the guest appears in listings as `guest/<session>` and takes
  * messages like any other, because the alternative is every call site growing a
  * branch for "unless it is remote", and branches like that are never added
  * everywhere they are needed.
