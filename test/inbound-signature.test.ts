@@ -216,24 +216,44 @@ test("a route with nobody trusted behaves exactly as before", () => {
 
 // ── attachments ──────────────────────────────────────────────────────────────
 
-test("attachments are announced, since they cannot travel through text", () => {
-  // Without this a session reads a comment mentioning "the screenshot" and has
-  // no idea one existed.
+test("attachments are an instruction with the address, not a description", () => {
+  // The first version said "not included here; open the link to see it" and was
+  // read as information: a picture was sent, the session was told one existed,
+  // and it answered without looking. A named file and a URL is an act.
   const body = composeDelivery(TRUSTING, {
     sender: { login: "an-operator" },
-    comment: { body: "see the picture", assets: [{ name: "a.png" }, { name: "b.png" }] },
+    comment: { body: "see the picture", assets: [
+      { name: "a.png", browser_download_url: "https://example.test/a" },
+      { name: "b.png", browser_download_url: "https://example.test/b" },
+    ] },
   });
-  assert.match(body, /attachments: 2 — not included here; open the link to see them/);
+  assert.match(body, /FETCH AND LOOK AT THEM BEFORE YOU ANSWER/);
+  assert.match(body, /a\.png — https:\/\/example\.test\/a/);
+  assert.match(body, /b\.png — https:\/\/example\.test\/b/);
 });
 
 test("one attachment is spoken about in the singular", () => {
-  const body = composeDelivery(TRUSTING, { issue: { assets: [{ name: "a.png" }] } });
-  assert.match(body, /attachments: 1 .* to see it/);
+  const body = composeDelivery(TRUSTING, { issue: { assets: [{ name: "a.png", browser_download_url: "https://example.test/a" }] } });
+  assert.match(body, /ATTACHMENTS \(1\) — FETCH AND LOOK AT IT/);
+});
+
+test("an attachment with no download address is not listed as fetchable", () => {
+  // Naming a file the reader cannot get is worse than silence: it looks like
+  // an instruction that was followed.
+  const body = composeDelivery(TRUSTING, { comment: { assets: [{ name: "a.png" }] } });
+  assert.equal(body.includes("ATTACHMENTS"), false);
+});
+
+test("a long list is capped and says how many were left out", () => {
+  const many = Array.from({ length: 9 }, (_, i) => ({ name: `f${i}.png`, browser_download_url: `https://example.test/${i}` }));
+  const body = composeDelivery(TRUSTING, { comment: { assets: many } });
+  assert.match(body, /ATTACHMENTS \(9\)/);
+  assert.match(body, /… and 4 more on the issue/);
 });
 
 test("no attachments means no line about them", () => {
   const body = composeDelivery(TRUSTING, { comment: { body: "no pictures", assets: [] } });
-  assert.equal(body.includes("attachments:"), false);
+  assert.equal(body.includes("ATTACHMENTS"), false);
 });
 
 test("a group prints what the events agree on once, and lists what differs", () => {
@@ -263,9 +283,9 @@ test("the body of a newly opened issue is carried, not just its title", () => {
 
 test("an attachment note is not repeated once per event in a group", () => {
   const route = { name: "i", secret: "s", owner: "W", mode: "message" as const, fields: ["action"], createdAt: "" };
-  const withAsset = { action: "opened", issue: { assets: [{ name: "a.png" }] } };
+  const withAsset = { action: "opened", issue: { assets: [{ name: "a.png", browser_download_url: "https://example.test/a" }] } };
   const body = composeDelivery(route, [withAsset, { ...withAsset, action: "assigned" }]);
-  assert.equal((body.match(/attachments:/g) ?? []).length, 1);
+  assert.equal((body.match(/ATTACHMENTS/g) ?? []).length, 1);
 });
 
 // ── the guard at two workers ─────────────────────────────────────────────────
