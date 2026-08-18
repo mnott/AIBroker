@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classify, decide, initialState, funnelHostname, funnelConfigured } from "../src/daemon/funnel-watchdog.js";
+import { classify, decide, initialState, funnelHostname, funnelConfigured, confirmAfterHeal } from "../src/daemon/funnel-watchdog.js";
 
 const OPTS = { failuresBeforeHeal: 3, healCooldownMs: 900_000, healthyIntervalMs: 300_000, suspectIntervalMs: 30_000 };
 
@@ -142,4 +142,53 @@ test("a long healthy stretch cannot accumulate into a bounce", () => {
     assert.equal(d.action, "sleep");
   }
   assert.equal(s.lastHealAt, undefined, "never healed across 50 isolated failures");
+});
+
+// ── judging the reconnect ────────────────────────────────────────────────────
+//
+// `tailscale up` returns before the coordination server has re-published the
+// node, so the probe that follows it measures propagation, not health. Getting
+// this wrong produced the worst kind of log line: a confident "STILL
+// unreachable — this needs a look" about a funnel that was back within a
+// minute.
+
+test("a reconnect is not judged before it has had a chance to take", async () => {
+  const seen: number[] = [];
+  let call = 0;
+  const probe = async () => (++call >= 2 ? [{ ip: "a", status: 405 }] : [{ ip: "a", error: "ECONNRESET" }]);
+  const verdict = await confirmAfterHeal(probe, "host", 3, 5_000, async (ms) => { seen.push(ms); });
+
+  assert.equal(verdict, "up", "the second attempt found it up");
+  assert.deepEqual(seen, [5_000, 5_000], "and it waited before each attempt, including the first");
+});
+
+test("it stops asking the moment the answer is yes", async () => {
+  let calls = 0;
+  const probe = async () => { calls++; return [{ ip: "a", status: 200 }]; };
+  await confirmAfterHeal(probe, "host", 5, 1, async () => {});
+  assert.equal(calls, 1, "no further probes once it is up");
+});
+
+test("a reconnect that truly failed still reads as down, after every attempt", async () => {
+  let calls = 0;
+  const probe = async () => { calls++; return [{ ip: "a", error: "ETIMEDOUT" }]; };
+  const verdict = await confirmAfterHeal(probe, "host", 3, 1, async () => {});
+  assert.equal(verdict, "down");
+  assert.equal(calls, 3, "it gave the node every attempt before saying so");
+});
+
+test("no ingress addresses at all is inconclusive, not a failed reconnect", async () => {
+  // An empty probe means we could not see, and blaming the node for our own
+  // blindness is what the unknown verdict exists to prevent.
+  const verdict = await confirmAfterHeal(async () => [], "host", 2, 1, async () => {});
+  assert.equal(verdict, "unknown");
+});
+
+test("recovery clears the announcement, so the next outage is announced too", () => {
+  // The bug this pins: an outage announced once, then silently recovered, left
+  // the flag set and the following outage went unreported.
+  const s = initialState();
+  s.announced = true;
+  decide(s, "up", 1_000, OPTS);
+  assert.equal(s.announced, false);
 });

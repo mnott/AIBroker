@@ -71,6 +71,21 @@ const FAILURES_BEFORE_HEAL = 3;
 const HEAL_COOLDOWN_MS = 15 * 60_000;
 const PROBE_TIMEOUT_MS = 10_000;
 
+/**
+ * How long a reconnected node is given before its recovery is judged.
+ *
+ * `tailscale up` returns as soon as the client is running, not when the
+ * coordination server has re-published the node and the ingress relays will
+ * route to it again. Probing straight afterwards therefore reads "down" on a
+ * reconnect that in fact worked — and the watchdog then printed "STILL
+ * unreachable … this needs a look" over a funnel that came back thirty seconds
+ * later. A false alarm is worse than no alarm: it is the one that teaches
+ * people to stop reading the log.
+ */
+const HEAL_SETTLE_MS = 5_000;
+/** Confirming attempts after a reconnect, spaced by the settle delay. */
+const HEAL_CONFIRM_ATTEMPTS = 3;
+
 export type Verdict = "up" | "down" | "unknown";
 
 export interface WatchdogState {
@@ -295,6 +310,29 @@ export async function probeIngress(hostname: string): Promise<ProbeResult[]> {
   return Promise.all(ips.map((ip) => probeOne(ip, hostname)));
 }
 
+/**
+ * Did the reconnect take? Ask more than once, and give it time between asks.
+ *
+ * Exported because the retry policy is the whole point of it: a single probe
+ * immediately after `up` measures the coordination server's propagation delay
+ * rather than the health of the node.
+ */
+export async function confirmAfterHeal(
+  probe: (hostname: string) => Promise<ProbeResult[]>,
+  hostname: string,
+  attempts = HEAL_CONFIRM_ATTEMPTS,
+  settleMs = HEAL_SETTLE_MS,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<Verdict> {
+  let verdict: Verdict = "unknown";
+  for (let i = 0; i < attempts; i++) {
+    await sleep(settleMs);
+    verdict = classify(await probe(hostname));
+    if (verdict === "up") return verdict;
+  }
+  return verdict;
+}
+
 /** Reconnect the node. The one lever, pulled only on proof. */
 export function reconnect(bin = tailscaleBinary()): boolean {
   if (!bin) return false;
@@ -385,7 +423,22 @@ export function startFunnelWatchdog(opts: {
         log(`funnel-watchdog: watching public ingress across ${results.length} relay(s), ` +
             `every ${Math.round(HEALTHY_INTERVAL_MS / 1000)}s — currently ${verdict}`);
       }
+      // decide() clears the flag as part of returning to the healthy path, so
+      // the fact that an outage was announced has to be read before it runs.
+      const hadAnnounced = state.announced;
       const decision = decide(state, verdict, Date.now());
+
+      if (verdict === "up" && hadAnnounced) {
+        // The end of an outage is news, and the healthy path is otherwise
+        // silent — so without this the log's last word on the subject is the
+        // failure, and a funnel that recovered by itself reads exactly like one
+        // that is still down.
+        log("funnel-watchdog: public ingress is answering again");
+        audit({
+          action: "funnel-watchdog", actor: "aibroker", target: "funnel",
+          outcome: "recovered", meta: { results },
+        });
+      }
 
       if (verdict === "down" && !state.announced) {
         state.announced = true;
@@ -400,7 +453,7 @@ export function startFunnelWatchdog(opts: {
       if (decision.action === "heal") {
         log(`funnel-watchdog: ${decision.reason} — reconnecting the node`);
         const ok = heal();
-        const after = ok ? classify(await probe(hostname)) : "unknown";
+        const after = ok ? await confirmAfterHeal(probe, hostname) : "unknown";
         log(`funnel-watchdog: reconnect ${ok ? "done" : "failed"}, ingress is now ${after}`);
         audit({
           action: "funnel-watchdog", actor: "aibroker", target: "funnel",
