@@ -1165,6 +1165,17 @@ export function writeStandingRules(text: string, path = RULES_FILE): void {
   writeFileSync(path, body.endsWith("\n") ? body : `${body}\n`);
 }
 
+/**
+ * The most a goal may be, in characters.
+ *
+ * Measured, not guessed: the receiving prompt answers "Goal condition is
+ * limited to 4000 characters" and rejects the whole thing. It cost an evening
+ * of armings that reported "typed, but the words never appeared" — true, and
+ * silent about the reason. Kept under the real limit so a rules file that grows
+ * by a sentence does not walk back over it.
+ */
+const GOAL_MAX_CHARS = 3800;
+
 /** Sensible default when a shift names no length. Long enough to be worth arming. */
 const SHIFT_DEFAULT_HOURS = 8;
 /** Nobody should be able to hand over a machine for longer than a day by accident. */
@@ -1234,9 +1245,36 @@ export function shiftObjective(): string {
  * into a live session, and a mistake in it is a mistake that arrives as
  * keystrokes.
  */
-export function composeGoal(objective: string, rules: string, hands: string, extra: string): string {
-  const standing = rules ? ` ALWAYS, on every item: ${rules}` : "";
-  return oneLine(`/goal ${objective}${standing}${hands}${extra}`);
+export function composeGoal(
+  objective: string,
+  rules: string,
+  hands: string,
+  extra: string,
+  rulesPath?: string,
+): string {
+  const withoutRules = oneLine(`/goal ${objective}${hands}${extra}`);
+  if (!rules) return withoutRules;
+
+  const inlined = oneLine(`/goal ${objective} ALWAYS, on every item: ${rules}${hands}${extra}`);
+  if (inlined.length <= GOAL_MAX_CHARS) return inlined;
+
+  /*
+   * Too long to paste, so point at it instead.
+   *
+   * The receiving prompt refuses a goal over a few thousand characters, and it
+   * refuses the WHOLE goal — so a rules file that grew by a paragraph silently
+   * stopped every arming, and the manager reported "typed but the words never
+   * appeared", which is true and says nothing about why. The rules were fine;
+   * the goal was rejected at the door.
+   *
+   * Pointing keeps every rule in force. Reading a named file is a discrete act
+   * that either happened or did not, which is the kind of instruction sessions
+   * actually follow; pasting is only better when it fits.
+   */
+  const pointer = rulesPath
+    ? ` FIRST, before anything else: read ${rulesPath} and follow every rule in it for the whole of this work — they are not optional and they are not summarised here.`
+    : "";
+  return oneLine(`/goal ${objective}${pointer}${hands}${extra}`);
 }
 
 /** The text actually typed at the session. Short goal, context by reference. */
@@ -1249,7 +1287,7 @@ function goalText(m: ManagedSession): string {
   const hands = m.noScreen
     ? " THE OPERATOR HAS THE SCREEN: do no screen or pointer work at all, and do not ask for it. Everything else continues as normal. Where something would need checking on screen, write down what would need checking instead of checking it."
     : "";
-  return composeGoal(m.objective, readStandingRules(), hands, extra);
+  return composeGoal(m.objective, readStandingRules(), hands, extra, standingRulesSource());
 }
 
 /**

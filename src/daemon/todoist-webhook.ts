@@ -526,17 +526,15 @@ async function handleInbound(
   res: ServerResponse,
 ): Promise<void> {
   const {
-    findRoute, secretMatches, rateLimited, deliverInbound, TOKEN_HEADER, MAX_BODY,
+    findRoute, authorised, rateLimited, deliverInbound, TOKEN_HEADER, SIGNATURE_HEADER, MAX_BODY,
   } = await import("./inbound.js");
 
   const route = findRoute(name);
-  const presented = req.headers[TOKEN_HEADER] as string | undefined;
-
-  if (!route || route.enabled === false || !secretMatches(presented, route.secret)) {
+  if (!route || route.enabled === false) {
     audit({
       action: "inbound", actor: "external", target: `hook:${name}`,
       outcome: "refused",
-      reason: !route ? "no such route" : route.enabled === false ? "route disabled" : "bad or missing token",
+      reason: !route ? "no such route" : "route disabled",
     });
     res.writeHead(404).end();
     return;
@@ -554,6 +552,30 @@ async function handleInbound(
   } catch {
     audit({ action: "inbound", actor: "external", target: `hook:${route.name}`, outcome: "refused", reason: "payload too large" });
     res.writeHead(413).end();
+    return;
+  }
+
+  /*
+   * Authenticated AFTER the body is read, because one of the two proofs IS the
+   * body: a caller that cannot set a header can still sign what it sends. The
+   * read is bounded and rate limited before it happens, so reading first costs
+   * a refused caller nothing it could not already spend.
+   */
+  if (!authorised(
+    raw,
+    {
+      token: req.headers[TOKEN_HEADER] as string | undefined,
+      signature: req.headers[SIGNATURE_HEADER] as string | undefined,
+    },
+    route.secret,
+  )) {
+    audit({
+      action: "inbound", actor: "external", target: `hook:${route.name}`,
+      outcome: "refused", reason: "bad or missing token and signature",
+    });
+    // The same answer as an unknown route, so probing cannot tell a real route
+    // with a wrong secret from one that does not exist.
+    res.writeHead(404).end();
     return;
   }
 

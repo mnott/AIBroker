@@ -145,3 +145,39 @@ test("a folded pointer still resolves to the rules", () => {
   writeStandingRules(`@${repo}`, p);
   assert.equal(readStandingRules(p), "one rule", "an absolute pointer still works");
 });
+
+// ── the goal has to fit through the door ─────────────────────────────────────
+//
+// The receiving prompt refuses a goal over a few thousand characters, and it
+// refuses the whole thing. A rules file that grew by a paragraph therefore
+// stopped every arming, while the manager reported "typed, but the objective's
+// own words never appeared" — true, and silent about the cause.
+
+test("a goal that would be too long points at the rules instead of pasting them", () => {
+  const long = "x".repeat(5000);
+  const goal = composeGoal("do the work", long, "", "", "/somewhere/rules.md");
+  assert.ok(goal.length < 4000, `goal was ${goal.length} characters`);
+  assert.match(goal, /read \/somewhere\/rules\.md/);
+  assert.match(goal, /do the work/, "the task itself is never what gets dropped");
+});
+
+test("rules that fit are still pasted, because inline beats a lookup when it fits", () => {
+  const goal = composeGoal("do the work", "bound every wait", "", "", "/somewhere/rules.md");
+  assert.match(goal, /ALWAYS, on every item: bound every wait/);
+  assert.equal(goal.includes("/somewhere/rules.md"), false);
+});
+
+test("a one-shot note and the screen state survive the switch to pointing", () => {
+  // These are about right now; losing them silently would be worse than losing
+  // the rules, which at least remain readable in the file.
+  const goal = composeGoal("do the work", "y".repeat(5000), " SCREEN IS TAKEN", " OPERATOR: also this", "/r.md");
+  assert.match(goal, /SCREEN IS TAKEN/);
+  assert.match(goal, /OPERATOR: also this/);
+});
+
+test("with no path to point at, an oversized rule set is dropped rather than sent", () => {
+  // Sending it would have the whole goal rejected, which loses the objective too.
+  const goal = composeGoal("do the work", "z".repeat(5000), "", "");
+  assert.ok(goal.length < 4000);
+  assert.match(goal, /do the work/);
+});
