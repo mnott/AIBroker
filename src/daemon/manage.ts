@@ -20,9 +20,9 @@
  * says what it did. Everything requiring judgement stays with the person.
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { log } from "../core/log.js";
 import { readSessionContent } from "./session-content.js";
@@ -282,6 +282,42 @@ export interface ManagedSession {
   handsUntil?: number;
   /** Which state the timer was set in, so reverting means the opposite of it. */
   handsWas?: boolean;
+  /**
+   * The checkout this session's state belongs to, decided once.
+   *
+   * It used to be resolved fresh on every write, from whatever the pane's
+   * process happened to be reading. That is right for a session that moves and
+   * catastrophic for several sessions at once: a mis-resolution then writes one
+   * worker's state over another's, silently, in a checkout neither of them is
+   * working in. It has already put a file in an unrelated repository once.
+   *
+   * So it is pinned when management starts. If the live answer later disagrees,
+   * nothing is written and it is said out loud once — a mirror that follows the
+   * pane to a new repository is not a mirror, it is a second author.
+   */
+  repoRoot?: string;
+  /** Said once when the pane's checkout stopped matching the pinned one. */
+  repoDriftReported?: boolean;
+  /**
+   * A bounded stretch of autonomous work on the tracker's open issues.
+   *
+   * This exists because the operator was writing the same long paragraph every
+   * night — which list, in what order, report where, commit how, screen or no
+   * screen, for how long — and any clause forgotten in a hurry was a rule that
+   * silently did not apply. A shift is that paragraph reduced to its three
+   * variables: how long, with the screen or without, and how many workers.
+   */
+  shift?: {
+    /** When it ends. Stopping claiming is not the same as being killed. */
+    until: number;
+    /** Upper bound on concurrent workers. See the fleet design note. */
+    workers: number;
+    /** Whether the screen was handed over for the duration. */
+    visual: boolean;
+    startedAt: number;
+    /** Said once, so the end of a shift is announced and not merely obeyed. */
+    endReported?: boolean;
+  };
   startedAt: number;
 }
 
@@ -383,8 +419,25 @@ function mirrorToRepo(m: ManagedSession): void {
     const tty = m.tty ?? snapshotTty(m.sessionId);
     const proc = tty ? processReading(tty) : { isSession: false, pid: null };
     if (!proc.pid) return;
-    const cwd = repoRootFor(proc.pid);
-    if (!cwd) return;
+    const live = repoRootFor(proc.pid);
+    if (!live) return;
+
+    // Pin on the first successful resolution — including for sessions that
+    // were being managed before this field existed, which is why it is set
+    // here rather than only at creation.
+    if (!m.repoRoot) m.repoRoot = live;
+
+    if (m.repoRoot !== live) {
+      // Positive evidence, not a guess: the pane is reading a different
+      // checkout than the one this session's state belongs to. Refuse, and say
+      // so once — repeating it every twenty seconds would bury the log.
+      if (!m.repoDriftReported) {
+        m.repoDriftReported = true;
+        log(`[manage:${m.name}] pane is now in a different checkout than the one pinned at start — not mirroring state, to avoid writing it into somebody else's repository`);
+      }
+      return;
+    }
+    const cwd = m.repoRoot;
 
     const dir = join(cwd, ".aibroker");
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -546,6 +599,21 @@ function snapshotTty(sessionId: string): string | undefined {
 }
 
 /** The checkout a process is sitting in, or null if it is not in one. */
+/**
+ * The checkout a session is working in, or undefined when it cannot be told.
+ *
+ * Undefined is a real answer here and must not be faked: a session whose
+ * checkout is unknown gets no mirror at all, which is better than a mirror
+ * written somewhere plausible.
+ */
+function repoRootForSession(sessionId: string): string | undefined {
+  const tty = snapshotTty(sessionId);
+  if (!tty) return undefined;
+  const proc = processReading(tty);
+  if (!proc.pid) return undefined;
+  return repoRootFor(proc.pid) ?? undefined;
+}
+
 function repoRootFor(pid: string): string | null {
   try {
     const cwdOut = execFileSync("/usr/sbin/lsof", ["-p", pid, "-a", "-d", "cwd", "-Fn"], {
@@ -1006,6 +1074,171 @@ function landsWhen(m: ManagedSession): string {
   );
 }
 
+/**
+ * Standing rules: how to work, written once, typed at every arming.
+ *
+ * WHY THIS IS NOT PART OF THE OBJECTIVE. The objective is re-typed verbatim on
+ * every arming, so for a long time it was the only thing that survived — and
+ * that made it the only place to put a rule you wanted obeyed all night. The
+ * result was an operator hand-writing the same paragraph into every goal, for
+ * every project: bound your waits, report when you start an item and when you
+ * finish, one commit per item, never send the quit keystroke, bring the app to
+ * the front before looking at it, put test files here. Two thirds of a goal
+ * that was supposed to say "work through this list".
+ *
+ * That cost never announced itself. Nothing failed; a person just retyped
+ * knowledge the machine already had, and any line they forgot that night was a
+ * rule that silently did not apply. So the rules live in one file, apply to
+ * every managed session, and the objective goes back to being the task.
+ *
+ * A FILE RATHER THAN A CLI FIELD, deliberately: these are read and edited far
+ * more often than they are written, and a paragraph is easier to revise in an
+ * editor than to re-type through a shell. `manage rules` prints the path.
+ */
+const RULES_FILE = join(homedir(), ".aibroker", "manage-rules.txt");
+
+/**
+ * The standing rules, or "" when none are set. Never throws.
+ *
+ * A file whose first line is `@` followed by a path is a POINTER, and the rules
+ * are read from there instead. That exists so the text can have one owner: the
+ * same rules belong in the working repository, where they are version
+ * controlled, reviewed with the code and read by sessions nobody is managing —
+ * and copying them here as well would be two places holding one piece of
+ * knowledge, which is a certainty of drift rather than a risk of it. Point at
+ * the repository's copy and an edit there is in force at the next arming.
+ *
+ * One level of indirection only. A pointer to a pointer is a loop waiting to
+ * be written, and nothing here is worth that.
+ */
+export function readStandingRules(path = RULES_FILE): string {
+  try {
+    if (!existsSync(path)) return "";
+    const raw = readFileSync(path, "utf8");
+    const target = raw.trim().match(/^@\s*(\S.*)$/m);
+    if (target) {
+      const p = expandHome(target[1].trim());
+      return existsSync(p) ? oneLine(readFileSync(p, "utf8")) : "";
+    }
+    return oneLine(raw);
+  } catch {
+    return "";
+  }
+}
+
+/** Where the rules are read from, for saying so out loud. */
+export function standingRulesSource(path = RULES_FILE): string {
+  try {
+    if (!existsSync(path)) return path;
+    const target = readFileSync(path, "utf8").trim().match(/^@\s*(\S.*)$/m);
+    return target ? target[1].trim() : foldHome(path);
+  } catch {
+    return path;
+  }
+}
+
+/**
+ * A path with the home directory folded back to `~`, and the reverse.
+ *
+ * The pointer is written by a machine and read by a person, and an absolute
+ * path carries the account name of whoever ran the command. That is nobody's
+ * business in a file that may be copied to another machine, pasted into a bug
+ * report or checked in by accident — and the same rules file on two machines
+ * should not need two different pointers.
+ */
+export function foldHome(p: string, home = homedir()): string {
+  return p === home ? "~" : p.startsWith(`${home}/`) ? `~/${p.slice(home.length + 1)}` : p;
+}
+
+export function expandHome(p: string, home = homedir()): string {
+  return p === "~" ? home : p.startsWith("~/") ? join(home, p.slice(2)) : p;
+}
+
+/** Write the standing rules. Passing empty text removes them. */
+export function writeStandingRules(text: string, path = RULES_FILE): void {
+  const body = text.trim();
+  if (!body) {
+    try { if (existsSync(path)) unlinkSync(path); } catch { /* nothing to remove */ }
+    return;
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, body.endsWith("\n") ? body : `${body}\n`);
+}
+
+/** Sensible default when a shift names no length. Long enough to be worth arming. */
+const SHIFT_DEFAULT_HOURS = 8;
+/** Nobody should be able to hand over a machine for longer than a day by accident. */
+const SHIFT_MAX_HOURS = 24;
+
+/**
+ * Read a shift request out of a sentence.
+ *
+ * Deliberately forgiving about wording and strict about values: the caller is a
+ * model turning "you are free to work on the issues for eight hours with your
+ * controls, two workers at most" into an action, and the failure to avoid is a
+ * shift that silently lasts a different length than the one that was said.
+ */
+export function parseShift(text: string): { hours: number; visual: boolean; workers: number } {
+  const t = text.toLowerCase();
+  const h = t.match(/(\d+(?:[.,]\d+)?)\s*(h\b|hours?|hrs?)/);
+  const m = t.match(/(\d+)\s*(m\b|minutes?|mins?)/);
+  const hours = h ? Number(h[1].replace(",", ".")) : m ? Number(m[1]) / 60 : SHIFT_DEFAULT_HOURS;
+
+  // The screen is withheld unless it was actually offered. A shift that grants
+  // the pointer because nobody said not to is the wrong way round.
+  const visual = /\b(your controls|with controls|visual|you have the screen|screen is yours)\b/.test(t)
+    && !/\b(no screen|without the screen|not visual|headless|screen is mine|i need the screen)\b/.test(t);
+
+  const w = t.match(/(\d+)\s*(workers?|sessions?|in parallel)|(?:max(?:imum)?|up to)\s*(?:of\s*)?(\d+)/);
+  const workers = w ? Number(w[1] ?? w[3]) : 1;
+
+  return {
+    hours: Math.min(SHIFT_MAX_HOURS, Math.max(0.25, hours)),
+    visual,
+    workers: Math.min(8, Math.max(1, workers)),
+  };
+}
+
+/**
+ * The standing objective for a shift, written once here instead of by hand
+ * every night. It says what to work on and what "done" means; how to work is
+ * the standing rules, which ride along with every arming.
+ */
+export function shiftObjective(): string {
+  return oneLine(`
+    Work the open issues in this repository's tracker, one at a time, and do not stop.
+    Take the oldest open issue you can act on that nobody has claimed. Claim it by
+    assigning it to yourself and adding the in-progress label, then RE-READ the issue
+    and confirm the claim is yours before doing anything else — if somebody else holds
+    it, drop it and take the next.
+    Work on a branch named for the issue. Comment on the issue when you start and again
+    when you finish, and read a clock for the timestamp.
+    Prove the problem is still real before fixing it, and prove the fix on the evidence
+    the issue names.
+    Commit per item. Merge only when it is a fast-forward and the checks pass; anything
+    else gets a label and is left for a person rather than forced.
+    When an issue is done, close it, release the claim, and take the next one.
+    If there is no issue you can act on, say so and wait rather than inventing work.
+  `);
+}
+
+/**
+ * What a goal is made of, in the order a reader needs it.
+ *
+ * Task first, because that is what the session is being asked to do. Standing
+ * rules second, because they qualify the task rather than replace it. The
+ * screen state and any one-shot operator note last, because they are about
+ * right now rather than about the job.
+ *
+ * Exported so the composition can be pinned by a test: this string is typed
+ * into a live session, and a mistake in it is a mistake that arrives as
+ * keystrokes.
+ */
+export function composeGoal(objective: string, rules: string, hands: string, extra: string): string {
+  const standing = rules ? ` ALWAYS, on every item: ${rules}` : "";
+  return oneLine(`/goal ${objective}${standing}${hands}${extra}`);
+}
+
 /** The text actually typed at the session. Short goal, context by reference. */
 function goalText(m: ManagedSession): string {
   const extra = m.pending.length ? ` OPERATOR, since you were last armed: ${m.pending.join(" ")}` : "";
@@ -1016,7 +1249,7 @@ function goalText(m: ManagedSession): string {
   const hands = m.noScreen
     ? " THE OPERATOR HAS THE SCREEN: do no screen or pointer work at all, and do not ask for it. Everything else continues as normal. Where something would need checking on screen, write down what would need checking instead of checking it."
     : "";
-  return oneLine(`/goal ${m.objective}${hands}${extra}`);
+  return composeGoal(m.objective, readStandingRules(), hands, extra);
 }
 
 /**
@@ -1282,6 +1515,21 @@ async function tick(): Promise<void> {
      * it happens without a person: "hands on for eight hours" has to hand the
      * screen back at the eighth hour whether or not anybody is awake to ask.
      */
+    /**
+     * The end of a shift, which is a stand-down and not a kill.
+     *
+     * Arming stops; nothing is interrupted. A session mid-turn finishes it, and
+     * the objective stays so that `resume` picks the work up rather than
+     * starting it over. Announced once, because a fleet that quietly stopped
+     * looks exactly like a fleet that is still going.
+     */
+    if (m.shift && now >= m.shift.until && !m.shift.endReported) {
+      m.shift.endReported = true;
+      m.paused = true;
+      notify(m, `shift over after ${Math.round((now - m.shift.startedAt) / 3_600_000)}h — no longer arming; the objective is kept, \`resume\` continues it`);
+      dirty = true;
+    }
+
     if (m.handsUntil && now >= m.handsUntil) {
       const wasOff = m.handsWas === true;
       delete m.handsUntil;
@@ -1683,6 +1931,14 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `                manager is a one-shot note; this changes what it re-arms\n` +
         `  add <text>    EXTEND the standing objective. Say it to the session\n` +
         `                instead and the next arming forgets it\n` +
+        `  rules [text|from <path>|clear]\n` +
+        `                HOW to work, as opposed to what to work on: typed into every\n` +
+        `                arming of every managed session, so it is written once rather\n` +
+        `                than into each objective by hand. No argument shows them\n` +
+        `  shift [8h] [your controls] [2 workers]\n` +
+        `                a bounded stretch of autonomous work on the tracker's open\n` +
+        `                issues: objective, screen decision, expiry and arming in one\n` +
+        `                sentence. \`shift off\` stands it down without killing it\n` +
         `  now           arm immediately, whatever the signals say\n` +
         `  pause         stop arming, keep the objective\n` +
         `  resume        start arming again\n` +
@@ -1695,6 +1951,126 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `  /btw manage <in words>        anything not in the list above goes to the\n` +
         `                                model, which reads it and calls the tool.\n\n` +
         `${existing ? `Currently managing ${name}: ${existing.objective}` : `${name} is not being managed.`}`,
+    };
+  }
+
+  /**
+   * rules — the standing "how to work" text, shared by every managed session.
+   *
+   * Answers on its own rather than through a session, because the rules are not
+   * a property of one: setting them from whichever pane happens to be to hand
+   * must not depend on which session that is.
+   */
+  const rulesMatch = arg.match(/^rules(?:\s+([\s\S]+))?$/i);
+  if (rulesMatch) {
+    const rest = (rulesMatch[1] ?? "").trim();
+    if (!rest || rest.toLowerCase() === "show") {
+      const current = readStandingRules();
+      return {
+        ok: true,
+        managed: !!existing,
+        message: current
+          ? `standing rules, typed into every arming of every managed session:\n\n  ${current}\n\n` +
+            `  read from ${standingRulesSource()} — edit them there.\n` +
+            `  \`manage rules from <path>\` points at a file the working repository owns.\n` +
+            `  \`manage rules clear\` removes them.`
+          : `no standing rules set.\n\n` +
+            `  These are the lines you would otherwise write into every objective by hand —\n` +
+            `  how to work, as opposed to what to work on. They are typed at every arming, so\n` +
+            `  they survive a compaction, and they are shared by every managed session.\n\n` +
+            `  Set them with \`manage rules <text>\`, write ${RULES_FILE} directly, or\n` +
+            `  \`manage rules from <path>\` to let the working repository own the text.`,
+      };
+    }
+    const from = rest.match(/^from\s+(\S.*)$/i);
+    if (from) {
+      const target = foldHome(expandHome(from[1].trim()));
+      writeStandingRules(`@${target}`);
+      const got = readStandingRules();
+      return {
+        ok: true,
+        managed: !!existing,
+        message: got
+          ? `standing rules now read from ${target} — edit them there and the next arming has them.\n  ${got.slice(0, 160)}${got.length > 160 ? "…" : ""}`
+          : `pointed at ${target}, but nothing readable is there yet. The pointer stays; armings carry no rules until that file exists.`,
+      };
+    }
+    if (rest.toLowerCase() === "clear") {
+      writeStandingRules("");
+      return { ok: true, managed: !!existing, message: "standing rules cleared — objectives now carry only themselves." };
+    }
+    writeStandingRules(rest);
+    return {
+      ok: true,
+      managed: !!existing,
+      message:
+        `standing rules set — they go into every arming, of every managed session.\n  ${oneLine(rest).slice(0, 200)}${rest.length > 200 ? "…" : ""}\n` +
+        `  Stored at ${RULES_FILE}.`,
+    };
+  }
+
+  /**
+   * shift — a bounded stretch of autonomous work, set up in one sentence.
+   *
+   * Everything the operator used to type by hand: the objective, the screen
+   * decision and its expiry, the arming, and how long it all lasts.
+   */
+  /*
+   * Only the word "shift", and only leading.
+   *
+   * The first version also accepted "go" and "work", which read well and was
+   * wrong: "work through the open items first" is how half of all objectives
+   * begin, and it would have been swallowed as a shift request — silently
+   * replacing what the operator typed with the issue-driven objective. A verb
+   * that can be mistaken for the start of a sentence is not a verb.
+   */
+  const shiftMatch = arg.match(/^shift\b\s*([\s\S]*)$/i);
+  if (shiftMatch) {
+    const rest = (shiftMatch[1] ?? "").trim();
+    if (!existing) {
+      return { ok: false, message: `${name} is not being managed yet. Start with an objective first, or use \`manage ${name} <objective>\`.` };
+    }
+    if (/^(off|stop|end|stand down)\b/i.test(rest)) {
+      const had = existing.shift;
+      delete existing.shift;
+      existing.paused = true;
+      note(existing, "shift ended by the operator — no longer arming");
+      saveState(state);
+      return {
+        ok: true,
+        managed: true,
+        message: had
+          ? `shift ended. ${name} keeps its objective and is no longer re-armed; whatever it is doing now runs to its natural stop.\n  \`manage ${name} resume\` picks it up again.`
+          : `${name} had no shift running. It is paused now either way.`,
+      };
+    }
+
+    const { hours, visual, workers } = parseShift(rest);
+    const until = Date.now() + hours * 3_600_000;
+    existing.objective = shiftObjective();
+    existing.pending = [];
+    existing.paused = false;
+    existing.noScreen = !visual;
+    existing.handsUntil = until;
+    existing.handsWas = !visual;
+    existing.shift = { until, workers, visual, startedAt: Date.now() };
+    // Arm on the next tick rather than typing over whatever is on screen now.
+    existing.lastRearmAt = 0;
+    note(existing, `shift started: ${hours}h, ${visual ? "screen granted" : "no screen"}, up to ${workers} worker(s)`);
+    saveState(state);
+
+    const ends = new Date(until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return {
+      ok: true,
+      managed: true,
+      message:
+        `${name} is on shift for ${hours} hour(s), until ${ends}.\n` +
+        `  ${visual ? "The screen is its own until then, and reverts by itself." : "No screen work — the operator has the machine."}\n` +
+        `  Objective set to the tracker's open issues; the standing rules ride along with every arming.\n` +
+        (workers > 1
+          ? `  Asked for ${workers} workers. Only one runs today — worktrees and the claim protocol are designed but not built, and a second worker without them would share a checkout with the first.\n`
+          : "") +
+        `  It arms on the next tick. \`manage ${name} shift off\` stands it down without killing it.`,
     };
   }
 
@@ -2010,6 +2386,9 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
       lastHash: hash(readPane(sessionId)),
       tty: snapshotTty(sessionId),
       paused: false,
+      // Pinned here so every later write goes to the checkout this session was
+      // started in, whatever the pane does afterwards.
+      repoRoot: repoRootForSession(sessionId),
       startedAt: Date.now(),
     };
     state[sessionId] = m;

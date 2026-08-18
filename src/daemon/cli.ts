@@ -222,7 +222,7 @@ switch (command) {
     // case that matters, since a busy session cannot answer for itself.
     const here = (process.env.ITERM_SESSION_ID ?? "").split(":").pop() ?? "";
     const first = args[1];
-    const KEYWORDS = new Set(["", "status", "state", "what", "info", "show", "off", "stop", "pause", "resume", "now", "help", "?"]);
+    const KEYWORDS = new Set(["", "status", "state", "what", "info", "show", "off", "stop", "pause", "resume", "now", "rules", "shift", "help", "?"]);
     // A leading dash is never a session name. Without this, `manage --help`
     // was read as "the session called --help" and answered "no live session
     // matches" — a true statement about a question nobody asked.
@@ -241,7 +241,18 @@ switch (command) {
      */
     let session: string;
     let rest: string[];
-    if (!isKeyword(first)) {
+    /**
+     * `rules` never takes a session, and the both-orders rule below would give
+     * it one: in `manage rules from <path>` the word after the verb is not a
+     * keyword, so it was read as the session name and the command failed with
+     * "no live session matches from". The standing rules belong to every
+     * managed session at once, so the only sensible session here is whichever
+     * pane the command was typed in.
+     */
+    if ((first ?? "").toLowerCase() === "rules") {
+      session = here || "-";
+      rest = args.slice(1);
+    } else if (!isKeyword(first)) {
       session = first!;
       rest = args.slice(2);
     } else if (isKeyword(first) && args[2] !== undefined && !isKeyword(args[2])) {

@@ -169,6 +169,101 @@ function getMessagesAfter(afterSeq: number, sessionId?: string): LogEntry[] {
   });
 }
 
+/**
+ * A ceiling on ONE message inside a catch-up.
+ *
+ * The total cap below cannot do this job alone: it always admits the first
+ * message whatever its size, because a cap that can return nothing is worse
+ * than no cap. So a single enormous message walks straight through it. That is
+ * not hypothetical — a catch-up reply of 203,179,518 bytes went out over MQTT,
+ * and anything of that order kills the connection carrying it.
+ *
+ * Above this size a message keeps its shape and loses its payload: the phone
+ * learns that an image was there and can ask for it, which is the part that
+ * matters for reading back a conversation.
+ */
+const ONE_MESSAGE_MAX_BYTES = 256 * 1024;
+
+/** A ceiling on the whole reply. See buildCatchUp for why both exist. */
+const CATCH_UP_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Make a catch-up batch a phone can actually receive.
+ *
+ * THE FAILURE THIS PREVENTS IS SELF-SUSTAINING, which is what makes it worth a
+ * shared function rather than a check at each call site. The client asks from
+ * its last sequence; if the reply is too big to take, the socket dies partway;
+ * the client reconnects and asks from the SAME sequence, because it never
+ * finished; and it is handed the identical payload again. Observed as a loop of
+ * connect, 172 KB reply, ECONNRESET three seconds later, repeat — for as long
+ * as the phone was on the network.
+ *
+ * Both transports go through here. The cap used to live only on the WebSocket
+ * path, which was the one being retired; the MQTT path that replaced it had
+ * none, so the protection stayed with the transport nobody used any more. A
+ * limit that lives on one of two paths is a limit that will be discovered by
+ * the path it is missing from.
+ *
+ * Trimming takes the newest first: if not everything fits, the recent end is
+ * what keeps a conversation coherent.
+ */
+export function buildCatchUp(missed: Array<{ payload: Record<string, unknown> }>): {
+  messages: Record<string, unknown>[];
+  bytes: number;
+  withheld: number;
+  lightened: number;
+} {
+  const messages: Record<string, unknown>[] = [];
+  let bytes = 0;
+  let withheld = 0;
+  let lightened = 0;
+
+  for (let i = missed.length - 1; i >= 0; i--) {
+    const p: Record<string, unknown> = { ...missed[i].payload };
+
+    // Audio never survives a replay: it is large, and the transcript carries
+    // what the message meant. Downgrading to text says so honestly rather than
+    // sending a voice note that cannot be played.
+    if (p.type === "voice" && p.audioBase64) {
+      delete p.audioBase64;
+      if (!p.content && p.transcript) p.content = p.transcript;
+      p.type = "text";
+    }
+
+    let size = JSON.stringify(p)?.length ?? 0;
+    if (size > ONE_MESSAGE_MAX_BYTES) {
+      // Keep the message, drop the weight. `omitted` is what lets the app say
+      // "an image was here" instead of showing a gap it cannot explain.
+      for (const field of ["imageBase64", "data"]) {
+        if (p[field] !== undefined) {
+          delete p[field];
+          p.omitted = field;
+        }
+      }
+      // An attachment with nothing written on it would otherwise disappear:
+      // the app drops a message with neither text nor image, so a stripped,
+      // uncaptioned picture leaves no trace at all. Giving it words keeps it
+      // in the history, and does so through a path every existing client
+      // already renders — which is worth more here than a field they would
+      // have to be taught.
+      if (p.omitted && !p.content && !p.transcript && !p.caption) {
+        p.content = "(an image from this conversation was too large to replay)";
+      }
+      lightened++;
+      size = JSON.stringify(p)?.length ?? 0;
+    }
+
+    if (bytes + size > CATCH_UP_MAX_BYTES && messages.length > 0) {
+      withheld = i + 1;
+      break;
+    }
+    messages.unshift(p);
+    bytes += size;
+  }
+
+  return { messages, bytes, withheld, lightened };
+}
+
 /** Handle catch_up command: replay missed messages to the client.
  *  Uses the persistent disk queue so messages survive daemon restarts.
  */
@@ -186,30 +281,16 @@ function handleCatchUp(ws: WebSocket, args?: Record<string, unknown>): void {
     return;
   }
 
-  // A ceiling on what one client can be handed at once.
-  //
   // A fresh install asks from seq 0, so "everything you missed" is the entire
   // buffer. That is how a phone was handed 117 MB in one reply, wrote it to its
   // local store, and was killed by the watchdog on the next launch — twice,
-  // because reinstalling asks from 0 again. The queue is byte-bounded now, but
-  // this must hold on its own: a limit that only works because another limit
-  // works is not a limit.
-  //
-  // Newest first when trimming. If we cannot send everything, the recent end is
-  // the part that keeps the conversation coherent.
-  const CATCH_UP_MAX_BYTES = 4 * 1024 * 1024;
-  const payloads: unknown[] = [];
-  let bytes = 0;
-  let skipped = 0;
-  for (let i = missed.length - 1; i >= 0; i--) {
-    const p = missed[i].payload;
-    const size = JSON.stringify(p)?.length ?? 0;
-    if (bytes + size > CATCH_UP_MAX_BYTES && payloads.length > 0) { skipped = i + 1; break; }
-    payloads.unshift(p);
-    bytes += size;
-  }
+  // because reinstalling asks from 0 again.
+  const { messages: payloads, bytes, withheld: skipped, lightened } = buildCatchUp(missed);
   if (skipped > 0) {
     log(`[PAILot] catch_up: withheld ${skipped} older message(s) — over ${Math.round(CATCH_UP_MAX_BYTES / 1048576)} MB`);
+  }
+  if (lightened > 0) {
+    log(`[PAILot] catch_up: ${lightened} message(s) sent without their attachment — over ${Math.round(ONE_MESSAGE_MAX_BYTES / 1024)} KB each`);
   }
 
   log(`[PAILot] catch_up: replaying ${payloads.length} messages, ${Math.round(bytes / 1024)} KB (client lastSeq=${lastSeq}, server seq=${currentSeq})`);
@@ -1752,24 +1833,25 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       const missed = mqGetAfter(lastSeq);
       log(`[MQTT] catch_up: lastSeq=${lastSeq} currentSeq=${currentSeq} missed=${missed.length}`);
 
-      // Strip audioBase64 from voice messages to avoid sending megabytes of
-      // audio data that would overwhelm the MQTT connection. Voice messages
-      // become text transcripts. Images are kept intact (typically <500KB).
-      const lightPayloads = missed.map(m => {
-        const p = { ...m.payload };
-        if (p.type === "voice" && p.audioBase64) {
-          delete p.audioBase64;
-          // Promote transcript to content so app shows it as text
-          if (!p.content && p.transcript) p.content = p.transcript;
-          p.type = "text";  // Downgrade to text — audio is not recoverable offline
-        }
-        return p;
-      });
+      // Same builder as the WebSocket path. The assumption that used to live
+      // here — audio stripped, "images kept intact (typically <500KB)" — is
+      // what produced a 194 MB reply and the reconnect loop that followed it.
+      const { messages: lightPayloads, bytes, withheld, lightened } = buildCatchUp(missed);
+      if (withheld > 0) {
+        log(`[MQTT] catch_up: withheld ${withheld} older message(s) — over ${Math.round(CATCH_UP_MAX_BYTES / 1048576)} MB`);
+      }
+      if (lightened > 0) {
+        log(`[MQTT] catch_up: ${lightened} message(s) sent without their attachment — over ${Math.round(ONE_MESSAGE_MAX_BYTES / 1024)} KB each`);
+      }
+      log(`[MQTT] catch_up: replaying ${lightPayloads.length} messages, ${Math.round(bytes / 1024)} KB`);
 
       mqttPublishControl({
         type: "catch_up",
         messages: lightPayloads,
         serverSeq: currentSeq,
+        // A partial reply must say so, or "that is all there was" and "that is
+        // all you are getting" are the same silence.
+        ...(withheld > 0 ? { truncated: true, withheld } : {}),
       });
 
       handleMqttCommand("sessions");

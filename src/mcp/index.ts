@@ -328,12 +328,12 @@ server.tool(
   {
     session: z.string().describe("Session name or id — the session being managed, not the caller"),
     action: z
-      .enum(["status", "start", "instruct", "off", "pause", "resume", "now"])
-      .describe("status = report; start = set the standing objective; instruct = one-shot note carried into the next arming; off = stop"),
+      .enum(["status", "start", "instruct", "off", "pause", "resume", "now", "shift", "shift-off"])
+      .describe("shift = a bounded stretch of autonomous work on the tracker's open issues, set up from one sentence in `text` (how long, whether it has the screen, how many workers) — this is what 'work the issues for 8 hours with your controls, 2 workers' means; shift-off = stand it down without killing it; status = report; start = set the standing objective; instruct = one-shot note carried into the next arming; off = stop"),
     text: z
       .string()
       .optional()
-      .describe("The objective for start, or the instruction for instruct. Ignored otherwise."),
+      .describe("The objective for start; the instruction for instruct; and for shift the operator's own sentence, verbatim — how long, whether it has the screen, how many workers. Pass it unedited: a shift given no text silently takes defaults rather than what was said. Ignored for the other actions."),
   },
   async ({ session, action, text }) => {
     // The daemon takes one string and decides; keep that as the single place
@@ -344,6 +344,8 @@ server.tool(
       action === "pause" ? "pause" :
       action === "resume" ? "resume" :
       action === "now" ? "now" :
+      action === "shift" ? `shift ${text ?? ""}`.trim() :
+      action === "shift-off" ? "shift off" :
       (text ?? "");
     if ((action === "start" || action === "instruct") && !text) {
       return err(new Error(`${action} needs the text to use`));
