@@ -131,8 +131,11 @@ test("several events render as one message that says they were grouped", () => {
     { action: "closed", issue: { number: 2 } },
   ]);
   assert.match(body, /2 events, grouped because they came from one action/);
-  assert.match(body, /action: created/);
-  assert.match(body, /action: closed/);
+  // Both actions survive; they are now on one line rather than in two blocks,
+  // because repeating the identical title and link per event was the thing
+  // that made a group harder to read than the flood it replaced.
+  assert.match(body, /action: created, closed/);
+  assert.match(body, /issue\.number: 2/);
 });
 
 test("a single event says nothing about grouping", () => {
@@ -231,4 +234,79 @@ test("one attachment is spoken about in the singular", () => {
 test("no attachments means no line about them", () => {
   const body = composeDelivery(TRUSTING, { comment: { body: "no pictures", assets: [] } });
   assert.equal(body.includes("attachments:"), false);
+});
+
+test("a group prints what the events agree on once, and lists what differs", () => {
+  // Three webhooks from one action produced three near-identical blocks with
+  // one word different — worse than the flood it replaced, because the reader
+  // has to diff three paragraphs to find the word.
+  const route = { name: "i", secret: "s", owner: "W", mode: "message" as const,
+                  fields: ["action", "issue.number", "issue.title"], createdAt: "" };
+  const base = { issue: { number: 173, title: "Allow adding empty pages" } };
+  const body = composeDelivery(route, [
+    { ...base, action: "assigned" }, { ...base, action: "opened" }, { ...base, action: "label_updated" },
+  ]);
+  assert.match(body, /action: assigned, opened, label_updated/);
+  assert.equal((body.match(/issue\.number: 173/g) ?? []).length, 1, "the number appears once, not three times");
+  assert.equal((body.match(/Allow adding empty pages/g) ?? []).length, 1);
+});
+
+test("the body of a newly opened issue is carried, not just its title", () => {
+  // An "opened" event puts the request in the issue body; a field list that
+  // only knew about comment bodies delivered a title and a link, with the ask
+  // itself left behind.
+  const route = { name: "i", secret: "s", owner: "W", mode: "message" as const,
+                  fields: ["action", "issue.body"], createdAt: "" };
+  const body = composeDelivery(route, { action: "opened", issue: { body: "insert a blank page from the page menu" } });
+  assert.match(body, /issue\.body: insert a blank page from the page menu/);
+});
+
+test("an attachment note is not repeated once per event in a group", () => {
+  const route = { name: "i", secret: "s", owner: "W", mode: "message" as const, fields: ["action"], createdAt: "" };
+  const withAsset = { action: "opened", issue: { assets: [{ name: "a.png" }] } };
+  const body = composeDelivery(route, [withAsset, { ...withAsset, action: "assigned" }]);
+  assert.equal((body.match(/attachments:/g) ?? []).length, 1);
+});
+
+// ── the guard at two workers ─────────────────────────────────────────────────
+//
+// With one session, "sent by our account" means "sent by the reader". With
+// several workers sharing an account it stops meaning that, and a route-wide
+// guard would suppress exactly the messages workers send each other.
+
+const WORKER_A = {
+  name: "issues", secret: "s", owner: "project-11", mode: "message" as const,
+  fields: ["comment.body"], ignore: ["comment.body~=worker: $owner"], createdAt: "",
+};
+const WORKER_B = { ...WORKER_A, owner: "project-12" };
+
+test("a worker's own comment is suppressed for itself", () => {
+  const ev = { comment: { body: "Fixed the crop path.\n— worker: project-11" } };
+  assert.match(shouldIgnore(WORKER_A, ev) ?? "", /worker: \$owner/);
+});
+
+test("and delivered to the other worker, which is the point", () => {
+  // The single-worker guard would have dropped this for everybody.
+  const ev = { comment: { body: "Fixed the crop path.\n— worker: project-11" } };
+  assert.equal(shouldIgnore(WORKER_B, ev), undefined);
+});
+
+test("the contains form does not match a different worker with a shared prefix", () => {
+  // "project-1" must not swallow "project-11".
+  const route = { ...WORKER_A, owner: "project-1" };
+  assert.equal(shouldIgnore(route, { comment: { body: "— worker: project-11" } }), undefined,
+    "a prefix is not a match when the trailer is written with a delimiter");
+});
+
+test("an exact rule still behaves as before", () => {
+  const route = { ...WORKER_A, ignore: ["sender.login=claude"] };
+  assert.match(shouldIgnore(route, { sender: { login: "Claude" } }) ?? "", /sender\.login/);
+  assert.equal(shouldIgnore(route, { sender: { login: "someone" } }), undefined);
+});
+
+test("a rule whose $owner cannot be expanded is refused, not matched loosely", () => {
+  // An unexpanded placeholder would otherwise be compared literally, or worse,
+  // an empty value would make `contains` true for every payload.
+  const route = { ...WORKER_A, owner: "", ignore: ["comment.body~=worker: $owner"] };
+  assert.equal(shouldIgnore(route, { comment: { body: "anything at all" } }), undefined);
 });

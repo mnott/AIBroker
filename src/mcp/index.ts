@@ -24,6 +24,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { execSync } from "node:child_process";
+import { missingIssueLink } from "./issue-links.js";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { WatcherClient } from "../ipc/client.js";
@@ -1050,8 +1051,20 @@ server.tool("telegram_restart", "Restart the Telegram watcher service", {}, asyn
 server.tool(
   "pailot_send",
   "Send a text message to the PAILot mobile app. ONLY use when the user's message started with [PAILot] prefix. NEVER use for terminal messages (no prefix). Route replies to the SAME channel the message came from.",
-  { message: z.string().min(1).describe("Message text") },
+  {
+    message: z
+      .string()
+      .min(1)
+      .describe(
+        "Message text. If it names an issue (#173), it MUST also carry a link — to the comment you just wrote if there is one, otherwise to the issue. Sends without one are refused.",
+      ),
+  },
   async ({ message }) => {
+    // Enforced rather than asked for. See mcp/issue-links.ts: the polite
+    // version was forgotten three times in one evening, and the cost lands on
+    // a reader holding a phone who cannot type a URL from memory.
+    const complaint = missingIssueLink(message);
+    if (complaint) return err(new Error(complaint.message));
     try {
       const sessionId = getSessionId();
       await hub.call_raw("pailot_send", { text: message, sessionId });

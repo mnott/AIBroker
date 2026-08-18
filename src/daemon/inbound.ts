@@ -301,6 +301,19 @@ function scalar(v: unknown): string | undefined {
 /** Longest a single lifted field may be before it is cut. */
 const FIELD_MAX = 300;
 
+/**
+ * One field, flattened and capped.
+ *
+ * A notification says what happened and where; the tracker holds the thing
+ * itself, and anything with a picture has to be fetched anyway. So a short
+ * question arrives whole, an essay arrives as its opening — and it says it was
+ * cut, because a silently truncated quotation is a misquotation.
+ */
+function trimField(v: string): string {
+  const flat = v.replace(/\s*[\r\n]+\s*/g, " ").trim();
+  return flat.length > FIELD_MAX ? `${flat.slice(0, FIELD_MAX)}… (cut — open the link for the rest)` : flat;
+}
+
 export function renderPayload(route: InboundRoute, payload: unknown): string {
   if (route.fields?.length) {
     const lines: string[] = [];
@@ -316,8 +329,7 @@ export function renderPayload(route: InboundRoute, payload: unknown): string {
        * first lines with the link to the rest — and the reader is told it was
        * cut, because a silently truncated quotation is a misquotation.
        */
-      const flat = v.replace(/\s*[\r\n]+\s*/g, " ").trim();
-      lines.push(`${f}: ${flat.length > FIELD_MAX ? `${flat.slice(0, FIELD_MAX)}… (cut — open the link for the rest)` : flat}`);
+      lines.push(`${f}: ${trimField(v)}`);
     }
     if (lines.length) return lines.join("\n");
     // Named fields, none present: fall through rather than deliver an empty
@@ -352,11 +364,41 @@ function attachmentNote(payload: unknown): string | undefined {
   return `attachments: ${n} — not included here; open the link to see ${n === 1 ? "it" : "them"}`;
 }
 
+/**
+ * Several events about one thing, written once.
+ *
+ * Grouping three webhooks from one action produced three near-identical
+ * blocks: the same title, the same link and the same sender, three times, with
+ * one word different. That is worse than the flood it replaced, because the
+ * reader has to diff three paragraphs to find the word. So fields every event
+ * agrees on are printed once, and the ones that differ are listed together.
+ *
+ * Only used when a group has more than one event; a single event renders
+ * exactly as it always did.
+ */
+function renderGroup(route: InboundRoute, list: unknown[]): string {
+  const fields = route.fields ?? [];
+  if (!fields.length) return list.map((p) => renderPayload(route, p)).join("\n\n");
+
+  const lines: string[] = [];
+  for (const f of fields) {
+    const seen: string[] = [];
+    for (const p of list) {
+      const v = scalar(pick(p, f));
+      if (v !== undefined && !seen.includes(v)) seen.push(v);
+    }
+    if (!seen.length) continue;
+    lines.push(`${f}: ${seen.map((v) => trimField(v)).join(", ")}`);
+  }
+  const notes = [...new Set(list.map((p) => attachmentNote(p)).filter(Boolean) as string[])];
+  return [...lines, ...notes].join("\n");
+}
+
 export function composeDelivery(route: InboundRoute, payloads: unknown | unknown[]): string {
   const list = Array.isArray(payloads) ? payloads : [payloads];
-  const rendered = list
-    .map((p) => [renderPayload(route, p), attachmentNote(p)].filter(Boolean).join("\n"))
-    .join("\n\n");
+  const rendered = list.length > 1
+    ? renderGroup(route, list)
+    : [renderPayload(route, list[0]), attachmentNote(list[0])].filter(Boolean).join("\n");
 
   // Framing depends on who sent it. See InboundRoute.trusted: the strict
   // wording protects a public endpoint, and applying it to the operator's own
@@ -409,21 +451,53 @@ export interface DeliveryResult {
  * Exported because it is the loop guard, and a loop guard that cannot be tested
  * on its own is a loop guard nobody trusts.
  */
-/** Does any `path=value` rule match this payload? Shared by ignore and trust. */
-function matchesAny(rules: string[] | undefined, payload: unknown): string | undefined {
+/**
+ * Does any rule match this payload? Shared by ignore and trust.
+ *
+ * Two forms, and the second exists for the multi-worker case:
+ *
+ *   `path=value`   the field equals the value
+ *   `path~=value`  the field contains the value
+ *
+ * `$owner` in a value expands to the session the route delivers to. That turns
+ * a route-wide rule into a per-recipient one, which is the whole difference
+ * between one worker and several: with a shared account, "sent by us" stops
+ * meaning "sent by the reader", and a guard that cannot see the reader
+ * suppresses the messages workers send each other. Self is a property of the
+ * reader, not of the channel.
+ */
+/**
+ * Does the text contain this value, ending where the value ends?
+ *
+ * A plain substring test is wrong for names that share a prefix: a worker
+ * called `x-1` would swallow every message from `x-11`, silently, and only
+ * once a second worker existed. So the match must not be followed by another
+ * name character.
+ */
+function containsWhole(text: string, want: string): boolean {
+  const escaped = want.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`${escaped}(?![\\w-])`).test(text);
+}
+
+function matchesAny(rules: string[] | undefined, payload: unknown, owner = ""): string | undefined {
   for (const rule of rules ?? []) {
-    const eq = rule.indexOf("=");
-    if (eq < 1) continue;
-    const path = rule.slice(0, eq).trim();
-    const want = rule.slice(eq + 1).trim().toLowerCase();
-    const got = scalar(pick(payload, path));
-    if (got !== undefined && got.trim().toLowerCase() === want) return rule;
+    const sep = rule.indexOf("~=");
+    const contains = sep >= 1;
+    const at = contains ? sep : rule.indexOf("=");
+    if (at < 1) continue;
+    const path = rule.slice(0, at).trim();
+    const want = rule.slice(at + (contains ? 2 : 1)).trim().toLowerCase().replaceAll("$owner", owner.toLowerCase());
+    // An unexpanded $owner would match far too much; refuse rather than guess.
+    if (!want || want.includes("$owner")) continue;
+    const got = scalar(pick(payload, path))?.trim().toLowerCase();
+    if (got === undefined) continue;
+    if (contains ? containsWhole(got, want) : got === want) return rule;
   }
   return undefined;
 }
 
 export function shouldIgnore(route: InboundRoute, payload: unknown): string | undefined {
-  return matchesAny(route.ignore, payload);
+  return matchesAny(route.ignore, payload, route.owner);
 }
 
 /**
@@ -434,7 +508,7 @@ export function shouldIgnore(route: InboundRoute, payload: unknown): string | un
  * nobody can check.
  */
 export function isTrusted(route: InboundRoute, payload: unknown): boolean {
-  return matchesAny(route.trusted, payload) !== undefined;
+  return matchesAny(route.trusted, payload, route.owner) !== undefined;
 }
 
 /**
