@@ -355,13 +355,37 @@ export function renderPayload(route: InboundRoute, payload: unknown): string {
  * refers to "the screenshot" and has no idea one was ever there.
  */
 function attachmentNote(payload: unknown): string | undefined {
-  let n = 0;
+  const files: { name: string; url: string }[] = [];
   for (const path of ["comment.assets", "issue.assets", "release.assets"]) {
     const v = pick(payload, path);
-    if (Array.isArray(v)) n += v.length;
+    if (!Array.isArray(v)) continue;
+    for (const a of v) {
+      const rec = a as Record<string, unknown>;
+      const name = typeof rec?.name === "string" ? rec.name : "(unnamed)";
+      const url = typeof rec?.browser_download_url === "string" ? rec.browser_download_url : "";
+      if (url) files.push({ name, url });
+    }
   }
-  if (!n) return undefined;
-  return `attachments: ${n} — not included here; open the link to see ${n === 1 ? "it" : "them"}`;
+  if (!files.length) return undefined;
+
+  /*
+   * An instruction, not a description, and with the address in it.
+   *
+   * The first version said "attachments: 1 — not included here; open the link
+   * to see it" and was read as information rather than as something to do: a
+   * picture was sent, the session was told one existed, and it answered
+   * without looking. A note that describes a state leaves the reader to infer
+   * the action; naming the file and giving the URL makes it a discrete act
+   * with an artifact, which is the kind that actually gets done.
+   */
+  const shown = files.slice(0, 5);
+  const rest = files.length - shown.length;
+  return [
+    `ATTACHMENTS (${files.length}) — FETCH AND LOOK AT ${files.length === 1 ? "IT" : "THEM"} BEFORE YOU ANSWER.`,
+    "They are not in this message and they usually carry the point of it.",
+    ...shown.map((f) => `  ${f.name} — ${f.url}`),
+    ...(rest > 0 ? [`  … and ${rest} more on the issue`] : []),
+  ].join("\n");
 }
 
 /**
