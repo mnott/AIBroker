@@ -31,6 +31,14 @@ import { discoverLiveSessions } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
 import { listDialogs, answerDialog } from "./dialogs.js";
+import {
+  readControls,
+  grantUntil,
+  returnToOperator,
+  verdict as screenVerdict,
+  describeControls,
+  screenGrantedClause,
+} from "./pointer-controls.js";
 
 const STATE_FILE = join(homedir(), ".aibroker", "managers.json");
 
@@ -298,6 +306,33 @@ export interface ManagedSession {
   repoRoot?: string;
   /** Said once when the pane's checkout stopped matching the pinned one. */
   repoDriftReported?: boolean;
+  /**
+   * When the CURRENT screen grant was made.
+   *
+   * Needed to tell two identical-looking states apart: a pointer grant that
+   * lapsed on its idle window, which is ours to renew, and the operator having
+   * taken the screen back, which is not. The discriminator is whether their
+   * hold started before or after the grant did.
+   */
+  screenSince?: number;
+  /**
+   * Said once when the operator takes the screen back while a grant is open.
+   * Their machine, their call — but a session that silently stopped doing
+   * visual work looks exactly like one that is still doing it.
+   */
+  screenStandOffReported?: boolean;
+  /**
+   * Said once while the manager withholds the screen and the pointer tool would
+   * nonetheless allow a click — the two halves disagreeing.
+   *
+   * NOT resolved automatically, deliberately. The obvious move is for the
+   * manager to adopt the grant it finds, and that would quietly remove the
+   * protection the grant exists for: nothing in the file distinguishes a grant
+   * the operator made from one a session wrote for itself. So the manager keeps
+   * withholding and says so, which is the half of the problem it can fix —
+   * every hour this went unreported was an hour of visual work not done.
+   */
+  screenDisagreementReported?: boolean;
   /**
    * A bounded stretch of autonomous work on the tracker's open issues.
    *
@@ -782,10 +817,32 @@ export function resolveSession(idOrName: string): { sessionId: string; name: str
   const byId = live.find((s) => s.id === id || s.aibrokerId === id);
   if (byId) return { sessionId: byId.id, name: byId.paiName ?? byId.name ?? id };
   const needle = idOrName.toLowerCase();
-  const byName = live.find(
-    (s) => (s.paiName ?? "").toLowerCase() === needle || (s.name ?? "").toLowerCase().includes(needle),
-  );
-  if (byName) return { sessionId: byName.id, name: byName.paiName ?? byName.name ?? idOrName };
+  const exact = (s: { paiName?: string | null }) => (s.paiName ?? "").toLowerCase() === needle;
+  const loose = (s: { name?: string | null }) => (s.name ?? "").toLowerCase().includes(needle);
+
+  /*
+   * A SESSION ALREADY UNDER MANAGEMENT WINS.
+   *
+   * The loose match is on the pane title, and pane titles are not unique: a
+   * plain shell opened in the project directory carries the project's name too.
+   * One appeared beside a managed session and was matched first — `status`
+   * answered "not being managed", which is true of that pane and says nothing
+   * about the session anybody meant. The next step would have been worse:
+   * arming types a goal at whatever was resolved, and a goal typed at a shell
+   * prompt runs as shell commands.
+   *
+   * Being managed is the strongest evidence available about which pane was
+   * meant, because somebody said so explicitly, by id, at some point.
+   */
+  const managed = new Set(Object.keys(loadState()));
+  const candidates = live.filter((s) => exact(s) || loose(s));
+  const pick =
+    candidates.find((s) => managed.has(s.id) && exact(s)) ??
+    candidates.find((s) => managed.has(s.id)) ??
+    candidates.find(exact) ??
+    candidates[0];
+
+  if (pick) return { sessionId: pick.id, name: pick.paiName ?? pick.name ?? idOrName };
   return null;
 }
 
@@ -1176,6 +1233,37 @@ export function writeStandingRules(text: string, path = RULES_FILE): void {
  */
 const GOAL_MAX_CHARS = 3800;
 
+/**
+ * `until 08:00` — an END, rather than a length.
+ *
+ * The two are not interchangeable in use, even though either can be converted
+ * into the other. A person deciding at midnight says "until eight" because
+ * eight is when they will be back; working out that this is seven and three
+ * quarter hours is arithmetic done at the exact moment somebody is too tired to
+ * do it, and a slip lands as a permission that ends in the dark.
+ *
+ * Reads the NEXT time the clock shows that hour, so "until 08:00" said at
+ * midnight means this morning and said at nine means tomorrow. Returns null
+ * when no such phrase is there, which is most of the time.
+ */
+export function parseUntilClock(text: string, now: Date = new Date()): number | null {
+  const m = text.match(/\b(?:until|till|til)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  if (!m) return null;
+
+  let hour = Number(m[1]);
+  const minute = m[2] ? Number(m[2]) : 0;
+  const half = (m[3] ?? "").toLowerCase();
+  if (hour > 23 || minute > 59) return null;
+  if (half === "pm" && hour < 12) hour += 12;
+  if (half === "am" && hour === 12) hour = 0;
+
+  const target = new Date(now);
+  target.setHours(hour, minute, 0, 0);
+  // Already gone today means they mean tomorrow — the usual case for a night.
+  if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+  return target.getTime();
+}
+
 /** Sensible default when a shift names no length. Long enough to be worth arming. */
 const SHIFT_DEFAULT_HOURS = 8;
 /** Nobody should be able to hand over a machine for longer than a day by accident. */
@@ -1189,11 +1277,18 @@ const SHIFT_MAX_HOURS = 24;
  * controls, two workers at most" into an action, and the failure to avoid is a
  * shift that silently lasts a different length than the one that was said.
  */
-export function parseShift(text: string): { hours: number; visual: boolean; workers: number } {
+export function parseShift(
+  text: string,
+  now: Date = new Date(),
+): { hours: number; visual: boolean; workers: number } {
   const t = text.toLowerCase();
+  // An end time beats a length, because somebody who said both meant the end.
+  const endsAt = parseUntilClock(t, now);
   const h = t.match(/(\d+(?:[.,]\d+)?)\s*(h\b|hours?|hrs?)/);
   const m = t.match(/(\d+)\s*(m\b|minutes?|mins?)/);
-  const hours = h ? Number(h[1].replace(",", ".")) : m ? Number(m[1]) / 60 : SHIFT_DEFAULT_HOURS;
+  const hours = endsAt !== null
+    ? (endsAt - now.getTime()) / 3_600_000
+    : h ? Number(h[1].replace(",", ".")) : m ? Number(m[1]) / 60 : SHIFT_DEFAULT_HOURS;
 
   // The screen is withheld unless it was actually offered. A shift that grants
   // the pointer because nobody said not to is the wrong way round.
@@ -1277,6 +1372,58 @@ export function composeGoal(
   return oneLine(`/goal ${objective}${pointer}${hands}${extra}`);
 }
 
+/**
+ * The screen grant the manager is currently holding open, if any.
+ *
+ * One place, because the operator can hand the screen over two ways — a shift,
+ * or `hands on for eight hours` — and a rule that only knew about one of them
+ * would silently not apply to the other. Both are the same fact: the screen is
+ * the session's until a stated moment.
+ */
+export function screenLease(m: ManagedSession, now: number): { until: number; since: number } | null {
+  if (m.noScreen) return null;
+  const until = m.shift?.visual && m.shift.until > now
+    ? m.shift.until
+    : m.handsUntil && m.handsUntil > now
+      ? m.handsUntil
+      : null;
+  if (until === null) return null;
+  return { until, since: m.screenSince ?? m.shift?.startedAt ?? m.startedAt };
+}
+
+/**
+ * The screen, in one line a watcher can act on.
+ *
+ * TWO facts, deliberately in one place, because the failure they explain is
+ * their disagreement: the manager can be telling the session "do no pointer
+ * work" in every arming while the pointer tool would happily allow a click, or
+ * the reverse. Reporting only one of them makes the other invisible, and an
+ * invisible disagreement is how a night of visual work was lost without
+ * anything anywhere looking wrong.
+ */
+function screenStatus(m: ManagedSession, now = Date.now()): string {
+  const lease = screenLease(m, now);
+  const tool = readControls(undefined, now);
+  const p = (n: number) => String(n).padStart(2, "0");
+  const at = (ms: number) => {
+    const d = new Date(ms);
+    return `${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+
+  if (!lease) {
+    const stance = m.noScreen
+      ? "withheld by the manager — every arming says do no pointer work"
+      : "not granted for any period — the session may use it, nothing is holding it open";
+    return tool.effective === "agent"
+      ? `screen: ${stance}; the pointer tool would still allow a click`
+      : `screen: ${stance}`;
+  }
+  if (tool.effective === "agent") {
+    return `screen: the session has it until ${at(lease.until)}, and the pointer tool agrees`;
+  }
+  return `screen: granted until ${at(lease.until)}, but ${describeControls(tool, now).replace(/^screen: /, "")} — renewing`;
+}
+
 /** The text actually typed at the session. Short goal, context by reference. */
 function goalText(m: ManagedSession): string {
   const extra = m.pending.length ? ` OPERATOR, since you were last armed: ${m.pending.join(" ")}` : "";
@@ -1284,9 +1431,19 @@ function goalText(m: ManagedSession): string {
   // lasts only until the session next reads a goal — and the goal is what tells
   // it what to do. So a standing rule that is not in the goal is a rule with a
   // lifetime of one turn, and the next arming would send it back to clicking.
+  //
+  // The positive case has to ride along too, and for a sharper reason. Silence
+  // about the screen is not neutral: a session that has been careful with the
+  // operator's machine all night reads it as permission having quietly ended,
+  // and one of them announced it had handed the controls back while the grant
+  // on disk still had two hours on it. Saying the expiry out loud, every time,
+  // is what stops a session inventing one.
   const hands = m.noScreen
     ? " THE OPERATOR HAS THE SCREEN: do no screen or pointer work at all, and do not ask for it. Everything else continues as normal. Where something would need checking on screen, write down what would need checking instead of checking it."
-    : "";
+    : (() => {
+        const lease = screenLease(m, Date.now());
+        return lease ? screenGrantedClause(lease.until) : "";
+      })();
   return composeGoal(m.objective, readStandingRules(), hands, extra, standingRulesSource());
 }
 
@@ -1564,7 +1721,110 @@ async function tick(): Promise<void> {
     if (m.shift && now >= m.shift.until && !m.shift.endReported) {
       m.shift.endReported = true;
       m.paused = true;
+      // A grant must never outlive the shift it was made for. Handing it back
+      // here means the operator finds their own machine in the morning without
+      // having to remember which of the night's decisions is still in force.
+      if (m.shift.visual) {
+        try {
+          returnToOperator("shift ended — grant returned by the manager");
+          delete m.screenSince;
+        } catch (e) {
+          log(`[manage:${m.name}] could not return the screen — ${(e as Error).message}`);
+        }
+      }
       notify(m, `shift over after ${Math.round((now - m.shift.startedAt) / 3_600_000)}h — no longer arming; the objective is kept, \`resume\` continues it`);
+      dirty = true;
+    }
+
+    /**
+     * Keep the screen for as long as the shift was given.
+     *
+     * The grant is an idle window, refreshed by each pointer call, so a session
+     * that spends two hours reading code and running tests loses the screen for
+     * having worked — and finds out only when it next needs to look at
+     * something. Renewing here is the arming rule applied to the other half of
+     * what was handed over: a standing decision has to be restated to survive,
+     * whether it is the objective or the controls.
+     *
+     * The operator always wins. An operator hold taken AFTER the shift began is
+     * a deliberate act and is left alone — reported once, then obeyed.
+     */
+    const lease = screenLease(m, now);
+    if (lease) {
+      try {
+        const controls = readControls();
+        const v = screenVerdict(controls, lease.since, lease.until, now);
+        if (v.action === "renew") {
+          grantUntil(lease.until, `held until ${new Date(lease.until).toISOString()} by the manager`);
+          note(m, `screen grant renewed — ${v.why}`);
+          dirty = true;
+        } else if (v.action === "stand-off" && !m.screenStandOffReported) {
+          m.screenStandOffReported = true;
+          /*
+           * "The operator" is the safe reading, not a proven one.
+           *
+           * The pointer tool's file records only that somebody wrote an
+           * operator hold; a session standing itself down writes exactly the
+           * same thing. Leaving the screen alone is right either way — it is
+           * the operator's machine — but reporting it as their doing, when the
+           * lease still had time on it, hides the case that has already cost a
+           * night: a session deciding on its own that its time was up. So the
+           * message says how much was left and lets a person judge.
+           */
+          const left = Math.max(0, Math.round((lease.until - now) / 60_000));
+          notify(
+            m,
+            `the screen went back to the operator with ${left} min still on the grant — leaving it with them; visual work stops, everything else carries on. If that was not you, the session stood itself down: \`hands on until HH:MM\` puts it back`,
+          );
+          m.noScreen = true;
+          m.lastRearmAt = 0;
+          dirty = true;
+        }
+      } catch (e) {
+        log(`[manage:${m.name}] screen check failed — ${(e as Error).message}`);
+      }
+    } else if (m.noScreen) {
+      /*
+       * The mirror case: the manager is withholding while the pointer tool
+       * would allow a click. Somebody handed the screen over without the
+       * manager hearing about it, and the next arming will countermand them —
+       * that is exactly how a night of visual work was lost, and it stayed
+       * invisible because nothing compared the two.
+       */
+      try {
+        const tool = readControls(undefined, now);
+        if (tool.effective === "agent" && !m.screenDisagreementReported) {
+          m.screenDisagreementReported = true;
+          const ends = new Date(tool.until!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          notify(
+            m,
+            `the screen was handed over outside the manager (grant runs to ${ends}) — I am still telling it to do no pointer work, so the two disagree. \`hands on until ${ends}\` makes it stick`,
+          );
+          dirty = true;
+        } else if (tool.effective !== "agent" && m.screenDisagreementReported) {
+          delete m.screenDisagreementReported;
+          dirty = true;
+        }
+      } catch (e) {
+        log(`[manage:${m.name}] screen check failed — ${(e as Error).message}`);
+      }
+    }
+
+    /*
+     * A shift outranks a timed hands decision that expires inside it.
+     *
+     * The night this was written for: a screen grant made with `hands on for
+     * N hours` ran out while the work it was made for was still going. The
+     * manager did exactly as told — typed "my controls", the session stopped
+     * all visual work and announced it had handed the controls back — and
+     * nothing gave them back, because a timed decision knows only its own
+     * clock. Hours of visual work were lost to a permission that expired
+     * while the permission it was part of was still running.
+     */
+    if (m.handsUntil && now >= m.handsUntil && m.shift?.visual && now < m.shift.until) {
+      m.handsUntil = m.shift.until;
+      m.handsWas = false;
+      note(m, "timed screen grant extended to the end of the shift, which is still running");
       dirty = true;
     }
 
@@ -1573,6 +1833,8 @@ async function tick(): Promise<void> {
       delete m.handsUntil;
       delete m.handsWas;
       m.noScreen = !wasOff;
+      if (m.noScreen) delete m.screenSince;
+      else m.screenSince = now;
       typeIntoSession(
         m.sessionId,
         m.noScreen
@@ -1957,9 +2219,11 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `  hands off     the operator needs the screen: stops visual work at once,\n` +
         `                keeps everything else going, and says why\n` +
         `  hands on      give the screen back\n` +
-        `  hands on|off for 8 hours | 30m\n` +
+        `  hands on|off for 8 hours | 30m | until 08:00\n` +
         `                same, but it reverts by itself — a permission that ends\n` +
-        `                only when somebody remembers outlives its reason\n` +
+        `                only when somebody remembers outlives its reason.\n` +
+        `                \`until\` takes the next time the clock reads it, which is\n` +
+        `                what somebody deciding at midnight actually means\n` +
         `  handover <path> [clear]\n` +
         `                where this session writes what it knows. At 82% context it\n` +
         `                is asked to update that file, then carries on — the terminal\n` +
@@ -1973,7 +2237,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `                HOW to work, as opposed to what to work on: typed into every\n` +
         `                arming of every managed session, so it is written once rather\n` +
         `                than into each objective by hand. No argument shows them\n` +
-        `  shift [8h] [your controls] [2 workers]\n` +
+        `  shift [8h | until 08:00] [your controls] [2 workers]\n` +
         `                a bounded stretch of autonomous work on the tracker's open\n` +
         `                issues: objective, screen decision, expiry and arming in one\n` +
         `                sentence. \`shift off\` stands it down without killing it\n` +
@@ -2092,6 +2356,22 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
     existing.handsUntil = until;
     existing.handsWas = !visual;
     existing.shift = { until, workers, visual, startedAt: Date.now() };
+    if (visual) existing.screenSince = Date.now();
+    else delete existing.screenSince;
+    delete existing.screenStandOffReported;
+    delete existing.screenDisagreementReported;
+    // Record the grant now rather than waiting for the session to ask for it.
+    // The operator said the screen was its own for these hours; the pointer
+    // tool is where that has to be written down for a click to be allowed.
+    let screenLine = "";
+    if (visual) {
+      try {
+        grantUntil(until, `held for a shift ending ${new Date(until).toISOString()}`);
+        screenLine = `  Screen granted and held until ${new Date(until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} — renewed on every tick, so it cannot lapse while working.\n`;
+      } catch (e) {
+        screenLine = `  Could not record the screen grant (${(e as Error).message}) — pointer work may be refused.\n`;
+      }
+    }
     // Arm on the next tick rather than typing over whatever is on screen now.
     existing.lastRearmAt = 0;
     note(existing, `shift started: ${hours}h, ${visual ? "screen granted" : "no screen"}, up to ${workers} worker(s)`);
@@ -2104,6 +2384,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
       message:
         `${name} is on shift for ${hours} hour(s), until ${ends}.\n` +
         `  ${visual ? "The screen is its own until then, and reverts by itself." : "No screen work — the operator has the machine."}\n` +
+        screenLine +
         `  Objective set to the tracker's open issues; the standing rules ride along with every arming.\n` +
         (workers > 1
           ? `  Asked for ${workers} workers. Only one runs today — worktrees and the claim protocol are designed but not built, and a second worker without them would share a checkout with the first.\n`
@@ -2150,6 +2431,10 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `objective: ${existing.objective}\n` +
         `\nright now:\n` +
         liveReading(sessionId, idle) +
+        // Who holds the screen belongs in the live reading, not in the
+        // manager's own record: it is a fact about the machine right now, and
+        // it is the one a watcher cannot get any other way.
+        `\n  ${screenStatus(existing)}` +
         `\n\nthe manager: ${armed}` +
         (existing.pending.length ? `, ${existing.pending.length} instruction(s) waiting to go out` : "") +
         (last ? `\n${last}` : ""),
@@ -2254,8 +2539,15 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
      * Both matter for the same reason: a permission that only ends when a person
      * remembers to end it is a permission that outlives its reason.
      */
-    const dur = (handsMatch?.[2] ?? "").match(/(?:for\s+)?(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b/i);
-    if (dur) {
+    const said = handsMatch?.[2] ?? "";
+    const untilClock = parseUntilClock(said);
+    const dur = untilClock === null
+      ? said.match(/(?:for\s+)?(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b/i)
+      : null;
+    if (untilClock !== null) {
+      existing.handsUntil = untilClock;
+      existing.handsWas = off;
+    } else if (dur) {
       const n = Number(dur[1]);
       const unit = dur[2].toLowerCase();
       const ms = /^h/.test(unit) ? n * 3_600_000 : n * 60_000;
@@ -2267,6 +2559,15 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
     }
 
     existing.noScreen = off;
+    // A grant that starts now: recorded so a later operator hold can be told
+    // apart from this one having lapsed. Handing the screen back clears it.
+    if (off) {
+      delete existing.screenSince;
+    } else {
+      existing.screenSince = Date.now();
+      delete existing.screenStandOffReported;
+    delete existing.screenDisagreementReported;
+    }
     if (off) {
       // The reason comes FIRST, and the phrase is inside a sentence rather than
       // barked on its own. "my controls" alone revokes the tool and explains

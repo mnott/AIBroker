@@ -9,7 +9,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseShift, shiftObjective } from "../src/daemon/manage.js";
+import { parseShift, shiftObjective, screenLease, parseUntilClock } from "../src/daemon/manage.js";
+import type { ManagedSession } from "../src/daemon/manage.js";
 
 // ── how long ─────────────────────────────────────────────────────────────────
 
@@ -98,4 +99,96 @@ test("only the word shift starts a shift", () => {
   assert.equal(VERB.test("work through the open items first"), false);
   assert.equal(VERB.test("go through the bug list in order"), false);
   assert.equal(VERB.test("shifting the panel left is the fix"), false, "a word that merely starts with shift is not the verb");
+});
+
+// ── who holds the screen, and until when ─────────────────────────────────────
+
+const NOW = Date.parse("2026-08-19T09:00:00.000Z");
+const HOUR = 3_600_000;
+
+function session(over: Partial<ManagedSession>): ManagedSession {
+  return {
+    sessionId: "s", name: "example", objective: "work", pending: [], history: [],
+    lastHash: "", lastChangeAt: NOW, lastRearmAt: NOW, startedAt: NOW - 10 * HOUR,
+    ...over,
+  } as ManagedSession;
+}
+
+test("a shift with the screen leases it for the length of the shift", () => {
+  const lease = screenLease(session({
+    shift: { until: NOW + 5 * HOUR, workers: 1, visual: true, startedAt: NOW - HOUR },
+    screenSince: NOW - HOUR,
+  }), NOW);
+  assert.deepEqual(lease, { until: NOW + 5 * HOUR, since: NOW - HOUR });
+});
+
+test("a shift without the screen leases nothing", () => {
+  // The screen is withheld unless it was offered; the lease must not invent it.
+  const lease = screenLease(session({
+    noScreen: true,
+    shift: { until: NOW + 5 * HOUR, workers: 1, visual: false, startedAt: NOW - HOUR },
+  }), NOW);
+  assert.equal(lease, null);
+});
+
+test("`hands on for eight hours` is a lease too, not only a shift", () => {
+  // Two ways to hand the screen over, one rule. A renewal that only knew about
+  // shifts would silently not apply to the other half of the interface.
+  const lease = screenLease(session({ handsUntil: NOW + 8 * HOUR, screenSince: NOW }), NOW);
+  assert.deepEqual(lease, { until: NOW + 8 * HOUR, since: NOW });
+});
+
+test("a timed hold — the operator taking the machine — is not a lease", () => {
+  const lease = screenLease(session({ noScreen: true, handsUntil: NOW + HOUR }), NOW);
+  assert.equal(lease, null);
+});
+
+test("an expired lease is over, and is not renewed one last time", () => {
+  assert.equal(screenLease(session({ handsUntil: NOW - 60_000, screenSince: NOW - HOUR }), NOW), null);
+  assert.equal(screenLease(session({
+    shift: { until: NOW - 60_000, workers: 1, visual: true, startedAt: NOW - 9 * HOUR },
+  }), NOW), null);
+});
+
+// ── an end time, not a length ────────────────────────────────────────────────
+
+test("`until 08:00` said at midnight means this morning", () => {
+  // The arithmetic this replaces is done at the exact moment somebody is too
+  // tired to do it, and a slip lands as a permission that ends in the dark.
+  const midnight = new Date("2026-08-19T00:10:00");
+  assert.equal(parseUntilClock("until 08:00", midnight), new Date("2026-08-19T08:00:00").getTime());
+});
+
+test("`until 08:00` said at nine means tomorrow, not eleven hours ago", () => {
+  const morning = new Date("2026-08-19T09:00:00");
+  assert.equal(parseUntilClock("until 08:00", morning), new Date("2026-08-20T08:00:00").getTime());
+});
+
+test("till, til, bare hours and am/pm all read", () => {
+  const at = new Date("2026-08-19T00:10:00");
+  const eight = new Date("2026-08-19T08:00:00").getTime();
+  for (const s of ["until 8", "till 8", "til 08:00", "until 8am"]) {
+    assert.equal(parseUntilClock(s, at), eight, s);
+  }
+  assert.equal(parseUntilClock("until 8pm", at), new Date("2026-08-19T20:00:00").getTime());
+});
+
+test("nonsense on the clock is not a time", () => {
+  const at = new Date("2026-08-19T00:10:00");
+  assert.equal(parseUntilClock("until 33:00", at), null);
+  assert.equal(parseUntilClock("until 8:99", at), null);
+  assert.equal(parseUntilClock("work the issues", at), null);
+  assert.equal(parseUntilClock("this is futile", at), null, "a word containing til is not the word");
+});
+
+test("a shift can be given an end time instead of a length", () => {
+  const at = new Date("2026-08-19T00:00:00");
+  assert.equal(parseShift("until 08:00, your controls", at).hours, 8);
+  assert.equal(parseShift("until 08:00, your controls", at).visual, true);
+});
+
+test("an end time beats a length when both are said", () => {
+  // Somebody who said both meant the end; the length is how they got there.
+  const at = new Date("2026-08-19T00:00:00");
+  assert.equal(parseShift("for 2 hours, until 08:00", at).hours, 8);
 });
