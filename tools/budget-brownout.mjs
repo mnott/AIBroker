@@ -65,7 +65,7 @@ function log(line) {
 /** `manage <name> <verb>`, never fatal: one stuck session must not strand the rest. */
 function manage(name, ...args) {
   try {
-    return execFileSync("node", [CLI, "manage", name, ...args], {
+    return execFileSync(process.execPath, [CLI, "manage", name, ...args], {
       encoding: "utf8",
       timeout: 90_000,
       env: { ...process.env, ANTHROPIC_API_KEY: undefined },
@@ -79,7 +79,7 @@ function manage(name, ...args) {
 /** Recreate a session from its PAI project. Never fatal, same reasoning as manage(). */
 function launch(name) {
   try {
-    return execFileSync("node", [CLI, "launch", name], { encoding: "utf8", timeout: 120_000 });
+    return execFileSync(process.execPath, [CLI, "launch", name], { encoding: "utf8", timeout: 120_000 });
   } catch (err) {
     log(`launch ${name} failed: ${err.message.split("\n")[0]}`);
     return "";
@@ -263,6 +263,21 @@ for (const name of names) {
       "automatically when the window resets.",
   );
   manage(name, "handover");
+  /*
+   * Clearing the goal is what actually stops the work, and it took a live
+   * failure to see why. `pause` stops the MANAGER from arming; it says nothing
+   * to the session, which is running its own goal loop and feeding itself. That
+   * loop never passes through the prompt hook either, so the refusal cannot
+   * reach it. A session under a goal therefore sails straight through a ceiling
+   * that has stopped everything else.
+   *
+   * So: clear the goal in the session, then pause the manager. Both are needed
+   * and neither substitutes for the other — clearing alone would let the next
+   * arming start it again, pausing alone leaves the loop running.
+   *
+   * Arming re-establishes the goal, so resume needs no counterpart to this.
+   */
+  manage(name, "/goal clear");
   manage(name, "pause");
   paused.push(name);
   log(`stood down ${name}`);
