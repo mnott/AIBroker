@@ -168,6 +168,12 @@ switch (command) {
     break;
   }
 
+  case "launch": {
+    const { runLaunch } = await import("./launch-cli.js");
+    await runLaunch(rest);
+    break;
+  }
+
   case "outbound": {
     const { runOutbound } = await import("./outbound-cli.js");
     await runOutbound(rest);

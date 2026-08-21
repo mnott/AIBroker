@@ -145,6 +145,59 @@ if (!actions.length && existsSync(STATE_FILE)) {
     record(`state file unreadable — ${String(e?.message ?? e)}`);
   }
 
+  /*
+   * 2a. Has anything under management lost its terminal?
+   *
+   * A restart kills every pane; `managers.json` keeps the objective, so the
+   * work is remembered and nothing is running it. This check is deliberately
+   * NOT part of the budget mechanism: whether a managed session has a terminal
+   * has nothing to do with spending, and hanging it off a brownout would mean
+   * an ordinary reboot — the common case — recovered nothing.
+   *
+   * What comes back is a session with the objective and an empty head. A
+   * planned stand-down asks for a handover first; a crash cannot, so the
+   * revived session is pointed at the newest handover on disk instead. Those
+   * are written whenever context runs high, so the loss is bounded by the gap
+   * since the last one rather than by the whole session.
+   */
+  for (const m of Object.values(managed)) {
+    if (!m || m.paused || !m.name) continue;
+    if (cli(["manage", m.name, "status"], 90_000).out.trim()) continue;
+
+    actions.push(`REVIVE ${m.name}: no terminal`);
+    record(`REVIVE ${m.name} — the session is gone, launching it again`);
+    // A failed launch still gets the rest of the attempt: "failed" here covers
+    // a non-zero exit from a launch that half-worked, and the check below is
+    // the one that actually knows whether a pane exists.
+    if (!cli(["launch", m.name], 120_000).ok) record(`REVIVE ${m.name} — launch reported failure, continuing anyway`);
+    // Wait for the pane before typing into it. A machine still settling after a
+    // restart takes longer than one that is idle, so this polls rather than
+    // guessing a duration.
+    let up = false;
+    for (let i = 0; i < 20 && !up; i++) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3000);
+      up = Boolean(cli(["manage", m.name, "status"], 90_000).out.trim());
+    }
+    // Not appearing within the window is a reason to be slower, not a reason to
+    // stop. Arming a pane that is not ready costs a failed keystroke and the
+    // next tick tries again; declining to arm one that WAS ready leaves a
+    // session sitting idle with its objective, which is the failure this whole
+    // pass exists to prevent. When in doubt, arm.
+    if (!up) record(`REVIVE ${m.name} — slow to appear; arming anyway`);
+    // The note goes first and the arming second: read what you knew, then work.
+    // A directory and a pattern rather than one path, because the crash may
+    // predate today's file and the newest one is what matters either way.
+    const where = String(m.handoverFile ?? "").replace(/handover-\{date\}\.md$/, "handover-*.md");
+    cli([
+      "manage", m.name,
+      `Your terminal was lost to a restart, not to a decision, so there was no chance to hand over. ` +
+        (where ? `Read the NEWEST ${where} first — it is the only record of what you knew. ` : "") +
+        `Check the tracker for anything you had claimed and left half-done, then carry on with the objective.`,
+    ], 90_000);
+    cli(["manage", m.name, "now"], 90_000);
+    record(`REVIVE ${m.name} — back up and armed`);
+  }
+
   for (const m of Object.values(managed)) {
     if (!m || m.paused) continue;
     // Mid-rollover sessions are deliberately still: one has been asked to write

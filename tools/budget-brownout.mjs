@@ -67,6 +67,21 @@ function manage(name, ...args) {
   }
 }
 
+/** Recreate a session from its PAI project. Never fatal, same reasoning as manage(). */
+function launch(name) {
+  try {
+    return execFileSync("node", [CLI, "launch", name], { encoding: "utf8", timeout: 120_000 });
+  } catch (err) {
+    log(`launch ${name} failed: ${err.message.split("\n")[0]}`);
+    return "";
+  }
+}
+
+/** Block without a timer: this runs in a watchdog tick, not an event loop. */
+function sleep(seconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000);
+}
+
 /*
  * Working, as the manager itself reports it — not as this script guesses. The
  * status line is the same one a human reads, which means a change in how busy
@@ -110,7 +125,34 @@ if (state?.pausedNames?.length) {
   const room = typeof pct === "number" && pct < ceiling;
   if (due && room) {
     for (const name of state.pausedNames) {
+      /*
+       * A pause survives a restart; a terminal does not. `managers.json` still
+       * holds the objective and the paused flag, so resume alone would clear
+       * the flag against a pane that no longer exists and report success while
+       * nothing ran. Recreating the session first is what makes the recovery
+       * real rather than bookkeeping.
+       *
+       * The test is whether the manager can still see it: status prints
+       * nothing when the session cannot be resolved.
+       */
+      if (!manage(name, "status").trim()) {
+        log(`${name} has no session — relaunching`);
+        launch(name);
+        // The pane has to exist before arming can type into it. Polling beats
+        // a fixed sleep: a machine still busy after a restart takes longer,
+        // and a fast one should not be made to wait for the slow case.
+        for (let i = 0; i < 20 && !manage(name, "status").trim(); i++) sleep(3);
+        // Slow is not the same as absent. Arming a pane that is not ready costs
+        // a keystroke and the next tick retries; not arming one that was ready
+        // leaves it idle holding its objective, which is the failure this is
+        // here to prevent.
+        if (!manage(name, "status").trim()) log(`${name} slow to appear — arming anyway`);
+      }
       manage(name, "resume");
+      // resume only permits arming again; the next tick would arm eventually,
+      // but a session brought back from nothing has an empty screen and no
+      // reason to do anything until it is told.
+      manage(name, "now");
       log(`resumed ${name}`);
     }
     writeFileSync(STATE, JSON.stringify({ ...state, resumedAt: new Date().toISOString(), pausedNames: [] }, null, 2));
