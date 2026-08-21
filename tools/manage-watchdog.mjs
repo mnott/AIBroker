@@ -82,7 +82,7 @@ function record(line) {
 /** Run the daemon CLI. Never throws — a failed probe IS the finding. */
 function cli(args, timeoutMs = 20_000) {
   try {
-    return { ok: true, out: execFileSync("node", [CLI, ...args], { timeout: timeoutMs, encoding: "utf8" }) };
+    return { ok: true, out: execFileSync(process.execPath, [CLI, ...args], { timeout: timeoutMs, encoding: "utf8" }) };
   } catch (e) {
     return { ok: false, out: String(e?.message ?? e) };
   }
@@ -227,7 +227,7 @@ if (!actions.length && existsSync(STATE_FILE)) {
  * miss a beat.
  */
 try {
-  const out = execFileSync("node", [join(dirname(fileURLToPath(import.meta.url)), "budget-brownout.mjs")], {
+  const out = execFileSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), "budget-brownout.mjs")], {
     encoding: "utf8",
     timeout: 240_000,
   }).trim();
