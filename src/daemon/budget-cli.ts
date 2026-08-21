@@ -16,9 +16,11 @@
  * quoted path in it is not.
  */
 
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const FILE = join(homedir(), ".aibroker", "budget-stop.json");
 
@@ -72,6 +74,58 @@ function show(): void {
   console.log("  Sessions sitting idle are left alone.");
 }
 
+/**
+ * Act on the ceiling now rather than at the next tick.
+ *
+ * Switching a limit on and watching nothing happen for a quarter of an hour is
+ * indistinguishable from a limit that does not work — which is exactly how this
+ * looked the first time it was tried. The periodic run is what makes it
+ * reliable; running it here is what makes it believable, and it is the same
+ * script either way, so there is no second code path to keep honest.
+ */
+/**
+ * Put back to work anything the ceiling stood down, and forget the record.
+ *
+ * `resume` alone lifts the pause without giving the session anything to do —
+ * it sits at a prompt holding an objective nobody has handed it. `now` is what
+ * makes the restart real, and it re-establishes the goal the stand-down cleared.
+ */
+function releasePaused(): void {
+  const state = join(homedir(), ".aibroker", "budget-brownout.json");
+  let names: string[] = [];
+  try {
+    names = (JSON.parse(readFileSync(state, "utf8")) as { pausedNames?: string[] }).pausedNames ?? [];
+  } catch {
+    return;
+  }
+  const cli = join(dirname(fileURLToPath(import.meta.url)), "cli.js");
+  for (const name of names) {
+    for (const verb of ["resume", "now"]) {
+      try {
+        execFileSync(process.execPath, [cli, "manage", name, verb], { encoding: "utf8", timeout: 90_000 });
+      } catch {
+        console.error(`  could not ${verb} ${name} — do it by hand`);
+      }
+    }
+    console.log(`  ${name} released and armed.`);
+  }
+  try {
+    writeFileSync(state, JSON.stringify({ releasedAt: new Date().toISOString(), pausedNames: [] }, null, 2));
+  } catch {
+    /* the record is a convenience; the sessions are what matter */
+  }
+}
+
+function checkNow(): void {
+  const script = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "tools", "budget-brownout.mjs");
+  try {
+    const out = execFileSync(process.execPath, [script], { encoding: "utf8", timeout: 300_000 }).trim();
+    console.log(out ? out : "  nothing to do at the moment.");
+  } catch (err) {
+    console.error(`  the check itself failed: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
+  }
+}
+
 export async function runBudget(args: string[]): Promise<void> {
   const [action, value] = args;
   const cfg = read();
@@ -82,6 +136,17 @@ export async function runBudget(args: string[]): Promise<void> {
   }
 
   if (action === "off" || action === "ignore") {
+    /*
+     * Release before switching off, in that order.
+     *
+     * Off means "stop protecting the budget", never "leave whatever you already
+     * stopped stopped". The periodic script exits immediately when the ceiling
+     * is disabled, so anything it had paused would sit paused for good — the
+     * operator lifts the limit, watches nothing come back, and reasonably
+     * concludes the whole mechanism is broken. Doing it here rather than there
+     * is deliberate: this is the moment the intention is expressed.
+     */
+    releasePaused();
     write({ ...cfg, enabled: false });
     console.log("Ceiling off. Nothing will be stopped, whatever the percentage says.");
     console.log("Back on with: aibroker budget on");
@@ -90,7 +155,13 @@ export async function runBudget(args: string[]): Promise<void> {
 
   if (action === "on") {
     write({ ...cfg, enabled: true, ceilingPercent: cfg.ceilingPercent ?? 96 });
-    console.log(`Ceiling on at ${cfg.ceilingPercent ?? 96}%.`);
+    console.log(`Ceiling on at ${cfg.ceilingPercent ?? 96}%. Checking now:`);
+    checkNow();
+    return;
+  }
+
+  if (action === "check") {
+    checkNow();
     return;
   }
 
