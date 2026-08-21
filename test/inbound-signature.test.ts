@@ -78,6 +78,7 @@ test("a wrong token is not rescued by the absence of a signature, or the reverse
 // network hop in it, and it is quiet — every step looks like normal work.
 
 import { shouldIgnore } from "../src/daemon/inbound.js";
+import { renderPayload } from "../src/daemon/inbound.js";
 
 const ROUTE = {
   name: "issues", secret: "s", owner: "Worker", mode: "message" as const,
@@ -329,4 +330,43 @@ test("a rule whose $owner cannot be expanded is refused, not matched loosely", (
   // an empty value would make `contains` true for every payload.
   const route = { ...WORKER_A, owner: "", ignore: ["comment.body~=worker: $owner"] };
   assert.equal(shouldIgnore(route, { comment: { body: "anything at all" } }), undefined);
+});
+
+// ── lists become names ───────────────────────────────────────────────────────
+
+test("labels and assignees arrive as names, not as a paragraph of JSON", () => {
+  // These two fields answer "is this mine, and is it a bug" at a glance.
+  // Stringified they answered nothing and cost 300 characters doing it.
+  const route = {
+    name: "r", token: "t", session: "s", owner: "o",
+    fields: ["issue.number", "issue.labels", "issue.assignees"],
+  } as Parameters<typeof renderPayload>[0];
+  const out = renderPayload(route, {
+    issue: {
+      number: 245,
+      labels: [{ id: 1, name: "bug", color: "d73a4a" }, { id: 2, name: "ui", color: "eeeeee" }],
+      assignees: [{ id: 9, login: "worker-a" }],
+    },
+  });
+  assert.match(out, /issue\.labels: bug, ui/);
+  assert.match(out, /issue\.assignees: worker-a/);
+  assert.equal(out.includes("color"), false, "the colour is not information");
+});
+
+test("an empty list prints no line at all", () => {
+  // "labels:" with nothing after it is noise; the absence already says it.
+  const route = {
+    name: "r", token: "t", session: "s", owner: "o",
+    fields: ["issue.number", "issue.labels"],
+  } as Parameters<typeof renderPayload>[0];
+  const out = renderPayload(route, { issue: { number: 7, labels: [] } });
+  assert.equal(out.includes("labels"), false);
+  assert.match(out, /issue\.number: 7/);
+});
+
+test("a list of plain strings survives unchanged", () => {
+  const route = {
+    name: "r", token: "t", session: "s", owner: "o", fields: ["tags"],
+  } as Parameters<typeof renderPayload>[0];
+  assert.match(renderPayload(route, { tags: ["one", "two"] }), /tags: one, two/);
 });

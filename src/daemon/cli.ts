@@ -162,6 +162,12 @@ switch (command) {
     break;
   }
 
+  case "budget": {
+    const { runBudget } = await import("./budget-cli.js");
+    await runBudget(rest);
+    break;
+  }
+
   case "outbound": {
     const { runOutbound } = await import("./outbound-cli.js");
     await runOutbound(rest);
