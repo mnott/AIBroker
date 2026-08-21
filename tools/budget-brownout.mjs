@@ -28,7 +28,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,6 +45,15 @@ function readJson(path, fallback = null) {
     return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : fallback;
   } catch {
     return fallback;
+  }
+}
+
+/** When a file was last written, or null. Freshness is the only use. */
+function statMtime(path) {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return null;
   }
 }
 
@@ -95,17 +104,71 @@ const cfg = readJson(CONFIG);
 if (!cfg || cfg.enabled === false) process.exit(0);
 
 const ceiling = typeof cfg.ceilingPercent === "number" ? cfg.ceilingPercent : 96;
-const pct = readJson(ADVISOR)?.weeklyBudgetPercent;
-const state = readJson(STATE, null);
 const now = Date.now();
 
-/*
- * The reset moment is configured rather than derived. The status bar's own
- * figure has been wrong before — it read 05:59 while the plan page counted
- * down to 08:00 local — and a resume that fires two hours early spends the
- * budget it was built to protect.
+/**
+ * The real figure, from the same endpoint the status bar uses.
+ *
+ * The alternative was a number someone reads off the screen and an agent
+ * writes to a file, which is wrong twice over: it is only as current as the
+ * last time a person looked, and after a stand-down nobody is left to look —
+ * so the reading freezes at the ceiling and the resume that waits for it waits
+ * for ever.
+ *
+ * Refreshing here rather than only reading is the point. This runs on a timer
+ * that does not care whether any session is alive, which is exactly the
+ * condition under which the number has to keep moving.
  */
-const resetAt = cfg.resetsAtIso ? Date.parse(cfg.resetsAtIso) : NaN;
+function readUsage() {
+  const cache = "/tmp/claude/statusline-usage-cache.json";
+  const age = statMtime(cache);
+  if (age === null || now - age > 10 * 60_000) {
+    try {
+      const token = JSON.parse(
+        execFileSync("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], {
+          encoding: "utf8",
+          timeout: 10_000,
+        }),
+      )?.claudeAiOauth?.accessToken;
+      if (token) {
+        const body = execFileSync(
+          "curl",
+          ["-sf", "--max-time", "10", "-H", `Authorization: Bearer ${token}`,
+           "-H", "anthropic-beta: oauth-2025-04-20", "https://api.anthropic.com/api/oauth/usage"],
+          { encoding: "utf8", timeout: 15_000 },
+        );
+        if (body.trim()) {
+          mkdirSync("/tmp/claude", { recursive: true });
+          writeFileSync(cache, body);
+        }
+      }
+    } catch {
+      // A refresh that fails leaves whatever was cached, which is still better
+      // evidence than a hand-typed number. Never fatal.
+    }
+  }
+  const j = readJson(cache, null);
+  const pct = j?.seven_day?.utilization;
+  const resets = j?.seven_day?.resets_at ? Date.parse(j.seven_day.resets_at) : NaN;
+  // `live` is what the caller needs to know: a measured figure can be trusted
+  // on its own, the hand-written fallback cannot.
+  if (typeof pct === "number") return { pct, resets, live: true };
+  return { pct: readJson(ADVISOR)?.weeklyBudgetPercent, resets: NaN, live: false };
+}
+
+const usage = readUsage();
+const pct = usage.pct;
+const state = readJson(STATE, null);
+
+/*
+ * The endpoint states the reset moment, so prefer it and keep the configured
+ * value as a fallback. The status BAR disagreed with the plan page — it showed
+ * 05:59 against a countdown to 08:00 local — but that turned out to be the bar
+ * rendering a UTC timestamp as if it were local, not a disagreement about the
+ * facts. The underlying value was right all along, which is the argument for
+ * reading it rather than transcribing what the screen says.
+ */
+const resetAt = Number.isFinite(usage.resets) ? usage.resets : cfg.resetsAtIso ? Date.parse(cfg.resetsAtIso) : NaN;
 
 // ---- stand back up ------------------------------------------------------
 /*
@@ -122,7 +185,19 @@ const resetAt = cfg.resetsAtIso ? Date.parse(cfg.resetsAtIso) : NaN;
  */
 if (state?.pausedNames?.length) {
   const due = Number.isFinite(resetAt) && now >= resetAt;
-  const room = typeof pct === "number" && pct < ceiling;
+
+  /*
+   * A measured figure gets a vote; a guessed one does not.
+   *
+   * When the endpoint answers, the percentage is current no matter how long
+   * everything has been paused, so it can veto a resume the clock would allow.
+   * When it does not answer, the only figure left is the one somebody typed
+   * after reading the screen — and after a stand-down nobody is left to read
+   * anything, so it is frozen at the ceiling by construction. Requiring it
+   * would mean waiting for a number that cannot change, for ever. In that case
+   * the reset time decides alone.
+   */
+  const room = !usage.live || (typeof pct === "number" && pct < ceiling);
   if (due && room) {
     for (const name of state.pausedNames) {
       /*
