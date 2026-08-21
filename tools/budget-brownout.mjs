@@ -76,6 +76,67 @@ function manage(name, ...args) {
   }
 }
 
+/**
+ * Say something to the session NOW, rather than leaving it for later.
+ *
+ * `manage <name> <text>` looks like it talks to a session and does not: it
+ * parks the text until the next arming. Pairing that with a pause — which is
+ * precisely what a stand-down does — means there is never a next arming, so
+ * every word sits unread in a queue while the log cheerfully reports the
+ * session stood down. It did not; only the bookkeeping did.
+ *
+ * dispatch types into the live session instead. Claude Code queues input
+ * during a turn, so silence is not evidence of non-delivery, and --no-spawn
+ * keeps a stand-down from launching anything.
+ */
+function say(name, text) {
+  try {
+    return execFileSync(process.execPath, [CLI, "dispatch", name, "--no-spawn", "--message", text], {
+      encoding: "utf8",
+      timeout: 120_000,
+    });
+  } catch (err) {
+    log(`dispatch to ${name} failed: ${err.message.split("\n")[0]}`);
+    return "";
+  }
+}
+
+/**
+ * Type a line into the terminal exactly as a person would.
+ *
+ * Every other route decorates what it sends — dispatch prefixes `[Task]` so the
+ * receiver knows to act rather than reply, which is right for prose and fatal
+ * for a slash command: `/goal clear` arrives as "[Task] /goal clear", which is
+ * text, and the goal keeps running. Asking the session to run the command
+ * itself does not work either; it can agree, and the hook that drives the goal
+ * is outside the conversation and keeps firing regardless. It blocked nine
+ * turns in a row before the client's own cap broke the loop.
+ *
+ * So this writes the line into the pane and nothing else. No prefix, no
+ * interpretation, no cooperation required.
+ */
+function typeRaw(sessionId, line) {
+  const script = `tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if id of s is "${sessionId}" then
+          tell s to write text ${JSON.stringify(line)}
+          return "typed"
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "session not found"
+end tell`;
+  try {
+    return execFileSync("osascript", ["-e", script], { encoding: "utf8", timeout: 60_000 }).trim();
+  } catch (err) {
+    log(`typing into ${sessionId} failed: ${err.message.split("\n")[0]}`);
+    return "";
+  }
+}
+
 /** Recreate a session from its PAI project. Never fatal, same reasoning as manage(). */
 function launch(name) {
   try {
@@ -183,6 +244,30 @@ const resetAt = Number.isFinite(usage.resets) ? usage.resets : cfg.resetsAtIso ?
  * The clock is therefore the earliest permitted moment and the reading is the
  * evidence. Missing the exact minute costs one tick and nothing else.
  */
+/*
+ * Reconcile the record against the sessions before believing it.
+ *
+ * The list says who was stood down; it does not say who still is. An operator
+ * who resumes a session by hand leaves the file asserting a pause that no
+ * longer exists, and every later run then takes the resume branch, finds the
+ * window not yet due, and exits — silently, having done nothing, for as long as
+ * the window lasts. Switching the ceiling on again looks like a ceiling that
+ * does not work, which is exactly how it was reported.
+ *
+ * So anyone no longer paused is dropped, and if that empties the list the run
+ * carries on to the stand-down below rather than returning.
+ */
+const stillPaused = (state?.pausedNames ?? []).filter((n) => {
+  const m = Object.values(readJson(MANAGERS, {})).find((x) => x?.name === n);
+  return m?.paused === true;
+});
+if (state && stillPaused.length !== (state.pausedNames ?? []).length) {
+  const dropped = (state.pausedNames ?? []).filter((n) => !stillPaused.includes(n));
+  log(`no longer paused, dropped from the record: ${dropped.join(", ")}`);
+  state.pausedNames = stillPaused;
+  writeFileSync(STATE, JSON.stringify(state, null, 2));
+}
+
 if (state?.pausedNames?.length) {
   const due = Number.isFinite(resetAt) && now >= resetAt;
 
@@ -244,29 +329,47 @@ if (state?.pausedNames?.length) {
 if (typeof pct !== "number" || pct < ceiling) process.exit(0);
 
 const managers = readJson(MANAGERS, {});
+// Carrying the session id alongside the name, because clearing the goal has to
+// address the terminal directly and the name only reaches the manager.
 const names = Object.values(managers)
-  .map((m) => m?.name)
-  .filter(Boolean);
+  .filter((m) => m?.name)
+  .map((m) => ({ name: m.name, sessionId: m.sessionId }));
 
 const paused = [];
-for (const name of names) {
+for (const { name, sessionId } of names) {
   if (!isWorking(name)) {
     log(`${name} is not working — left alone`);
     continue;
   }
   // Order matters: the handover has to be asked for while the session can
   // still answer, and the pause has to land before it picks anything else up.
-  manage(
+  /*
+   * One message, and it ASKS for the slash command rather than sending it.
+   *
+   * Delivery prefixes the body with `[Task]`, which is the contract that tells
+   * a session to act rather than reply — so `/goal clear` arrives as the text
+   * "[Task] /goal clear" and is read, not run. Punching a hole in that contract
+   * for one caller would be worse than the problem. The session can run its own
+   * commands; it only has to be told to, and the order matters enough to spell
+   * out: write down what you know, then release the goal, then stop.
+   */
+  say(
     name,
     "Weekly budget ceiling reached. Write your handover NOW — everything you know that is not " +
       "already in the tracker or a file — then stop and do not start another item. Work resumes " +
       "automatically when the window resets.",
   );
-  manage(name, "handover");
+  // Typed rather than asked for: the goal is driven by a hook outside the
+  // conversation, so a session can sincerely agree to stop and still be
+  // restarted by it on the next turn.
+  if (sessionId) typeRaw(sessionId, "/goal clear");
   /*
-   * Clearing the goal is what actually stops the work, and it took a live
-   * failure to see why. `pause` stops the MANAGER from arming; it says nothing
-   * to the session, which is running its own goal loop and feeding itself. That
+   * Pausing is the second half, not the whole of it. `pause` stops the MANAGER
+   * from arming; it says nothing to the session, which is running its own goal
+   * loop and feeding itself — which is why the message above asks it to clear
+   * the goal. Both are needed and neither substitutes for the other: clearing
+   * alone would let the next arming start it again, pausing alone leaves the
+   * loop running. That
    * loop never passes through the prompt hook either, so the refusal cannot
    * reach it. A session under a goal therefore sails straight through a ceiling
    * that has stopped everything else.
@@ -277,7 +380,6 @@ for (const name of names) {
    *
    * Arming re-establishes the goal, so resume needs no counterpart to this.
    */
-  manage(name, "/goal clear");
   manage(name, "pause");
   paused.push(name);
   log(`stood down ${name}`);
