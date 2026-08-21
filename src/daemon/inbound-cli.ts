@@ -19,6 +19,7 @@ function usage(): void {
   console.log("      --mode message|task        message → the session's mailbox; task → Todoist (default)");
   console.log("      --fields a,b.c             Lift only these payload fields into the message");
   console.log("      --note \"...\"               What sends here, for the next reader");
+  console.log("  fields <name> <a,b.c>          Change which fields are lifted; the secret is untouched");
   console.log("  remove <name>                  Delete a route");
   console.log("");
   console.log("A route names WHERE events go, never what they mean — the receiving session");
@@ -34,7 +35,7 @@ export async function runInbound(args: string[]): Promise<void> {
   const [action, name, owner] = rest;
 
 
-  const { listRoutes, addRoute, removeRoute } = await import("./inbound.js");
+  const { listRoutes, addRoute, removeRoute, setRouteFields } = await import("./inbound.js");
   
 
   if (!action || action === "list") {
@@ -84,6 +85,28 @@ export async function runInbound(args: string[]): Promise<void> {
     console.log(`  Owner   ${r.owner} (${r.mode})`);
     console.log(`\nThis is the only time the secret is shown. Anything holding it can reach`);
     console.log(`${r.owner} — treat it like a password, and recreate the route to rotate it.`);
+    return;
+  }
+
+  /*
+   * Changing what a route SHOWS must not rotate what it TRUSTS. Recreating was
+   * the only way to add a field, and that hands you a new secret to go and
+   * paste into the sending system — so a route with a wrong field list tended
+   * to keep it.
+   */
+  if (action === "fields") {
+    if (!name || !owner) {
+      console.error('Usage: aibroker inbound fields <name> <a,b.c>   ("-" to lift the whole payload)');
+      process.exit(1);
+    }
+    const list = owner === "-" ? [] : owner.split(",").map((x) => x.trim()).filter(Boolean);
+    const r = setRouteFields(name, list);
+    if (!r) {
+      console.error(`No route named ${name}.`);
+      process.exit(1);
+    }
+    console.log(`/hook/${name} now lifts: ${r.fields ? r.fields.join(", ") : "the whole payload"}`);
+    console.log("The secret is unchanged — nothing to re-paste at the sender.");
     return;
   }
 

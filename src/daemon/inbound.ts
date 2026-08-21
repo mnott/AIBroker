@@ -183,6 +183,26 @@ export function addRoute(
   return route;
 }
 
+/**
+ * Change WHICH fields a route lifts, without touching its credential.
+ *
+ * Until this existed, the only way to add a field was to recreate the route —
+ * which rotates the secret, so adjusting what a notification *displays* meant
+ * going and re-pasting a password into the sending system. Coupling a display
+ * setting to a credential rotation is how a route ends up wrong forever
+ * instead of being corrected in ten seconds.
+ */
+export function setRouteFields(name: string, fields: string[]): InboundRoute | undefined {
+  const s = read();
+  const route = s.routes.find((r) => r.name === name.toLowerCase());
+  if (!route) return undefined;
+  route.fields = fields.length ? fields : undefined;
+  saveJson(FILE, s);
+  audit({ action: "inbound-route", actor: "aibroker", target: `hook:${name}`, outcome: "fields-changed" });
+  log(`inbound: /hook/${name} now lifts ${fields.length ? fields.join(", ") : "the whole payload"}`);
+  return route;
+}
+
 export function removeRoute(name: string): boolean {
   const s = read();
   const before = s.routes.length;
@@ -283,10 +303,42 @@ function pick(obj: unknown, path: string): unknown {
   return cur;
 }
 
+/**
+ * The identifying words on an object in a list.
+ *
+ * Trackers describe labels, assignees and reviewers as objects with a dozen
+ * fields each — colour, id, description, url. Exactly one of them is what a
+ * reader wants, and it is always the human name.
+ */
+function label(v: unknown): string | undefined {
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (v && typeof v === "object") {
+    for (const key of ["name", "login", "title", "username", "id"]) {
+      const inner = (v as Record<string, unknown>)[key];
+      if (typeof inner === "string" || typeof inner === "number") return String(inner);
+    }
+  }
+  return undefined;
+}
+
 function scalar(v: unknown): string | undefined {
   if (v === null || v === undefined) return undefined;
   if (typeof v === "string") return v;
   if (typeof v === "number" || typeof v === "boolean") return String(v);
+  /*
+   * A LIST BECOMES ITS NAMES.
+   *
+   * `labels` and `assignees` are the two fields that answer "is this mine, and
+   * is it a bug" at a glance — and JSON.stringify turned them into a paragraph
+   * of colour codes and urls, which is worse than not sending them. An empty
+   * list returns undefined so the line is skipped: "labels:" with nothing after
+   * it is noise, and an unlabelled issue is a fact the absence already states.
+   */
+  if (Array.isArray(v)) {
+    const names = v.map(label).filter((s): s is string => s !== undefined);
+    return names.length ? names.join(", ") : undefined;
+  }
   return JSON.stringify(v);
 }
 

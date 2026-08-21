@@ -161,6 +161,31 @@ if (!actions.length && existsSync(STATE_FILE)) {
   }
 }
 
+// -------------------------------------------------------------- the ceiling
+
+/*
+ * The spending ceiling rides on this tick rather than owning a launchd job of
+ * its own. It needs to fire within minutes of a crossing and again after the
+ * window resets, which is exactly this cadence, and a second timer would be a
+ * second thing to notice had stopped.
+ *
+ * Its own failure must not take the watchdog with it: standing sessions down
+ * is the more elaborate job, and the arming above is the one that must not
+ * miss a beat.
+ */
+try {
+  const out = execFileSync("node", [join(dirname(fileURLToPath(import.meta.url)), "budget-brownout.mjs")], {
+    encoding: "utf8",
+    timeout: 240_000,
+  }).trim();
+  if (out) {
+    for (const line of out.split("\n")) record(line.replace(/^\[budget-brownout [^\]]+\]\s*/, "budget: "));
+    actions.push("budget ceiling acted");
+  }
+} catch (err) {
+  record(`budget check failed: ${String(err.message).split("\n")[0]}`);
+}
+
 // ------------------------------------------------------------------ the note
 
 /**
