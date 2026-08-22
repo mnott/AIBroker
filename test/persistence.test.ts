@@ -177,12 +177,36 @@ test("pruning drops names whose session is gone and keeps the live ones", () => 
   setPersistentSessionName("DEAD-2", "PAI");
   setPersistentSessionName("LIVE-2", "Home");
 
+  // Absence has to persist: the first two sightings only record the miss.
+  assert.equal(pruneSessionNames(["LIVE-1", "LIVE-2"]), 0);
+  assert.equal(pruneSessionNames(["LIVE-1", "LIVE-2"]), 0);
   const removed = pruneSessionNames(["LIVE-1", "LIVE-2"]);
 
   assert.equal(removed, 2);
   const names = getAllPersistentSessionNames();
   assert.deepEqual(Object.keys(names).sort(), ["LIVE-1", "LIVE-2"]);
   assert.equal(names["LIVE-1"], "AIBroker");
+});
+
+test("one enumeration that misses a LIVE session does not forget its name", () => {
+  // The failure this exists to stop. The empty-set guard catches a total
+  // enumeration failure and says nothing about a partial one, so a terminal
+  // that answered late had two running sessions deleted from the name store —
+  // and the visible symptom, days later, was work being dispatched into fresh
+  // duplicate tabs with none of the context.
+  tmp();
+  setPersistentSessionName("A", "AIBroker");
+  setPersistentSessionName("B", "Home");
+
+  assert.equal(pruneSessionNames(["A"]), 0, "a single miss must not delete");
+  assert.deepEqual(Object.keys(getAllPersistentSessionNames()).sort(), ["A", "B"]);
+
+  // Seen again, so the count starts over rather than accumulating across
+  // unrelated hiccups.
+  pruneSessionNames(["A", "B"]);
+  assert.equal(pruneSessionNames(["A"]), 0);
+  assert.equal(pruneSessionNames(["A"]), 0);
+  assert.deepEqual(Object.keys(getAllPersistentSessionNames()).sort(), ["A", "B"]);
 });
 
 test("an empty live set prunes NOTHING", () => {
