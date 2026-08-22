@@ -37,7 +37,7 @@ import { readSessionContent, readAllSessionContent } from "./session-content.js"
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession } from "../transport/sync-facade.js";
-import { matchSession } from "../core/session-match.js";
+import { matchSession, resolveCallerSession } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, revealItermSession } from "../adapters/iterm/sessions.js";
@@ -130,7 +130,10 @@ export function registerCoreHandlers(
         name: s.name,
         paiName,
         atPrompt: s.atPrompt,
-        kind: (paiName || !s.atPrompt) ? "claude" : "shell",
+        // Measured first, guessed only when there is no measurement: a pane
+        // running the launcher is titled like a node process and is not a
+        // session, which is how the picker came to list itself.
+        kind: (s.isClaude ?? (Boolean(paiName) || !s.atPrompt)) ? "claude" : "shell",
         active: s.id === activeItermSessionId,
       };
     });
@@ -1551,9 +1554,30 @@ export function registerCoreHandlers(
 
     // Resolve caller's iTerm2 session UUID from "w0t0p0:UUID" format
     const rawItermId = req.itermSessionId;
-    const itermSessionId = rawItermId
+    const claimedId = rawItermId
       ? (rawItermId.includes(":") ? rawItermId.split(":").pop()! : rawItermId)
       : undefined;
+
+    /*
+     * Believe the claim only if the session it names exists.
+     *
+     * `ITERM_SESSION_ID` is inherited like any environment variable, so a
+     * process can go on announcing the id of a pane that is gone. Naming then
+     * succeeds against nothing: the store gains an entry no enumeration will
+     * ever match, the real pane stays anonymous, and the operator repeats the
+     * rename and watches it not take. The tty is the corrective — it describes
+     * where the process is attached NOW, and iTerm reports it per session, so
+     * a stale claim can be traded for the pane the caller is really in.
+     */
+    const live = snapshotAllSessions();
+    const itermSessionId = resolveCallerSession(claimedId, req.callerTty, live);
+
+    if (claimedId && itermSessionId && itermSessionId !== claimedId) {
+      log(
+        `rename: caller claimed session ${claimedId.slice(0, 8)}, which is not open; ` +
+          `using ${itermSessionId.slice(0, 8)} found via tty ${req.callerTty}`,
+      );
+    }
 
     // Update in hub's session manager
     if (itermSessionId) {

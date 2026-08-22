@@ -15,6 +15,18 @@ export interface IpcRequest {
    * identity for tmux sessions.
    */
   tmuxPane?: string;
+  /**
+   * The caller's terminal device, e.g. "/dev/ttys004".
+   *
+   * A second, independent answer to "which session is this?", and the one that
+   * cannot go stale. `ITERM_SESSION_ID` is an environment variable: a process
+   * that outlives the pane it was started in, or inherits an environment from
+   * somewhere else, keeps announcing an id that no longer exists — and a name
+   * written against it lands on a session nobody can see, while the real pane
+   * stays anonymous. The tty is what the process is actually attached to now,
+   * and iTerm reports it per session, so the two can be reconciled.
+   */
+  callerTty?: string;
   method: string;
   params: Record<string, unknown>;
 }

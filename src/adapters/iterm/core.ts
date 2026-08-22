@@ -5,7 +5,7 @@
  * with zero transport-specific imports.
  */
 
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
 
@@ -264,6 +264,12 @@ export interface SessionSnapshot {
    * on this when present so a tmux session keeps its name across %N churn.
    */
   aibrokerId?: string | null;
+  /**
+   * Whether a Claude is actually running on this terminal, read from the
+   * process table. Undefined when that could not be read — a caller must then
+   * fall back to guessing from the title rather than treat "unknown" as "no".
+   */
+  isClaude?: boolean;
 }
 
 /**
@@ -287,6 +293,39 @@ export interface SessionSnapshot {
  * tab name — "(node)" = Claude Code running (not at prompt). "(-zsh)", "(-bash)",
  * "(ssh)", bare path names = shell at prompt. Accurate for sessions display.
  */
+/**
+ * Which terminals have a Claude running on them, asked of the process table.
+ *
+ * The alternative was reading the window title, and a title is a rumour: it
+ * tracks whatever the foreground process last called itself, so the launcher —
+ * `node …/pai`, sitting in its picker — was titled `pai (node)`, matched the
+ * "(node) means Claude" heuristic, and listed ITSELF as a session. It could not
+ * be named, could not be dispatched to, and reappeared under a new id every
+ * time the picker was opened.
+ *
+ * One `ps` for the whole table, not one per session: this runs on every
+ * enumeration, and a call per pane would multiply by however many tabs are
+ * open — the same shape of mistake as the AppleScript timeout that scaled with
+ * tab count.
+ */
+function ttysRunningClaude(): Set<string> {
+  const found = new Set<string>();
+  try {
+    const out = execFileSync("ps", ["-ao", "tty=,command="], { encoding: "utf8", timeout: 10_000 });
+    for (const line of out.split("\n")) {
+      const m = line.match(/^\s*(\S+)\s+(.*)$/);
+      if (!m) continue;
+      const [, tty, command] = m;
+      // The binary, not a path that merely mentions it: an MCP server living
+      // under a .claude directory is not a session.
+      if (/(^|\/)claude(\s|$)/.test(command)) found.add(tty.startsWith("/dev/") ? tty : `/dev/${tty}`);
+    }
+  } catch {
+    /* no answer: callers fall back to the title heuristic rather than see nothing */
+  }
+  return found;
+}
+
 export function snapshotAllSessions(): SessionSnapshot[] {
   // Fetch id, name, tty, tab.title. Skip `profile name` (~0.6s) and
   // `is at shell prompt` (~3.3s) — both derived or irrelevant.
@@ -323,6 +362,7 @@ end tell`;
   const result = runAppleScript(script, 30_000);
   if (!result) return [];
 
+  const claudeTtys = ttysRunningClaude();
   const sessions: SessionSnapshot[] = [];
   for (const line of result.split("\n").filter(Boolean)) {
     const parts = line.split("\t");
@@ -338,6 +378,10 @@ end tell`;
       tty: parts[2],
       atPrompt,
       tabTitle: (parts[3] && parts[3] !== "missing value" && parts[3] !== "") ? parts[3] : null,
+      // Measured, where the title was only guessed. Undefined when the process
+      // table could not be read, so callers keep their old heuristic rather
+      // than conclude that nothing is a session.
+      isClaude: claudeTtys.size ? claudeTtys.has(parts[2]) : undefined,
       // paiName is null here — callers merge from getAllPersistentSessionNames()
       paiName: null,
     });
