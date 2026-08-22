@@ -42,7 +42,28 @@ const cfg = readJson(CONFIG);
 if (!cfg || cfg.enabled === false) process.exit(0);
 
 const ceiling = typeof cfg.ceilingPercent === "number" ? cfg.ceilingPercent : 96;
-const pct = readJson(ADVISOR)?.weeklyBudgetPercent;
+
+/*
+ * The measured figure first, the transcribed one only if there is nothing else.
+ *
+ * `advisor-mode.json` holds a number a person reads off the status bar and an
+ * agent writes down. It does not change when the window resets, so a ceiling
+ * reading it goes on refusing every prompt against a budget that is already
+ * back to zero — which is exactly what happened: real usage 0%, this hook still
+ * quoting 97, until the operator switched it off by hand.
+ *
+ * The cache is what the status bar itself reads, refreshed from the usage
+ * endpoint. This only reads it — a hook runs on every prompt and must not do
+ * network calls; the periodic brownout keeps it warm, and it does so precisely
+ * when the ceiling is on and the number matters.
+ */
+function currentPercent() {
+  const live = readJson("/tmp/claude/statusline-usage-cache.json")?.seven_day?.utilization;
+  if (typeof live === "number") return live;
+  return readJson(ADVISOR)?.weeklyBudgetPercent;
+}
+
+const pct = currentPercent();
 
 // An unreadable or missing percentage is not evidence of being under the
 // ceiling, but it is not evidence of being over it either, and refusing every
