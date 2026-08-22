@@ -8,7 +8,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { matchSession, normaliseLabel, labelOf } from "../src/core/session-match.js";
+import { matchSession, normaliseLabel, labelOf, resolveCallerSession } from "../src/core/session-match.js";
 
 const sessions = [
   { id: "s-claude", name: "✳ Task Bus (node)", paiName: "Task Bus" },
@@ -66,4 +66,37 @@ test("normaliseLabel folds every separator to one space", () => {
 test("labelOf prefers the persistent name over the tab title", () => {
   assert.equal(labelOf(sessions[0]), "Task Bus");
   assert.equal(labelOf(sessions[2]), "~/dev/ai/clickr (-zsh)");
+});
+
+test("a caller claiming a session that is not open is placed by its terminal", () => {
+  // The failure this prevents: ITERM_SESSION_ID is inherited, so a process can
+  // announce a pane that no longer exists. Naming against it succeeds into the
+  // void — the store gains an entry no enumeration will match and the real pane
+  // stays anonymous, so the rename appears to do nothing however often it is
+  // repeated.
+  const live = [
+    { id: "LIVE-A", tty: "/dev/ttys001" },
+    { id: "LIVE-B", tty: "/dev/ttys004" },
+  ];
+
+  assert.equal(resolveCallerSession("GONE", "/dev/ttys004", live), "LIVE-B");
+});
+
+test("a caller that knows its own live session keeps it, terminal or not", () => {
+  // The claim is the better evidence when it is true: two panes can share a tty
+  // in odd setups, and a session that names itself correctly must never be
+  // second-guessed.
+  const live = [
+    { id: "LIVE-A", tty: "/dev/ttys001" },
+    { id: "LIVE-B", tty: "/dev/ttys001" },
+  ];
+
+  assert.equal(resolveCallerSession("LIVE-B", "/dev/ttys001", live), "LIVE-B");
+});
+
+test("with nothing to correct it, the claim stands", () => {
+  // No tty (an MCP server whose ancestry could not be walked) and no match:
+  // guessing would be worse than passing the claim through unchanged.
+  assert.equal(resolveCallerSession("GONE", undefined, [{ id: "LIVE-A", tty: "/dev/ttys001" }]), "GONE");
+  assert.equal(resolveCallerSession(undefined, undefined, []), undefined);
 });

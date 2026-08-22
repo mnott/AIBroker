@@ -10,7 +10,68 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename } from "node:path";
 
+import { execFileSync } from "node:child_process";
+import { readlinkSync } from "node:fs";
+
 import type { IpcRequest, IpcResponse } from "../types/ipc.js";
+
+/**
+ * The terminal this process is attached to, or undefined when there is none.
+ *
+ * Read from the file descriptor rather than by running `tty`: this is on the
+ * path of every call, and spawning a process to learn something the kernel
+ * already knows would be a cost paid thousands of times a day. Any of the three
+ * standard descriptors will do — a caller with a redirected stdin usually still
+ * has a terminal on stdout or stderr.
+ */
+let _callerTty: string | null | undefined;
+
+function callerTty(): string | undefined {
+  if (_callerTty !== undefined) return _callerTty ?? undefined;
+  _callerTty = resolveTty();
+  return _callerTty ?? undefined;
+}
+
+function resolveTty(): string | null {
+  // The direct case: a CLI run straight in the pane owns the terminal.
+  for (const fd of [0, 1, 2]) {
+    try {
+      const path = readlinkSync(`/dev/fd/${fd}`);
+      if (path.startsWith("/dev/tty")) return path;
+    } catch {
+      /* not a terminal, or no such descriptor — try the next */
+    }
+  }
+
+  /*
+   * The indirect case, and the one that matters: an MCP server is spawned by
+   * the session with pipes for stdio, so it owns no terminal while sitting
+   * squarely inside the session whose identity is in question. Its ancestors
+   * do own one — walk up until a process reports a terminal, and that is the
+   * pane the whole tree lives in.
+   *
+   * Cached for the life of the process: a session does not move between panes,
+   * and this is otherwise on the path of every call.
+   */
+  try {
+    let pid = process.pid;
+    for (let hop = 0; hop < 8; hop++) {
+      const line = execFileSync("ps", ["-o", "ppid=,tty=", "-p", String(pid)], {
+        encoding: "utf8",
+        timeout: 5_000,
+      }).trim();
+      if (!line) return null;
+      const [ppid, tty] = line.split(/\s+/);
+      if (tty && tty !== "??" && tty !== "?") return tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
+      if (!ppid || ppid === "0" || ppid === "1") return null;
+      pid = Number(ppid);
+      if (!Number.isFinite(pid)) return null;
+    }
+  } catch {
+    /* no ps, no permission, no answer — identity falls back to the claim */
+  }
+  return null;
+}
 
 export class WatcherClient {
   private readonly sessionId: string;
@@ -178,6 +239,8 @@ export class WatcherClient {
         const itermId = process.env.ITERM_SESSION_ID;
         if (itermId) request.itermSessionId = itermId;
         if (process.env.TMUX_PANE) request.tmuxPane = process.env.TMUX_PANE;
+        const tty = callerTty();
+        if (tty) request.callerTty = tty;
         socket!.write(JSON.stringify(request) + "\n");
       });
 

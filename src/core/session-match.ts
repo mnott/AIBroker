@@ -33,6 +33,31 @@ export type MatchKind = "exact" | "normalised" | "substring";
 
 const KIND_RANK: Record<MatchKind, number> = { exact: 3, normalised: 2, substring: 1 };
 
+/**
+ * Which session a caller is really in, given what it claims and where it is.
+ *
+ * A caller announces itself with `ITERM_SESSION_ID`, which is an environment
+ * variable and therefore inherited, copied and outlived. When it names a pane
+ * that no longer exists, acting on it is worse than failing: a name written
+ * against a dead id lands in the store, matches no enumeration ever again, and
+ * leaves the real pane anonymous — so the operator renames, sees nothing
+ * change, and renames again.
+ *
+ * The tty is the corrective. It says where the process is attached now, iTerm
+ * reports it per session, and the two can therefore be reconciled. A live claim
+ * still wins, because a caller that knows its own id is the best evidence there
+ * is; the tty only decides when the claim has already been proved false.
+ */
+export function resolveCallerSession(
+  claimedId: string | undefined,
+  callerTty: string | undefined,
+  live: { id: string; tty?: string | null }[],
+): string | undefined {
+  if (claimedId && live.some((s) => s.id === claimedId)) return claimedId;
+  const byTty = callerTty ? live.find((s) => s.tty === callerTty)?.id : undefined;
+  return byTty ?? claimedId;
+}
+
 /** The name a human would call this session. */
 export function labelOf(s: SessionCandidate): string {
   return s.paiName ?? s.name;
