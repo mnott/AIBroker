@@ -38,9 +38,27 @@ export function labelOf(s: SessionCandidate): string {
   return s.paiName ?? s.name;
 }
 
-/** Fold the written forms of one name onto common ground. */
+/**
+ * Fold the written forms of one name onto common ground.
+ *
+ * A terminal title is decorated by whoever drew it — a spinner glyph while the
+ * session is busy, the process in brackets after it — and none of that is part
+ * of the name. Leaving it in matters only when the label IS the title, which is
+ * exactly the case that goes wrong: an unregistered session falls back to its
+ * title, `✳ Example Project (node)` fails to equal `Example Project`, and the
+ * caller concludes nothing is running and opens a second one.
+ *
+ * Stripping is confined to those two decorations. Anything more eager would
+ * start folding real names together, and a wrong match here does not spawn a
+ * duplicate — it delivers work to the wrong session.
+ */
 export function normaliseLabel(s: string): string {
-  return s.toLowerCase().replace(/[\s_-]+/g, " ").trim();
+  return s
+    .toLowerCase()
+    .replace(/\s*\((?:node|-?[a-z]*sh|python\d*|bash)\)\s*$/i, "")
+    .replace(/^[^\p{L}\p{N}]+/u, "")
+    .replace(/[\s_-]+/g, " ")
+    .trim();
 }
 
 export interface MatchOptions {

@@ -245,16 +245,75 @@ export function pruneSessionNames(liveIds: Iterable<string>): number {
   const live = new Set(liveIds);
   if (live.size === 0) return 0;
 
+  /*
+   * One sighting is not enough to declare a name dead.
+   *
+   * The empty-set guard above catches the total failure and misses the partial
+   * one, which is the case that actually happened: an enumeration returned most
+   * sessions but not all, every id it did not mention was deleted, and two
+   * sessions that were running the whole time lost their names permanently.
+   * From the outside that looks like dispatch spawning duplicates for no
+   * reason, days later, with nothing to connect it to a momentary hiccup.
+   *
+   * Absence has to persist to count. A miss is recorded rather than acted on,
+   * and only an id missing from several consecutive enumerations is removed —
+   * so a slow terminal costs a delay, never a name. Being seen clears the
+   * record, because the point is CONSECUTIVE absence.
+   */
   const store = loadSessionNames();
+  const misses = loadPruneMisses();
   let removed = 0;
+
   for (const id of Object.keys(store)) {
-    if (!live.has(id)) {
+    if (live.has(id)) {
+      delete misses[id];
+      continue;
+    }
+    misses[id] = (misses[id] ?? 0) + 1;
+    if (misses[id] >= PRUNE_AFTER_CONSECUTIVE_MISSES) {
       delete store[id];
+      delete misses[id];
       removed += 1;
     }
   }
+
+  savePruneMisses(misses);
   if (removed > 0) saveSessionNames();
   return removed;
+}
+
+/**
+ * How many enumerations in a row may omit an id before its name is forgotten.
+ *
+ * Three rather than two: two consecutive hiccups are rarer than one but not
+ * rare, and the cost of waiting is a stale entry for a few minutes while the
+ * cost of being wrong is a name the user chose, gone, with no way to tell that
+ * is what happened.
+ */
+const PRUNE_AFTER_CONSECUTIVE_MISSES = 3;
+
+/**
+ * Consecutive-miss counters, beside the store rather than inside it.
+ *
+ * The store maps id to name and is read by other things; adding bookkeeping to
+ * its values would change a published shape for the sake of a detail that only
+ * this function cares about. Losing this file costs one extra grace period.
+ */
+function pruneMissesPath(): string {
+  return join(_appDir, SESSION_NAMES_FILE.replace(/\.json$/, "-misses.json"));
+}
+
+function loadPruneMisses(): Record<string, number> {
+  const r = loadJson<Record<string, number>>(pruneMissesPath());
+  return r.status === "ok" ? r.data : {};
+}
+
+function savePruneMisses(misses: Record<string, number>): void {
+  try {
+    saveJson(pruneMissesPath(), misses, { backup: false });
+  } catch {
+    /* bookkeeping only: failing to record a miss costs a grace period, not a name */
+  }
 }
 
 /**
