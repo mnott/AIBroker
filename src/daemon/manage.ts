@@ -1438,13 +1438,20 @@ function goalText(m: ManagedSession): string {
   // and one of them announced it had handed the controls back while the grant
   // on disk still had two hours on it. Saying the expiry out loud, every time,
   // is what stops a session inventing one.
+  //
+  // `rules clear` is the operator saying objectives now carry only themselves,
+  // so the screen guidance goes with the rest of the standing prose and only
+  // the expiry rides along. The prohibition below is NOT shortened with it: a
+  // goal template that hands the screen over says nothing about the case where
+  // the screen is withheld, so that guidance exists nowhere else.
+  const rules = readStandingRules();
   const hands = m.noScreen
     ? " THE OPERATOR HAS THE SCREEN: do no screen or pointer work at all, and do not ask for it. Everything else continues as normal. Where something would need checking on screen, write down what would need checking instead of checking it."
     : (() => {
         const lease = screenLease(m, Date.now());
-        return lease ? screenGrantedClause(lease.until) : "";
+        return lease ? screenGrantedClause(lease.until, !rules) : "";
       })();
-  return composeGoal(m.objective, readStandingRules(), hands, extra, standingRulesSource());
+  return composeGoal(m.objective, rules, hands, extra, standingRulesSource());
 }
 
 /**

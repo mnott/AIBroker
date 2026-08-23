@@ -202,8 +202,22 @@ export function describeControls(c: Controls, now = Date.now()): string {
  * session inventing an expiry and standing down two hours early. Silence in the
  * goal about the screen reads, to a session that has been careful about the
  * operator's machine all night, as permission having quietly ended.
+ *
+ * Two parts, and only one of them is load-bearing here. THE EXPIRY is state the
+ * session cannot obtain any other way — the grant lives on disk, the session
+ * never sees it, so a goal that omits the time invites the invented one. THE
+ * GUIDANCE around it is ordinary instruction about how to behave, and an
+ * operator whose objective already carries that — a goal template, a rules file
+ * — is having it said twice, in the one place where every wasted word is
+ * retyped at every arming.
+ *
+ * So `terse` drops the guidance and keeps the fact. It is never the other way
+ * round: there is no configuration in which the manager grants the screen and
+ * declines to say until when.
  */
-export function screenGrantedClause(until: number): string {
+export function screenGrantedClause(until: number, terse = false): string {
+  const fact = ` YOU HAVE THE SCREEN until ${clock(until)}.`;
+  if (terse) return fact;
   return (
     ` YOU HAVE THE SCREEN until ${clock(until)} — the grant is recorded and renewed for you, so do not hand the controls back,` +
     ` do not announce handing them back, and do not stand down from visual work before then.` +
