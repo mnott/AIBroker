@@ -76,9 +76,34 @@ const SEND_ACK_TIMEOUT_MS = 15_000;
  * Falls back through raw ids rather than to "unknown": an unattributed action
  * is the thing the audit log exists to prevent, so a GUID beats a blank.
  */
+/**
+ * The caller's iTerm2 session id, from whichever field carried it.
+ *
+ * Two fields hold the same fact and callers do not agree on which to fill, so
+ * asking only one of them silently loses the identity. That is not theoretical:
+ * a message between sessions arrived labelled
+ * `[Session:w11t0p0:066504E1-…]` because `itermSessionId` was empty and the
+ * resolution never ran — the raw composite id went out where the sender's NAME
+ * belongs. The `w11t0p0:` prefix is the proof, since the normalisation below
+ * strips it and so could never have printed it.
+ *
+ * That label is not cosmetic. It is the receiver's only evidence of who sent a
+ * message, and it is the address they are told to reply to — and a reply tool
+ * that takes a name or an index cannot use a GUID. A relay of the operator's
+ * own instruction arrived unattributable and unanswerable.
+ *
+ * Both forms are accepted and normalised the same way: iTerm2 reports
+ * `w<window>t<tab>p<pane>:<uuid>`, and only the uuid identifies the session
+ * across a move between windows.
+ */
+export function callerItermId(req: IpcRequest): string | undefined {
+  const raw = req.itermSessionId ?? req.sessionId;
+  if (!raw) return undefined;
+  return raw.includes(":") ? raw.split(":").pop()! : raw;
+}
+
 function callerLabel(req: IpcRequest): string {
-  const raw = req.itermSessionId;
-  const id = raw ? (raw.includes(":") ? raw.split(":").pop()! : raw) : undefined;
+  const id = callerItermId(req);
   if (id) {
     const snap = snapshotAllSessions().find((s) => s.id === id);
     if (snap) {
@@ -1005,18 +1030,16 @@ export function registerCoreHandlers(
       };
     }
 
-    // Resolve the sender's name for the mailbox "from" label.
-    // Normalize "w0t0p0:UUID" → "UUID" before snapshot lookup.
-    const rawSenderId = req.itermSessionId;
-    const senderItermId = rawSenderId
-      ? (rawSenderId.includes(":") ? rawSenderId.split(":").pop()! : rawSenderId)
-      : undefined;
+    // Resolve the sender's name for the mailbox "from" label and the prefix.
+    // Takes the id from either field — see callerItermId for why that matters
+    // and what it looks like when it does not happen.
+    const senderItermId = callerItermId(req);
     const senderSnap = senderItermId
       ? snapshots.find((s) => s.id === senderItermId)
       : undefined;
     const senderLabel = senderSnap
       ? (senderSnap.paiName ?? senderSnap.name)
-      : (senderItermId ?? req.sessionId ?? "unknown");
+      : (senderItermId ?? "unknown");
 
     // Refuse before depositing OR typing: if the target is a shell, the message
     // is not merely undeliverable, it is executable. Say so plainly rather than
@@ -1552,11 +1575,9 @@ export function registerCoreHandlers(
       return { ok: true, result: { success: true, name } };
     }
 
-    // Resolve caller's iTerm2 session UUID from "w0t0p0:UUID" format
-    const rawItermId = req.itermSessionId;
-    const claimedId = rawItermId
-      ? (rawItermId.includes(":") ? rawItermId.split(":").pop()! : rawItermId)
-      : undefined;
+    // Resolve caller's iTerm2 session UUID from "w0t0p0:UUID" format, taking it
+    // from whichever field carried it — the same reason as callerItermId.
+    const claimedId = callerItermId(req);
 
     /*
      * Believe the claim only if the session it names exists.
