@@ -160,6 +160,22 @@ aibroker_issue { repo: "https://forge.example/owner/name", verb: "list" }
 aibroker_issue { repo: …, verb: "comment", issue: 12, body: "Measured: …" }
 ```
 
+**The same verbs are on the command line**, and that is not a convenience. A
+newly published MCP tool does not appear in a session that is already running,
+and making it appear needs a person at the keyboard — so a session can be
+holding a finding, with the tool published, and be unable to post it. A shell
+needs nobody:
+
+```bash
+aibroker issue https://forge.example/owner/name list
+aibroker issue <repo> comment --issue 12 --body -   # long text on stdin
+```
+
+It asks the daemon rather than the forge, so the permission check and the
+record of what was just written both still apply. Identity comes from the
+environment the shell was launched in: running it in a pane is asking as that
+pane, and there is no flag to claim otherwise.
+
 | Read | |
 |---|---|
 | `list` | open issues (or `state: closed`/`all`), each with who opened it |
