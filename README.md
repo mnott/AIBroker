@@ -481,7 +481,7 @@ Addressing is explicit: `hub:machine-b/session:abc` routes through the bridge to
 | [task-manager-as-interface.md](docs/task-manager-as-interface.md) | Todoist as the front door to AI: what it feels like, what it will not do |
 | [todoist.md](docs/todoist.md) | Todoist inbound channel: webhook setup, routing, security model, the comment mirror |
 | [channels.md](docs/channels.md) | The model every inbound path shares — read first for anything inbound |
-| [inbound.md](docs/inbound.md) | Generic `POST /hook/<route>` endpoint |
+| [inbound.md](docs/inbound.md) | Generic `POST /hook/<route>` endpoint, and subscribing a session to a repository's issues |
 | [outbound.md](docs/outbound.md) | Acting in external systems through a platform's own actions |
 | [mailbox.md](docs/mailbox.md) | Durable per-session queue and confirmed delivery |
 | [session-watchdog.md](docs/session-watchdog.md) | Keeping a long autonomous session running: one goal at a time, context rollover, and the failures that shaped it |
