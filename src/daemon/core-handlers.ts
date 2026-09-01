@@ -1862,14 +1862,17 @@ export function registerCoreHandlers(
     if ((WRITE_VERBS as string[]).includes(verb)) {
       audit({
         action: `issue:${verb}`, actor: `session:${owner}`,
-        target: `${ref.owner}/${ref.repo}${issue ? `#${issue}` : ""}`,
+        target: `${ref.owner}/${ref.repo}${(issue ?? r.issue) ? `#${issue ?? r.issue}` : ""}`,
         outcome: r.ok ? "ok" : "refused", reason: r.error ?? r.warning,
       });
       // The forge will report this back through the route within a second or
       // two. Remember it, so the session is not handed its own footprint as
       // something new to consider.
       if (r.ok) {
-        const touched = issue ?? (r.data as { number?: number } | undefined)?.number;
+        // r.issue covers the verbs the caller does not name an issue for —
+        // amend is given a comment id, and an edit echoes back just as a new
+        // comment does.
+        const touched = issue ?? r.issue ?? (r.data as { number?: number } | undefined)?.number;
         if (touched) noteOwnWrite(route.name, touched);
       }
     }
