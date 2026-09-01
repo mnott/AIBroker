@@ -18,7 +18,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { issueOp, explain, authHeader, apiRoot, forgetIdentities, sign, unsign, READ_VERBS, WRITE_VERBS } from "../src/daemon/forge-issues.js";
+import { issueOp, explain, authHeader, apiRoot, forgetIdentities, sign, unsign, issueOfComment, READ_VERBS, WRITE_VERBS } from "../src/daemon/forge-issues.js";
 import { parseRepoUrl } from "../src/daemon/subscribe-issues.js";
 
 const REF = parseRepoUrl("https://forge.example.org/o/r")!;
@@ -279,6 +279,52 @@ test("a comment written by a different ACCOUNT may not be edited either", async 
   assert.equal(r.ok, false);
   assert.match(r.error ?? "", /written by a-person/);
   assert.match(r.error ?? "", /not yours to edit/);
+});
+
+test("amend reports which issue it touched, so the edit's echo can be recognised", async () => {
+  /*
+   * Reported from a subscribed session and found in the audit trail rather than
+   * guessed at: its correction to a comment came back as an inbound event a
+   * minute later. The trail read `issue:amend | owner/repo | ok` with no issue
+   * number at all — so it was never "remembered on create only" or "filtered on
+   * action created", the two plausible explanations. Nothing was remembered,
+   * because amend is given a COMMENT id and the daemon had no way to know which
+   * issue that comment belongs to. The forge says; this carries the answer back.
+   */
+  forgetIdentities();
+  const f = forge([
+    { status: 200, json: { body: sign("old", "me"), user: { login: "shared" }, issue_url: "https://forge.example.org/o/r/issues/42" } },
+    { status: 200, json: { login: "shared" } },
+    { status: 200, json: {} },
+    { status: 200, json: { body: sign("new", "me"), html_url: "https://forge/c#5" } },
+  ]);
+  const r = await issueOp("amend", { comment: 5, body: "new" },
+    { ref: REF, token: "t", authorLabel: "me", fetchImpl: f.impl });
+  assert.equal(r.ok, true);
+  assert.equal(r.issue, 42, "without this the daemon cannot know what it just wrote to");
+});
+
+test("an unconfirmed amend still says which issue, since that is when it matters most", async () => {
+  forgetIdentities();
+  const f = forge([
+    { status: 200, json: { body: sign("old", "me"), user: { login: "shared" }, issue_url: "https://forge.example.org/o/r/issues/42" } },
+    { status: 200, json: { login: "shared" } },
+    { status: 200, json: {} },
+    { status: 500 },
+  ]);
+  const r = await issueOp("amend", { comment: 5, body: "new" },
+    { ref: REF, token: "t", authorLabel: "me", fetchImpl: f.impl });
+  assert.match(r.warning ?? "", /unconfirmed/);
+  assert.equal(r.issue, 42);
+});
+
+test("issueOfComment reads the number, and refuses to invent one", () => {
+  assert.equal(issueOfComment({ issue_url: "https://f/o/r/issues/7" }), 7);
+  assert.equal(issueOfComment({ issue_url: "https://f/o/r/issues/7?x=1" }), 7);
+  assert.equal(issueOfComment({}), undefined);
+  assert.equal(issueOfComment({ issue_url: "https://f/o/r/pulls/7" }), undefined);
+  // A repository literally named "issues" must not be read as a number.
+  assert.equal(issueOfComment({ issue_url: "https://f/o/issues" }), undefined);
 });
 
 test("amend without a comment id is refused before anything is sent", async () => {

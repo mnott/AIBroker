@@ -25,7 +25,7 @@ import type { ManagedSession, SendOptions, SessionTransport, TransportKind } fro
 const SHELL_COMMANDS = new Set(["zsh", "-zsh", "bash", "-bash", "sh", "-sh", "fish", "-fish"]);
 
 /** Field separator for list-panes -F output; unlikely to appear in titles. */
-const FIELD_SEP = "";
+const FIELD_SEP = "\u0001";
 
 /**
  * Resolve an absolute tmux path. A launchd-managed daemon has a minimal PATH

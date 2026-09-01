@@ -75,6 +75,15 @@ export interface IssueResult {
   error?: string;
   /** Set when the write landed but could not be confirmed. */
   warning?: string;
+  /**
+   * Which issue this touched, when the caller did not name one.
+   *
+   * `amend` is given a COMMENT id, so the daemon cannot know from the request
+   * which issue was written to — and what it cannot name, it cannot remember,
+   * so the echo of an edit came straight back to its own session. The forge
+   * says which issue a comment belongs to; this carries that answer back.
+   */
+  issue?: number;
 }
 
 export interface Ctx {
@@ -197,6 +206,13 @@ export function signedAuthor(body: string): string | undefined {
   const rest = last.slice(SIGNATURE_MARK.length).trim();
   const at = rest.lastIndexOf(" · ");
   return at > 0 ? rest.slice(0, at).trim() : undefined;
+}
+
+/** The issue number inside a comment’s issue_url, if the forge gave one. */
+export function issueOfComment(c: { issue_url?: string }): number | undefined {
+  const m = /\/issues\/(\d+)(?:$|[?#])/.exec(c.issue_url ?? "");
+  const n = m ? Number(m[1]) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 /** Strip a signature this wrote earlier, so rewrites do not accumulate them. */
@@ -340,7 +356,7 @@ export async function issueOp(
       if (back.status !== 200) {
         return { ok: true, url: made.html_url, warning: "opened, but could not be read back — treat as unconfirmed" };
       }
-      return { ok: true, url: back.issue.html_url, data: { number: back.issue.number, title: back.issue.title } };
+      return { ok: true, url: back.issue.html_url, issue: back.issue.number, data: { number: back.issue.number, title: back.issue.title } };
     }
     case "comment": {
       const bad = needsNumber(); if (bad) return { ok: false, error: bad };
@@ -378,7 +394,10 @@ export async function issueOp(
 
       const cur = await call(c, "GET", `/issues/comments/${id}`);
       if (cur.status !== 200) return { ok: false, error: explain(cur.status) };
-      const existing = cur.json as { body?: string; user?: { login?: string } };
+      const existing = cur.json as { body?: string; user?: { login?: string }; issue_url?: string };
+      // Which issue this belongs to, so the edit can be recognised as our own
+      // when the forge reports it back a minute later.
+      const belongsTo = issueOfComment(existing);
 
       const me = await whoAmI(c);
       if (!me || existing.user?.login !== me) {
@@ -396,10 +415,10 @@ export async function issueOp(
       if (r.status !== 200 && r.status !== 201) return { ok: false, error: explain(r.status) };
       const back = await call(c, "GET", `/issues/comments/${id}`);
       if (back.status !== 200) {
-        return { ok: true, warning: "amended, but could not be read back — treat as unconfirmed" };
+        return { ok: true, issue: belongsTo, warning: "amended, but could not be read back — treat as unconfirmed" };
       }
       const now = back.json as { body?: string; html_url?: string };
-      return { ok: true, url: now.html_url, data: { body: now.body } };
+      return { ok: true, url: now.html_url, issue: belongsTo, data: { body: now.body } };
     }
     case "rewrite": {
       const bad = needsNumber(); if (bad) return { ok: false, error: bad };
