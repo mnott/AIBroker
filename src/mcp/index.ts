@@ -383,6 +383,34 @@ server.tool(
 );
 
 server.tool(
+  "aibroker_issue",
+  "Work a repository's issue tracker: read (get, comments, list, labels, assets) and write (new, comment, rewrite, retitle, label, unlabel, claim, release, close). Allowed only for repositories THIS session is subscribed to. Every write is read back and returns the resulting URL.",
+  {
+    repo: z.string().min(1).describe("Repository URL, e.g. https://forge.example/owner/name"),
+    verb: z.enum([
+      "get", "comments", "list", "labels", "assets",
+      "new", "comment", "rewrite", "retitle", "label", "unlabel", "claim", "release", "close",
+    ]),
+    issue: z.number().int().positive().optional().describe("Issue number, for verbs that act on one"),
+    body: z.string().optional().describe("Body text for new, comment, rewrite"),
+    title: z.string().optional().describe("Title for new or retitle"),
+    label: z.string().optional().describe("Label name for label/unlabel; must already exist"),
+    state: z.string().optional().describe("For list: open (default), closed, all"),
+    count: z.number().int().positive().optional().describe("For comments: only the newest N"),
+  },
+  async (a) => {
+    try {
+      const r = (await hub.call_raw("issue", a)) as any;
+      const parts: string[] = [];
+      if (r.url) parts.push(r.url);
+      if (r.warning) parts.push(`WARNING: ${r.warning}`);
+      if (r.data !== undefined) parts.push(typeof r.data === "string" ? r.data : JSON.stringify(r.data, null, 2));
+      return ok(parts.join("\n") || "done");
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
   "aibroker_subscribe_issues",
   "Subscribe THIS session to a repository's issues and comments. Creates the inbound route and registers the webhook on the forge (GitHub, Gitea or Forgejo). Idempotent: subscribing the same repository again re-points it rather than duplicating.",
   { repo: z.string().min(1).describe("Repository URL, e.g. https://forge.example/owner/name") },

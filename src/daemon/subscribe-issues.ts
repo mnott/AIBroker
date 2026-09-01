@@ -154,6 +154,98 @@ export function hookPayload(ref: RepoRef, url: string, secret: string): Record<s
   };
 }
 
+/** Where a comment is posted, and where it is read back from. */
+export function commentsEndpoint(ref: RepoRef, issue: number): string {
+  const path = `repos/${encodeURIComponent(ref.owner)}/${encodeURIComponent(ref.repo)}/issues/${issue}/comments`;
+  return forgeOf(ref) === "github"
+    ? `https://api.github.com/${path}`
+    : `${ref.origin}/api/v1/${path}`;
+}
+
+export interface CommentOutcome {
+  ok: boolean;
+  /** The address the forge gave the comment. Proof it exists, and the link a report should carry. */
+  url?: string;
+  /** What the server holds now, read back rather than echoed from the request. */
+  body?: string;
+  error?: string;
+}
+
+/**
+ * Post a comment, then READ IT BACK.
+ *
+ * The read-back is not belt and braces. A network call returns and carries on;
+ * a post that failed while the caller believed it succeeded is invisible until
+ * somebody needs what it said — which is the same fault as a check that passes
+ * having measured nothing, in its most expensive form, because the missing
+ * thing is a record somebody is relying on. Borrowed from a sibling project's
+ * issue tool, which has had this from the start.
+ *
+ * Returning the URL serves a second purpose: a report naming an issue is
+ * required to carry a link, and a link to the comment just written is the
+ * honest one. Handing it back means the caller never has to assemble a URL from
+ * an issue number, which is a guess wearing the clothes of a citation.
+ */
+export async function postComment(
+  ref: RepoRef,
+  issue: number,
+  body: string,
+  token: string | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<CommentOutcome> {
+  if (!token) return { ok: false, error: "no forge token configured — set AIBROKER_FORGE_TOKEN" };
+  if (!body.trim()) return { ok: false, error: "refusing to post an empty comment" };
+
+  const url = commentsEndpoint(ref, issue);
+  let created: { id?: number; html_url?: string };
+  try {
+    const res = await fetchImpl(url, {
+      method: "POST",
+      headers: { authorization: `token ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ body }),
+    });
+    if (res.status !== 201 && res.status !== 200) {
+      // Say which of the two it is. A forge answers 404 both for an issue that
+      // is not there and for one the credential may not see, and reading the
+      // first when it is the second sends people looking for a missing thing
+      // that is merely locked.
+      const hint =
+        res.status === 404
+          ? " — the issue does not exist, OR the token cannot see this repository; both answer 404"
+          : res.status === 403
+            ? " — the token lacks write access to this repository"
+            : "";
+      return { ok: false, error: `forge answered ${res.status}${hint}` };
+    }
+    created = (await res.json()) as { id?: number; html_url?: string };
+  } catch (e) {
+    return { ok: false, error: `forge unreachable: ${(e as Error).message}` };
+  }
+
+  // Read back. If this cannot confirm the comment, say the post is unconfirmed
+  // rather than reporting success — an unverified write is exactly what this
+  // function exists to stop being reported as done.
+  try {
+    const res = await fetchImpl(`${url}?limit=50`, { headers: { authorization: `token ${token}` } });
+    if (res.status === 200) {
+      const all = (await res.json()) as Array<{ id?: number; body?: string; html_url?: string }>;
+      const mine = all.find((c) => c.id === created.id);
+      if (mine) return { ok: true, url: mine.html_url ?? created.html_url, body: mine.body };
+    }
+    return {
+      ok: true,
+      url: created.html_url,
+      error: "posted, but could not read it back — treat the link as unconfirmed",
+    };
+  } catch (e) {
+    return {
+      ok: true,
+      url: created.html_url,
+      error: `posted, but the read-back failed: ${(e as Error).message}`,
+    };
+  }
+}
+
 export interface SubscribeOutcome {
   ok: boolean;
   /** The route that now exists, whether or not the forge was reached. */

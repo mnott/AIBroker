@@ -46,7 +46,8 @@ import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { addRoute } from "./inbound.js";
+import { addRoute, findRoute, noteOwnWrite } from "./inbound.js";
+import { issueOp, whoAmI, READ_VERBS, WRITE_VERBS, type IssueVerb } from "./forge-issues.js";
 import { funnelHostname } from "./funnel-watchdog.js";
 import {
   ISSUE_FIELDS,
@@ -1800,6 +1801,83 @@ export function registerCoreHandlers(
   });
 
   /**
+   * Comment on an issue in a repository this session RECEIVES FROM.
+   *
+   * The subscription is the permission. A session may write where it already
+   * reads, and nowhere else — so the boundary cannot widen by accident, because
+   * widening it means creating a route, which is itself an act the session can
+   * only perform for itself and which lands in the audit trail.
+   *
+   * Deliberately NOT the whole lifecycle. A sibling project's tool restricts
+   * closing to issues the session itself opened, on the grounds that receiving
+   * events about a tracker is not the same as owning what is in it. That
+   * distinction is right and it is the operator's to draw, so this does the one
+   * verb that was actually asked for and leaves custody alone.
+   */
+  server.on("issue", async (req) => {
+    const { repo, verb, issue, body, title, label, state, count } = req.params as {
+      repo?: string; verb?: string; issue?: number;
+      body?: string; title?: string; label?: string; state?: string; count?: number;
+    };
+    const ref = parseRepoUrl(repo ?? "");
+    if (!ref) return { ok: false, error: "repo must be a repository URL" };
+    const known = [...READ_VERBS, ...WRITE_VERBS] as string[];
+    if (!verb || !known.includes(verb)) {
+      return { ok: false, error: `verb must be one of: ${known.join(", ")}` };
+    }
+
+    const id = callerItermId(req);
+    const snap = id ? snapshotAllSessions().find((s) => s.id === id) : undefined;
+    const owner = snap
+      ? lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId)
+      : undefined;
+    if (!owner) return { ok: false, error: "cannot tell which session is asking" };
+
+    // The permission check, and the whole of it: is there a route for this
+    // repository, and does it deliver HERE? Matching on the derived route name
+    // means the same repository always resolves to the same route, so this
+    // cannot be fooled by a differently-spelled URL for the same place.
+    const route = findRoute(routeNameFor(ref));
+    if (!route) {
+      return {
+        ok: false,
+        error: `not subscribed to ${ref.owner}/${ref.repo} — subscribe first, and you may write only where you receive`,
+      };
+    }
+    if (route.owner !== owner) {
+      return {
+        ok: false,
+        error: `${ref.owner}/${ref.repo} delivers to "${route.owner}", not to you — a session writes only to trackers it receives from`,
+      };
+    }
+
+    const r = await issueOp(verb as IssueVerb, { issue, body, title, label, state, count }, {
+      ref,
+      token: process.env.AIBROKER_FORGE_TOKEN,
+      botLogin: process.env.AIBROKER_FORGE_BOT_LOGIN,
+    });
+    // Reads are traffic; writes are acts. Only the acts go in the trail, so it
+    // stays readable as a record of what was changed and by whom.
+    if ((WRITE_VERBS as string[]).includes(verb)) {
+      audit({
+        action: `issue:${verb}`, actor: `session:${owner}`,
+        target: `${ref.owner}/${ref.repo}${issue ? `#${issue}` : ""}`,
+        outcome: r.ok ? "ok" : "refused", reason: r.error ?? r.warning,
+      });
+      // The forge will report this back through the route within a second or
+      // two. Remember it, so the session is not handed its own footprint as
+      // something new to consider.
+      if (r.ok) {
+        const touched = issue ?? (r.data as { number?: number } | undefined)?.number;
+        if (touched) noteOwnWrite(route.name, touched);
+      }
+    }
+    return r.ok
+      ? { ok: true, result: { url: r.url, data: r.data, warning: r.warning } }
+      : { ok: false, error: r.error ?? `${verb} failed` };
+  });
+
+  /**
    * Bind a repository's issues to the CALLING session's mailbox.
    *
    * Creating the route and registering the webhook were two manual steps with a
@@ -1848,6 +1926,15 @@ export function registerCoreHandlers(
       return { ok: false, error: "no public host: set AIBROKER_PUBLIC_HOST or bring the funnel up" };
     }
 
+    // Which account this machine posts as, asked of the forge itself. Falls
+    // back to the configured name only when the forge will not answer.
+    const selfIgnore = await whoAmI({
+      ref,
+      token: process.env.AIBROKER_FORGE_TOKEN ?? "",
+      fetchImpl: fetch,
+      botLogin: process.env.AIBROKER_FORGE_BOT_LOGIN,
+    });
+
     const name = routeNameFor(ref);
     const route = addRoute(name, {
       owner,
@@ -1866,11 +1953,16 @@ export function registerCoreHandlers(
       // to consider — and considering it produces another comment. The first
       // route carried this rule from the start and it is the half most easily
       // forgotten, because nothing looks wrong until a session is talking to
-      // itself. Driven by configuration rather than a hardcoded login, since
-      // which account a session posts as is a property of the setup.
-      ignore: process.env.AIBROKER_FORGE_BOT_LOGIN
-        ? [`sender.login=${process.env.AIBROKER_FORGE_BOT_LOGIN}`]
-        : undefined,
+      // itself.
+      //
+      // The name comes from the FORGE, not from configuration. It was
+      // configuration once, and on the first live write the configured name and
+      // the token's real account turned out to be different — so this filtered
+      // a login that never arrived, and the loop it exists to prevent ran: a
+      // comment written at 11:51:45 came back to the same session at 11:51:47.
+      // Nothing looked wrong, which is the whole difficulty. Asking the
+      // credential who it is removes the chance to get it wrong.
+      ignore: selfIgnore ? [`sender.login=${selfIgnore}`] : undefined,
       note: `issues and comments from ${ref.owner}/${ref.repo}`,
     });
     const hookUrl = `https://${host}/hook/${route.name}`;
