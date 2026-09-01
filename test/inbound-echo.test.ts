@@ -18,6 +18,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { shouldIgnore, noteOwnWrite, forgetOwnWrites } from "../src/daemon/inbound.js";
 
 const route = (ignore?: string[]) =>
@@ -69,6 +70,37 @@ test("an event with no issue number is untouched by this", () => {
   forgetOwnWrites();
   noteOwnWrite("a-tracker", 2);
   assert.equal(shouldIgnore(route(), { action: "ping", sender: { login: "a-person" } }), undefined);
+});
+
+test("the handler remembers the issue a verb reports, not only one the caller named", () => {
+  /*
+   * The gap that let an edited comment echo back. `comment` is given an issue
+   * number and `amend` is given a comment id, so a handler that only looks at
+   * what the CALLER passed remembers nothing for amend — and what it cannot
+   * name, it cannot suppress. Measured before and after on a live route:
+   *
+   *   12:11:14  issue:amend | owner/repo    | ok      (echo delivered)
+   *   12:15:59  issue:amend | owner/repo#2  | ok
+   *   12:16:00  inbound     | ignored | own write to #2
+   *
+   * Source-reading, because the wiring lives in a handler that needs a daemon
+   * to run; it cannot see the property defeated through a helper it does not
+   * recognise. The live readings above are the real evidence.
+   */
+  const src = readFileSync(new URL("../src/daemon/core-handlers.ts", import.meta.url), "utf8");
+  const h = src.slice(src.indexOf('server.on("issue"'));
+  const body = h.slice(0, h.indexOf("\n  });"));
+  assert.ok(body.length > 0, "handler not found — this check has gone stale");
+  assert.match(body, /noteOwnWrite\(/, "a write must be recorded or its echo returns as news");
+  // Anchored to the assignment, not merely present somewhere in the handler:
+  // an unanchored match found the same text in the audit line and passed a
+  // mutation that had removed it from the line that matters.
+  assert.match(
+    body,
+    /const touched\s*=\s*issue \?\? r\.issue/,
+    "the verb's own answer must count, not only the caller's argument",
+  );
+  assert.match(body, /`#\$\{issue \?\? r\.issue\}`/, "and the audit line must name it, which is how this was found at all");
 });
 
 test("the configured ignore rules still apply on top", () => {
