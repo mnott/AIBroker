@@ -73,6 +73,59 @@ a session should merely *know*.
 
 ---
 
+## Subscribing a session to a repository's issues
+
+The common case has its own verb, because doing it by hand is two steps with a
+secret carried between them:
+
+```
+aibroker_subscribe_issues  repo: https://forge.example.org/owner/name
+```
+
+A session calls this itself — *"subscribe me to that repository's issues"* — and
+it creates the route **and** registers the webhook on the forge. The secret never
+leaves the daemon unless the forge could not be reached.
+
+**A session can only subscribe itself.** There is no target parameter: the owner
+is resolved from the caller's own identity. That is what keeps the property this
+whole document rests on — a caller still cannot choose which session runs with
+your rights, and a session filling its own mailbox gains nothing it did not
+already have. A check fails the build if a target parameter is ever added.
+
+**GitHub, Gitea and Forgejo.** Only registration differs; the events themselves
+name their fields identically, which is why one field list serves all three.
+Forgejo serves the Gitea API surface — the instance this was written against
+answers `/api/v1/version` with `12.0.4+gitea-1.22.0`.
+
+**Subscribing twice is safe.** The route name is derived from the repository, so
+a second call re-points the existing route and keeps its secret rather than
+accumulating duplicates. A forge that already has the hook answers `422`, which
+counts as success for the same reason.
+
+Two defaults come from watching real traffic rather than from taste:
+
+| Default | Why |
+|---|---|
+| `coalesce: 25s by issue number` | One action by a person is several events on the forge. Opening an issue with an assignee fires `opened` **and** `assigned` within a second. Grouping by issue turns that back into the one thing that happened. |
+| `ignore: sender.login=<bot>` | A session that comments causes an event on that issue, which returns as something to consider, which produces another comment. Nothing looks wrong until a session is talking to itself. Set `AIBROKER_FORGE_BOT_LOGIN` to the account your sessions post as. |
+
+### What you need configured
+
+| Variable | Without it |
+|---|---|
+| `AIBROKER_FORGE_TOKEN` | The route is still created and the URL and secret are handed back for you to paste into the forge once. Needs repository write scope. |
+| `AIBROKER_PUBLIC_HOST` | Falls back to the Tailscale funnel hostname, which is usually right. Only set it if that is wrong. |
+| `AIBROKER_FORGE_BOT_LOGIN` | No self-ignore rule, so a session can wake itself with its own comments. |
+
+**Forges expand `issues` into sub-events.** Forgejo turns a request for `issues`
+into `issues`, `issue_assign`, `issue_label` and `issue_milestone`. Coalescing
+folds most of that into the parent issue; if a particular kind proves noisy in
+practice, drop it with `ignore` rather than guessing in advance — a filtered
+event is still recorded, so a route gone quiet can be told from one being
+filtered.
+
+---
+
 ## Verify
 
 ```bash
