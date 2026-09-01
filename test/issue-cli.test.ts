@@ -39,7 +39,7 @@ test("no flag can claim to be another session", () => {
   // past it, since the dashes are added inside the helper.
   const accepted = [...code.matchAll(/\b(?:flag|num)\("([^"]+)"\)/g)].map((m) => m[1]);
   assert.ok(accepted.length > 0, "no options found — this check has gone stale");
-  const allowed = new Set(["issue", "body", "title", "label", "state", "count"]);
+  const allowed = new Set(["issue", "comment", "body", "title", "label", "state", "count"]);
   for (const name of accepted) {
     assert.ok(allowed.has(name), `"${name}" is not a permitted option — identity must not be selectable`);
   }

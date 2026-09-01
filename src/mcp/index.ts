@@ -384,14 +384,15 @@ server.tool(
 
 server.tool(
   "aibroker_issue",
-  "Work a repository's issue tracker: read (get, comments, list, labels, assets) and write (new, comment, rewrite, retitle, label, unlabel, claim, release, close). Allowed only for repositories THIS session is subscribed to. Every write is read back and returns the resulting URL.",
+  "Work a repository's issue tracker: read (get, comments, list, labels, assets) and write (new, comment, amend, rewrite, retitle, label, unlabel, claim, release, close). Allowed only for repositories THIS session is subscribed to. Every write is read back and returns the resulting URL.",
   {
     repo: z.string().min(1).describe("Repository URL, e.g. https://forge.example/owner/name"),
     verb: z.enum([
       "get", "comments", "list", "labels", "assets",
-      "new", "comment", "rewrite", "retitle", "label", "unlabel", "claim", "release", "close",
+      "new", "comment", "amend", "rewrite", "retitle", "label", "unlabel", "claim", "release", "close",
     ]),
     issue: z.number().int().positive().optional().describe("Issue number, for verbs that act on one"),
+    comment: z.number().int().positive().optional().describe("Comment id, for amend"),
     body: z.string().optional().describe("Body text for new, comment, rewrite"),
     title: z.string().optional().describe("Title for new or retitle"),
     label: z.string().optional().describe("Label name for label/unlabel; must already exist"),
