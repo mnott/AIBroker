@@ -188,6 +188,7 @@ pane, and there is no flag to claim otherwise.
 |---|---|
 | `new` | open one (`title`, `body`) |
 | `comment` | add to the thread |
+| `amend` | correct a comment you wrote (`--comment ID`) |
 | `rewrite`, `retitle` | change body or title |
 | `label`, `unlabel` | only names that already exist — see below |
 | `claim`, `release` | take or drop the assignment |
@@ -203,6 +204,15 @@ believed it succeeded stays invisible until somebody needs what it said.
 **`close` is restricted to issues this account opened.** Receiving events about a
 tracker is not the same as owning what is in it. A session reports a fix and
 leaves the tick to a person — the refusal says so, and says to comment instead.
+
+**Written text says which session wrote it.** Where sessions and the operator
+share one credential, every comment carries the same author and the tracker
+keeps no trace of which came from a person — permission does not care, but a
+reader in six months has only the ticket. A signature line is appended, naming
+the session; `amend` replaces it rather than stacking a second.
+
+**`amend` refuses a comment signed by another session**, even though the forge
+would allow it: sharing an account is not sharing authorship.
 
 **`claim` refuses work already assigned to somebody else**, so two workers cannot
 quietly take the same item.

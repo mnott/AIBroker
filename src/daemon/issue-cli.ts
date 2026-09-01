@@ -36,6 +36,7 @@ function usage(): void {
   console.log("Write:");
   console.log("  new --title T --body B   Open an issue");
   console.log("  comment --issue N --body B");
+  console.log("  amend --comment ID --body B   Correct a comment you wrote");
   console.log("  rewrite --issue N --body B      retitle --issue N --title T");
   console.log("  label|unlabel --issue N --label L");
   console.log("  claim|release --issue N");
@@ -84,6 +85,7 @@ export async function runIssue(args: string[]): Promise<void> {
   const params = {
     repo, verb,
     issue: num("issue"),
+    comment: num("comment"),
     body,
     title: flag("title"),
     label: flag("label"),

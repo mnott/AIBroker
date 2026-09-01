@@ -1815,8 +1815,8 @@ export function registerCoreHandlers(
    * verb that was actually asked for and leaves custody alone.
    */
   server.on("issue", async (req) => {
-    const { repo, verb, issue, body, title, label, state, count } = req.params as {
-      repo?: string; verb?: string; issue?: number;
+    const { repo, verb, issue, comment, body, title, label, state, count } = req.params as {
+      repo?: string; verb?: string; issue?: number; comment?: number;
       body?: string; title?: string; label?: string; state?: string; count?: number;
     };
     const ref = parseRepoUrl(repo ?? "");
@@ -1851,10 +1851,11 @@ export function registerCoreHandlers(
       };
     }
 
-    const r = await issueOp(verb as IssueVerb, { issue, body, title, label, state, count }, {
+    const r = await issueOp(verb as IssueVerb, { issue, comment, body, title, label, state, count }, {
       ref,
       token: process.env.AIBROKER_FORGE_TOKEN,
       botLogin: process.env.AIBROKER_FORGE_BOT_LOGIN,
+      authorLabel: owner,
     });
     // Reads are traffic; writes are acts. Only the acts go in the trail, so it
     // stays readable as a record of what was changed and by whom.

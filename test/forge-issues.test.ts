@@ -18,7 +18,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { issueOp, explain, authHeader, apiRoot, forgetIdentities, READ_VERBS, WRITE_VERBS } from "../src/daemon/forge-issues.js";
+import { issueOp, explain, authHeader, apiRoot, forgetIdentities, sign, unsign, READ_VERBS, WRITE_VERBS } from "../src/daemon/forge-issues.js";
 import { parseRepoUrl } from "../src/daemon/subscribe-issues.js";
 
 const REF = parseRepoUrl("https://forge.example.org/o/r")!;
@@ -26,13 +26,15 @@ const REF = parseRepoUrl("https://forge.example.org/o/r")!;
 /** A forge that answers a scripted sequence and records what it was asked. */
 function forge(steps: Array<{ status: number; json?: unknown }>) {
   const seen: Array<{ method: string; url: string }> = [];
+  const sentBodies: string[] = [];
   let i = 0;
   const impl = (async (url: string, init?: any) => {
     seen.push({ method: init?.method ?? "GET", url: String(url) });
+    if (init?.body) sentBodies.push(String(init.body));
     const step = steps[Math.min(i++, steps.length - 1)];
     return { status: step.status, json: async () => step.json, text: async () => "" };
   }) as unknown as typeof fetch;
-  return { impl, seen };
+  return { impl, seen, sentBodies };
 }
 
 test("a comment is read back, and what the server holds is what is returned", async () => {
@@ -193,6 +195,106 @@ test("comments page too — otherwise 'the newest two' is the 49th and 50th olde
   ]);
   const r = await issueOp("comments", { issue: 1, count: 2 }, { ref: REF, token: "t", fetchImpl: f.impl });
   assert.deepEqual((r.data as any[]).map((x) => x.body), ["c201", "c202"], "must be the genuinely newest");
+});
+
+test("a written comment says which session wrote it", async () => {
+  /*
+   * Where sessions and the operator share one credential, every comment carries
+   * the same author and the tracker keeps no trace of which came from a person.
+   * Permission does not care — that rests on the subscription — but a reader in
+   * six months has only the ticket.
+   */
+  const f = forge([
+    { status: 201, json: { id: 7, html_url: "https://forge/x#7" } },
+    { status: 200, json: [{ id: 7, body: "stored", html_url: "https://forge/x#7" }] },
+  ]);
+  await issueOp("comment", { issue: 3, body: "Gemessen: ..." },
+    { ref: REF, token: "t", authorLabel: "a-session", fetchImpl: f.impl });
+  const sent = JSON.parse((f.sentBodies[0] ?? "{}")).body as string;
+  assert.match(sent, /Gemessen: \.\.\./, "the author's own text is untouched");
+  assert.match(sent, /a-session/, "and it names the session");
+  assert.ok(sent.indexOf("Gemessen") < sent.indexOf("a-session"), "appended, not prefixed");
+});
+
+test("a rewrite replaces its signature rather than stacking a second", async () => {
+  const f = forge([
+    { status: 200, json: {} },
+    { status: 200, json: { number: 3, body: "x", html_url: "https://forge/3" } },
+  ]);
+  const once = sign("text", "a-session");
+  await issueOp("rewrite", { issue: 3, body: once },
+    { ref: REF, token: "t", authorLabel: "a-session", fetchImpl: f.impl });
+  const sent = JSON.parse((f.sentBodies[0] ?? "{}")).body as string;
+  assert.equal(sent, once, "signing an already-signed body must be idempotent");
+  assert.equal(sent.match(/a-session/g)?.length, 1);
+});
+
+test("a comment signed by another session may not be edited", async () => {
+  /*
+   * The forge only lets a credential edit its own comments, and where sessions
+   * share one credential that covers everybody's. Sharing an account is not
+   * sharing authorship. Found by falling into it: a comment was written under
+   * one session's identity by something else entirely, and there was no way to
+   * correct the record without adding a third entry three below the mistake.
+   */
+  forgetIdentities();
+  const f = forge([
+    { status: 200, json: { body: "text\n\n" + sign("text", "another-session"), user: { login: "shared" } } },
+    { status: 200, json: { login: "shared" } },
+  ]);
+  const r = await issueOp("amend", { comment: 5, body: "corrected" },
+    { ref: REF, token: "t", authorLabel: "me", fetchImpl: f.impl });
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? "", /signed by "another-session"/);
+  assert.match(r.error ?? "", /shared account is not shared authorship/);
+});
+
+test("a session may correct its own comment, and it is read back", async () => {
+  forgetIdentities();
+  const f = forge([
+    { status: 200, json: { body: sign("old", "me"), user: { login: "shared" } } },
+    { status: 200, json: { login: "shared" } },
+    { status: 200, json: {} },
+    { status: 200, json: { body: sign("new text", "me"), html_url: "https://forge/c#5" } },
+  ]);
+  const r = await issueOp("amend", { comment: 5, body: "new text" },
+    { ref: REF, token: "t", authorLabel: "me", fetchImpl: f.impl });
+  assert.equal(r.ok, true);
+  assert.equal(r.url, "https://forge/c#5");
+  assert.match((r.data as any).body, /new text/);
+  assert.equal((r.data as any).body.match(/me · aibroker/g)?.length, 1, "and not two signatures");
+});
+
+test("a comment written by a different ACCOUNT may not be edited either", async () => {
+  // The outer of the two custody checks. The signature check catches sessions
+  // sharing one account; this catches a genuinely different person, which is
+  // the case a forge with several human contributors has all the time.
+  forgetIdentities();
+  const f = forge([
+    { status: 200, json: { body: "a person wrote this, unsigned", user: { login: "a-person" } } },
+    { status: 200, json: { login: "shared" } },
+  ]);
+  const r = await issueOp("amend", { comment: 5, body: "corrected" },
+    { ref: REF, token: "t", authorLabel: "me", fetchImpl: f.impl });
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? "", /written by a-person/);
+  assert.match(r.error ?? "", /not yours to edit/);
+});
+
+test("amend without a comment id is refused before anything is sent", async () => {
+  const f = forge([{ status: 200 }]);
+  const r = await issueOp("amend", { body: "x" }, { ref: REF, token: "t", fetchImpl: f.impl });
+  assert.equal(r.ok, false);
+  assert.equal(f.seen.length, 0);
+});
+
+test("with no session name nothing is appended", () => {
+  assert.equal(sign("text", undefined), "text");
+});
+
+test("unsign leaves a body that merely mentions the marker mid-text alone", () => {
+  const body = "the 🤖 in line one is part of the sentence";
+  assert.equal(unsign(body), body, "only a trailing signature line is a signature");
 });
 
 test("404 says it may be permission, not only absence", () => {
