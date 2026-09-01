@@ -383,6 +383,26 @@ server.tool(
 );
 
 server.tool(
+  "aibroker_subscribe_issues",
+  "Subscribe THIS session to a repository's issues and comments. Creates the inbound route and registers the webhook on the forge (GitHub, Gitea or Forgejo). Idempotent: subscribing the same repository again re-points it rather than duplicating.",
+  { repo: z.string().min(1).describe("Repository URL, e.g. https://forge.example/owner/name") },
+  async ({ repo }) => {
+    try {
+      const r = (await hub.call_raw("subscribe_issues", { repo })) as any;
+      const where = `${r.route} → ${r.owner}`;
+      if (r.registered) {
+        return ok(`Subscribed ${where}. Webhook registered on the ${r.forge} forge${r.reason ? ` (${r.reason})` : ""}. Issues and comments now arrive in this session's mailbox.`);
+      }
+      return ok(
+        `Route created: ${where} at ${r.url}\n` +
+        `The forge step did not happen — ${r.reason}.\n` +
+        `Add the webhook by hand: URL above, content type JSON, secret ${r.secret}, events: issues and issue comments.`,
+      );
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
   "aibroker_rename",
   "Rename the current Claude session (tab title + registry)",
   { name: z.string().min(1).describe("New session name") },
