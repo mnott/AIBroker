@@ -572,8 +572,55 @@ function matchesAny(rules: string[] | undefined, payload: unknown, owner = ""): 
   return undefined;
 }
 
+/**
+ * Events this machine caused itself, remembered just long enough.
+ *
+ * A session that comments on an issue causes an event on that issue, which
+ * comes back as something to consider, which produces another comment. The
+ * `ignore` rule was meant to stop that by filtering the account the session
+ * posts as — and it cannot, whenever the session and the operator share one
+ * credential. Setting it to that shared account would silence the operator's
+ * own comments, which are the entire reason the route exists; leaving it naming
+ * a different account filters nothing. Measured on 2026-09-01: a write at
+ * 11:51:45 returned to its own session at 11:51:47.
+ *
+ * So the question asked here is not "who sent this" but "did we just do this",
+ * which no account naming can get wrong. A write records the issue it touched;
+ * an event about that issue arriving within the window is the echo of it. A
+ * person commenting on the same issue in that window is lost, which is the one
+ * cost, and it is bounded by seconds and by that issue.
+ */
+const RECENT_WRITE_MS = 90_000;
+const recentWrites = new Map<string, number>();
+
+const echoKey = (routeName: string, issue: number | string) => `${routeName}#${issue}`;
+
+/** Record that this machine just wrote to an issue, so its echo can be known. */
+export function noteOwnWrite(routeName: string, issue: number | string): void {
+  recentWrites.set(echoKey(routeName, issue), Date.now());
+  // Bounded without a timer: anything past the window is gone by definition.
+  for (const [k, at] of recentWrites) if (Date.now() - at > RECENT_WRITE_MS) recentWrites.delete(k);
+}
+
+/** For tests, and for a daemon that wants a clean slate. */
+export function forgetOwnWrites(): void {
+  recentWrites.clear();
+}
+
+function isOwnEcho(route: InboundRoute, payload: unknown): string | undefined {
+  const issue = scalar(pick(payload, "issue.number"));
+  if (issue === undefined || issue === null || issue === "") return undefined;
+  const at = recentWrites.get(echoKey(route.name, issue));
+  if (at === undefined) return undefined;
+  if (Date.now() - at > RECENT_WRITE_MS) {
+    recentWrites.delete(echoKey(route.name, issue));
+    return undefined;
+  }
+  return `own write to #${issue}`;
+}
+
 export function shouldIgnore(route: InboundRoute, payload: unknown): string | undefined {
-  return matchesAny(route.ignore, payload, route.owner);
+  return isOwnEcho(route, payload) ?? matchesAny(route.ignore, payload, route.owner);
 }
 
 /**

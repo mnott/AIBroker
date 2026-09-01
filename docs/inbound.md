@@ -107,7 +107,8 @@ Two defaults come from watching real traffic rather than from taste:
 | Default | Why |
 |---|---|
 | `coalesce: 25s by issue number` | One action by a person is several events on the forge. Opening an issue with an assignee fires `opened` **and** `assigned` within a second. Grouping by issue turns that back into the one thing that happened. |
-| `ignore: sender.login=<bot>` | A session that comments causes an event on that issue, which returns as something to consider, which produces another comment. Nothing looks wrong until a session is talking to itself. Set `AIBROKER_FORGE_BOT_LOGIN` to the account your sessions post as. |
+| `ignore: sender.login=<account>` | Filters a named account outright. Useful when your sessions genuinely post as a separate bot account; useless when they share your credential, which is why it is no longer what prevents the loop. |
+| echo suppression (automatic) | A session that comments causes an event on that issue, which returns as something to consider, which produces another comment. Nothing looks wrong until a session is talking to itself. Every write records the issue it touched, and an event about that issue within 90 seconds is dropped as the echo of it. No configuration, and no account name to get wrong. |
 
 ### What you need configured
 
@@ -115,7 +116,21 @@ Two defaults come from watching real traffic rather than from taste:
 |---|---|
 | `AIBROKER_FORGE_TOKEN` | The route is still created and the URL and secret are handed back for you to paste into the forge once. Needs repository write scope. |
 | `AIBROKER_PUBLIC_HOST` | Falls back to the Tailscale funnel hostname, which is usually right. Only set it if that is wrong. |
-| `AIBROKER_FORGE_BOT_LOGIN` | No self-ignore rule, so a session can wake itself with its own comments. |
+| `AIBROKER_FORGE_BOT_LOGIN` | Nothing, in the normal case. The account is asked of the forge itself; this is only the fallback for a forge that will not answer `/user`. |
+
+**Why the account is asked rather than configured.** It was configured once, and
+on the first live write the configured name and the token's real account turned
+out to be different. Nothing checked, and two rules failed silently in opposite
+directions: the self-ignore filtered a login that never arrived, and the custody
+rule on `close` compared against a name that had opened nothing. A name that
+describes a credential should not be typed twice — the forge knows, so it is
+asked.
+
+**And why sharing your own credential is still fine.** If your sessions post as
+you, no account name can separate "my own echo" from "a person wrote to me" —
+filtering that account would silence exactly the comments the route exists to
+carry. Echo suppression asks a different question, "did we just do this", which
+does not depend on who signed it.
 
 **Forges expand `issues` into sub-events.** Forgejo turns a request for `issues`
 into `issues`, `issue_assign`, `issue_label` and `issue_milestone`. Coalescing
@@ -123,6 +138,79 @@ folds most of that into the parent issue; if a particular kind proves noisy in
 practice, drop it with `ignore` rather than guessing in advance — a filtered
 event is still recorded, so a route gone quiet can be told from one being
 filtered.
+
+---
+
+## Writing back — `aibroker_issue`
+
+A route is one-directional: the tracker reaches the session and the session has
+nothing to answer with. `aibroker_issue` is the return leg, and it is deliberately
+NOT a general forge client.
+
+**Subscription is the permission.** A session may act on a repository exactly
+when a route already delivers that repository to it, and a session can only ever
+subscribe itself. So the reach of this tool is the reach of the mailbox the
+session already had, and there is no parameter anywhere that lets a caller pick
+someone else's. Both refusals say which one it is — not subscribed, or
+subscribed to somebody else — because "denied" without which is a debugging
+session.
+
+```
+aibroker_issue { repo: "https://forge.example/owner/name", verb: "list" }
+aibroker_issue { repo: …, verb: "comment", issue: 12, body: "Measured: …" }
+```
+
+| Read | |
+|---|---|
+| `list` | open issues (or `state: closed`/`all`), each with who opened it |
+| `get` | one issue: title, body, state, labels, assignees |
+| `comments` | the thread; `count: N` for the newest N |
+| `labels` | the label names this repository actually has |
+| `assets` | attachments on an issue |
+
+| Write | |
+|---|---|
+| `new` | open one (`title`, `body`) |
+| `comment` | add to the thread |
+| `rewrite`, `retitle` | change body or title |
+| `label`, `unlabel` | only names that already exist — see below |
+| `claim`, `release` | take or drop the assignment |
+| `close` | only issues this account opened — see below |
+
+### Four refusals worth knowing about
+
+**Every write is read back**, and one that cannot be confirmed returns a
+`WARNING: … treat as unconfirmed` beside its result rather than plain success. A
+network call returns and carries on; a write that failed while the caller
+believed it succeeded stays invisible until somebody needs what it said.
+
+**`close` is restricted to issues this account opened.** Receiving events about a
+tracker is not the same as owning what is in it. A session reports a fix and
+leaves the tick to a person — the refusal says so, and says to comment instead.
+
+**`claim` refuses work already assigned to somebody else**, so two workers cannot
+quietly take the same item.
+
+**`label` refuses a name the repository does not have.** Labels are a vocabulary
+somebody chose; a tool that creates one on a typo produces `bugg` next to `bug`
+and no error anywhere.
+
+### Reading is paged, and that is the point
+
+Forges answer fifty and say nothing about the rest. `list` and `comments` follow
+every page, because a truncated listing reads exactly like a complete one — and
+on a long thread, "the newest two" out of an unpaged fetch is silently the 49th
+and 50th *oldest*.
+
+`get` returns chosen fields rather than the forge's own object, which nests a
+full user record — including an email address — that nothing here needs.
+
+### Credentials
+
+`AIBROKER_FORGE_TOKEN` takes either an API token or `user:password`; the second
+is sent as Basic auth. Attachments need the same credential — a plain fetch of a
+private asset answers "Not Found", which reads as a missing file rather than a
+locked one.
 
 ---
 
