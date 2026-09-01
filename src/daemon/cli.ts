@@ -162,6 +162,12 @@ switch (command) {
     break;
   }
 
+  case "issue": {
+    const { runIssue } = await import("./issue-cli.js");
+    await runIssue(rest);
+    break;
+  }
+
   case "budget": {
     const { runBudget } = await import("./budget-cli.js");
     await runBudget(rest);
@@ -317,6 +323,6 @@ switch (command) {
 
   default:
     console.error(`Unknown command: ${command}`);
-    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|sessions|dispatch|ask|audit|help]");
+    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|sessions|dispatch|ask|audit|inbound|issue|help]");
     process.exit(1);
 }
