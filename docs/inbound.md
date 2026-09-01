@@ -132,6 +132,19 @@ filtering that account would silence exactly the comments the route exists to
 carry. Echo suppression asks a different question, "did we just do this", which
 does not depend on who signed it.
 
+**Where echo suppression does NOT reach.** It knows about writes that went
+through the daemon, because that is where the record is kept. A session with its
+own script talking to the forge directly appears in no such record and will get
+its own events back — which is fine when that script posts as a **separate bot
+account**, because then the account filter above does the job properly. The two
+mechanisms cover different cases and neither covers both:
+
+| Written by | What stops the echo |
+|---|---|
+| `aibroker_issue` / `aibroker issue` | the write record — works whatever account it posts as |
+| a repo-local script with its own bot credential | `ignore: sender.login=<bot>` |
+| a repo-local script sharing your account | nothing; give it a bot account or route it through the daemon |
+
 **Forges expand `issues` into sub-events.** Forgejo turns a request for `issues`
 into `issues`, `issue_assign`, `issue_label` and `issue_milestone`. Coalescing
 folds most of that into the parent issue; if a particular kind proves noisy in
