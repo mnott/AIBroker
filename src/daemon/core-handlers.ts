@@ -46,6 +46,15 @@ import { log } from "../core/log.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { addRoute } from "./inbound.js";
+import { funnelHostname } from "./funnel-watchdog.js";
+import {
+  ISSUE_FIELDS,
+  parseRepoUrl,
+  routeNameFor,
+  registerHook,
+  forgeOf,
+} from "./subscribe-issues.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1788,5 +1797,100 @@ export function registerCoreHandlers(
     return r.ok
       ? { ok: true, result: { message: r.message, managed: r.managed ?? false } }
       : { ok: false, error: r.message };
+  });
+
+  /**
+   * Bind a repository's issues to the CALLING session's mailbox.
+   *
+   * Creating the route and registering the webhook were two manual steps with a
+   * secret carried between them by hand. This does both, and the secret stays
+   * in the daemon unless the forge could not be reached.
+   *
+   * **There is deliberately no target parameter.** The owner is the caller's own
+   * resolved session, so a session can subscribe itself and nothing else. That
+   * keeps the property docs/inbound.md rests on — a caller cannot choose which
+   * session runs with the operator's rights — while removing the friction that
+   * had every subscription going through the operator's terminal.
+   */
+  server.on("subscribe_issues", async (req) => {
+    const { repo } = req.params as { repo?: string };
+    const ref = parseRepoUrl(repo ?? "");
+    if (!ref) {
+      return { ok: false, error: "repo must be a repository URL, e.g. https://forge.example/owner/name" };
+    }
+
+    // The caller, and only the caller. Resolved from the request rather than
+    // read from params — see callerItermId.
+    //
+    // Resolved through the PERSISTENT name, the same way callerLabel does, and
+    // never from the snapshot's `name`. That field is the iTerm tab title:
+    // decorated with a status glyph that CHANGES as the session works, and
+    // suffixed "(node)". The first route this created was stored as
+    // "◑ 20 - Webseiten (node)" — an owner containing a character that is
+    // different a second later. A route outlives the moment it was made, so its
+    // owner has to be the name that outlives it too. Refuse rather than store a
+    // decorated title: a route pointing at a spinner is worse than an error,
+    // because it looks correct in the listing.
+    const id = callerItermId(req);
+    const snap = id ? snapshotAllSessions().find((s) => s.id === id) : undefined;
+    const owner = snap
+      ? lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId)
+      : undefined;
+    if (!owner) {
+      return {
+        ok: false,
+        error: "cannot tell which session is asking by a stable name — name this session first (aibroker_rename), then subscribe",
+      };
+    }
+
+    const host = process.env.AIBROKER_PUBLIC_HOST ?? funnelHostname().hostname;
+    if (!host) {
+      return { ok: false, error: "no public host: set AIBROKER_PUBLIC_HOST or bring the funnel up" };
+    }
+
+    const name = routeNameFor(ref);
+    const route = addRoute(name, {
+      owner,
+      mode: "message",
+      fields: ISSUE_FIELDS,
+      // One action by a person is several events on the forge: opening an issue
+      // with an assignee fires `opened` AND `assigned`, and both arrive within a
+      // second of each other. Grouping by issue number turns that back into the
+      // one thing that actually happened. 25 seconds is the window the first
+      // hand-built route settled on and it has held since 2026-08-18 — copied
+      // deliberately rather than re-derived, because the number came from
+      // watching real traffic and I have none yet.
+      coalesce: { ms: 25_000, key: "issue.number" },
+      // Do not wake a session with its own footprints. A session that comments
+      // on an issue causes an event on that issue, which arrives back as work
+      // to consider — and considering it produces another comment. The first
+      // route carried this rule from the start and it is the half most easily
+      // forgotten, because nothing looks wrong until a session is talking to
+      // itself. Driven by configuration rather than a hardcoded login, since
+      // which account a session posts as is a property of the setup.
+      ignore: process.env.AIBROKER_FORGE_BOT_LOGIN
+        ? [`sender.login=${process.env.AIBROKER_FORGE_BOT_LOGIN}`]
+        : undefined,
+      note: `issues and comments from ${ref.owner}/${ref.repo}`,
+    });
+    const hookUrl = `https://${host}/hook/${route.name}`;
+
+    const token = process.env.AIBROKER_FORGE_TOKEN;
+    const outcome = await registerHook(ref, hookUrl, route.secret, token);
+
+    return {
+      ok: true,
+      result: {
+        route: route.name,
+        owner,
+        url: hookUrl,
+        forge: forgeOf(ref),
+        registered: outcome.registered,
+        reason: outcome.reason,
+        // Handed back ONLY when the operator has to paste it themselves. When
+        // the forge took it, the secret has no reason to leave the daemon.
+        secret: outcome.registered ? undefined : route.secret,
+      },
+    };
   });
 }
