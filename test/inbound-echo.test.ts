@@ -24,10 +24,18 @@ import { shouldIgnore, noteOwnWrite, forgetOwnWrites } from "../src/daemon/inbou
 const route = (ignore?: string[]) =>
   ({ name: "a-tracker", owner: "a-session", mode: "message", ignore }) as any;
 
+const named = (name: string) => ({ name, owner: "a-session", mode: "message" }) as any;
+
 const event = (issue: number, sender: string) => ({
   action: "created",
   issue: { number: issue },
   sender: { login: sender },
+});
+
+/** What a forge actually posts: the repository is in every copy of the event. */
+const forgeEvent = (repo: string, issue: number, sender: string) => ({
+  ...event(issue, sender),
+  repository: { full_name: repo },
 });
 
 test("the echo of our own write is dropped, whoever the forge says signed it", () => {
@@ -101,6 +109,75 @@ test("the handler remembers the issue a verb reports, not only one the caller na
     "the verb's own answer must count, not only the caller's argument",
   );
   assert.match(body, /`#\$\{issue \?\? r\.issue\}`/, "and the audit line must name it, which is how this was found at all");
+});
+
+test("a SECOND route for the same repository drops the echo too", () => {
+  /*
+   * The failure this exists for, from the audit trail of 2026-09-02. One
+   * repository had two hooks — one added by hand in August, one created by
+   * subscribing — and both delivered to the same session. The write was
+   * remembered under the route the permission check resolved, so:
+   *
+   *   19:52:49  inbound hook:owner-repo   ignored   own write to #489
+   *   19:52:49  inbound hook:a-tracker  delivered held for grouping
+   *
+   * The session was told its echo had been suppressed and got it anyway. Both
+   * copies name the same repository, so that is what the record is keyed by.
+   */
+  forgetOwnWrites();
+  noteOwnWrite("owner/repo", 489);
+  const e = forgeEvent("owner/repo", 489, "the-shared-account");
+  assert.match(shouldIgnore(named("derived-name"), e) ?? "", /own write to #489/);
+  assert.match(shouldIgnore(named("made-by-hand"), e) ?? "", /own write to #489/, "the older hook delivers the same event");
+});
+
+test("a write to one repository does not silence another", () => {
+  forgetOwnWrites();
+  noteOwnWrite("owner/repo", 7);
+  assert.equal(shouldIgnore(named("some-route"), forgeEvent("owner/other", 7, "a-person")), undefined);
+});
+
+test("the repository is matched however the forge cases it", () => {
+  // The URL a session subscribes with is typed by a person; what the forge
+  // sends back is its own spelling. A key that distinguishes them suppresses
+  // nothing while looking correct.
+  forgetOwnWrites();
+  noteOwnWrite("Owner/Repo", 4);
+  assert.ok(shouldIgnore(named("a-route"), forgeEvent("owner/repo", 4, "x")));
+});
+
+test("the write is recorded against the repository, not the route", () => {
+  /*
+   * Source-reading, for the same reason as the handler check below: the wiring
+   * needs a daemon to run. A record keyed by the route is exactly the bug —
+   * it looks right, and it only fails once a repository has a second hook.
+   */
+  const src = readFileSync(new URL("../src/daemon/core-handlers.ts", import.meta.url), "utf8");
+  const h = src.slice(src.indexOf('server.on("issue"'));
+  const body = h.slice(0, h.indexOf("\n  });"));
+  assert.match(
+    body,
+    /noteOwnWrite\(`\$\{ref\.owner\}\/\$\{ref\.repo\}`/,
+    "keyed by the repository written to, so every hook carrying it suppresses the echo",
+  );
+});
+
+test("subscribing does not filter the account the token posts as", () => {
+  /*
+   * It did, and that account is the operator's own whenever the credential is
+   * shared — so the rule dropped the operator's comments, which are the reason
+   * the route exists. From the trail of 2026-09-02, twice inside ten seconds:
+   *
+   *   08:37:37  inbound hook:owner-repo  ignored  sender.login=<operator>
+   *
+   * The loop is stopped by the write record instead, which does not care who
+   * signed anything.
+   */
+  const src = readFileSync(new URL("../src/daemon/core-handlers.ts", import.meta.url), "utf8");
+  const h = src.slice(src.indexOf('server.on("subscribe_issues"'));
+  const body = h.slice(0, h.indexOf("\n  });"));
+  assert.ok(body.length > 0, "handler not found — this check has gone stale");
+  assert.doesNotMatch(body, /ignore:\s*\w+\s*\?\s*\[`sender\.login=/, "a self-ignore here silences the operator");
 });
 
 test("the configured ignore rules still apply on top", () => {

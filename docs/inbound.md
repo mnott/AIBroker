@@ -107,8 +107,9 @@ Two defaults come from watching real traffic rather than from taste:
 | Default | Why |
 |---|---|
 | `coalesce: 25s by issue number` | One action by a person is several events on the forge. Opening an issue with an assignee fires `opened` **and** `assigned` within a second. Grouping by issue turns that back into the one thing that happened. |
-| `ignore: sender.login=<account>` | Filters a named account outright. Useful when your sessions genuinely post as a separate bot account; useless when they share your credential, which is why it is no longer what prevents the loop. |
-| echo suppression (automatic) | A session that comments causes an event on that issue, which returns as something to consider, which produces another comment. Nothing looks wrong until a session is talking to itself. Every write records the issue it touched, and an event about that issue within 90 seconds is dropped as the echo of it. No configuration, and no account name to get wrong. |
+| `ignore:` **nothing** | Subscribing used to add `sender.login=<the token's account>`. Where the credential is your own — the ordinary case — that rule drops *your* comments, which are the reason the route exists; measured on 2026-09-02, two in ten seconds. So no account is filtered by default, and `ignore` is yours to set for a repo-local script posting as a separate bot. |
+| echo suppression (automatic) | A session that comments causes an event on that issue, which returns as something to consider, which produces another comment. Nothing looks wrong until a session is talking to itself. Every write records the **repository and issue** it touched, and an event about that issue within 90 seconds is dropped as the echo of it. No configuration, and no account name to get wrong. |
+| keyed by repository, not by route | A repository may have more than one hook — one added by hand, one from subscribing — and the forge posts to all of them. A record keyed by the route dropped the copy coming down the route the write resolved and delivered the other, so the trail said "suppressed" while the session got its own comment back. Keyed by the place written to, every copy is suppressed. Subscribing now says so when it finds a second hook pointing here. |
 
 ### What you need configured
 
@@ -129,8 +130,21 @@ asked.
 **And why sharing your own credential is still fine.** If your sessions post as
 you, no account name can separate "my own echo" from "a person wrote to me" —
 filtering that account would silence exactly the comments the route exists to
-carry. Echo suppression asks a different question, "did we just do this", which
-does not depend on who signed it.
+carry. That is not a hypothetical: subscribing set that filter automatically
+until 2026-09-02, and it was dropping the operator's own comments. It no longer
+does. Echo suppression asks a different question, "did we just do this", which
+does not depend on who signed it. Subscribing still *reports* which account the
+credential is, because a credential that turns out to be somebody else's should
+be visible at the moment you set the route up rather than in the tracker later.
+
+**One repository, one hook.** Echo suppression covers every hook a repository
+has, but double delivery is not something it can fix: two hooks means two copies
+of every event, and a session woken twice by one comment. Subscribing lists any
+other hook on that repository pointing at this machine and says so; remove the
+one you did not mean to keep. The hook to keep is the one whose route name is
+derived from the repository, because `aibroker_issue` resolves permission by
+that name — a repository whose only route is called something else can be read
+from and not written to.
 
 **Where echo suppression does NOT reach.** It knows about writes that went
 through the daemon, because that is where the record is kept. A session with its

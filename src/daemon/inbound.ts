@@ -118,6 +118,15 @@ export interface InboundRoute {
   trusted?: string[];
   /** A one-line human note about what sends here. */
   note?: string;
+  /**
+   * The repository this route carries, as `owner/name`, when one made it.
+   *
+   * Recorded so that a second route for a repository that already has one is
+   * visible in the listing rather than only in the traffic. Absent on routes
+   * built by hand before this existed, so it may be read but never relied on
+   * as the only way to tell what a route carries.
+   */
+  repo?: string;
   enabled?: boolean;
   createdAt: string;
 }
@@ -148,7 +157,7 @@ export function findRoute(name: string): InboundRoute | undefined {
 /** Create or update a route. Returns the route, with a generated secret if new. */
 export function addRoute(
   name: string,
-  opts: { owner: string; mode?: InboundMode; fields?: string[]; ignore?: string[]; trusted?: string[]; coalesce?: { ms: number; key: string }; note?: string; secret?: string },
+  opts: { owner: string; mode?: InboundMode; fields?: string[]; ignore?: string[]; trusted?: string[]; coalesce?: { ms: number; key: string }; note?: string; repo?: string; secret?: string },
 ): InboundRoute {
   const s = read();
   const clean = name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
@@ -170,6 +179,7 @@ export function addRoute(
   if (opts.coalesce) route.coalesce = opts.coalesce;
   if (opts.trusted) route.trusted = opts.trusted;
   if (opts.note !== undefined) route.note = opts.note;
+  if (opts.repo !== undefined) route.repo = opts.repo;
   if (opts.secret) route.secret = opts.secret;
   if (!existing) s.routes.push(route);
   saveJson(FILE, s);
@@ -593,11 +603,28 @@ function matchesAny(rules: string[] | undefined, payload: unknown, owner = ""): 
 const RECENT_WRITE_MS = 90_000;
 const recentWrites = new Map<string, number>();
 
-const echoKey = (routeName: string, issue: number | string) => `${routeName}#${issue}`;
+const echoKey = (scope: string, issue: number | string) => `${scope.trim().toLowerCase()}#${issue}`;
 
-/** Record that this machine just wrote to an issue, so its echo can be known. */
-export function noteOwnWrite(routeName: string, issue: number | string): void {
-  recentWrites.set(echoKey(routeName, issue), Date.now());
+/**
+ * Record that this machine just wrote to an issue, so its echo can be known.
+ *
+ * `scope` is the PLACE that was written to — `owner/repo` for a forge — and
+ * deliberately not the route the news will come back down. Both read the same
+ * while a repository had exactly one route. On 2026-09-02 one had two: a
+ * hand-made route from August and the derived-name one `subscribe_issues`
+ * creates, with the forge posting every event to both. The write was recorded
+ * under the route the permission check resolved, so that copy was dropped and
+ * the other was delivered — the audit trail said the echo was suppressed and
+ * the session got it anyway, at 19:52:49 on #489:
+ *
+ *   inbound external hook:owner-repo   ignored   own write to #489
+ *   inbound hook:a-tracker    → ...  delivered held for grouping
+ *
+ * Keying by the place written to suppresses every copy, however many hooks the
+ * forge has been given.
+ */
+export function noteOwnWrite(scope: string, issue: number | string): void {
+  recentWrites.set(echoKey(scope, issue), Date.now());
   // Bounded without a timer: anything past the window is gone by definition.
   for (const [k, at] of recentWrites) if (Date.now() - at > RECENT_WRITE_MS) recentWrites.delete(k);
 }
@@ -607,13 +634,31 @@ export function forgetOwnWrites(): void {
   recentWrites.clear();
 }
 
+/**
+ * The repository an event is about, as the forge itself names it.
+ *
+ * Read from the payload rather than from the route's configuration, because the
+ * payload is the one thing every copy of the same event agrees on — which is
+ * exactly the property the per-route key lacked.
+ */
+function repoOf(payload: unknown): string | undefined {
+  const full = scalar(pick(payload, "repository.full_name"));
+  if (full) return String(full);
+  const owner = scalar(pick(payload, "repository.owner.login"));
+  const name = scalar(pick(payload, "repository.name"));
+  return owner && name ? `${owner}/${name}` : undefined;
+}
+
 function isOwnEcho(route: InboundRoute, payload: unknown): string | undefined {
   const issue = scalar(pick(payload, "issue.number"));
   if (issue === undefined || issue === null || issue === "") return undefined;
-  const at = recentWrites.get(echoKey(route.name, issue));
+  // The repository when the payload names one; the route otherwise, which keeps
+  // a caller that is not a forge behaving as it always did.
+  const key = echoKey(repoOf(payload) ?? route.name, issue);
+  const at = recentWrites.get(key);
   if (at === undefined) return undefined;
   if (Date.now() - at > RECENT_WRITE_MS) {
-    recentWrites.delete(echoKey(route.name, issue));
+    recentWrites.delete(key);
     return undefined;
   }
   return `own write to #${issue}`;

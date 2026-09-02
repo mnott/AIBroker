@@ -54,6 +54,7 @@ import {
   parseRepoUrl,
   routeNameFor,
   registerHook,
+  duplicateHooks,
   forgeOf,
 } from "./subscribe-issues.js";
 
@@ -1865,15 +1866,16 @@ export function registerCoreHandlers(
         target: `${ref.owner}/${ref.repo}${(issue ?? r.issue) ? `#${issue ?? r.issue}` : ""}`,
         outcome: r.ok ? "ok" : "refused", reason: r.error ?? r.warning,
       });
-      // The forge will report this back through the route within a second or
-      // two. Remember it, so the session is not handed its own footprint as
-      // something new to consider.
+      // The forge will report this back within a second or two — down every
+      // hook it has for this repository, not only the one this permission check
+      // resolved. Remember the REPOSITORY, so the session is not handed its own
+      // footprint by a second route that names the same place.
       if (r.ok) {
         // r.issue covers the verbs the caller does not name an issue for —
         // amend is given a comment id, and an edit echoes back just as a new
         // comment does.
         const touched = issue ?? r.issue ?? (r.data as { number?: number } | undefined)?.number;
-        if (touched) noteOwnWrite(route.name, touched);
+        if (touched) noteOwnWrite(`${ref.owner}/${ref.repo}`, touched);
       }
     }
     return r.ok
@@ -1931,8 +1933,9 @@ export function registerCoreHandlers(
     }
 
     // Which account this machine posts as, asked of the forge itself. Falls
-    // back to the configured name only when the forge will not answer.
-    const selfIgnore = await whoAmI({
+    // back to the configured name only when the forge will not answer. Reported
+    // back rather than turned into a filter — see below.
+    const postsAs = await whoAmI({
       ref,
       token: process.env.AIBROKER_FORGE_TOKEN ?? "",
       fetchImpl: fetch,
@@ -1952,27 +1955,38 @@ export function registerCoreHandlers(
       // deliberately rather than re-derived, because the number came from
       // watching real traffic and I have none yet.
       coalesce: { ms: 25_000, key: "issue.number" },
-      // Do not wake a session with its own footprints. A session that comments
-      // on an issue causes an event on that issue, which arrives back as work
-      // to consider — and considering it produces another comment. The first
-      // route carried this rule from the start and it is the half most easily
-      // forgotten, because nothing looks wrong until a session is talking to
-      // itself.
+      // No account is filtered here, and that is the correction rather than an
+      // omission. This used to add `sender.login=<the token's account>` so a
+      // session would not be woken by its own footprints. Where the credential
+      // is the operator's own — the normal case here, and what the forge
+      // answered on 2026-09-02 — that rule silences the OPERATOR's comments,
+      // which are the entire reason the route exists. Measured at 08:37:37: two
+      // comments by the operator dropped as `sender.login=<operator>`.
       //
-      // The name comes from the FORGE, not from configuration. It was
-      // configuration once, and on the first live write the configured name and
-      // the token's real account turned out to be different — so this filtered
-      // a login that never arrived, and the loop it exists to prevent ran: a
-      // comment written at 11:51:45 came back to the same session at 11:51:47.
-      // Nothing looked wrong, which is the whole difficulty. Asking the
-      // credential who it is removes the chance to get it wrong.
-      ignore: selfIgnore ? [`sender.login=${selfIgnore}`] : undefined,
+      // What stops the loop is the write record in inbound.ts, which asks "did
+      // we just do this" instead of "who signed this" and so cannot be defeated
+      // by a shared credential. The one case it does not cover is a repo-local
+      // script posting with its OWN bot account, which never reaches the daemon
+      // to be recorded — that wants an `ignore` naming the bot, added
+      // deliberately by the operator who set that script up, because only they
+      // can tell a bot account from their own.
       note: `issues and comments from ${ref.owner}/${ref.repo}`,
+      repo: `${ref.owner}/${ref.repo}`,
     });
     const hookUrl = `https://${host}/hook/${route.name}`;
 
     const token = process.env.AIBROKER_FORGE_TOKEN;
     const outcome = await registerHook(ref, hookUrl, route.secret, token);
+
+    // Asked after registering, so the answer is what the forge holds now. A
+    // second hook for this repository pointing at this machine delivers every
+    // event twice, and the copy arriving down the older route is the one that
+    // used to come back as news — worth saying at the moment somebody is
+    // looking, rather than leaving to be found in the traffic.
+    const duplicates = await duplicateHooks(ref, hookUrl, token);
+    if (duplicates.length) {
+      log(`inbound: ${ref.owner}/${ref.repo} also posts to ${duplicates.join(", ")} — every event arrives twice until one is removed`);
+    }
 
     return {
       ok: true,
@@ -1983,6 +1997,15 @@ export function registerCoreHandlers(
         forge: forgeOf(ref),
         registered: outcome.registered,
         reason: outcome.reason,
+        // Which account writes from here will be signed with. Not a filter:
+        // stated so it can be recognised in the tracker, and so a credential
+        // that turns out to be somebody else's is visible at once.
+        postsAs,
+        // Named, not counted — the operator has to go and remove one.
+        duplicateHooks: duplicates.length ? duplicates : undefined,
+        warning: duplicates.length
+          ? `${ref.owner}/${ref.repo} also posts to ${duplicates.join(", ")}: every event will arrive twice until one of those hooks is removed`
+          : undefined,
         // Handed back ONLY when the operator has to paste it themselves. When
         // the forge took it, the secret has no reason to leave the daemon.
         secret: outcome.registered ? undefined : route.secret,
