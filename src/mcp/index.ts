@@ -419,13 +419,18 @@ server.tool(
     try {
       const r = (await hub.call_raw("subscribe_issues", { repo })) as any;
       const where = `${r.route} → ${r.owner}`;
+      // A duplicate hook is not a failure of the subscription, so it is carried
+      // alongside the success rather than instead of it — but it is said every
+      // time, because double delivery looks like the tracker being busy.
+      const also = r.warning ? `\nWARNING: ${r.warning}` : "";
+      const signs = r.postsAs ? ` Writes from here are signed ${r.postsAs}.` : "";
       if (r.registered) {
-        return ok(`Subscribed ${where}. Webhook registered on the ${r.forge} forge${r.reason ? ` (${r.reason})` : ""}. Issues and comments now arrive in this session's mailbox.`);
+        return ok(`Subscribed ${where}. Webhook registered on the ${r.forge} forge${r.reason ? ` (${r.reason})` : ""}. Issues and comments now arrive in this session's mailbox.${signs}${also}`);
       }
       return ok(
         `Route created: ${where} at ${r.url}\n` +
         `The forge step did not happen — ${r.reason}.\n` +
-        `Add the webhook by hand: URL above, content type JSON, secret ${r.secret}, events: issues and issue comments.`,
+        `Add the webhook by hand: URL above, content type JSON, secret ${r.secret}, events: issues and issue comments.${also}`,
       );
     } catch (e) { return err(e); }
   },

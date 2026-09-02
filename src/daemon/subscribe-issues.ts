@@ -295,3 +295,54 @@ export async function registerHook(
     return { registered: false, reason: `forge unreachable: ${(e as Error).message}` };
   }
 }
+
+/**
+ * Other hooks on this repository that post HERE under a different route.
+ *
+ * A route name derived from the repository makes subscribing twice safe, and
+ * says nothing about a hook somebody added by hand under another name. One
+ * repository ended up with both: `/hook/a-tracker` from August and the
+ * derived `/hook/owner-repo`, each configured to filter a different account,
+ * so between them they delivered everything — including the session's own
+ * writes, which arrived down the route that had no record of them. Nothing
+ * reported the duplicate; it had to be found in the traffic.
+ *
+ * So it is asked of the forge, which is the only place that knows how many
+ * hooks it has. Same host, different path: this machine, another route.
+ * Answering with an empty list on any difficulty is deliberate — this is a
+ * warning attached to a subscription that has already succeeded, and it must
+ * never be the thing that fails one.
+ */
+export async function duplicateHooks(
+  ref: RepoRef,
+  hookUrl: string,
+  token: string | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string[]> {
+  if (!token) return [];
+  let mine: URL;
+  try {
+    mine = new URL(hookUrl);
+  } catch {
+    return [];
+  }
+  try {
+    const res = await fetchImpl(hooksEndpoint(ref), { headers: { authorization: `token ${token}` } });
+    if (res.status !== 200) return [];
+    const hooks = (await res.json()) as Array<{ config?: { url?: string } }>;
+    if (!Array.isArray(hooks)) return [];
+    return hooks
+      .map((h) => h.config?.url)
+      .filter((u): u is string => typeof u === "string")
+      .filter((u) => {
+        try {
+          const other = new URL(u);
+          return other.host === mine.host && other.pathname !== mine.pathname;
+        } catch {
+          return false;
+        }
+      });
+  } catch {
+    return [];
+  }
+}
