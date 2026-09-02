@@ -36,8 +36,29 @@ function oneLine(s: string, max = 100): string {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
+/**
+ * The time an event happened, on the clock the reader is looking at.
+ *
+ * The file stores UTC, which is right — it is compared, sorted and moved
+ * between machines. Printing that UTC time to a terminal is not. Every other
+ * reading an operator takes while investigating is local: `date`, the manager's
+ * status, the forge's own timestamps. Rendering this one in UTC put a silent
+ * two-hour offset between lines of the same investigation, and on 2026-09-01 it
+ * cost real time — an audit line at 11:51 was compared against a forge comment
+ * at 13:51 and read as an hour and a half apart when they were two seconds.
+ *
+ * A clock that is wrong announces itself. A clock that is right in a different
+ * zone does not, and the reader does the arithmetic without knowing they should.
+ */
+function localTime(iso: string): string {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return iso.slice(11, 19); // unparseable: show what is stored
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+}
+
 function render(e: AuditEvent, bodies: boolean): void {
-  const time = e.ts.slice(11, 19);
+  const time = localTime(e.ts);
   const icon = ICON[e.action] ?? "·";
   const chain = e.causedBy ? ` ⟵${e.causedBy}` : "";
   console.log(`${time} [${e.id}]${chain} ${e.actor} ${icon} ${e.target}  ${e.action}:${e.outcome}`);

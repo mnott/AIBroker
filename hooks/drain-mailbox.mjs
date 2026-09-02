@@ -67,7 +67,11 @@ const messages = res?.ok ? (res.result?.messages ?? []) : [];
 if (messages.length === 0) process.exit(0);
 
 const lines = messages.map((m) => {
-  const when = m.timestamp ? new Date(m.timestamp).toISOString().slice(11, 19) : "";
+  // Local, not UTC. The reader compares this against `date`, the manager's
+  // status and a forge's own timestamps, all of which are local — an hour
+  // printed in a different zone reads as a delay that did not happen, and the
+  // reader does the arithmetic without knowing they should.
+  const when = m.timestamp ? new Date(m.timestamp).toLocaleTimeString("en-GB", { hour12: false }) : "";
   const waited = m.timestamp ? Math.round((Date.now() - m.timestamp) / 60000) : null;
   const age = waited !== null && waited >= 1 ? ` (waited ${waited} min)` : "";
   return `[Session:${m.from}] ${when}${age}\n${m.content}`;
