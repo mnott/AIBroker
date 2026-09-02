@@ -76,7 +76,11 @@ app.post("/api/apps", requirePublisher, upload.single("file"), async (req: Reque
 
   await rename(req.file.path, dest);
 
+  // Merge into the existing record so an iOS publish keeps the APK and vice
+  // versa; the landing page offers every platform that has a file.
+  const previous = readMeta(slug);
   const meta: AppMeta = {
+    ...(previous ?? {}),
     name, bundleId, version, platform,
     updatedAt: new Date().toISOString(),
     updatedBy: callerLogin(req),
@@ -119,7 +123,7 @@ app.get("/install/:slug/", (req: Request, res: Response) => {
 app.get("/install/:slug/manifest.plist", (req: Request, res: Response) => {
   const { slug } = req.params;
   const meta = readMeta(slug);
-  if (!meta || meta.platform !== "ios") {
+  if (!meta || !meta.ipaFile) {
     res.status(404).send("Not found");
     return;
   }
