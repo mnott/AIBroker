@@ -11,6 +11,13 @@ export const INPUT_LINE = /^\s*❯/;
 export const CLAUDE_UI = /─{20,}/;
 /** A shell prompt: a line ending in a common prompt terminator. */
 export const SHELL_PROMPT = /[➜$%#»]\s*$/;
+/**
+ * A row of the background-agents panel Claude draws UNDER its status lines
+ * while agents run: a "main" header, one `◯ <agent> <task> · <time> · <tokens>`
+ * row per agent, an overflow count, and the navigation hint. Up to a dozen
+ * lines, all Claude's own, all below the closing rule.
+ */
+export const AGENT_PANEL = /^\s*(❯\s*)?⏺\s+main\b|^\s*[◯●◉]\s+\S+\s{2,}|^\s*↓\s+\d+\s+more\b|↑\/↓ to select/;
 
 /** Collapse whitespace so wrapped and padded terminal text compares sanely. */
 export function flatten(s: string): string { return s.replace(/\s+/g, " ").trim(); }
@@ -38,11 +45,18 @@ export function isClaudeReady(frame: string): boolean {
 
   // Claude renders only its status lines below the box; a shell fills the rest
   // of the screen, pushing the box further and further up.
-  if (lines.length - 1 - lastRule > 8) return false;
+  //
+  // The background-agents panel is the exception: with agents running Claude
+  // draws up to a dozen more rows under the status lines, and a session that
+  // was plainly working was read as "at a shell" for exactly that reason —
+  // the manager could not arm it and every send was refused (2026-09-03).
+  // Those rows are Claude's, so they do not count against the box.
+  const below = lines.slice(lastRule + 1).filter((l) => !AGENT_PANEL.test(l));
+  if (below.length > 8) return false;
 
   // Belt and braces: an explicit prompt below the box means the shell has it.
-  for (let i = lastRule + 1; i < lines.length; i++) {
-    if (SHELL_PROMPT.test(lines[i])) return false;
+  for (const l of below) {
+    if (SHELL_PROMPT.test(l)) return false;
   }
 
   return lines.some((l) => INPUT_LINE.test(l));
