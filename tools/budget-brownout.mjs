@@ -162,9 +162,32 @@ function isWorking(name) {
 }
 
 const cfg = readJson(CONFIG);
-if (!cfg || cfg.enabled === false) process.exit(0);
 
-const ceiling = typeof cfg.ceilingPercent === "number" ? cfg.ceilingPercent : 96;
+/*
+ * TWO CEILINGS, and they protect different things.
+ *
+ * `ceilingPercent` (with `enabled`) is the hard stop for everything: the
+ * refusal hook reads it and answers no prompt anywhere past it. It is the wall
+ * at the end of the week.
+ *
+ * `managedCeilingPercent` is lower and stops only what is being managed. A
+ * night of unattended work is the thing that can quietly spend the week; the
+ * operator's own sessions are not. So the managed sessions are stood down at
+ * this line, with the same handover-first sequence, while every other session
+ * keeps answering. It does not need `enabled`: that flag belongs to the wall,
+ * and switching the wall off must not switch this off with it.
+ *
+ * This script stands managed sessions down at whichever of the two is lower
+ * and in force, and stands them back up under that same line.
+ */
+const wall = cfg && cfg.enabled !== false
+  ? (typeof cfg.ceilingPercent === "number" ? cfg.ceilingPercent : 96)
+  : null;
+const managedCeiling = cfg && typeof cfg.managedCeilingPercent === "number" ? cfg.managedCeilingPercent : null;
+if (wall === null && managedCeiling === null) process.exit(0);
+
+const ceiling = Math.min(...[wall, managedCeiling].filter((c) => c !== null));
+const ceilingKind = managedCeiling !== null && (wall === null || managedCeiling < wall) ? "managed-session" : "weekly";
 const now = Date.now();
 
 /**
@@ -355,9 +378,10 @@ for (const { name, sessionId } of names) {
    */
   say(
     name,
-    "Weekly budget ceiling reached. Write your handover NOW — everything you know that is not " +
-      "already in the tracker or a file — then stop and do not start another item. Work resumes " +
-      "automatically when the window resets.",
+    `Budget ceiling for ${ceilingKind} work reached (${pct}% of the week, ceiling ${ceiling}%). ` +
+      "Write your handover NOW — everything you know that is not already in the tracker or a " +
+      "file — then stop and do not start another item. Work resumes automatically when the " +
+      "window resets.",
   );
   // Typed rather than asked for: the goal is driven by a hook outside the
   // conversation, so a session can sincerely agree to stop and still be
@@ -399,4 +423,4 @@ writeFileSync(
     2,
   ),
 );
-log(`brownout at ${pct}% — ${paused.length} of ${names.length} managed session(s) stood down`);
+log(`brownout at ${pct}% (${ceilingKind} ceiling ${ceiling}%) — ${paused.length} of ${names.length} managed session(s) stood down`);

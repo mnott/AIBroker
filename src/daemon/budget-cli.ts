@@ -27,6 +27,12 @@ const FILE = join(homedir(), ".aibroker", "budget-stop.json");
 interface BudgetConfig {
   enabled?: boolean;
   ceilingPercent?: number;
+  /**
+   * A lower line that stops only MANAGED sessions. Unattended overnight work is
+   * what can spend the week; the operator's own sessions keep answering past
+   * it. Independent of `enabled`, which belongs to the wall above.
+   */
+  managedCeilingPercent?: number | null;
   resetsAtIso?: string | null;
   note?: string;
 }
@@ -59,6 +65,9 @@ function show(): void {
   const pct = percent();
   const on = cfg.enabled !== false && existsSync(FILE);
   console.log(`  ceiling   ${on ? `${cfg.ceilingPercent ?? 96}%` : "off — nothing stops"}`);
+  console.log(
+    `  managed   ${typeof cfg.managedCeilingPercent === "number" ? `${cfg.managedCeilingPercent}% — managed sessions only` : "off"}`,
+  );
   console.log(`  now at    ${pct === null ? "unknown" : `${pct}%`}`);
   if (cfg.resetsAtIso) {
     const at = new Date(cfg.resetsAtIso);
@@ -71,7 +80,8 @@ function show(): void {
   console.log("");
   console.log("  Crossing the ceiling asks every WORKING managed session for a handover,");
   console.log("  pauses its arming, and refuses new prompts everywhere until the reset.");
-  console.log("  Sessions sitting idle are left alone.");
+  console.log("  Crossing the managed line does the same to managed sessions only;");
+  console.log("  everything else keeps answering. Sessions sitting idle are left alone.");
 }
 
 /**
@@ -176,6 +186,23 @@ export async function runBudget(args: string[]): Promise<void> {
     return;
   }
 
+  if (action === "managed") {
+    if (value === "off" || value === "clear") {
+      write({ ...cfg, managedCeilingPercent: null });
+      console.log("Managed line off. Managed sessions now stop only at the ceiling.");
+      return;
+    }
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0 || n > 100) {
+      console.error("Usage: aibroker budget managed <1-100|off>");
+      process.exit(1);
+    }
+    write({ ...cfg, managedCeilingPercent: n });
+    console.log(`Managed sessions stop at ${n}% of the weekly budget; everything else keeps going. Checking now:`);
+    checkNow();
+    return;
+  }
+
   if (action === "resets") {
     if (!value) {
       console.error('Usage: aibroker budget resets "2026-01-31T08:00"   (local time, or "clear")');
@@ -196,11 +223,12 @@ export async function runBudget(args: string[]): Promise<void> {
     return;
   }
 
-  console.log("Usage: aibroker budget [status|on|off|ceiling <n>|resets <time>]");
+  console.log("Usage: aibroker budget [status|on|off|ceiling <n>|managed <n|off>|resets <time>]");
   console.log("");
   console.log("  off            ignore the limit entirely — the escape hatch");
   console.log("  on             put the ceiling back");
-  console.log("  ceiling <n>    stop at n% of the weekly budget");
+  console.log("  ceiling <n>    stop EVERYTHING at n% of the weekly budget");
+  console.log("  managed <n>    stand MANAGED sessions down at n%, leave the rest running");
   console.log('  resets <time>  when the window reopens, e.g. "2026-01-31T08:00"');
   if (action) process.exit(1);
 }
