@@ -35,9 +35,66 @@
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { log } from "../core/log.js";
 import { audit } from "./audit.js";
 import { handleOAuthCallback } from "./todoist-oauth.js";
+import { handleA2A, a2aConfigured, type A2AContext } from "../a2a/server.js";
+import { funnelHostname } from "./funnel-watchdog.js";
+
+const __a2a_dirname = dirname(fileURLToPath(import.meta.url));
+function a2aPackageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(__a2a_dirname, "..", "..", "package.json"), "utf-8"));
+    return pkg.version ?? "unknown";
+  } catch { return "unknown"; }
+}
+
+/**
+ * Deliver framed A2A text to a session's mailbox — the same two-hop pattern
+ * deliverBatch() below uses for message-mode inbound routes, written again
+ * here rather than imported because that function is not exported and this
+ * module's public surface should not grow to accommodate it.
+ */
+async function deliverA2A(session: string, text: string): Promise<{ delivered: boolean; detail?: string }> {
+  try {
+    const { matchSession } = await import("../core/session-match.js");
+    const { snapshotAllSessions, isClaudeSession } = await import("../transport/sync-facade.js");
+    const { getAllPersistentSessionNames, lookupPersistentName } = await import("../core/persistence.js");
+    const { depositToSessionMailbox } = await import("../core/state.js");
+    const { submitAndConfirm } = await import("./dispatch.js");
+
+    const snapshots = snapshotAllSessions();
+    const names = getAllPersistentSessionNames();
+    const candidates = snapshots.map((s) => ({ id: s.id, name: lookupPersistentName(names, s.id, s.aibrokerId) ?? s.name }));
+    const hit = matchSession([session], candidates);
+    if (!hit) return { delivered: false, detail: `no live session matches "${session}"` };
+    if (!isClaudeSession(hit.session.id)) return { delivered: false, detail: `session "${hit.session.name}" is at a shell prompt` };
+
+    depositToSessionMailbox(hit.session.id, "a2a", text);
+    const ack = await submitAndConfirm(hit.session.id, text, 15_000, undefined, 1);
+    return { delivered: true, detail: ack ? "delivered" : "queued (session busy)" };
+  } catch (e) {
+    return { delivered: false, detail: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** AIBROKER_A2A_URL wins whole; else https://<public host>/a2a. Mirrors the
+ *  fallback core-handlers.ts already uses for other public-URL fields. */
+function buildA2AContext(): A2AContext {
+  return {
+    version: a2aPackageVersion(),
+    publicUrl: () => {
+      if (process.env.AIBROKER_A2A_URL) return process.env.AIBROKER_A2A_URL.replace(/\/+$/, "");
+      const host = process.env.AIBROKER_PUBLIC_HOST ?? funnelHostname().hostname ?? "unknown-host";
+      return `https://${host}/a2a`;
+    },
+    token: process.env.AIBROKER_A2A_TOKEN,
+    deliver: deliverA2A,
+  };
+}
 
 /** Prefix on anything an agent writes back to Todoist, so we ignore our own echo. */
 export const AGENT_MARK = "🤖";
@@ -605,7 +662,16 @@ async function handleInbound(
 /** Mirrors inbound.ts — kept local so this module has no load-time dependency on it. */
 const HOOK_PREFIX = "/hook/";
 
-export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Server {
+/**
+ * `cfg` is null when Todoist itself is not configured (or was refused —
+ * see the empty-ingress case in `startTodoistWebhook`). The listener still
+ * comes up whenever A2A needs it; every Todoist-shaped path below falls
+ * through to the same 404 an unknown route gets, so the two surfaces read
+ * as independent from the outside — a prober cannot tell "Todoist is off"
+ * from "no such route" any more than it already could tell a wrong secret
+ * from a nonexistent one.
+ */
+export function createWebhookServer(cfg: WebhookConfig | null, deps: WebhookDeps): Server {
   const seen = new SeenSet();
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -614,13 +680,25 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
       // OAuth landing is the one place here where the query IS the payload.
       const reqPath = (req.url ?? "/").split("?")[0];
 
-      if (req.method === "GET" && reqPath === cfg.oauthPath) {
+      if (cfg && req.method === "GET" && reqPath === cfg.oauthPath) {
         const url = new URL(req.url ?? "/", "http://localhost");
         const { status, html } = await handleOAuthCallback(url, {
           clientId: cfg.clientId,
           clientSecret: cfg.secret,
         });
         res.writeHead(status, { "content-type": "text/html; charset=utf-8" }).end(html);
+        return;
+      }
+
+      // A2A shares this listener for the same reason /hook/* does: a public
+      // HTTPS endpoint is the hard part to arrange, and this daemon already
+      // has one. Handled before the Todoist-specific checks so it can never
+      // be mistaken for a webhook and fail HMAC verification instead of
+      // authenticating on its own terms — handleA2A 404s anything that is
+      // not exactly one of its two routes, so nothing else here is shadowed.
+      if ((req.method === "GET" && reqPath === "/.well-known/agent-card.json") ||
+          (req.method === "POST" && reqPath === "/a2a")) {
+        await handleA2A(req, res, buildA2AContext());
         return;
       }
 
@@ -635,7 +713,9 @@ export function createWebhookServer(cfg: WebhookConfig, deps: WebhookDeps): Serv
         return;
       }
 
-      if (reqPath !== cfg.path) { res.writeHead(404).end(); return; }
+      // No Todoist config at all (A2A-only listener) is the same 404 as a
+      // path Todoist itself does not recognise.
+      if (!cfg || reqPath !== cfg.path) { res.writeHead(404).end(); return; }
 
       let raw: Buffer;
       try {
@@ -978,31 +1058,72 @@ export function webhookConfigFromEnv(): WebhookConfig | null {
   };
 }
 
-/** Start the receiver if configured. No-op otherwise. */
+/** Is Todoist itself configured — the client secret its webhooks are signed with? */
+export function todoistConfigured(): boolean {
+  return Boolean(process.env.TODOIST_CLIENT_SECRET);
+}
+
+/**
+ * Should the shared HTTP listener bind at all?
+ *
+ * Todoist and A2A are two independent callers of the one thing that is hard
+ * to arrange — a public HTTPS endpoint — sharing this listener the same way
+ * `/hook/*` already shares it with both. Neither may gate the other: an A2A
+ * agent gated behind an unrelated Todoist secret is not shippable, and
+ * Todoist must keep working exactly as before when A2A is untouched.
+ *
+ * `exposureFile` is a test seam — see `a2aConfigured()`.
+ */
+export function sharedListenerShouldStart(exposureFile?: string): boolean {
+  return todoistConfigured() || a2aConfigured(exposureFile);
+}
+
+/** Start the shared listener if either Todoist or A2A is configured. No-op otherwise. */
 export function startTodoistWebhook(deps: WebhookDeps): Server | null {
-  const cfg = webhookConfigFromEnv();
-  if (!cfg) {
-    log("todoist-webhook: not configured (set TODOIST_CLIENT_SECRET to enable)");
-    return null;
-  }
-  if (cfg.ingressProjectIds.size === 0) {
+  let cfg = webhookConfigFromEnv();
+  if (cfg && cfg.ingressProjectIds.size === 0) {
     // Refusing here is deliberate: with an empty allowlist the ingress would
     // accept work from every project on the account, including shared ones.
+    // This refuses Todoist ONLY — A2A, judged independently below, still
+    // gets the listener it needs.
     log("todoist-webhook: TODOIST_INGRESS_PROJECTS is empty — refusing to accept every project");
+    cfg = null;
+  }
+  // Same rule as `sharedListenerShouldStart()`, evaluated against `cfg` (not
+  // the raw `todoistConfigured()`) so Todoist's own empty-ingress veto above
+  // still holds: a secret with nothing it may touch is not "configured"
+  // enough to justify starting the listener on its account alone.
+  const todoistOn = cfg !== null;
+  const a2aOn = a2aConfigured();
+  if (!todoistOn && !a2aOn) {
+    log("todoist-webhook: not configured (set TODOIST_CLIENT_SECRET to enable) — " +
+        "A2A not configured either (AIBROKER_A2A_TOKEN/AIBROKER_A2A_URL unset, nothing exposed) — listener not started");
     return null;
   }
 
+  // Port/bind are read the same way regardless of who asked for the
+  // listener: binding a socket is not a Todoist-specific decision, and
+  // `aibroker a2a setup` already assumes this exact precedence (a2a-cli.ts)
+  // when it tells Tailscale Funnel / a reverse proxy where to forward.
+  const port = Number(process.env.AIBROKER_A2A_PORT ?? process.env.TODOIST_WEBHOOK_PORT) || 8766;
+  const bind = process.env.TODOIST_WEBHOOK_BIND ?? "127.0.0.1";
+
   const server = createWebhookServer(cfg, deps);
-  if (cfg.bind !== "127.0.0.1" && cfg.bind !== "localhost") {
-    log(`todoist-webhook: WARNING binding ${cfg.bind}, not loopback — this puts an execution ingress ` +
+  if (cfg && bind !== "127.0.0.1" && bind !== "localhost") {
+    log(`todoist-webhook: WARNING binding ${bind}, not loopback — this puts an execution ingress ` +
         `directly on the network. Prefer loopback with a TLS proxy (Tailscale Funnel, Cloudflare Tunnel, Caddy) in front.`);
   }
-  server.listen(cfg.port, cfg.bind, () => {
-    log(`todoist-webhook: listening on ${cfg.bind}:${cfg.port}${cfg.path}, ` +
-        `${cfg.ingressProjectIds.size} ingress project(s), default owner ${cfg.defaultOwner ?? "(none)"}`);
-    log(`todoist-webhook: OAuth landing on ${cfg.oauthPath}` +
-        (cfg.clientId ? "" : " — inert until TODOIST_CLIENT_ID is set"));
+  server.listen(port, bind, () => {
+    const surfaces = [
+      cfg ? `todoist (${cfg.ingressProjectIds.size} ingress project(s), default owner ${cfg.defaultOwner ?? "(none)"})` : null,
+      a2aOn ? "a2a" : null,
+    ].filter((s): s is string => s !== null).join(", ");
+    log(`shared-listener: listening on ${bind}:${port} — ${surfaces}`);
+    if (cfg) {
+      log(`todoist-webhook: OAuth landing on ${cfg.oauthPath}` +
+          (cfg.clientId ? "" : " — inert until TODOIST_CLIENT_ID is set"));
+    }
   });
-  server.on("error", (err) => log(`todoist-webhook: server error — ${err.message}`));
+  server.on("error", (err) => log(`shared-listener: server error — ${err.message}`));
   return server;
 }

@@ -39,6 +39,7 @@ import {
   describeControls,
   screenGrantedClause,
 } from "./pointer-controls.js";
+import { AG2_SPEC } from "./agentish.js";
 
 const STATE_FILE = join(homedir(), ".aibroker", "managers.json");
 
@@ -1451,7 +1452,15 @@ function goalText(m: ManagedSession): string {
         const lease = screenLease(m, Date.now());
         return lease ? screenGrantedClause(lease.until, !rules) : "";
       })();
-  return composeGoal(m.objective, rules, hands, extra, standingRulesSource());
+  // AG2 goes first, ahead of the objective and the standing rules, on every
+  // arming — not once at setup. A managed session works unattended for hours
+  // and a reminder given only at the start does not survive a compaction or a
+  // `/clear`. This is folded into composeGoal's own objective argument, not
+  // spliced in afterwards, so the ordering it produces (task, then rules,
+  // then right-now context) still holds with AG2 simply riding in front of
+  // the task. What a managed session sends the operator, and what it commits
+  // to git, stays prose either way — AG2 is only how agents talk to agents.
+  return composeGoal(`${AG2_SPEC} ${m.objective}`, rules, hands, extra, standingRulesSource());
 }
 
 /**

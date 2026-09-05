@@ -168,6 +168,18 @@ switch (command) {
     break;
   }
 
+  case "a2a": {
+    const { runA2A } = await import("./a2a-cli.js");
+    await runA2A(rest);
+    break;
+  }
+
+  case "agentish": {
+    const { runAgentish } = await import("./agentish-cli.js");
+    await runAgentish(rest);
+    break;
+  }
+
   case "budget": {
     const { runBudget } = await import("./budget-cli.js");
     await runBudget(rest);
@@ -316,6 +328,7 @@ switch (command) {
     console.log("  ask <project>      Ask a session a question and wait for its reply (--stdin --json)");
     console.log("  audit              What one session did to another (--session|--trace|--bodies)");
     console.log("  todoist <sub>      Todoist inbound channel: auth|status");
+    console.log("  agentish <verb>    AG2 wire format: spec|check|measure");
     console.log("  help               Show this help");
     console.log("\nFlags:");
     console.log("  --version, -v      Show version");
@@ -323,6 +336,6 @@ switch (command) {
 
   default:
     console.error(`Unknown command: ${command}`);
-    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|sessions|dispatch|ask|audit|inbound|issue|help]");
+    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|sessions|dispatch|ask|audit|inbound|issue|agentish|help]");
     process.exit(1);
 }
