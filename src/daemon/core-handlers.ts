@@ -2012,4 +2012,43 @@ export function registerCoreHandlers(
       },
     };
   });
+
+  /**
+   * Reply to an A2A task addressed to THIS session. Same identity path as
+   * subscribe_issues above: resolved from the caller's persistent name,
+   * never from a parameter — a `session` field here would let any caller
+   * answer any task, which is exactly the boundary inbound routes and forge
+   * subscriptions both hold.
+   */
+  server.on("a2a_reply", async (req) => {
+    const { taskId, text } = req.params as { taskId?: string; text?: string };
+    if (!taskId || !text) return { ok: false, error: "taskId and text are required" };
+
+    const { getTask } = await import("../a2a/tasks.js");
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: `no such task: ${taskId}` };
+
+    const id = callerItermId(req);
+    const snap = id ? snapshotAllSessions().find((s) => s.id === id) : undefined;
+    const caller = snap
+      ? lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId)
+      : undefined;
+    if (!caller || caller.toLowerCase() !== task.session.toLowerCase()) {
+      audit({
+        action: "a2a-reply", actor: caller ? `session:${caller}` : "unknown-session",
+        target: `a2a:${taskId}`, outcome: "refused",
+        reason: `task is addressed to "${task.session}"`,
+      });
+      return { ok: false, error: `task ${taskId} is not addressed to this session` };
+    }
+
+    const { applyA2AReply } = await import("../a2a/server.js");
+    const result = applyA2AReply(taskId, text);
+    if (!result) return { ok: false, error: `no such task: ${taskId}` };
+    audit({
+      action: "a2a-reply", actor: `session:${caller}`, target: `a2a:${taskId}`,
+      outcome: result.task.state, body: text, meta: { agentishOk: result.ag2?.ok },
+    });
+    return { ok: true, result: { state: result.task.state, agentishOk: result.ag2?.ok } };
+  });
 }

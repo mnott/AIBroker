@@ -475,6 +475,9 @@ Addressing is explicit: `hub:machine-b/session:abc` routes through the bridge to
 | [routing.md](docs/routing.md) | Message routing logic and channel system |
 | [sessions.md](docs/sessions.md) | Session management and lifecycle |
 | [commands.md](docs/commands.md) | Slash command reference |
+| [agentish.md](docs/agentish.md) | AG2: the wire format sessions use to talk to each other |
+| [a2a-agentish-extension.md](docs/a2a-agentish-extension.md) | AG2 declared as an A2A protocol extension (definition + helpers, no transport) |
+| [a2a.md](docs/a2a.md) | A2A v0.3.0 transport: expose sessions as skills for outside agents to task, and task outside agents from a session |
 | [mcp-tools.md](docs/mcp-tools.md) | All 42 MCP tools with parameters |
 | [adapters.md](docs/adapters.md) | Adapter development guide |
 | [pailot.md](docs/pailot.md) | PAILot iOS app integration |

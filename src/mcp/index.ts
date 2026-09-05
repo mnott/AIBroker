@@ -437,6 +437,53 @@ server.tool(
 );
 
 server.tool(
+  "aibroker_a2a_reply",
+  "Reply to an A2A task addressed to THIS session (one that arrived framed as [A2A:...][task <id>]). A reply that reads as a question leaves the task input-required; anything else completes it.",
+  { taskId: z.string().min(1), body: z.string().min(1) },
+  async ({ taskId, body }) => {
+    try {
+      const r = (await hub.call_raw("a2a_reply", { taskId, text: body })) as { state?: string; agentishOk?: boolean };
+      const ag2 = r.agentishOk === false ? " (AG2 in your reply did not validate)" : "";
+      return ok(`Task ${taskId} → ${r.state ?? "updated"}${ag2}`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_a2a_send",
+  "Task an OUTSIDE A2A agent's exposed skill. Returns the task id and state; poll it with aibroker_a2a_get. Reaches OUT to a URL you name — unlike aibroker_a2a_reply, which answers something already addressed to you, this does not go through the daemon's permission model.",
+  {
+    url: z.string().min(1).describe("The agent's A2A endpoint, e.g. https://agent.example.org/a2a"),
+    skill: z.string().optional().describe("skillId from the agent's card, if it has one"),
+    body: z.string().min(1),
+    ag2: z.boolean().optional().describe("Tag the message as an Agentish v2 (AG2) part"),
+    token: z.string().optional().describe("Bearer token, if the agent requires one"),
+  },
+  async ({ url, skill, body, ag2, token }) => {
+    try {
+      const { sendMessage } = await import("../a2a/client.js");
+      const r = await sendMessage(url, { skillId: skill, text: body, ag2, token });
+      if (!r.ok) return err(new Error(r.error));
+      return ok(`task ${r.task!.id} (${r.task!.status.state})`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_a2a_get",
+  "Poll an A2A task by id from the agent that owns it.",
+  { url: z.string().min(1), taskId: z.string().min(1), token: z.string().optional() },
+  async ({ url, taskId, token }) => {
+    try {
+      const { getTask } = await import("../a2a/client.js");
+      const r = await getTask(url, taskId, token);
+      if (!r.ok) return err(new Error(r.error));
+      return ok(JSON.stringify(r.task, null, 2));
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
   "aibroker_rename",
   "Rename the current Claude session (tab title + registry)",
   { name: z.string().min(1).describe("New session name") },
@@ -715,7 +762,7 @@ server.tool(
 
 server.tool(
   "aibroker_send_to_session",
-  "Send a message to another iTerm2 session by typing it into the session's terminal AND depositing it into that session's AIBP mailbox. The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can read structured messages via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message. The result distinguishes `delivered: true` (the target was observed taking it) from `delivered: false, queued: true` (typed but unconfirmed — the target is probably mid-task; the message is in its mailbox). Do not read ok:true as \"they have seen it\".",
+  "Send a message to another iTerm2 session by typing it into the session's terminal AND depositing it into that session's AIBP mailbox. The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can read structured messages via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message. The result distinguishes `delivered: true` (the target was observed taking it) from `delivered: false, queued: true` (typed but unconfirmed — the target is probably mid-task; the message is in its mailbox). Do not read ok:true as \"they have seen it\". Text to another Claude session is Agentish v2 (AG2); only text to the operator and to git is prose. `aibroker agentish spec` prints the format.",
   {
     target: z.string().min(1).describe("Session to send to: index (1-based), name substring, or iTerm2 session UUID"),
     message: z.string().min(1).describe("The raw message content. Do NOT include a [Session:...] prefix — the hub auto-prepends [Session:SENDER_NAME] for routing."),
