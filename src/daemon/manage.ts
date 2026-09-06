@@ -30,6 +30,7 @@ import { typeIntoSession } from "../transport/sync-facade.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
+import { captureSessionPng } from "./screenshot.js";
 import { listDialogs, answerDialog } from "./dialogs.js";
 import {
   readControls,
@@ -129,6 +130,34 @@ const HANDOVER_GRACE_MS = 6 * 60_000;
 const STUCK_AFTER_MS = 12 * 60_000;
 
 /**
+ * How long a session may sit with arming failing before it is treated as
+ * BLOCKED rather than merely slow to confirm.
+ *
+ * This is the content-agnostic path, for the case the fast prompt-text match
+ * cannot see: a native macOS dialog (a permission or security escalation
+ * that even bypass mode raises) steals keyboard focus without leaving any
+ * trace in the pane it sits in front of. Nothing distinguishes that from an
+ * ordinary slow turn except that arming keeps failing — so this fires only
+ * once BOTH are true: ARM_ATTEMPTS have already failed, and the screen still
+ * has not moved since. Three minutes, not twelve, because a session already
+ * failing to arm is already a worse sign than a merely quiet one.
+ */
+const BLOCKED_STATIC_MS = 3 * 60_000;
+
+/**
+ * How long to wait before re-alerting the operator about a BLOCKED session.
+ *
+ * The overnight failure this exists for produced the same log line every
+ * tick for four hours with nobody told. The opposite fault — a buzz every
+ * 20 seconds for as long as the dialog sits there — is nearly as bad, since
+ * an alert that repeats every tick teaches its reader to swipe it away
+ * unread. Fifteen minutes says it once, then again if it is still true a
+ * while later, which is the shape a "you need to look at this" message
+ * should have.
+ */
+const BLOCKED_REALERT_MS = 15 * 60_000;
+
+/**
  * The startup banner, which is the pane's only POSITIVE evidence of a clear.
  *
  * The first version of this test asked the opposite question — whether the
@@ -218,6 +247,26 @@ const OUT_OF_GOAL = [
   /could not achieve the goal/i,
 ];
 
+/**
+ * Whether the pane is showing a Claude Code permission/approval prompt.
+ *
+ * Kept deliberately narrow. A busy pane and a stuck one both look the same
+ * to a change-hash — nothing moves — so telling them apart has to come from
+ * the actual words on screen, and the words checked here are ones a genuine
+ * permission dialog produces and very little else does. A background-agent
+ * status line ("Waiting for 1 background agent to finish") or a bare shell
+ * prompt must both read as false here, or every long tool call starts
+ * looking like a stuck session and the manager stops arming real work.
+ */
+export function pendingPrompt(content: string): boolean {
+  return (
+    /Do you want to proceed\?/i.test(content) ||
+    /tell Claude what to do differently/i.test(content) ||
+    /❯\s*\d+\.\s*(Yes|No)\b/.test(content) ||
+    /Yes,\s*and don'?t ask again/i.test(content)
+  );
+}
+
 export interface ManagedSession {
   sessionId: string;
   /** Human name at the time of starting, for logs only — sessions get renamed. */
@@ -252,6 +301,35 @@ export interface ManagedSession {
   clearAfterHandover?: boolean;
   /** Consecutive armings typed but never seen to land. Bounded — see ARM_ATTEMPTS. */
   armFails?: number;
+  /**
+   * Consecutive arm-failure CAPS crossed, never reset by hitting the cap.
+   *
+   * `armFails` resets to 0 the instant it reaches ARM_ATTEMPTS, which is right
+   * for the backoff mechanics but wrong for detecting a genuinely stuck
+   * session: a content-agnostic "are we stuck" check keyed off `armFails`
+   * never sees anything but 0..ARM_ATTEMPTS-1. This survives that reset, so
+   * `blockedReason` has something durable to look at.
+   */
+  armFailStreak?: number;
+  /**
+   * When arming first crossed ARM_ATTEMPTS and the manager gave up typing at
+   * this session. Distinct from `blockedSince` (when the operator was told):
+   * this is set the moment the streak crosses the cap, `blockedSince` only
+   * once the pane has also gone static long enough to confirm it.
+   */
+  stuckSince?: number;
+  /**
+   * When this session was first seen BLOCKED — waiting on a permission
+   * prompt or similar, not merely idle. Kept across ticks so the operator
+   * can be told how long it has actually been stuck, not just that it is.
+   * Cleared the moment it stops looking blocked, so a later block re-alerts
+   * fresh rather than inheriting a stale duration.
+   */
+  blockedSince?: number;
+  /** When the operator was last alerted about this BLOCKED session — the
+   *  dedup clock. See BLOCKED_REALERT_MS: without this, every 20-second tick
+   *  the pane still shows the prompt would be its own alert. */
+  blockedAlertedAt?: number;
   /** When a handover was last obtained, so it is not demanded every tick. */
   handoverDoneAt?: number;
   /** The context reading when it was obtained, so "how much work since" is
@@ -723,6 +801,36 @@ function alertOperator(text: string): void {
 function reportToOperator(text: string): void {
   if (!hasPailotClients()) return;
   alertOperator(text);
+}
+
+/**
+ * Alert the operator about a BLOCKED session, with a screenshot if one can
+ * be had.
+ *
+ * A picture of the actual prompt is worth having — "blocked" alone does not
+ * say whether it is a two-line yes/no or a wall of text — but capturing one
+ * means stealing the operator's window focus for a moment (see
+ * captureSessionPng), so it is only attempted at all when a phone is
+ * actually there to receive it. Any failure along the way — no client
+ * connected, the window could not be found, the capture itself errored —
+ * falls back to the plain text alert rather than saying nothing.
+ */
+async function alertBlocked(m: ManagedSession, caption: string): Promise<void> {
+  if (hasPailotClients()) {
+    try {
+      const shot = await captureSessionPng(m.sessionId);
+      if (shot) {
+        getAibpBridge()?.routeToMobile(m.sessionId, caption, "IMAGE", {
+          imageBase64: shot.buffer.toString("base64"),
+          mimeType: shot.mime,
+        });
+        return;
+      }
+    } catch (e) {
+      log(`[manage:${m.name}] blocked-alert screenshot failed — ${(e as Error).message}`);
+    }
+  }
+  alertOperator(caption);
 }
 
 /**
@@ -1568,6 +1676,42 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   return false;
 }
 
+/**
+ * Why a managed session should be treated as BLOCKED — waiting on a human
+ * decision arming cannot supply — rather than merely idle or slow.
+ *
+ * Two paths, checked in this order because they answer different questions.
+ * The fast path reads the words on screen and needs nothing else: a
+ * permission prompt IS a permission prompt the instant it appears, however
+ * recently the pane last changed. The slow path exists for what the fast one
+ * cannot see — a native macOS dialog steals keyboard focus and leaves no
+ * trace in the terminal's own buffer — so it infers the same state from
+ * arming's own repeated failure instead: ARM_ATTEMPTS have already come back
+ * unconfirmed AND the screen has still not moved since. Neither signal alone
+ * would be trustworthy (a slow turn fails to arm too; a quiet pane is often
+ * just a quiet pane) but together they are the two ways this actually
+ * happens.
+ *
+ * Returns the reason string rather than a boolean because the caller puts it
+ * straight into the operator alert — computing it a second time to describe
+ * what the first computation found is how the two descriptions drift apart.
+ */
+export function blockedReason(
+  m: Pick<ManagedSession, "armFailStreak" | "stuckSince" | "lastChangeAt">,
+  content: string,
+  now: number,
+): string | null {
+  if (pendingPrompt(content)) return "permission prompt";
+  const quietFor = now - (m.lastChangeAt ?? now);
+  // Stuck = we tried to arm repeatedly (streak survived the cap reset) AND,
+  // now that we have stopped typing, the pane has gone static. The static
+  // check matters because our own arming used to keep the pane changing.
+  if (m.stuckSince !== undefined && quietFor >= BLOCKED_STATIC_MS) {
+    return `stuck ${Math.round((now - m.stuckSince) / 60_000)}m, input not accepted`;
+  }
+  return null;
+}
+
 function reasonToArm(m: ManagedSession, content: string, now: number): string | null {
   if (m.paused) return null;
 
@@ -1706,8 +1850,16 @@ async function tick(): Promise<void> {
      * turn, costing nothing; against a dead one it is the whole recovery. The
      * asymmetry is the argument — and it is why this fires on a signal as crude
      * as "nothing changed", which no more precise test would improve on.
+     *
+     * Excluded once `stuckSince` is set: that means arming has already been
+     * tried and failed enough to be classed as stuck, and this backstop's
+     * response — type into it, and count the typing itself as a change — is
+     * exactly the loop the blocked-alert exists to stop. Firing here would
+     * reset `lastChangeAt` right when the blocked check needs it to keep
+     * climbing, silently clearing the confirmed-blocked state without the
+     * session having moved at all.
      */
-    if (!m.paused && !m.handoverAskedAt && now - m.lastChangeAt > STUCK_AFTER_MS) {
+    if (!m.paused && !m.handoverAskedAt && !m.stuckSince && now - m.lastChangeAt > STUCK_AFTER_MS) {
       notify(
         m,
         `nothing has moved on that screen for ${minutesSince(m.lastChangeAt, now)} — arming, because a managed session is never meant to be still this long`,
@@ -2114,6 +2266,67 @@ async function tick(): Promise<void> {
       }
     }
 
+    /**
+     * BLOCKED: waiting on a human decision that arming cannot supply.
+     *
+     * This is the fix for a session that hit a permission or security
+     * prompt overnight — even bypass mode escalates some of these — and sat
+     * answered by nobody for four hours while the manager kept typing the
+     * goal at it and logging "will retry". Typing MORE text at a modal does
+     * not help; at best it queues, at worst it lands somewhere the operator
+     * never sees. So this is checked BEFORE any arm attempt below, and it
+     * never answers the prompt itself — only says, loudly, that it exists.
+     *
+     * Gated on holding a screen grant (`lease`, computed above) because
+     * confirming a screenshot requires bringing that iTerm2 window to the
+     * front via AppleScript, which steals whatever window currently has the
+     * operator's focus. Without a grant that is not this manager's window to
+     * take, so a session in that state gets no special handling here and
+     * simply keeps going through the ordinary arm path below — worse than
+     * ideal, but never worse than before this existed.
+     */
+    if (!m.paused && lease) {
+      const blocked = blockedReason(m, content, now);
+      if (blocked) {
+        if (!m.blockedAlertedAt || now - m.blockedAlertedAt >= BLOCKED_REALERT_MS) {
+          const quietMin = Math.round(Math.max(0, now - m.lastChangeAt) / 60_000);
+          m.blockedSince ??= now;
+          m.blockedAlertedAt = now;
+          const caption =
+            `⚠️ ${m.name} looks blocked (${blocked}) — no change for ${quietMin}m. ` +
+            `Needs your approve/decline; I will not answer it.`;
+          void alertBlocked(m, caption);
+          note(m, `blocked (${blocked}) — alerted the operator, not arming`);
+          dirty = true;
+        }
+        continue;
+      }
+      // Recovery. Gated on having ALREADY confirmed-and-alerted a block —
+      // not merely on armFailStreak/stuckSince being set — because quietFor
+      // is, by construction, still under BLOCKED_STATIC_MS for the entire
+      // ramp from "stuck" to "confirmed blocked": clearing on that alone
+      // would wipe stuckSince on the very next tick, every time, and the
+      // alert below would never get a chance to fire. Once blockedSince
+      // exists, though, BLOCKED_STATIC_MS of true silence already elapsed,
+      // so a later drop in quietFor is unambiguously the session moving on
+      // its own, not an artifact of this manager's own last typed attempt.
+      if (m.blockedSince !== undefined || m.blockedAlertedAt !== undefined) {
+        m.armFailStreak = 0;
+        delete m.stuckSince;
+        delete m.blockedSince;
+        delete m.blockedAlertedAt;
+        dirty = true;
+      }
+    }
+
+    // Once arming has failed enough to be considered stuck, stop typing into
+    // the session — the only way BLOCKED_STATIC_MS of true quiet is ever
+    // reached is if this manager is not the one refreshing the pane every
+    // REARM_COOLDOWN_MS. This is what actually fixes the overnight bug: the
+    // old code kept re-arming (and re-spamming) forever because each retype
+    // reset lastChangeAt and the freeze detector never got a quiet window.
+    if (m.stuckSince !== undefined) continue;
+
     if (now - m.lastRearmAt < REARM_COOLDOWN_MS) continue;
 
     const reason = reasonToArm(m, content, now);
@@ -2140,16 +2353,28 @@ async function tick(): Promise<void> {
     dirty = true;
     if (armed) {
       m.armFails = 0;
+      m.armFailStreak = 0;
+      delete m.stuckSince;
+      delete m.blockedSince;
+      delete m.blockedAlertedAt;
       continue;
     }
     m.armFails = (m.armFails ?? 0) + 1;
+    m.armFailStreak = (m.armFailStreak ?? 0) + 1;
     if (m.armFails >= ARM_ATTEMPTS) {
       m.armFails = 0;
       m.lastRearmAt = now;
-      notify(
+      m.stuckSince ??= now;
+      // No operator push here. Pushing on every cap is the 144-alerts-overnight
+      // bug: this fires again every ~2-4 minutes for as long as arming keeps
+      // failing, and it is content-agnostic — it cannot tell "mid-turn, will
+      // clear itself" from "stuck on a modal for hours". The blocked check
+      // above owns the operator alert now: it has `armFailStreak`/`stuckSince`
+      // (which survive this reset) plus a static-pane confirmation, and its
+      // own BLOCKED_REALERT_MS dedup. This stays log-only.
+      note(
         m,
-        `typed the goal ${ARM_ATTEMPTS} times without being able to confirm it landed — stopping, so it is not queued again. ` +
-          `The session is usually mid-turn when this happens; it stays managed and will arm at the next real lapse.`,
+        `arming keeps failing (streak ${m.armFailStreak}) — holding off; the blocked check owns the operator alert now`,
       );
     }
   }
