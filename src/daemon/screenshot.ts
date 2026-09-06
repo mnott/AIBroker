@@ -17,6 +17,7 @@ import {
   runAppleScript,
   stripItermPrefix,
   snapshotAllSessions,
+  withSessionAppleScript,
 } from "../adapters/iterm/core.js";
 import { listClaudeSessions } from "../adapters/iterm/sessions.js";
 import { log } from "../core/log.js";
@@ -134,6 +135,64 @@ end tell`;
   }
 }
 
+/**
+ * Find the iTerm2 window containing a session and select its tab.
+ *
+ * `screencapture -l` captures whatever tab is currently visible in the
+ * window, so the tab holding the target session has to be brought to the
+ * front first — this is that step, shared by the ctx-driven screenshot and
+ * the headless capture below. Returns "" if the session cannot be found.
+ */
+function resolveWindowIdForSession(sessionId: string): string {
+  const script = withSessionAppleScript(
+    sessionId,
+    `          select aTab\n          return (id of aWindow as text)`,
+    'return ""',
+  );
+  const result = runAppleScript(script);
+  return result?.trim() ?? "";
+}
+
+/**
+ * Capture a window to a PNG buffer via `screencapture`.
+ *
+ * Throws on failure (screen lock, bad window id, etc.) — callers that want a
+ * text fallback catch it themselves; `captureSessionPng` below catches it to
+ * return null instead, since a headless caller has no text fallback to run.
+ */
+function capturePngForWindow(windowId: string): Buffer {
+  const filePath = join(tmpdir(), `aibroker-screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+  try {
+    execSync(`/usr/sbin/screencapture -x -l ${windowId} "${filePath}"`, { timeout: 15_000 });
+    return readFileSync(filePath);
+  } finally {
+    try { unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Headless screenshot capture — no CommandContext, no reply channel.
+ *
+ * For a caller (the daemon manager alerting the operator about a stuck
+ * session) that has a bare iTerm2 sessionId and wants PNG bytes back
+ * directly, with no session-lookup fallbacks and no text-mode fallback:
+ * either this session's window is found and captured, or null comes back
+ * and the caller decides what to do (e.g. fall back to a text alert).
+ */
+export async function captureSessionPng(sessionId: string): Promise<{ buffer: Buffer; mime: string } | null> {
+  try {
+    const windowId = resolveWindowIdForSession(sessionId);
+    if (!windowId) return null;
+    // Brief delay for the just-selected tab to render before capture.
+    spawnSync("sleep", ["0.3"]);
+    const buffer = capturePngForWindow(windowId);
+    return { buffer, mime: "image/png" };
+  } catch (err) {
+    log(`captureSessionPng: failed — ${(err as Error).message}`);
+    return null;
+  }
+}
+
 let _screenshotInFlight = false;
 
 export async function handleScreenshot(ctx: CommandContext): Promise<void> {
@@ -189,8 +248,6 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
 
   await ctx.reply("Capturing screenshot...");
 
-  const filePath = join(tmpdir(), `aibroker-screenshot-${Date.now()}.png`);
-
   try {
     // Resolve the window
     let windowId: string = "";
@@ -222,21 +279,7 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
     // Find the window and SELECT the tab containing the target session
     // screencapture -l captures the visible tab, so we must switch to it
     if (itermSessionId) {
-      const findAndSelectScript = `tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if id of s is "${itermSessionId}" then
-          select t
-          return (id of w as text)
-        end if
-      end repeat
-    end repeat
-  end repeat
-  return ""
-end tell`;
-      const findResult = runAppleScript(findAndSelectScript);
-      windowId = findResult?.trim() ?? "";
+      windowId = resolveWindowIdForSession(itermSessionId);
       // Brief delay for tab to render
       if (windowId) {
         spawnSync("sleep", ["0.3"]);
@@ -255,9 +298,7 @@ end tell`;
     }
 
     log(`/ss: capturing window ${windowId}`);
-    execSync(`/usr/sbin/screencapture -x -l ${windowId} "${filePath}"`, { timeout: 15_000 });
-
-    const buffer = readFileSync(filePath);
+    const buffer = capturePngForWindow(windowId);
 
     // Send to PAILot WebSocket clients (skip if request came from PAILot)
     if (ctx.source !== "pailot") broadcastImage(buffer, "Screenshot");
@@ -273,10 +314,7 @@ end tell`;
     // If screencapture failed (e.g. screen locked but ioreg didn't detect it,
     // or "could not create image from rect"), fall back to text mode
     log("/ss: falling back to terminal text capture");
-    try { unlinkSync(filePath); } catch { /* ignore */ }
     await handleTextScreenshot(ctx);
     return;
-  } finally {
-    try { unlinkSync(filePath); } catch { /* ignore */ }
   }
 }
