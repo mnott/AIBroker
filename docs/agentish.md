@@ -64,6 +64,23 @@ outcome character, not a list.
 Carrying AG2 over A2A instead of AIBroker's own IPC: see
 `docs/a2a-agentish-extension.md`.
 
+### Symbols and `expand`
+
+A long path repeated across several lines — or several messages in the same
+thread — is the compression AG2 gives up the most tokens for free: declare it
+once as `@n=path` on its own line, then write `@n:220` wherever the file and
+line would otherwise be spelled out again. `check` resolves these against
+`earlier[]` too, so a reply can reuse a symbol a `T` declared without
+repeating it.
+
+That compactness is lossless — `aibroker agentish expand` recovers the full
+form. It inlines every `@n` reference back to its declared path (keeping any
+`:line(...)` suffix attached) and drops the now-redundant `@n=path`
+declaration lines, so a compressed message round-trips to one a human can
+read without holding the symbol table in their head. A reference to a symbol
+nothing declared is left as-is and reported (`E_REF_UNDECLARED`) rather than
+silently dropped or corrupting the rest of the message.
+
 ### A task (`T`)
 
 ```
@@ -99,10 +116,11 @@ instead requires a `y=` explaining why; so does naming a `worst=` issue.
 ## CLI
 
 ```
-aibroker agentish spec [--json]                       the format, plus the extensions this validator adds
-aibroker agentish check <file|-> [earlier...] [--json] validate a message; earlier messages supply @n symbols
-aibroker agentish measure <file> <prose-file>          token count, agentish vs. a prose twin
-aibroker agentish stats [--since YYYY-MM-DD] [--json]  AG2 vs. prose on real traffic — see "Measuring", below
+aibroker agentish spec [--json]                        the format, plus the extensions this validator adds
+aibroker agentish check <file|-> [earlier...] [--json]  validate a message; earlier messages supply @n symbols
+aibroker agentish expand <file|-> [earlier...] [--json] decompress: inline every @n reference to its declared path
+aibroker agentish measure <file> <prose-file>           token count, agentish vs. a prose twin
+aibroker agentish stats [--since YYYY-MM-DD] [--json]   AG2 vs. prose on real traffic — see "Measuring", below
 ```
 
 Without `--json`, `check` prints one `ERR ...` line per problem, then a
@@ -113,13 +131,18 @@ stdin. With `--json`, `check` prints:
 {"version":"2","kind":"T","fields":{"...":"..."},"errors":[{"code":"E_REQUIRED","message":"T requires t","line":1}],"ok":false}
 ```
 
+`expand` follows the same shape: without `--json` it prints one `ERR ...`
+line per dangling reference, then the expanded message; with `--json` it
+prints `{"version":"2","expanded":"...","symbols":{"a":"..."},"errors":[...],"ok":true}`.
+
 `spec --json` prints `{"version":"2","spec":"...","extensions":"...","uri":"urn:aibroker:a2a:ext:agentish:2"}`.
 
-**Exit codes** (`check`, `measure`): `0` the message is valid, `1` it parsed
-but failed validation, `2` the invocation itself was wrong — bad usage, or a
-file that could not be read. This distinction exists so a CI step can tell
-"the message you gave me is bad" from "I couldn't even read what you gave
-me" without parsing stderr.
+**Exit codes** (`check`, `expand`, `measure`): `0` the message is valid (or,
+for `expand`, every reference resolved), `1` it parsed but failed validation
+(or, for `expand`, at least one reference was left dangling), `2` the
+invocation itself was wrong — bad usage, or a file that could not be read.
+This distinction exists so a CI step can tell "the message you gave me is
+bad" from "I couldn't even read what you gave me" without parsing stderr.
 
 ## Validator rules
 

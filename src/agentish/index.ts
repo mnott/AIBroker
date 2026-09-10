@@ -124,6 +124,29 @@ function splitOnce(s: string, sep: string): [string, string] {
   return i < 0 ? [s, ""] : [s.slice(0, i), s.slice(i + 1)];
 }
 
+/** `@n=path` on its own line — a symbol declaration. Returns null if `l`
+ * isn't one. Shared between `check` (which needs the symbols) and `expand`
+ * (which also needs to know which lines to drop, since a declaration is
+ * inlined rather than reprinted). */
+function parseDeclaration(l: string): { sym: string; path: string } | null {
+  if (!(l.startsWith("@") && l.includes("="))) return null;
+  const [sym, path] = splitOnce(l.slice(1), "=");
+  return { sym: sym.trim(), path: path.trim() };
+}
+
+/** Split a `k=v` or `k:v` line into its separator and raw (untrimmed-value)
+ * parts, the same way `check` has always chosen between `=` and `:` — `=`
+ * wins unless a `:` appears first. Returns null when neither separator is
+ * present. Shared between `check` and `expand`. */
+function splitKeyLine(l: string): { sep: string; rawKey: string; rawValue: string } | null {
+  const eq = l.indexOf("=");
+  const colon = l.indexOf(":");
+  const sep = eq >= 0 && (colon < 0 || eq < colon) ? "=" : ":";
+  if (l.indexOf(sep) < 0) return null;
+  const [rawKey, rawValue] = splitOnce(l, sep);
+  return { sep, rawKey, rawValue };
+}
+
 /** `Name+` → `+`, `Name=+` → `+`, bare `+` → `+`. */
 function outcomeOf(entry: string): string {
   const e = entry.trim();
@@ -192,19 +215,17 @@ export function check(msg: string, earlier: string[] = []): AgentishCheckResult 
   for (let i = 1; i < ls.length; i++) {
     const l = ls[i];
     const lineNo = i + 1;
-    if (l.startsWith("@") && l.includes("=")) {
-      const [sym, path] = splitOnce(l.slice(1), "=");
-      symbols[sym.trim()] = path.trim();
+    const decl = parseDeclaration(l);
+    if (decl) {
+      symbols[decl.sym] = decl.path;
       continue;
     }
-    const eq = l.indexOf("=");
-    const colon = l.indexOf(":");
-    const sep = eq >= 0 && (colon < 0 || eq < colon) ? "=" : ":";
-    if (l.indexOf(sep) < 0) {
+    const kv = splitKeyLine(l);
+    if (!kv) {
       fail("E_PARSE", `not k=v: ${JSON.stringify(l.slice(0, 40))}`, lineNo);
       continue;
     }
-    const [rawKey, rawValue] = splitOnce(l, sep);
+    const { rawKey, rawValue } = kv;
     const k = KEYS[rawKey.trim()] ?? rawKey.trim();
     if (k in fields) fail("E_DUP", `duplicate key ${k}`, lineNo);
     fields[k] = rawValue.trim();
@@ -283,6 +304,93 @@ export function check(msg: string, earlier: string[] = []): AgentishCheckResult 
   }
 
   return { kind, fields, symbols, errors, details };
+}
+
+/** Matches a symbol reference: `@` + word chars, not preceded by a word
+ * character (so `foo@a` doesn't match mid-token), optionally followed by a
+ * `:`-led suffix that runs up to the next whitespace or `|` — e.g. `@a`,
+ * `@a:220`, `@a:220(blackoutTag)`. Capture group 1 is the symbol, group 2 the
+ * suffix (including its leading `:`), if any. */
+const REF_RE = /(?<!\w)@([A-Za-z0-9_]+)(:[^\s|]*)?/g;
+
+export interface AgentishExpandResult {
+  /** `msg` with every declared `@n=path` line removed and every reference to
+   * a declared symbol inlined to its path (suffix, if any, kept attached). */
+  expanded: string;
+  symbols: Record<string, string>;
+  /** Human-readable messages for any reference whose symbol was never
+   * declared (in `msg` or in `earlier`) — those are left verbatim in
+   * `expanded` rather than dropped. */
+  errors: string[];
+  details: AgentishError[];
+}
+
+/**
+ * Decompress an AG2 message: resolve every `@n` reference back to the path
+ * its `@n=path` declaration named, and drop the declaration lines themselves
+ * (they're inlined, so repeating them would just restate what `expanded`
+ * already says). `earlier` supplies symbols declared in prior thread
+ * messages, exactly as `check` does.
+ *
+ * A reference to a symbol nothing declared — in this message or in
+ * `earlier` — is left as-is in `expanded` and reported via `errors`/
+ * `details` (code `E_REF_UNDECLARED`), so a dangling ref surfaces instead of
+ * silently vanishing or corrupting output.
+ */
+export function expand(msg: string, earlier: string[] = []): AgentishExpandResult {
+  const details: AgentishError[] = [];
+  const errors: string[] = [];
+  const fail = (code: AgentishErrorCode, message: string, line?: number): void => {
+    details.push(line === undefined ? { code, message } : { code, message, line });
+    errors.push(message);
+  };
+
+  const ls = lines(msg);
+  if (ls.length === 0) return { expanded: "", symbols: {}, errors, details };
+
+  const symbols: Record<string, string> = {};
+  for (const e of earlier) Object.assign(symbols, check(e).symbols);
+
+  // Pass 1: collect this message's own declarations first, so a reference
+  // that appears before its `@n=path` line (unusual, but not forbidden)
+  // still resolves — matches how `check` sees the whole message before it
+  // validates any one field.
+  for (let i = 1; i < ls.length; i++) {
+    const decl = parseDeclaration(ls[i]);
+    if (decl) symbols[decl.sym] = decl.path;
+  }
+
+  // Pass 2: reprint every line but the declarations, expanding references.
+  const outLines: string[] = [ls[0]]; // kind line: never touched
+  for (let i = 1; i < ls.length; i++) {
+    const l = ls[i];
+    const lineNo = i + 1;
+    if (parseDeclaration(l)) continue; // inlined already — drop the line
+
+    const kv = splitKeyLine(l);
+    if (!kv) {
+      outLines.push(l); // not k=v; not this function's job to flag
+      continue;
+    }
+    const { sep, rawKey, rawValue } = kv;
+    const k = KEYS[rawKey.trim()] ?? rawKey.trim();
+    if (k === "id") {
+      outLines.push(l); // never expand inside the id field
+      continue;
+    }
+
+    const expandedValue = rawValue.replace(REF_RE, (full: string, sym: string, suffix: string | undefined) => {
+      const path = symbols[sym];
+      if (path === undefined) {
+        fail("E_REF_UNDECLARED", `ref: undeclared symbol @${sym}`, lineNo);
+        return full;
+      }
+      return `${path}${suffix ?? ""}`;
+    });
+    outLines.push(`${rawKey}${sep}${expandedValue}`);
+  }
+
+  return { expanded: outLines.join("\n"), symbols, errors, details };
 }
 
 /**

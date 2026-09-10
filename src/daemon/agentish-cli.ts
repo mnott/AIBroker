@@ -15,7 +15,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { AG2_SPEC, AG2_EXTENSIONS, AGENTISH_URI, check, measure } from "../agentish/index.js";
+import { AG2_SPEC, AG2_EXTENSIONS, AGENTISH_URI, check, expand, measure } from "../agentish/index.js";
 import { agentishStats, formatStatsReport } from "./agentish-stats.js";
 
 const JSON_VERSION = "2";
@@ -26,12 +26,14 @@ function usage(): void {
   console.log("  spec [--json]                 Print the AG2 format and the extensions this validator adds");
   console.log("  check <file|-> [earlier...] [--json]");
   console.log("                                Validate a message; earlier messages supply @n symbols");
+  console.log("  expand <file|-> [earlier...] [--json]");
+  console.log("                                Decompress: inline every @n reference to its declared path");
   console.log("  measure <file> <prose-file>   Token count, agentish vs. a prose twin");
   console.log("  stats [--since YYYY-MM-DD] [--json]");
   console.log("                                AG2 vs. prose on real inter-session traffic, from the audit log");
   console.log("");
-  console.log("`-` reads the message to check from stdin.");
-  console.log("Exit codes (check): 0 valid, 1 invalid, 2 bad usage or a file could not be read.");
+  console.log("`-` reads the message to check/expand from stdin.");
+  console.log("Exit codes (check, expand): 0 valid, 1 invalid/dangling ref, 2 bad usage or a file could not be read.");
 }
 
 async function readStdin(): Promise<string> {
@@ -96,6 +98,36 @@ export async function runAgentish(args: string[]): Promise<void> {
       console.log(
         `${kind ?? "?"} ${Object.keys(fields).length} fields ${Object.keys(symbols).length} symbols ${ok ? "ok" : "INVALID"}`,
       );
+    }
+    process.exitCode = ok ? 0 : 1;
+    return;
+  }
+
+  if (verb === "expand") {
+    const { rest, present: json } = takeFlag(rawRest, "--json");
+    const [file, ...earlierFiles] = rest;
+    if (!file) {
+      usage();
+      process.exitCode = 2;
+      return;
+    }
+    let msg: string;
+    let earlier: string[];
+    try {
+      msg = await readArg(file);
+      earlier = earlierFiles.map((f) => readFileSync(f, "utf8"));
+    } catch (e) {
+      console.log(`ERR could not read a message file: ${e instanceof Error ? e.message : String(e)}`);
+      process.exitCode = 2;
+      return;
+    }
+    const { expanded, symbols, errors, details } = expand(msg, earlier);
+    const ok = errors.length === 0;
+    if (json) {
+      console.log(JSON.stringify({ version: JSON_VERSION, expanded, symbols, errors: details, ok }));
+    } else {
+      for (const e of errors) console.log(`ERR ${e}`);
+      console.log(expanded);
     }
     process.exitCode = ok ? 0 : 1;
     return;
