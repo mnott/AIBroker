@@ -34,6 +34,7 @@ import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
+import { promptUnsentText, inputLineDecision } from "./manage.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession } from "../transport/sync-facade.js";
@@ -1071,6 +1072,41 @@ export function registerCoreHandlers(
           `so nothing was sent (a shell would execute the message rather than read it). ` +
           `An ended session leaves its tab behind; close it, or target a session that is running.`,
       };
+    }
+
+    // Refuse to type on top of unsent text already sitting in the target's
+    // input line — see manage.ts's inputLineDecision for the full policy
+    // (shared with arm()'s tick loop). This call site has no continuity
+    // across calls to tell a ghost from someone typing, so `sameForTicks: 1`
+    // pins it to "type" only when the line is empty and "skip" (never clear)
+    // otherwise — a single-shot send has no business ever hitting Ctrl-U on
+    // a session it does not own the arming loop for. The message is still
+    // deposited to the mailbox below, so nothing is lost — only the
+    // immediate typed delivery is withheld.
+    {
+      const targetContent = readSessionContent(itermSessionId, 5);
+      const onLine = promptUnsentText(targetContent?.content ?? "") ?? "";
+      const lineDecision = inputLineDecision({ text: onLine, sameForTicks: 1, idle: false });
+      if (lineDecision.action !== "type") {
+        const evicted = depositToSessionMailbox(itermSessionId, senderLabel, message);
+        const reason = `input line holds '${onLine}'`;
+        audit({
+          action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
+          outcome: "refused", body: message,
+          reason: `not typed — ${reason}`,
+        });
+        if (evicted) {
+          audit({
+            action: "send", actor: `session:${evicted.from}`, target: resolvedName ?? target,
+            outcome: "evicted", body: evicted.content,
+            reason: "mailbox full — oldest undrained message discarded to make room",
+          });
+        }
+        return {
+          ok: false,
+          error: `not typed — ${reason}. Queued in ${resolvedName ?? target}'s mailbox instead; it can drain it with aibroker_receive.`,
+        };
+      }
     }
 
     // Deposit into the target session's mailbox (structured receive). This is

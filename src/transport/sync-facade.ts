@@ -173,6 +173,38 @@ export function pasteTextIntoSession(id: string, text: string, opts: { allowShel
   return iterm.pasteTextIntoSession(id, text);
 }
 
+/**
+ * Clear whatever is on the input line with Ctrl-U, WITHOUT typing or
+ * submitting anything. Used only by the read-back-first typing sequence, and
+ * only after text has been confirmed to have sat unchanged for minutes — see
+ * inputLineDecision. Never sent blind ahead of a type.
+ */
+export function sendControlU(id: string): boolean {
+  if (routeToTmux(id)) return tmuxTransport.sendKey(id, "C-u");
+  return iterm.sendKeystrokeToSession(id, 21);
+}
+
+/** Send a bare Enter/CR — the last step of the read-back-first sequence,
+ *  only once the line has been read back and verified. */
+export function sendEnterKey(id: string): boolean {
+  if (routeToTmux(id)) return tmuxTransport.sendKey(id, "Enter");
+  return iterm.sendKeystrokeToSession(id, 13);
+}
+
+/**
+ * Escape a possible vi-normal-mode stall in the input box before typing.
+ * iTerm-specific (AppleScript's `write text` into Claude Code's input can
+ * land in vi normal mode); tmux's raw key injection never gets stuck this
+ * way, so this is a no-op there. Safe to call on an already-empty line: 'i'
+ * enters insert mode (or types nothing new if already in it beyond one
+ * transient char), the backspace removes exactly what that keystroke added.
+ */
+export function escapeInputMode(id: string): void {
+  if (routeToTmux(id)) return;
+  iterm.sendKeystrokeToSession(id, 105); // 'i'
+  iterm.sendKeystrokeToSession(id, 127); // backspace (DEL)
+}
+
 /** Drop a cached readiness verdict (call right after launching into a tab). */
 export function invalidateReadyCache(id?: string): void {
   if (id) readyCache.delete(id); else readyCache.clear();

@@ -26,7 +26,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { log } from "../core/log.js";
 import { readSessionContent } from "./session-content.js";
-import { typeIntoSession } from "../transport/sync-facade.js";
+import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode } from "../transport/sync-facade.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
@@ -93,18 +93,70 @@ const GOAL_MAX_AGE_MS = 45 * 60_000;
 const GOAL_ACTIVE = /\/goal\s+active/i;
 
 /**
- * Where a session is asked to hand over, as a share of its context.
+ * Where a session is asked to hand over — NOT a fixed share of context, a
+ * margin BELOW the point it actually compacts at.
  *
- * NOT where it dies — where it should stop and write down what it knows while
- * it still can. A session at the wall cannot compose a handover, because
- * composing one is exactly the sort of work it no longer has room for. The
- * margin has to be big enough to write in.
+ * A fixed fraction of a fixed window was tried and measurement moved the
+ * ground under it twice in one investigation: 63 compactions averaged
+ * ~1,000k (the full window) before 2026-09-12, then the same configured
+ * override (80) started producing compactions at ~784k after. Reading
+ * "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80" off the session's own environment
+ * predicted NEITHER regime — the configured value did not move, the observed
+ * trigger did. So the trigger is now read where possible (measured off the
+ * session's own compact_boundary history — see measuredCompactK) rather than
+ * assumed, and everything downstream is a MARGIN below whatever that trigger
+ * turns out to be, not a fraction of a window that may not be the one in
+ * force.
  *
- * Deliberately conservative. Rolling over early costs one cycle of re-reading a
- * file; rolling over late costs everything the session had not written down,
- * and that loss is silent — the successor does not know what it was not told.
+ * NOT where it dies — where it should stop and write down what it knows
+ * while it still can. A session at the wall cannot compose a handover,
+ * because composing one is exactly the sort of work it no longer has room
+ * for. The margin has to be big enough to write in.
  */
-const HANDOVER_AT = 0.82;
+const HANDOVER_MARGIN_K_DEFAULT = 100; // warm-up band: ask this far below the trigger, given time or work done
+const REFRESH_MARGIN_K = 40; // refresh band: ask again if it has grown 40k+ since the last one
+const REFRESH_GROWN_K = 40;
+const IMMEDIATE_MARGIN_K = 15; // immediate band: ask NOW, no gating — this close, waiting is the wrong trade
+
+/**
+ * How long a session must have been idle before ANY band's ask actually
+ * fires — un-gating the ask from `handoverFile` widened the blast radius
+ * from one opted-in session to every managed one, each ask a typed
+ * interruption. A band being satisfied says the trigger is close; it says
+ * nothing about whether NOW is a good moment to type into that session, and
+ * "idle" is the same question `arm()` already answers for the standing
+ * objective. Not zero even for IMMEDIATE — this close to compaction the
+ * urgency is real, but typing into a session mid-keystroke is still the one
+ * thing that must never happen, so it gets a shorter floor, not none.
+ */
+const HANDOVER_IDLE_FLOOR_MS = 60_000;
+const HANDOVER_IDLE_FLOOR_IMMEDIATE_MS = 20_000;
+
+/**
+ * The percentage assumed when NEITHER a measured trigger nor a configured
+ * override is available.
+ *
+ * 80, not 100 (the full window). Two regimes were observed with the SAME
+ * configured override (80) in force: compactions averaging ~1,000k before
+ * 2026-09-12 and ~784k after — so the configured value does not predict the
+ * trigger either way, and there is no reading available that has earned the
+ * assumption of a full window. What is known is that the two ways to be
+ * wrong here cost differently: assuming too LOW wastes one summary; assuming
+ * too HIGH is a session that compacts before its handover lands, which loses
+ * work that cannot be recovered. 80 is the cheap-failure side of that
+ * asymmetry, not a measurement — this was tried at 100 first and the data
+ * argued it back down.
+ */
+const ASSUMED_OVERRIDE_PCT = 80;
+
+/** Lowest and highest a session's own margin override may be set to, in K. */
+const MARGIN_K_MIN = 20;
+const MARGIN_K_MAX = 400;
+
+/** The warm-up margin actually in force for a session — its own, or the default. */
+function resolvedMarginK(m: ManagedSession): number {
+  return m.handoverMarginK ?? HANDOVER_MARGIN_K_DEFAULT;
+}
 
 /**
  * How long the manager waits for the handover before giving up on it.
@@ -291,6 +343,31 @@ export interface ManagedSession {
    * file, and the drift grows by a day every day.
    */
   handoverFile?: string;
+  /**
+   * This session's own warm-up margin, in K tokens below the trigger —
+   * overrides HANDOVER_MARGIN_K_DEFAULT. Set with
+   * `manage <session> handover-at <k>`. Per-session because no one margin is
+   * right for every session's shape of work: one doing long single turns
+   * wants more room below the trigger than one that idles between short
+   * ones and can react quickly once asked.
+   */
+  handoverMarginK?: number;
+  /**
+   * This session's own context window, in K tokens — defaults to 1000.
+   * Exists because the window is a property of the MODEL a session is
+   * running, not a constant of this file, and a different window changes
+   * what "the full window" means for effectiveCompactK's fallback case.
+   */
+  contextWindowK?: number;
+  /**
+   * A ring of recent context readings, so a rate of fill can be reported
+   * rather than only a point-in-time number. Capped at 90 — 30 minutes at the
+   * 20s tick — because older readings say nothing about how fast context is
+   * filling NOW. Only ever appended to when a reading is actually available —
+   * never carries a synthetic 0 for a tick where the transcript could not be
+   * read.
+   */
+  contextSamples?: { at: number; k: number }[];
   /** The path actually asked for, so a date rolling over mid-episode cannot
    *  make the change check compare two different files. */
   handoverAskedPath?: string;
@@ -596,6 +673,291 @@ function fileFingerprint(path: string): string {
   }
 }
 
+/**
+ * Real compaction points, read straight off a project's own transcripts —
+ * ground truth, where a configured override or an assumed default are both
+ * inferences about what OUGHT to happen. Shape, from a live transcript
+ * (~/.claude/projects/<cwd-slug>/*.jsonl), confirmed against a real file
+ * carrying one of these events:
+ *
+ *   { type: "system", subtype: "compact_boundary", timestamp: "2026-09-13T08:34:18.927Z",
+ *     compactMetadata: { trigger: "auto", preTokens: 784066, postTokens: 31163, ... } }
+ *
+ * Takes the MINIMUM of the most recent three, not the average or the latest
+ * alone, because the two ways to be wrong here cost differently: a trigger
+ * estimated too LOW costs one wasted summary; estimated too HIGH is a
+ * session that compacts before its handover lands, which is not recoverable.
+ * The minimum of a small recent sample is the cheap-failure estimate, same
+ * reasoning as ASSUMED_OVERRIDE_PCT below.
+ */
+export function measuredCompactK(
+  lines: string[],
+): { k: number; events: { at: string; preTokens: number }[] } | undefined {
+  const events: { at: string; preTokens: number }[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const j = JSON.parse(line);
+      if (j.type === "system" && j.subtype === "compact_boundary" && typeof j.compactMetadata?.preTokens === "number") {
+        events.push({ at: j.timestamp ?? "", preTokens: j.compactMetadata.preTokens });
+      }
+    } catch { /* not JSON, or a truncated line from a tail — skip */ }
+  }
+  if (!events.length) return undefined;
+
+  // Most recent first. String comparison is safe here: every event carries
+  // an ISO-8601 timestamp, which sorts lexicographically in time order.
+  events.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+  const recent = events.slice(0, 3);
+  const k = Math.round(Math.min(...recent.map((e) => e.preTokens)) / 1000);
+  return { k, events: recent };
+}
+
+/**
+ * The compaction point to plan around, in K — MEASURED when a project has
+ * its own compact_boundary history, otherwise a percentage of the window
+ * (a configured override, or ASSUMED_OVERRIDE_PCT).
+ */
+export function effectiveCompactK(input: { windowK: number; overridePct: number | undefined; measuredK?: number }): number {
+  const configuredK = (input.windowK * (input.overridePct ?? ASSUMED_OVERRIDE_PCT)) / 100;
+  // A measurement is only trusted downwards. A project whose newest compaction
+  // predates a regime change measures a stale HIGH value (seen: 998k against a
+  // real boundary of ~784k), which would push every band above the real
+  // trigger and never fire. Lower than configured is the finding we want;
+  // higher than configured is history, not the present.
+  if (input.measuredK !== undefined) return Math.min(input.measuredK, configuredK);
+  return configuredK;
+}
+
+/** Which band a reading falls in, against the three margins below the trigger. */
+export function bandOf(usedK: number, effectiveK: number, marginK: number): "below" | "warm-up" | "refresh" | "immediate" {
+  if (usedK >= effectiveK - IMMEDIATE_MARGIN_K) return "immediate";
+  if (usedK >= effectiveK - REFRESH_MARGIN_K) return "refresh";
+  if (usedK >= effectiveK - marginK) return "warm-up";
+  return "below";
+}
+
+/**
+ * Whether a handover is due — the pure decision, extracted so it is testable
+ * without a pane, a process table, or a transcript file.
+ *
+ * THREE BANDS below the trigger, checked most-urgent first, because a high
+ * enough reading qualifies for more than one and the most urgent is the one
+ * that should win:
+ *
+ *   IMMEDIATE (trigger − 15k) — no gating at all. This close, waiting for a
+ *   time or work signal is the wrong trade; the cost of asking again for
+ *   nothing is one redundant note, the cost of NOT asking is the session
+ *   compacting before it writes anything down.
+ *
+ *   REFRESH (trigger − 40k) — due once REFRESH_GROWN_K of new work has
+ *   landed since the last handover, regardless of the clock. A handover
+ *   this close to the trigger that predates a lot of new work is stale
+ *   exactly where staleness costs the most.
+ *
+ *   WARM-UP (trigger − marginK, default 100k) — the ordinary case, gated the
+ *   same way as before this was split into bands: due by the CLOCK
+ *   (`lastAskAt` old enough) or by WORK done since the last one.
+ *
+ * `contextK: undefined` — no reading available — returns due:false with a
+ * named reason rather than being coerced through `0`, which would read as
+ * "no context used" and could never cross any band. That silent failure
+ * mode is exactly what a `number | null` reading treated as falsy would
+ * produce; keeping it as its own case is the fix.
+ *
+ * `idleMs` gates every band separately from the band itself: a band being
+ * satisfied says the trigger is close, not that this is a safe moment to
+ * type. A band that is due but not idle enough reports due:false with a
+ * reason naming which band it was and how idle the session actually was, so
+ * the log reads as "was about to ask, held off" rather than "never
+ * qualified" — a real distinction for anyone debugging why an ask was late.
+ */
+export function handoverDue(input: {
+  contextK: number | undefined;
+  effectiveK: number;
+  marginK?: number;
+  lastAskAt?: number;
+  handoverDoneK?: number;
+  idleMs: number;
+  now: number;
+}): { due: boolean; reason: string } {
+  if (input.contextK === undefined) return { due: false, reason: "context unknown" };
+
+  const used = input.contextK;
+  const marginK = input.marginK ?? HANDOVER_MARGIN_K_DEFAULT;
+  const immediateK = input.effectiveK - IMMEDIATE_MARGIN_K;
+  const refreshK = input.effectiveK - REFRESH_MARGIN_K;
+  const warmUpK = input.effectiveK - marginK;
+  const idleSec = Math.round(input.idleMs / 1000);
+
+  if (used >= immediateK) {
+    if (input.idleMs < HANDOVER_IDLE_FLOOR_IMMEDIATE_MS) {
+      return { due: false, reason: `band immediate but busy (idle ${idleSec}s)` };
+    }
+    return { due: true, reason: "immediate" };
+  }
+
+  const grownBy = input.handoverDoneK !== undefined ? used - input.handoverDoneK : undefined;
+
+  if (used >= refreshK && grownBy !== undefined && grownBy >= REFRESH_GROWN_K) {
+    if (input.idleMs < HANDOVER_IDLE_FLOOR_MS) {
+      return { due: false, reason: `band refresh but busy (idle ${idleSec}s)` };
+    }
+    return { due: true, reason: "refresh" };
+  }
+
+  const sinceLast = input.now - (input.lastAskAt ?? 0);
+  const dueByTime = sinceLast > HANDOVER_REASK_MS;
+  const dueByWork = grownBy !== undefined && grownBy >= HANDOVER_REASK_K && sinceLast > HANDOVER_MIN_GAP_MS;
+
+  if (used >= warmUpK && (dueByTime || dueByWork)) {
+    if (input.idleMs < HANDOVER_IDLE_FLOOR_MS) {
+      return { due: false, reason: `band warm-up but busy (idle ${idleSec}s)` };
+    }
+    return {
+      due: true,
+      reason: dueByWork && !dueByTime ? "warm-up — work done since the last handover" : "warm-up",
+    };
+  }
+
+  return { due: false, reason: `below the warm-up band (${used}k < ${Math.round(warmUpK)}k)` };
+}
+
+/**
+ * The rate context is filling, from recent readings — first/last over a
+ * trailing window rather than every point, because the question this answers
+ * ("how fast, right now") is about the recent slope, not a session's whole
+ * history. Undefined with fewer than two readings inside the window: a rate
+ * needs two points, and guessing one from a single sample is worse than
+ * saying nothing.
+ */
+export function contextSlope(
+  samples: { at: number; k: number }[],
+  windowMs = 600_000,
+  now: number = Date.now(),
+): { kPerMin: number | undefined; minutesTo: (targetK: number) => number | undefined } {
+  const cutoff = now - windowMs;
+  const windowed = samples.filter((s) => s.at >= cutoff).sort((a, b) => a.at - b.at);
+
+  if (windowed.length < 2) {
+    return { kPerMin: undefined, minutesTo: () => undefined };
+  }
+
+  const first = windowed[0];
+  const last = windowed[windowed.length - 1];
+  const dtMin = (last.at - first.at) / 60_000;
+  if (dtMin <= 0) return { kPerMin: undefined, minutesTo: () => undefined };
+
+  const kPerMin = (last.k - first.k) / dtMin;
+  return {
+    kPerMin,
+    minutesTo(targetK: number): number | undefined {
+      if (kPerMin <= 0) return undefined; // flat or falling — no ETA to give
+      const remaining = targetK - last.k;
+      if (remaining <= 0) return 0;
+      return remaining / kPerMin;
+    },
+  };
+}
+
+/**
+ * Does a line read back off the pane actually carry the text just typed?
+ *
+ * The verification step in the read-back-first typing sequence (see arm()):
+ * type with no newline, read the pane again, confirm before sending CR. Two
+ * real failures this catches: a stray character surviving from something the
+ * terminal did not fully clear, and — observed on 2026-09-13 — a long `/goal
+ * …` line folding in the terminal and landing as a pasted message instead of
+ * a slash command, which a length- or hash-based check would not catch but a
+ * literal prefix match does.
+ *
+ * Tolerant of a leading `❯` prompt marker and trailing whitespace, because
+ * `readBack` may be a raw line straight off the pane rather than one already
+ * run through promptUnsentText's own stripping.
+ */
+export function typedLineMatches(readBack: string, intended: string): boolean {
+  const cleaned = readBack.replace(/^\s*❯\s*/, "").trimEnd();
+  return cleaned.startsWith(intended.trimEnd());
+}
+
+/**
+ * Whether the pane shows Claude Code's vim-keybinding status indicator — the
+ * ONLY condition under which escapeInputMode's 'i' keystroke means anything.
+ *
+ * Sending 'i' on a pane WITHOUT vim mode enabled is not neutral: nothing
+ * intercepts it as a modal command, so it lands as a literal character in an
+ * ordinary input line — this project's own reference note on typing into a
+ * Claude pane records exactly that ("a stray `i` lands literally"). Sent
+ * unconditionally, the read-back-first sequence would then never see what it
+ * typed match what it reads back, abort with Ctrl-U every time, and the
+ * session would never arm — silently and permanently, on every non-vim
+ * session. Checking the indicator before ever sending the keystroke is what
+ * keeps the same sequence safe on both.
+ */
+export function needsVimEscape(paneText: string): boolean {
+  return /--\s*(INSERT|NORMAL)\s*--/.test(paneText);
+}
+
+/**
+ * What to do about text already sitting in a session's input line, before
+ * typing anything — the pure decision behind the read-back-first sequence in
+ * arm() and send_to_session.
+ *
+ * NEVER type on top of live input and never clear it on sight: typing over
+ * it mangles two things into one prompt, and clearing on sight was tried
+ * once already and reverted (see test/manage-unsent-prompt.test.ts's own
+ * header) because a terminal's greyed-out Tab-completion suggestion cannot
+ * be told apart from someone mid-sentence in a captured pane — a real
+ * sentence eaten by an over-eager clear is worse than a delayed handover.
+ *
+ * So: EMPTY types immediately. Anything else is only ever SKIPPED — retried
+ * next tick, 20s away — unless the IDENTICAL text has now persisted for
+ * `GHOST_TICKS` consecutive ticks (2 minutes) while the session is idle, at
+ * which point it reads as an abandoned ghost rather than someone typing, and
+ * only then is it cleared. Text that changes between ticks is someone
+ * typing, full stop — the caller resets `sameForTicks` to 1 on any change,
+ * which alone keeps this skipping for as long as that keeps happening.
+ *
+ * `idleMs` and `band` are threaded through into the return value rather than
+ * only consumed here so the caller can log the evidence for a clear-then-type
+ * decision without recomputing it — a decision this rare is worth a complete
+ * log line, not a re-derivation from parts scattered across the caller.
+ */
+const GHOST_TICKS = 6; // 6 * TICK_MS(20s) = 2 minutes
+
+export function inputLineDecision(input: {
+  text: string;
+  sameForTicks: number;
+  idle: boolean;
+  idleMs?: number;
+  band?: string;
+}): {
+  action: "type" | "skip" | "clear-then-type";
+  logCleared?: string;
+  sameForTicks: number;
+  idleMs?: number;
+  band?: string;
+} {
+  const { text, sameForTicks, idle, idleMs, band } = input;
+  if (!text) return { action: "type", sameForTicks, idleMs, band };
+
+  if (sameForTicks >= GHOST_TICKS && idle) {
+    const totalSec = sameForTicks * (TICK_MS / 1000);
+    const durationLabel = `${Math.floor(totalSec / 60)}m${String(Math.round(totalSec % 60)).padStart(2, "0")}s`;
+    return {
+      action: "clear-then-type",
+      logCleared:
+        `clearing persistent input-line text before typing: "${text}" ` +
+        `(identical for ${sameForTicks} ticks / ${durationLabel}, idle ${Math.round((idleMs ?? 0) / 1000)}s, band=${band ?? "unknown"})`,
+      sameForTicks,
+      idleMs,
+      band,
+    };
+  }
+
+  return { action: "skip", sameForTicks, idleMs, band };
+}
+
 /** This session's context in thousands of tokens, from its own transcript. */
 function contextK(m: ManagedSession): number | null {
   const tty = m.tty ?? snapshotTty(m.sessionId);
@@ -872,6 +1234,23 @@ let lastReportAt = 0;
 const armingsSinceReport = new Map<string, number>();
 
 /**
+ * Rate-limiting state for the per-tick diagnostic context/trigger/band line —
+ * NOT persisted, same reasoning as armingsSinceReport: it answers "did this
+ * change since the last time it was logged", which only means anything
+ * against readings from the same daemon run.
+ */
+const lastContextLog = new Map<string, { k: number; reason: string }>();
+
+/**
+ * How many CONSECUTIVE arm() calls have seen the identical text sitting
+ * unsent in a session's input line — the memory inputLineDecision's
+ * `sameForTicks` needs to tell a ghost from someone mid-sentence. NOT
+ * persisted: a daemon restart losing this only delays a ghost-clear by up to
+ * GHOST_TICKS more ticks, never causes one to fire early.
+ */
+const inputLineTracking = new Map<string, { text: string; sameForTicks: number }>();
+
+/**
  * The periodic reading: what every managed session is doing, in one message.
  *
  * One message for all of them rather than one each, because the useful thing on
@@ -1008,6 +1387,34 @@ function processReading(tty: string): { isSession: boolean; pid: string | null }
 }
 
 /**
+ * Pure extraction of context usage from raw transcript JSONL lines.
+ *
+ * Split out of transcriptReading() so the one rule that matters here — NO
+ * usage on the tail means the context reading is UNKNOWN, never a claimed
+ * zero — is checkable without a process table, lsof, or a file on disk.
+ *
+ * `undefined` covers every case where nothing can be said: no parseable
+ * lines, no assistant message on the tail, or an assistant message whose
+ * `usage` field is absent. A real reading of zero tokens (a brand new
+ * session) is not this case and is returned as `0`, which is why the
+ * distinction is undefined-vs-number rather than falsy-vs-truthy.
+ */
+export function usageFromLines(lines: string[]): number | undefined {
+  const msgs: any[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const j = JSON.parse(line);
+      if (j.type === "assistant" || j.type === "user") msgs.push(j);
+    } catch { /* a truncated first line is normal when tailing */ }
+  }
+  const lastAssistant = [...msgs].reverse().find((m) => m.type === "assistant");
+  const u = lastAssistant?.message?.usage;
+  if (!u) return undefined;
+  return Math.round(((u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)) / 1000);
+}
+
+/**
  * What the session is doing, from its own transcript — the authority.
  *
  * THE PROCESS TABLE WAS THE SECOND WRONG ANSWER. Reading the screen was the
@@ -1030,6 +1437,51 @@ function processReading(tty: string): { isSession: boolean; pid: string | null }
  *   - WHEN: the entry's timestamp, so "how long has this been going" is a
  *     subtraction rather than a guess.
  */
+/**
+ * A running process's cwd, from the operating system — the actual authority
+ * on where a session is rooted (a name or a config value could lag a `cd`).
+ * Shared by everything below that needs it, so it is resolved with one lsof
+ * call per session per tick rather than once per caller.
+ */
+function sessionCwd(claudePid: string): string | null {
+  try {
+    const cwdOut = execFileSync("/usr/sbin/lsof", ["-p", claudePid, "-a", "-d", "cwd", "-Fn"], {
+      encoding: "utf8",
+      timeout: 4_000,
+    });
+    return cwdOut.split("\n").find((l) => l.startsWith("n"))?.slice(1) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The transcript directory for a session's own project, derived from its cwd.
+ * Shared by transcriptReading (the live session's own tail) and the
+ * measured-compaction reading (every .jsonl in the project, not only the
+ * live one).
+ */
+function projectTranscriptDir(claudePid: string): string | null {
+  const cwd = sessionCwd(claudePid);
+  if (!cwd) return null;
+  const dir = join(homedir(), ".claude", "projects", cwd.replace(/\//g, "-"));
+  return existsSync(dir) ? dir : null;
+}
+
+/**
+ * Where a handover goes when nobody has named a file — the convention this
+ * project already uses without the manager's help, so a session asked cold
+ * has somewhere sane to write rather than nowhere at all.
+ *
+ * `notesDirExists` is passed in rather than checked here so this stays pure
+ * and testable without touching a filesystem: the caller does one existsSync
+ * and hands in the answer.
+ */
+export function defaultHandoverTarget(cwd: string | null, notesDirExists: boolean): string | null {
+  if (!cwd || !notesDirExists) return null;
+  return join(cwd, "Notes", "TODO.md");
+}
+
 function transcriptReading(claudePid: string): {
   working: boolean | null;
   doing: string | null;
@@ -1038,17 +1490,8 @@ function transcriptReading(claudePid: string): {
 } {
   const none = { working: null, doing: null, contextK: null, lastAt: null };
   try {
-    // The transcript directory is named for the session's working directory,
-    // which the process itself is the authority on.
-    const cwdOut = execFileSync("/usr/sbin/lsof", ["-p", claudePid, "-a", "-d", "cwd", "-Fn"], {
-      encoding: "utf8",
-      timeout: 4_000,
-    });
-    const cwd = cwdOut.split("\n").find((l) => l.startsWith("n"))?.slice(1);
-    if (!cwd) return none;
-
-    const dir = join(homedir(), ".claude", "projects", cwd.replace(/\//g, "-"));
-    if (!existsSync(dir)) return none;
+    const dir = projectTranscriptDir(claudePid);
+    if (!dir) return none;
 
     // The live transcript is the one being written. Newest wins; a session that
     // has not written for a long time will show that in its own timestamp
@@ -1092,17 +1535,134 @@ function transcriptReading(claudePid: string): {
         ? "waiting on a tool result"
         : null;
 
-    const u = lastAssistant?.message?.usage;
-    const contextK = u
-      ? Math.round(
-          ((u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)) / 1000,
-        )
-      : null;
+    // Same rule as usageFromLines(): no usage on the tail is UNKNOWN, not a
+    // reading of zero. Re-parses the same raw text rather than reusing `msgs`
+    // above so the pure extraction stays the single source of truth for what
+    // counts as "no usage" — duplicating the parse is cheap against 40 lines.
+    const contextK = usageFromLines(raw.split("\n")) ?? null;
 
     return { working, doing, contextK, lastAt };
   } catch {
     return none;
   }
+}
+
+interface OverrideReading {
+  pct: number | undefined;
+  source: "session env" | "settings.json";
+}
+const overridePctCache = new Map<string, { at: number; reading: OverrideReading | undefined }>();
+
+/**
+ * `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, read from where it actually governs the
+ * running session — its own process environment — falling back to the
+ * config file a fresh process would inherit it from. Cached for a minute per
+ * pid: `ps -E` is not free to run every 20-second tick for every managed
+ * session, and this value does not change inside a running process.
+ */
+function readOverridePct(pid: string | null): OverrideReading | undefined {
+  const key = pid ?? "no-pid";
+  const cached = overridePctCache.get(key);
+  if (cached && Date.now() - cached.at < 60_000) return cached.reading;
+
+  let reading: OverrideReading | undefined;
+  if (pid) {
+    try {
+      // macOS `ps -E` appends the process environment after the command.
+      const out = execFileSync("/bin/ps", ["-E", "-p", pid, "-o", "command="], {
+        encoding: "utf8",
+        timeout: 4_000,
+      });
+      const m = out.match(/CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=(\d+)/);
+      if (m) reading = { pct: Number(m[1]), source: "session env" };
+    } catch { /* process gone, or ps refused — fall through to the config file */ }
+  }
+  if (!reading) {
+    try {
+      const settings = JSON.parse(readFileSync(join(homedir(), ".claude", "settings.json"), "utf8"));
+      const v = settings?.env?.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE;
+      if (v !== undefined && v !== null && v !== "") reading = { pct: Number(v), source: "settings.json" };
+    } catch { /* no settings file, or unreadable — assumed default applies */ }
+  }
+  overridePctCache.set(key, { at: Date.now(), reading });
+  return reading;
+}
+
+const measuredCompactCache = new Map<string, { mtimeSum: number; result: ReturnType<typeof measuredCompactK> }>();
+
+/**
+ * measuredCompactK, wired to a project directory — every .jsonl in it, not
+ * only the session's own live transcript, because the last three
+ * compactions for this PROJECT may belong to sessions that have since ended.
+ *
+ * Bounded to the five most recently modified files and a tail of each,
+ * rather than reading whole transcripts that reach tens of megabytes: recent
+ * compactions are, definitionally, recent, so they live in recently-touched
+ * files near their own end. Cached by the summed mtime of those files so a
+ * tick where nothing in the project changed does no file I/O at all — the
+ * cache mostly does NOT help the live file, whose mtime moves most ticks,
+ * but it is nearly free to keep and helps every other managed session
+ * sharing this call.
+ */
+function measuredCompactForProject(dir: string): ReturnType<typeof measuredCompactK> {
+  let entries: { f: string; m: number }[];
+  try {
+    entries = readdirSync(dir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({ f, m: statSync(join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m)
+      .slice(0, 5);
+  } catch {
+    return undefined;
+  }
+  if (!entries.length) return undefined;
+
+  const mtimeSum = entries.reduce((s, e) => s + e.m, 0);
+  const cached = measuredCompactCache.get(dir);
+  if (cached && cached.mtimeSum === mtimeSum) return cached.result;
+
+  const lines: string[] = [];
+  for (const e of entries) {
+    try {
+      const raw = execFileSync("/usr/bin/tail", ["-n", "500", join(dir, e.f)], {
+        encoding: "utf8",
+        timeout: 4_000,
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      lines.push(...raw.split("\n"));
+    } catch { /* file raced a delete, or tail refused — skip it */ }
+  }
+  const result = measuredCompactK(lines);
+  measuredCompactCache.set(dir, { mtimeSum, result });
+  return result;
+}
+
+/**
+ * The compaction point to plan a session's handover around, and a one-line
+ * account of where that number came from — printed in `status` and in the
+ * per-tick log line, because a number nobody can trace back to a source is a
+ * number nobody can debug when it is wrong again.
+ */
+function compactionReading(m: ManagedSession, pid: string | null, dir: string | null): { effectiveK: number; label: string } {
+  const windowK = m.contextWindowK ?? 1000;
+  const measured = dir ? measuredCompactForProject(dir) : undefined;
+  const override = readOverridePct(pid);
+  const effectiveK = effectiveCompactK({ windowK, overridePct: override?.pct, measuredK: measured?.k });
+
+  let label: string;
+  const configuredK = effectiveCompactK({ windowK, overridePct: override?.pct });
+  if (measured && measured.k > configuredK) {
+    const src = override ? `${override.source} override=${override.pct}` : `assumed ${ASSUMED_OVERRIDE_PCT}`;
+    label = `${src}; measured ${measured.k.toLocaleString("en-US")}k is stale-high and ignored`;
+  } else if (measured) {
+    const vals = measured.events.map((e) => e.preTokens.toLocaleString("en-US")).join(" / ");
+    label = `measured: min of ${measured.events.length} event${measured.events.length > 1 ? "s" : ""} ${vals} in this project`;
+  } else if (override) {
+    label = `${override.source} override=${override.pct}`;
+  } else {
+    label = `assumed ${ASSUMED_OVERRIDE_PCT}, no history, no override`;
+  }
+  return { effectiveK, label };
 }
 
 /**
@@ -1118,7 +1678,7 @@ function transcriptReading(claudePid: string): {
  * which number came from the transcript and which was scraped off a status bar
  * cannot tell which one to doubt.
  */
-function liveReading(sessionId: string, idleSec: number): string {
+function liveReading(sessionId: string, idleSec: number, m?: ManagedSession): string {
   const snap = discoverLiveSessions().find((s) => s.id === sessionId);
   const proc = snap?.tty ? processReading(snap.tty) : { isSession: false, pid: null };
 
@@ -1135,7 +1695,31 @@ function liveReading(sessionId: string, idleSec: number): string {
       `  ${t.working ? "working" : "idle"} · last transcript entry ${agoSec < 90 ? `${agoSec}s` : `${Math.round(agoSec / 60)} min`} ago` +
         (t.doing ? ` · ${t.doing}` : ""),
     );
-    if (t.contextK !== null) out.push(`  context ${t.contextK}k tokens (from the transcript's own usage, not the status bar)`);
+    if (t.contextK !== null) {
+      out.push(`  context ${t.contextK}k tokens (from the transcript's own usage, not the status bar)`);
+      // The trigger, fill rate and ETA are only meaningful alongside a
+      // session's own margin, so all three are printed together and only
+      // when a managed session (`m`) is available to supply it.
+      if (m) {
+        const dir = proc.pid ? projectTranscriptDir(proc.pid) : null;
+        const { effectiveK, label } = compactionReading(m, proc.pid, dir);
+        const marginK = resolvedMarginK(m);
+        const warmUpK = Math.round(effectiveK - marginK);
+        out.push(`  compaction trigger ≈${Math.round(effectiveK)}k (${label})`);
+        const slope = contextSlope(m.contextSamples ?? []);
+        if (slope.kPerMin === undefined) {
+          out.push(`  filling rate unknown (not enough recent readings) · handover from ${warmUpK}k`);
+        } else {
+          const eta = slope.minutesTo(warmUpK);
+          out.push(
+            `  filling ~${slope.kPerMin >= 0 ? "" : "-"}${Math.abs(Math.round(slope.kPerMin))}k/min` +
+              (eta === undefined
+                ? ` · handover from ${warmUpK}k (not approaching it)`
+                : ` · ~${Math.round(eta)} min to handover at ${warmUpK}k`),
+          );
+        }
+      }
+    }
   } else {
     out.push(`  a session is running, but its transcript could not be read — falling back to the screen`);
   }
@@ -1629,29 +2213,81 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   }
 
   /**
-   * TEXT ON THE INPUT LINE IS NOTED, NEVER OBEYED.
+   * TEXT ON THE INPUT LINE — READ BACK FIRST, NEVER DESTROY LIVE INPUT.
    *
-   * This used to refuse to arm while anything sat unsent in the prompt, to
-   * avoid running the manager's goal into a half-typed sentence. The intention
-   * was right and the mechanism could not support it: the terminal offers a
-   * greyed-out SUGGESTION on that same line, accepted with Tab, and in a
-   * captured pane no colour survives to tell the two apart. So a suggestion
-   * read as somebody mid-sentence, and since a suggestion never finishes being
-   * typed, the refusal never lifted. A session sat idle with its goal spent and
-   * its work unfinished while every log line reported the guard working.
+   * An outright refusal was tried before and reverted (see the header of
+   * test/manage-unsent-prompt.test.ts): the terminal offers a greyed-out
+   * SUGGESTION on the same line, accepted with Tab, and no colour survives a
+   * pane capture to tell it apart from somebody mid-sentence. An earlier pass
+   * of THIS change reinstated that same refusal outright and was corrected
+   * mid-flight — clearing on sight, or refusing forever, both risk exactly
+   * the failure the revert was for.
    *
-   * Arming is the one thing that must not be blocked by a signal this weak. A
-   * stalled agent is certain and unbounded; running into somebody's half-typed
-   * line is occasional and costs one prompt they can retype. So the reading is
-   * kept — it is worth having in the record when a goal arrives mangled — and
-   * it decides nothing.
+   * So: empty line types immediately (below). Anything else is only ever
+   * SKIPPED and retried next tick — never cleared, never typed over —
+   * unless the IDENTICAL text has sat there for GHOST_TICKS consecutive
+   * ticks (2 minutes) while the session is idle, which is inputLineDecision's
+   * job to decide. Skips still count toward armFails/armFailStreak below, so
+   * a line occupied for minutes still reaches blockedReason's operator alert
+   * (with a screenshot) — the daemon does not stall silently either way.
    */
   const onLine = promptUnsentText(readPane(m.sessionId));
+  const armIdleMs = Math.max(0, Date.now() - m.lastChangeAt);
+  const armIdle = armIdleMs >= HANDOVER_IDLE_FLOOR_MS;
 
-  if (!typeIntoSession(m.sessionId, text)) {
+  const prevLine = inputLineTracking.get(m.sessionId);
+  const sameForTicks = onLine && prevLine && prevLine.text === onLine ? prevLine.sameForTicks + 1 : 1;
+  if (onLine) inputLineTracking.set(m.sessionId, { text: onLine, sameForTicks });
+  else inputLineTracking.delete(m.sessionId);
+
+  const lineDecision = inputLineDecision({ text: onLine ?? "", sameForTicks, idle: armIdle, idleMs: armIdleMs });
+
+  if (lineDecision.action === "skip") {
+    note(
+      m,
+      `arm deferred: input line holds '${onLine}' (unsent for ${sameForTicks} tick${sameForTicks === 1 ? "" : "s"}, idle ${Math.round(armIdleMs / 1000)}s)`,
+    );
+    return false;
+  }
+
+  if (lineDecision.action === "clear-then-type") {
+    note(m, lineDecision.logCleared ?? "clearing persistent input-line text before typing");
+    sendControlU(m.sessionId);
+    inputLineTracking.delete(m.sessionId);
+  }
+
+  // TYPE, READ BACK, VERIFY, THEN CR. Never combined in one shot: a `/goal …`
+  // line was observed folding in the terminal and landing as a pasted
+  // message instead of a slash command on 2026-09-13 — a failure a read-back
+  // catches and a fire-and-forget send cannot.
+  //
+  // escapeInputMode is gated on TWO conditions, neither optional:
+  //   1. needsVimEscape(...) — only send it when the pane's own status area
+  //      shows vim mode is actually on ("-- INSERT --" / "-- NORMAL --").
+  //      Unconditionally sending 'i' lands as a literal character on a
+  //      non-vim pane, which the read-back below would then never match —
+  //      aborting every single arming with Ctrl-U, forever, silently, on
+  //      every session that doesn't have vim mode enabled.
+  //   2. armIdle — this must NEVER run while the session might still be
+  //      mid-turn. An Esc/keystroke sent into a running turn can cancel it
+  //      (observed 2026-09-13), and arm() is otherwise fine typing into a
+  //      busy session (the goal text below queues harmlessly behind it) —
+  //      it is specifically the escape sequence that is not safe there.
+  if (armIdle && needsVimEscape(readPane(m.sessionId))) {
+    escapeInputMode(m.sessionId);
+  }
+  if (!pasteTextIntoSession(m.sessionId, text)) {
     note(m, `could not type into the session (${reason}) — will retry`);
     return false;
   }
+  await sleep(300); // let the pane catch up before reading it back
+  const echoedLine = promptUnsentText(readPane(m.sessionId)) ?? "";
+  if (!typedLineMatches(echoedLine, text)) {
+    sendControlU(m.sessionId);
+    note(m, `arm aborted: line read back as "${echoedLine.slice(0, 60)}" not "${text.slice(0, 60)}"`);
+    return false;
+  }
+  sendEnterKey(m.sessionId);
 
   // Typed is not sent, and sent is not received.
   for (let i = 0; i < 5; i++) {
@@ -1661,13 +2297,11 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
       const carried = m.pending.length;
       m.pending = [];
       armingsSinceReport.set(m.sessionId, (armingsSinceReport.get(m.sessionId) ?? 0) + 1);
-      note(
-        m,
-        `armed: ${reason}${carried ? ` (carrying ${carried} operator instruction${carried > 1 ? "s" : ""})` : ""}` +
-          // Recorded because it is the one thing that explains a goal arriving
-          // with somebody's half-sentence welded to the front of it.
-          (onLine ? ` — the input line held "${onLine.slice(0, 60)}" when this went in` : ""),
-      );
+      // The read-back above already confirmed the line held exactly what was
+      // typed before CR ever went out, so there is nothing left here to weld
+      // a goal onto — unlike before any of this guard existed, this note
+      // never has an "input line held X" case left to report.
+      note(m, `armed: ${reason}${carried ? ` (carrying ${carried} operator instruction${carried > 1 ? "s" : ""})` : ""}`);
       return true;
     }
   }
@@ -1833,6 +2467,79 @@ async function tick(): Promise<void> {
       m.lastHash = h;
       m.lastChangeAt = now;
       dirty = true;
+    }
+
+    // Resolved once and reused for everything below that needs the pane's
+    // process and project — the context sample, the diagnostic log line, and
+    // (further down) the handover-due decision. Re-resolving per use is what
+    // this file did before and it is one lsof/ps/tail call each time; doing
+    // it once per session per tick is the same reading at a fraction of the
+    // cost.
+    const tickTty = m.tty ?? snapshotTty(m.sessionId);
+    const tickPid = tickTty ? processReading(tickTty).pid : null;
+    const tickTranscript = tickPid ? transcriptReading(tickPid) : null;
+    const tickUsed = tickTranscript?.contextK ?? null;
+    const tickCwd = tickPid ? sessionCwd(tickPid) : null;
+    const tickDirCandidate = tickCwd ? join(homedir(), ".claude", "projects", tickCwd.replace(/\//g, "-")) : null;
+    const tickDir = tickDirCandidate && existsSync(tickDirCandidate) ? tickDirCandidate : null;
+
+    // Sample context for the fill-rate reading in `status`. Pushed only when
+    // a real number is available — never a synthetic 0 for a tick where the
+    // transcript could not be read, which would read as a session that
+    // stopped filling rather than one that could not be measured this tick.
+    if (tickUsed !== null) {
+      m.contextSamples ??= [];
+      m.contextSamples.push({ at: now, k: tickUsed });
+      if (m.contextSamples.length > 90) m.contextSamples = m.contextSamples.slice(-90);
+      dirty = true;
+    }
+
+    /**
+     * DIAGNOSTIC: one log line per session per tick, rate-limited.
+     *
+     * The daemon log had NO record of the context reading or the handover
+     * decision anywhere — `liveReading()`'s numbers are computed on demand
+     * for `manage status` and never written down otherwise, so the ONE
+     * question worth asking after the fact ("was a handover due, and why
+     * didn't it fire") had no evidence to answer it from. This is that
+     * evidence. Rate-limited to when the reading actually moves — every 20s
+     * tick logging an unchanged number would bury the log exactly as badly
+     * as saying nothing.
+     */
+    // Idle for the handover ask's own purposes: NOT "time since the last
+    // transcript entry" alone — a long-running tool call leaves that entry
+    // old while the session is still working. Only counts as idle time when
+    // the transcript's own `working` flag says the turn has actually ended;
+    // otherwise forced to 0, which fails every idle floor regardless of how
+    // long that entry has sat there.
+    const tickIdleMs =
+      tickTranscript?.working === false && tickTranscript.lastAt !== null
+        ? Math.max(0, now - tickTranscript.lastAt)
+        : 0;
+
+    const tickCompaction = compactionReading(m, tickPid, tickDir);
+    const tickHandoverDecision = handoverDue({
+      contextK: tickUsed ?? undefined,
+      effectiveK: tickCompaction.effectiveK,
+      marginK: resolvedMarginK(m),
+      lastAskAt: m.handoverDoneAt,
+      handoverDoneK: m.handoverDoneK,
+      idleMs: tickIdleMs,
+      now,
+    });
+    {
+      const prevLog = lastContextLog.get(m.sessionId);
+      const kMoved = tickUsed !== null && (prevLog?.k === undefined || Math.abs(tickUsed - prevLog.k) >= 10);
+      const reasonMoved = prevLog?.reason !== tickHandoverDecision.reason;
+      if (kMoved || reasonMoved || !prevLog) {
+        const band = tickUsed !== null ? bandOf(tickUsed, tickCompaction.effectiveK, resolvedMarginK(m)) : "below";
+        log(
+          `[manage] ${m.name} context=${tickUsed !== null ? `${tickUsed}k` : "unknown"} ` +
+            `trigger≈${Math.round(tickCompaction.effectiveK)}k(${tickCompaction.label}) band=${band} ` +
+            `due=${tickHandoverDecision.due} reason=${tickHandoverDecision.reason}`,
+        );
+        lastContextLog.set(m.sessionId, { k: tickUsed ?? (prevLog?.k ?? -1), reason: tickHandoverDecision.reason });
+      }
     }
 
     /**
@@ -2202,54 +2909,61 @@ async function tick(): Promise<void> {
     // high precisely because the clear has not landed, so without this the
     // threshold re-qualifies the session every tick and the rollover machinery
     // runs in a circle, each lap adding another clear to the queue.
-    if (!m.paused && !m.handoverAskedAt && !m.clearPendingSince && m.handoverFile) {
-      // The pane is resolved here rather than carried in from elsewhere in the
-      // tick, so this block does not depend on the order of what precedes it.
-      const tty = m.tty ?? snapshotTty(m.sessionId);
-      const pid = tty ? processReading(tty).pid : null;
-      const t = pid ? transcriptReading(pid) : null;
-      const used = t?.contextK ?? null;
-
-      /**
-       * TWO WAYS TO BECOME DUE, because a handover goes out of date two ways.
-       *
-       * By the clock, which is the ordinary case. And by work done since the
-       * last one, which is the case that mattered and was missing: a session
-       * asked at the threshold keeps working to the wall, and everything it
-       * learns in that stretch is absent from the file precisely when
-       * compaction discards it. The second trigger keeps the document current
-       * with the work rather than with the hour.
-       */
-      const sinceLast = now - (m.handoverDoneAt ?? 0);
+    //
+    // NOTE: `m.handoverFile` is NOT required here. It used to be, and that
+    // was the actual root cause found by investigation — the ask never fires
+    // for a session nobody has run `manage <session> handover <path>` on,
+    // whatever the threshold arithmetic says, and most managed sessions never
+    // have that command run on them. A named file stays the explicit,
+    // preferred target; an unnamed session still gets asked, at a sane
+    // default (see defaultHandoverTarget) or, failing that, with no path at
+    // all rather than not asking.
+    if (!m.paused && !m.handoverAskedAt && !m.clearPendingSince) {
+      // Reuses the pid/context/decision already resolved once above, for
+      // every managed session, so the diagnostic log and the actual ask are
+      // never able to disagree about what was seen this tick.
+      const used = tickUsed;
+      const decision = tickHandoverDecision;
       const grownBy = used !== null && m.handoverDoneK !== undefined ? used - m.handoverDoneK : null;
-      const dueByTime = sinceLast > HANDOVER_REASK_MS;
-      const dueByWork = grownBy !== null && grownBy >= HANDOVER_REASK_K && sinceLast > HANDOVER_MIN_GAP_MS;
 
-      // 1M is the window these sessions run in; treat anything else as unknown
-      // rather than guessing, because a wrong denominator rolls over a session
-      // that had plenty of room left.
-      if ((dueByTime || dueByWork) && used !== null && used / 1000 >= HANDOVER_AT) {
-        const askedPath = resolveHandoverPath(m.handoverFile);
+      if (decision.due) {
+        const notesDirExists = tickCwd ? existsSync(join(tickCwd, "Notes")) : false;
+        const usedDefault = !m.handoverFile;
+        const askedPath = m.handoverFile
+          ? resolveHandoverPath(m.handoverFile)
+          : (defaultHandoverTarget(tickCwd, notesDirExists) ?? undefined);
+
         m.handoverAskedAt = now;
         m.handoverAskedPath = askedPath;
-        m.handoverWas = fileFingerprint(askedPath);
+        m.handoverWas = askedPath ? fileFingerprint(askedPath) : undefined;
+
         // A dated handover starts empty each day, and an empty one is worse
         // than none: it reads as authoritative and says nothing. So the
         // instruction carries the rule for that case rather than assuming the
         // session will think of it at the moment it is running out of room.
-        const carry = existsSync(askedPath)
-          ? ""
-          : `That file does not exist yet — start it by carrying forward from the most recent handover beside it whatever still matters, especially anything written nowhere else. `;
-        // A top-up reads differently from a first request: the session has
-        // already written one and needs to know this is about the work SINCE,
-        // not a repeat it can satisfy by confirming the file is still there.
-        const topUp = dueByWork && !dueByTime && grownBy !== null;
+        const carry = askedPath && !existsSync(askedPath)
+          ? `That file does not exist yet — start it by carrying forward from the most recent handover beside it whatever still matters, especially anything written nowhere else. `
+          : "";
+        const whereClause = askedPath
+          ? `Update ${askedPath}. ${carry}`
+          : `Write it to your project's handover file (its ## Continue section, or wherever this project's convention keeps that) — nothing was set or found automatically, so use your own judgement about where that lives here. `;
+
+        // Wording follows the band: IMMEDIATE has no time to spare and says
+        // so; REFRESH and a work-triggered WARM-UP both mean the session has
+        // already written one and this is about the work SINCE, not a repeat
+        // it can satisfy by confirming the file is still there; anything else
+        // is a first request.
+        const topUp = m.handoverDoneAt !== undefined && (decision.reason === "refresh" || decision.reason.startsWith("warm-up — work"));
+        const urgent = decision.reason === "immediate";
         typeIntoSession(
           m.sessionId,
-          (topUp
-            ? `Bring your handover up to date — you are at ${used}k tokens, ${grownBy}k of work since you last wrote it, and the terminal will compact before long. Everything you have learned in that stretch is currently written nowhere but this context, which is the part compaction takes. `
-            : `Write your handover now — you are at ${used}k tokens and the terminal will compact before long. `) +
-            `Update ${askedPath}. ${carry}Three things: where the current item stands, what you would do next and why, ` +
+          (urgent
+            ? `URGENT — write your handover NOW. You are at ${used}k tokens and compaction is imminent; there is no time left to keep working first. `
+            : topUp
+              ? `Bring your handover up to date — you are at ${used}k tokens${grownBy !== null ? `, ${grownBy}k of work since you last wrote it` : ""}, and the terminal will compact before long. Everything you have learned in that stretch is currently written nowhere but this context, which is the part compaction takes. `
+              : `Write your handover now — you are at ${used}k tokens and the terminal will compact before long. `) +
+            whereClause +
+            `Three things: where the current item stands, what you would do next and why, ` +
             `and — the irreplaceable part — anything you know that is written nowhere else. Commit it. ` +
             (m.clearAfterHandover
               ? `You will be cleared once that file has changed on disk, and not before.`
@@ -2257,9 +2971,18 @@ async function tick(): Promise<void> {
         );
         notify(
           m,
-          topUp
-            ? `at ${used}k tokens, ${grownBy}k of new work since the last one — asked to bring the handover up to date`
-            : `at ${used}k tokens — asked for a handover${m.clearAfterHandover ? " before rolling over" : " before it compacts"}`,
+          `at ${used}k tokens (${decision.reason})` +
+            (grownBy !== null ? `, ${grownBy}k of new work since the last one` : "") +
+            ` — asked for a handover${m.clearAfterHandover ? " before rolling over" : " before it compacts"}` +
+            (askedPath ? ` — target: ${askedPath}${usedDefault ? " (default — no handoverFile set)" : ""}` : " — no target resolved, asked without naming a path"),
+        );
+        // The idle age that justified typing into this session now — the
+        // un-gated ask reaches every managed session, not just the one
+        // opted-in session it used to, so the evidence for "this was a safe
+        // moment to interrupt it" belongs in the log every single time.
+        log(
+          `[manage] ${m.name} asked for handover: context=${used}k band=${bandOf(used ?? 0, tickCompaction.effectiveK, resolvedMarginK(m))} ` +
+            `idle=${Math.round(tickIdleMs / 1000)}s target=${askedPath ?? "none"}`,
         );
         dirty = true;
         continue;
@@ -2466,10 +3189,15 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `                \`until\` takes the next time the clock reads it, which is\n` +
         `                what somebody deciding at midnight actually means\n` +
         `  handover <path> [clear]\n` +
-        `                where this session writes what it knows. At 82% context it\n` +
-        `                is asked to update that file, then carries on — the terminal\n` +
-        `                compacts by itself and the file is what survives it. Add\n` +
-        `                "clear" to also clear the session (queues, in a long turn)\n` +
+        `                where this session writes what it knows. It is asked to update\n` +
+        `                that file once context nears the compaction trigger (measured\n` +
+        `                from this project's own history where possible, else assumed),\n` +
+        `                then carries on — the terminal compacts by itself and the file\n` +
+        `                is what survives it. Add "clear" to also clear the session\n` +
+        `                (queues, in a long turn)\n` +
+        `  handover-at <k>\n` +
+        `                this session's own warm-up margin in K tokens below the\n` +
+        `                trigger, instead of the ${HANDOVER_MARGIN_K_DEFAULT}k default (range ${MARGIN_K_MIN}-${MARGIN_K_MAX})\n` +
         `  set <text>    REPLACE the standing objective. Plain text on a running\n` +
         `                manager is a one-shot note; this changes what it re-arms\n` +
         `  add <text>    EXTEND the standing objective. Say it to the session\n` +
@@ -2671,7 +3399,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `managing ${name}${existing.paused ? " (paused)" : ""}\n` +
         `objective: ${existing.objective}\n` +
         `\nright now:\n` +
-        liveReading(sessionId, idle) +
+        liveReading(sessionId, idle, existing) +
         // Who holds the screen belongs in the live reading, not in the
         // manager's own record: it is a fact about the machine right now, and
         // it is the one a watcher cannot get any other way.
@@ -2897,14 +3625,14 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
     }
     note(
       existing,
-      `handover file set to ${path} — asked for at ${Math.round(HANDOVER_AT * 100)}% context${wantsClear ? ", then cleared" : ", no clear"}`,
+      `handover file set to ${path} — asked for ${resolvedMarginK(existing)}k below the compaction trigger${wantsClear ? ", then cleared" : ", no clear"}`,
     );
     saveState(state);
     return {
       ok: true,
       managed: true,
       message:
-        `${name} will be asked to hand over at ${Math.round(HANDOVER_AT * 100)}% of its context, into ${path}.\n` +
+        `${name} will be asked to hand over ${resolvedMarginK(existing)}k below wherever its compaction trigger turns out to be (see \`manage ${name} status\` for the current reading), into ${path}.\n` +
         (resolved === path
           ? ""
           : `  Today that resolves to ${resolved}; the date is worked out each time it is asked for, not now.\n`) +
@@ -2918,6 +3646,38 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         (existsSync(resolved)
           ? ""
           : `\n  NOTE: ${resolved} does not exist yet. It counts as changed when first written, and the\n  request will tell the session to carry forward what still matters from the most recent one beside it.`),
+    };
+  }
+
+  /**
+   * handover-at <k> — this session's own warm-up margin, overriding the
+   * default 100k.
+   *
+   * A fixed FRACTION of a fixed window cannot be right for every session —
+   * that was tried (0.82 of a 1000k window) and the ground moved under it:
+   * the same configured override produced compactions averaging ~1000k
+   * before 2026-09-12 and ~784k after. So the margin is now measured from
+   * wherever the trigger actually turns out to be for THIS project (see
+   * effectiveCompactK / measuredCompactK), and this only ever overrides how
+   * far below that point to ask — in K tokens, not a share of anything.
+   */
+  const handoverAtMatch = arg.match(/^handover-at\s+(\d+)\s*$/i);
+  if (handoverAtMatch && existing) {
+    const n = Number(handoverAtMatch[1]);
+    if (!Number.isFinite(n) || n < MARGIN_K_MIN || n > MARGIN_K_MAX) {
+      return {
+        ok: false,
+        message: `handover-at must be a whole number of K tokens between ${MARGIN_K_MIN} and ${MARGIN_K_MAX} (got "${handoverAtMatch[1]}")`,
+      };
+    }
+    const wasK = resolvedMarginK(existing);
+    existing.handoverMarginK = n;
+    note(existing, `handover warm-up margin set to ${n}k below the trigger`);
+    saveState(state);
+    return {
+      ok: true,
+      managed: true,
+      message: `${name} will now be asked to hand over ${n}k below its compaction trigger (was ${wasK}k).`,
     };
   }
 

@@ -1,17 +1,26 @@
 /**
- * Reading the input line — for the record, not for a decision.
+ * Reading the input line.
  *
- * This once blocked arming: if anything sat unsent in the prompt, the manager
- * stood back rather than run its goal into a half-typed sentence. The terminal
- * defeated it. Claude Code offers a greyed-out SUGGESTION on that same line,
- * accepted with Tab, and no colour survives a pane capture — so a suggestion
- * read as somebody mid-sentence, and a suggestion never finishes being typed.
- * The refusal never lifted and a session sat idle with work outstanding.
+ * This once blocked arming outright: if anything sat unsent in the prompt,
+ * the manager stood back rather than run its goal into a half-typed
+ * sentence. The terminal defeated it. Claude Code offers a greyed-out
+ * SUGGESTION on that same line, accepted with Tab, and no colour survives a
+ * pane capture — so a suggestion read as somebody mid-sentence, and a
+ * suggestion never finishes being typed. The refusal never lifted and a
+ * session sat idle with work outstanding.
  *
- * The reading is kept because it explains a goal that arrives welded to
- * somebody's half-sentence, and it decides nothing. These tests pin what it
- * reports, and above all that it finds the LIVE line rather than scrollback —
- * a wrong answer here now costs a confusing log entry instead of a stall.
+ * It now DOES feed a decision — inputLineDecision (test/manage-type-guard
+ * .test.ts) — but not that same wall: non-empty text is only ever SKIPPED
+ * and retried next tick, never blocked forever and never typed over. Only
+ * once IDENTICAL text has sat unchanged for several minutes while the
+ * session is idle does it read as an abandoned ghost rather than someone
+ * typing, and only then is the line cleared. So a live suggestion or a real
+ * half-sentence costs a delayed arming, never a permanent stall and never a
+ * destroyed keystroke — which is the failure this reading originally caused.
+ *
+ * These tests pin what the raw reading itself reports, and above all that it
+ * finds the LIVE line rather than scrollback — a wrong answer here now feeds
+ * a wrong decision instead of a confusing log entry.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
