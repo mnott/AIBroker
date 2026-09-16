@@ -197,6 +197,13 @@ export class TmuxTransport implements SessionTransport {
     return true;
   }
 
+  /** Send a single named tmux key (e.g. "C-u", "Enter") — no text, no retry. */
+  sendKey(id: string, key: string): boolean {
+    const pane = this.paneFor(id);
+    if (pane == null) return false;
+    return runTmux(["send-keys", "-t", pane, key]) != null;
+  }
+
   capture(id: string, lines?: number): string | null {
     const pane = this.paneFor(id);
     if (pane == null) return null;
