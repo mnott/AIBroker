@@ -899,6 +899,20 @@ export function needsVimEscape(paneText: string): boolean {
 }
 
 /**
+ * Whether a pane's tab title names a Claude session rather than a bare shell.
+ * iTerm titles encode the foreground process: idle Claude tabs report
+ * "(claude)", busy ones "(node)"; both are the session, only a title with
+ * neither is a shell. `atPrompt` alone cannot tell them apart, because an
+ * idle Claude pane sits at its own input line too.
+ */
+export function isClaudePane(name: string | undefined): boolean {
+  return (
+    !!name &&
+    (name.toLowerCase().includes("claude") || name.includes("(node)") || name.includes("(npm)") || name.includes("(bun)"))
+  );
+}
+
+/**
  * What to do about text already sitting in a session's input line, before
  * typing anything — the pure decision behind the read-back-first sequence in
  * arm() and send_to_session.
@@ -2195,18 +2209,21 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
    * A goal whose wording happened to begin a line with a real command would
    * have run it, in the operator's own shell, with no confirmation.
    *
-   * `atPrompt` is exactly the discriminator: it is false for a session running
-   * Claude — the foreground process is node whether it is working or idle — and
-   * true when the shell itself is waiting for input. So true means the thing we
-   * are managing is gone, and the right move is to say so and stop, not to keep
-   * typing into whatever is there now.
+   * `atPrompt` was first taken as the whole discriminator, but it is not: an
+   * idle Claude pane sits at its own input line and reports atPrompt too, and
+   * a manager armed against it would pause claiming an exit that never
+   * happened. The tab title carries what atPrompt cannot — an idle Claude tab
+   * shows "(claude)", a busy one "(node)", and only a shell shows neither
+   * (see isClaudePane). So atPrompt with a title that names no session means
+   * the thing we are managing is gone, and the right move is to say so and
+   * stop, not to keep typing into whatever is there now.
    */
   const live = readSessionContent(m.sessionId, 5);
   if (!live) {
     note(m, "the session could not be read — not typing anything");
     return false;
   }
-  if (live.atPrompt) {
+  if (live.atPrompt && !isClaudePane(live.name)) {
     m.paused = true;
     notify(m, "PAUSED — that pane is at a shell prompt, so the session has exited. Not typing a goal into a shell. `resume` once it is back.");
     return false;
@@ -3702,9 +3719,14 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
      * manager exists, appears in every listing, and has to be found and removed
      * by somebody who did not create it on purpose. Check at the point of
      * creation, where the mistake is still one command old.
+     *
+     * atPrompt alone is not that check: an idle Claude pane reports atPrompt
+     * too — its own input line — so refusing on it alone turned away a live
+     * but idle session. Only a title that names no session (see isClaudePane)
+     * is a shell to refuse.
      */
     const probe = readSessionContent(sessionId, 5);
-    if (probe?.atPrompt) {
+    if (probe?.atPrompt && !isClaudePane(probe.name)) {
       return {
         ok: false,
         message:

@@ -18,10 +18,15 @@
  * before sending CR — catching, among other things, a long `/goal …` line
  * observed folding in the terminal and landing as a pasted message instead
  * of a slash command (2026-09-13).
+ *
+ * `isClaudePane` is the shell-vs-session guard behind manage's creation
+ * check and arm(): idle Claude tabs report "(claude)", busy ones "(node)",
+ * and only a bare shell's title names neither — atPrompt alone misread a
+ * live but idle session as a shell (2026-09-17).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { inputLineDecision, typedLineMatches, needsVimEscape } from "../src/daemon/manage.js";
+import { inputLineDecision, typedLineMatches, needsVimEscape, isClaudePane } from "../src/daemon/manage.js";
 
 // ── inputLineDecision ────────────────────────────────────────────────────
 
@@ -98,4 +103,30 @@ test("needsVimEscape: pane showing -- NORMAL -- needs the escape", () => {
 
 test("needsVimEscape: a plain prompt with no mode indicator does not", () => {
   assert.equal(needsVimEscape("some pane content\n❯ "), false);
+});
+
+// ── isClaudePane ──────────────────────────────────────────────────────────
+//
+// The guard that keeps manage from refusing a live but IDLE Claude session:
+// iTerm tab titles encode the foreground process, so "(claude)" is the idle
+// session and "(node)" a busy one; a title naming neither is a shell.
+
+test("isClaudePane: an idle Claude tab is the session", () => {
+  assert.equal(isClaudePane("✳ PAI (claude)"), true);
+});
+
+test("isClaudePane: a busy Claude tab (node) is the session", () => {
+  assert.equal(isClaudePane("Chat (node)"), true);
+});
+
+test("isClaudePane: a bare zsh title is a shell", () => {
+  assert.equal(isClaudePane("~/dev/ai/PAI (-zsh)"), false);
+});
+
+test("isClaudePane: any node foreground process is not a shell", () => {
+  assert.equal(isClaudePane("exec (node)"), true);
+});
+
+test("isClaudePane: no title at all is not a Claude pane", () => {
+  assert.equal(isClaudePane(undefined), false);
 });
