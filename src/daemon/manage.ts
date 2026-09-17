@@ -874,10 +874,23 @@ export function contextSlope(
  * Tolerant of a leading `❯` prompt marker and trailing whitespace, because
  * `readBack` may be a raw line straight off the pane rather than one already
  * run through promptUnsentText's own stripping.
+ *
+ * Observed twice live on 2026-09-18: a real terminal WRAPS long input lines,
+ * so the pane read-back shows the intended text broken across several lines
+ * with continuation whitespace, the exact-prefix check failed, Enter was
+ * never sent, and the typed goal was left sitting unsubmitted on the input
+ * line. Both sides are therefore normalized the same way — strip a leading
+ * `❯`, collapse every whitespace run (spaces, tabs, newlines) to a single
+ * space, trim — before the startsWith compare. Collapsing whitespace is safe
+ * here because the intended text is pasted verbatim: only the pane re-flows
+ * it, so any whitespace difference in the read-back is wrapping, not
+ * corruption, while word-level damage (truncation, a pasted-message fold,
+ * wrong words) still fails the prefix check.
  */
 export function typedLineMatches(readBack: string, intended: string): boolean {
-  const cleaned = readBack.replace(/^\s*❯\s*/, "").trimEnd();
-  return cleaned.startsWith(intended.trimEnd());
+  const normalize = (line: string) =>
+    line.replace(/^\s*❯\s*/, "").replace(/\s+/g, " ").trim();
+  return normalize(readBack).startsWith(normalize(intended));
 }
 
 /**

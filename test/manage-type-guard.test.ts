@@ -83,6 +83,34 @@ test("typedLineMatches: a shorter read-back than intended does not match", () =>
   assert.equal(typedLineMatches("❯ /goal do the th", "/goal do the thing"), false);
 });
 
+// The 2026-09-18 failure: a real terminal wraps long input lines, so the
+// read-back carries the intended text broken across pane lines with
+// continuation indent. That is wrapping, not corruption — it must match.
+
+test("typedLineMatches: wrapped across three lines with deep continuation indent still matches", () => {
+  const intended = "/goal fix the MCP remoting for Chrome tabs";
+  const readBack = "/goal fix the MCP\n              remoting for\n              Chrome tabs";
+  assert.equal(typedLineMatches(readBack, intended), true);
+});
+
+test("typedLineMatches: ❯ marker plus a wrapped fold still matches", () => {
+  const intended = "/goal fix the MCP remoting for Chrome tabs";
+  const readBack = "❯ /goal fix the MCP remoting\n  for Chrome tabs";
+  assert.equal(typedLineMatches(readBack, intended), true);
+});
+
+test("typedLineMatches: wrapped read-back with different words does not match", () => {
+  const intended = "/goal fix the MCP remoting for Chrome tabs";
+  const readBack = "❯ /goal fix the MCP remoting for\n    Firefox tabs";
+  assert.equal(typedLineMatches(readBack, intended), false);
+});
+
+test("typedLineMatches: wrapped but truncated read-back does not match", () => {
+  const intended = "/goal fix the MCP remoting for Chrome tabs";
+  const readBack = "❯ /goal fix the MCP\n    remoting for Chr";
+  assert.equal(typedLineMatches(readBack, intended), false);
+});
+
 // ── needsVimEscape ───────────────────────────────────────────────────────
 //
 // Gates escapeInputMode's 'i' keystroke — sent unconditionally, it lands as
