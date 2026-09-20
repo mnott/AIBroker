@@ -14,7 +14,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pendingPrompt, blockedReason } from "../src/daemon/manage.js";
+import { pendingPrompt, blockedReason, sessionIsWorking } from "../src/daemon/manage.js";
 
 // ── pendingPrompt: the fast, text-based path ────────────────────────────────
 
@@ -115,4 +115,46 @@ test("blockedReason: armFailStreak=0, no stuckSince, long quiet, no prompt -> nu
   const busyPane = "❯ ";
 
   assert.equal(blockedReason(m, busyPane, now), null);
+});
+
+// ── sessionIsWorking: the transcript-derived signal that gates arming/alerting ──
+//
+// A session mid-turn, waiting on a sub-agent, shows a static pane — nothing
+// distinguishes it there from one genuinely stuck. The transcript is the one
+// signal that does distinguish them, so both arming and the blocked check
+// must consult it before treating silence as a fault.
+
+test("sessionIsWorking: working true, lastAt null -> true", () => {
+  const now = 10 * 60_000;
+  assert.equal(sessionIsWorking({ working: true, lastAt: null }, now), true);
+});
+
+test("sessionIsWorking: working false, lastAt 30s ago -> true", () => {
+  const now = 10 * 60_000;
+  assert.equal(sessionIsWorking({ working: false, lastAt: now - 30_000 }, now), true);
+});
+
+test("sessionIsWorking: working false, lastAt 5m ago -> false", () => {
+  const now = 10 * 60_000;
+  assert.equal(sessionIsWorking({ working: false, lastAt: now - 5 * 60_000 }, now), false);
+});
+
+test("sessionIsWorking: working null, lastAt null -> false", () => {
+  const now = 10 * 60_000;
+  assert.equal(sessionIsWorking({ working: null, lastAt: null }, now), false);
+});
+
+test("sessionIsWorking: null input -> false", () => {
+  const now = 10 * 60_000;
+  assert.equal(sessionIsWorking(null, now), false);
+});
+
+test("sessionIsWorking: undefined input -> false", () => {
+  const now = 10 * 60_000;
+  assert.equal(sessionIsWorking(undefined, now), false);
+});
+
+test("sessionIsWorking: custom withinMs — lastAt 90s ago with withinMs 60_000 -> false", () => {
+  const now = 10 * 60_000;
+  assert.equal(sessionIsWorking({ working: false, lastAt: now - 90_000 }, now, 60_000), false);
 });
