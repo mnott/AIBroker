@@ -111,6 +111,47 @@ test("typedLineMatches: wrapped but truncated read-back does not match", () => {
   assert.equal(typedLineMatches(readBack, intended), false);
 });
 
+// The 2026-09-20 failure: Claude Code scrolls long input lines so only the
+// tail is visible, or collapses the paste into a placeholder "[Pasted text
+// #N]" followed by the tail. Both are sufficient evidence of a successful
+// paste; tail matches are now accepted.
+
+test("typedLineMatches: scrolled tail of a very long line matches", () => {
+  const LONG = "/goal AG2. msg=kind line+k=v lines. kinds T R S Q A X. keys " + "x".repeat(480) + " YOUR CONTROLS until 15:40 and get on with what does not need the screen.";
+  const readBack = "❯ n with what does not need the screen.";
+  assert.equal(typedLineMatches(readBack, LONG), true);
+});
+
+test("typedLineMatches: collapsed paste placeholder plus tail matches", () => {
+  const LONG = "/goal AG2. msg=kind line+k=v lines. kinds T R S Q A X. keys " + "x".repeat(480) + " YOUR CONTROLS until 15:40 and get on with what does not need the screen.";
+  const readBack = "[Pasted text #8]n with what does not need the screen.";
+  assert.equal(typedLineMatches(readBack, LONG), true);
+});
+
+test("typedLineMatches: collapsed paste placeholder alone (empty after strip) matches", () => {
+  const LONG = "/goal AG2. msg=kind line+k=v lines. kinds T R S Q A X. keys " + "x".repeat(480) + " YOUR CONTROLS until 15:40 and get on with what does not need the screen.";
+  const readBack = "[Pasted text #8]";
+  assert.equal(typedLineMatches(readBack, LONG), true);
+});
+
+test("typedLineMatches: an empty read-back with no placeholder does not match — nothing was pasted", () => {
+  const LONG = "/goal AG2. msg=kind line+k=v lines. kinds T R S Q A X. keys " + "x".repeat(480) + " YOUR CONTROLS until 15:40 and get on with what does not need the screen.";
+  assert.equal(typedLineMatches("", LONG), false);
+  assert.equal(typedLineMatches("❯ ", LONG), false);
+});
+
+test("typedLineMatches: a short tail (< 30 chars) does not match", () => {
+  const LONG = "/goal AG2. msg=kind line+k=v lines. kinds T R S Q A X. keys " + "x".repeat(480) + " YOUR CONTROLS until 15:40 and get on with what does not need the screen.";
+  const readBack = "the screen.";
+  assert.equal(typedLineMatches(readBack, LONG), false);
+});
+
+test("typedLineMatches: a tail of a different line does not match", () => {
+  const LONG = "/goal AG2. msg=kind line+k=v lines. kinds T R S Q A X. keys " + "x".repeat(480) + " YOUR CONTROLS until 15:40 and get on with what does not need the screen.";
+  const readBack = "n with what does not need the keyboard.";
+  assert.equal(typedLineMatches(readBack, LONG), false);
+});
+
 // ── needsVimEscape ───────────────────────────────────────────────────────
 //
 // Gates escapeInputMode's 'i' keystroke — sent unconditionally, it lands as

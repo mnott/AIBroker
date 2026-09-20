@@ -210,6 +210,37 @@ const BLOCKED_STATIC_MS = 3 * 60_000;
 const BLOCKED_REALERT_MS = 15 * 60_000;
 
 /**
+ * A session whose transcript moved within this window is WORKING — text
+ * typed at it queues invisibly rather than landing on screen, and a static
+ * pane is exactly what a mid-turn session looks like from the outside. This
+ * is the signal that was missing from both arming and the blocked check: a
+ * session waiting on a sub-agent looks identical, from the pane alone, to
+ * one stuck on a permission prompt, and only the transcript tells them apart.
+ */
+const WORKING_RECENT_MS = 2 * 60_000;
+
+/**
+ * Is this session mid-turn right now, per the transcript reading taken the
+ * same tick? True if the transcript says so directly (`working: true`), or
+ * if it moved within `withinMs` even without a definite working flag. Falls
+ * back to false — not working — whenever the signal itself is missing
+ * (`null`/`undefined` input, or both fields unknown), which is the safe
+ * default: it leaves arming and the blocked check exactly as they behaved
+ * before this existed rather than suppressing them on a reading that never
+ * arrived.
+ */
+export function sessionIsWorking(
+  t: { working: boolean | null; lastAt: number | null } | null | undefined,
+  now: number,
+  withinMs = WORKING_RECENT_MS,
+): boolean {
+  if (!t) return false;
+  if (t.working === true) return true;
+  if (typeof t.lastAt === "number" && now - t.lastAt < withinMs) return true;
+  return false;
+}
+
+/**
  * The startup banner, which is the pane's only POSITIVE evidence of a clear.
  *
  * The first version of this test asked the opposite question — whether the
@@ -395,6 +426,10 @@ export interface ManagedSession {
    * once the pane has also gone static long enough to confirm it.
    */
   stuckSince?: number;
+  /** When arming last logged "busy, not arming" for this session — the dedup
+   *  clock for that note, since the skip itself happens every tick while the
+   *  session stays mid-turn. */
+  busyNotedAt?: number;
   /**
    * When this session was first seen BLOCKED — waiting on a permission
    * prompt or similar, not merely idle. Kept across ticks so the operator
@@ -886,11 +921,48 @@ export function contextSlope(
  * it, so any whitespace difference in the read-back is wrapping, not
  * corruption, while word-level damage (truncation, a pasted-message fold,
  * wrong words) still fails the prefix check.
+ *
+ * Observed live on 2026-09-20: very long input lines (>400 chars) cause
+ * Claude Code to either scroll the input box so only the visible tail is
+ * shown in the read-back, or collapse a pasted line into a placeholder like
+ * "[Pasted text #8]" followed by the tail. When the pane reads back only the
+ * tail of the intended line, the prefix check fails, blocking all long goals.
+ * Tail matching now accepts read-backs that strip the paste placeholder and
+ * appear as a suffix of the intended line, provided they are ≥30 chars or
+ * empty (pure placeholder). A short tail is rejected to avoid false positives.
  */
 export function typedLineMatches(readBack: string, intended: string): boolean {
   const normalize = (line: string) =>
     line.replace(/^\s*❯\s*/, "").replace(/\s+/g, " ").trim();
-  return normalize(readBack).startsWith(normalize(intended));
+
+  const normalizedReadBack = normalize(readBack);
+  const normalizedIntended = normalize(intended);
+
+  // Existing rule: prefix match (handles wrapping).
+  if (normalizedReadBack.startsWith(normalizedIntended)) {
+    return true;
+  }
+
+  // Strip Claude Code paste placeholder.
+  const placeholder = /^\[Pasted text #\d+\]\s*/;
+  const collapsed = placeholder.test(normalizedReadBack);
+  const strippedReadBack = normalizedReadBack.replace(placeholder, "");
+
+  // Accept an empty read-back ONLY behind the placeholder (the entire paste
+  // collapsed). An empty line with no placeholder means nothing was pasted.
+  if (strippedReadBack === "") {
+    return collapsed;
+  }
+
+  // Tail match: read-back appears as the end of intended, if long enough.
+  if (
+    strippedReadBack.length >= 30 &&
+    normalizedIntended.endsWith(strippedReadBack)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -2508,6 +2580,7 @@ async function tick(): Promise<void> {
     const tickTty = m.tty ?? snapshotTty(m.sessionId);
     const tickPid = tickTty ? processReading(tickTty).pid : null;
     const tickTranscript = tickPid ? transcriptReading(tickPid) : null;
+    const working = sessionIsWorking(tickTranscript, now);
     const tickUsed = tickTranscript?.contextK ?? null;
     const tickCwd = tickPid ? sessionCwd(tickPid) : null;
     const tickDirCandidate = tickCwd ? join(homedir(), ".claude", "projects", tickCwd.replace(/\//g, "-")) : null;
@@ -3037,8 +3110,27 @@ async function tick(): Promise<void> {
      * take, so a session in that state gets no special handling here and
      * simply keeps going through the ordinary arm path below — worse than
      * ideal, but never worse than before this existed.
+     *
+     * Gated on the pane having been quiet for WORKING_RECENT_MS: a session
+     * whose transcript moved inside that window is mid-turn, not stuck, so
+     * neither blockedReason nor the alert below run for it at all. This
+     * delays a real permission prompt's alert by up to WORKING_RECENT_MS
+     * from when it would otherwise fire — it never suppresses one, since a
+     * genuinely stuck session goes quiet on the transcript too.
      */
     if (!m.paused && lease) {
+      if (working) {
+        const hadState = m.blockedSince !== undefined || m.blockedAlertedAt !== undefined || m.stuckSince !== undefined;
+        if (hadState) {
+          delete m.stuckSince;
+          delete m.blockedSince;
+          delete m.blockedAlertedAt;
+          m.armFailStreak = 0;
+          dirty = true;
+          note(m, `working (transcript moved <${Math.round(WORKING_RECENT_MS / 1000)}s ago) — not blocked, not arming`);
+        }
+        continue;
+      }
       const blocked = blockedReason(m, content, now);
       if (blocked) {
         if (!m.blockedAlertedAt || now - m.blockedAlertedAt >= BLOCKED_REALERT_MS) {
@@ -3070,6 +3162,19 @@ async function tick(): Promise<void> {
         delete m.blockedAlertedAt;
         dirty = true;
       }
+    }
+
+    // Mid-turn — typing here queues invisibly and the read-back that confirms
+    // an arming can never see it land. Logged at most once every 5 minutes
+    // (the skip itself runs every tick regardless) so a session in a long
+    // turn does not fill its own history with the same line.
+    if (working) {
+      if (!m.busyNotedAt || now - m.busyNotedAt >= 5 * 60_000) {
+        note(m, `busy — transcript moved <${Math.round(WORKING_RECENT_MS / 1000)}s ago; not arming`);
+        m.busyNotedAt = now;
+        dirty = true;
+      }
+      continue;
     }
 
     // Once arming has failed enough to be considered stuck, stop typing into
