@@ -22,7 +22,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const ADVISOR = join(homedir(), ".claude", "advisor-mode.json");
+// PAI moved this file under PAI_HOME (pre-2026-09-19 it always lived at
+// ~/.claude); prefer the live location, fall back to the old one if that's
+// all a not-yet-updated install has, otherwise assume the new layout.
+const PAI_HOME = process.env.PAI_HOME || join(homedir(), ".claude", "pai");
+const ADVISOR_NEW = join(PAI_HOME, "advisor-mode.json");
+const ADVISOR_OLD = join(homedir(), ".claude", "advisor-mode.json");
+const ADVISOR = existsSync(ADVISOR_NEW) ? ADVISOR_NEW : existsSync(ADVISOR_OLD) ? ADVISOR_OLD : ADVISOR_NEW;
 const CONFIG = join(homedir(), ".aibroker", "budget-stop.json");
 
 /** Never throw out of a hook: a parse error must not become a stuck session. */

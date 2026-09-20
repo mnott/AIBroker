@@ -52,7 +52,13 @@ function write(cfg: BudgetConfig): void {
 
 function percent(): number | null {
   try {
-    const p = join(homedir(), ".claude", "advisor-mode.json");
+    // PAI moved this file under PAI_HOME (pre-2026-09-19 it always lived at
+    // ~/.claude); prefer the live location, fall back to the old one if
+    // that's all a not-yet-updated install has.
+    const paiHome = process.env.PAI_HOME || join(homedir(), ".claude", "pai");
+    const pNew = join(paiHome, "advisor-mode.json");
+    const pOld = join(homedir(), ".claude", "advisor-mode.json");
+    const p = existsSync(pNew) ? pNew : existsSync(pOld) ? pOld : pNew;
     const v = JSON.parse(readFileSync(p, "utf8")).weeklyBudgetPercent;
     return typeof v === "number" ? v : null;
   } catch {
