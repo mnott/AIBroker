@@ -171,6 +171,19 @@ Rename the current Claude session. Updates both the hub registry and all adapter
 
 **Returns:** `"Session renamed to \"<name>\""`
 
+The `/resume` picker title is written into the transcript by the PreToolUse hook `hooks/aibroker-rename-title.mjs` (matcher `mcp__aibroker__aibroker_rename`), wired in Claude Code's `settings.json`:
+
+```json
+{
+  "matcher": "mcp__aibroker__aibroker_rename",
+  "hooks": [
+    { "type": "command", "command": "node <repo>/hooks/aibroker-rename-title.mjs" }
+  ]
+}
+```
+
+Earlier the daemon typed `/rename <name>` into the caller's own input line, which raced the operator's keyboard.
+
 ---
 
 ### `aibroker_discover`
