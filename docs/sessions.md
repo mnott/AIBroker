@@ -381,6 +381,7 @@ Sessions get names from several sources:
 2. **User command**: `/N [name]` renames the active session (`updateName()`)
 3. **Name sync**: When the daemon discovers an iTerm2 tab, it can sync the tab's title as the session name
 4. **MCP registration**: The MCP server sends `name` in its registration payload
+5. **`/resume` picker title**: written into the Claude Code transcript by the PreToolUse hook `hooks/aibroker-rename-title.mjs` on `aibroker_rename` — never typed into the session
 
 Names are persisted in `sessions.json` and restored at startup.
 
