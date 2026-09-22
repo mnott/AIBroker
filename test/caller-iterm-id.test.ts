@@ -21,7 +21,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { callerItermId } from "../src/daemon/core-handlers.js";
+import { callerItermId, sendToSessionDelivery } from "../src/daemon/core-handlers.js";
 import type { IpcRequest } from "../src/types/ipc.js";
 
 const UUID = "066504E1-BB16-48D3-9A74-C1F8BA45B7F3";
@@ -55,4 +55,26 @@ test("both fields present: itermSessionId is the more specific one and wins", ()
 
 test("neither field: undefined, so the caller can say \"unknown\" rather than guess", () => {
   assert.equal(callerItermId(req({})), undefined);
+});
+
+// ── sendToSessionDelivery — a beat is typed bare and never mailed ───────────
+//
+// The bug this pins: an idle cache-keepalive beat went through send_to_session
+// like any other message, so it always picked up a `[Session:...]` prefix —
+// telling the receiving Claude to reply to it — and a mailbox copy, so the
+// drain-mailbox reminder repeated that demand. Idle sessions spent a turn and
+// a tool call answering a beat, and the acks landed in unrelated sessions
+// because the sender label was not a registered session at all.
+
+test("noReply: typed bare, no [Session:] prefix, and nothing is deposited", () => {
+  const r = sendToSessionDelivery("beat", "cache-keepalive", true);
+  assert.equal(r.typed, "beat");
+  assert.equal(r.deposit, false);
+});
+
+test("default (noReply absent/false): unchanged — prefixed and deposited", () => {
+  const r = sendToSessionDelivery("run the sweep", "PAI", false);
+  assert.equal(r.typed, "[Session:PAI] run the sweep");
+  assert.ok(r.typed.startsWith("[Session:"));
+  assert.equal(r.deposit, true);
 });

@@ -32,7 +32,8 @@ plumbing to notice when the session has run out of goal.
 
 ## Typing, not messaging
 
-`send_to_session` prefixes every message with `[Session:<sender>] `. That is
+`send_to_session` prefixes every message with `[Session:<sender>] ` (the one
+exception is a `noReply` beat, see [mailbox.md](mailbox.md)). That is
 right for conversation and fatal for a command: a slash command is only a command
 at the start of a line, so a prefixed `/goal …` arrives as literal text and does
 nothing at all — silently.

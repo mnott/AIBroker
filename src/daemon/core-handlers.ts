@@ -114,6 +114,26 @@ export function callerItermId(req: IpcRequest): string | undefined {
   return raw.includes(":") ? raw.split(":").pop()! : raw;
 }
 
+/**
+ * What send_to_session types and whether it deposits to the mailbox, for a
+ * given noReply mode.
+ *
+ * noReply is for automated beats that expect no answer: nothing is queued
+ * (a beat has no value later, and the drain-mailbox reminder would repeat a
+ * demand to reply that the sender can never see), and no `[Session:...]`
+ * prefix is typed (the prefix tells the receiving Claude to route a reply
+ * back to a sender, but a beat's label is not a registered session).
+ */
+export function sendToSessionDelivery(
+  message: string,
+  senderLabel: string,
+  noReply: boolean,
+): { typed: string; deposit: boolean } {
+  return noReply
+    ? { typed: message, deposit: false }
+    : { typed: `[Session:${senderLabel}] ${message}`, deposit: true };
+}
+
 function callerLabel(req: IpcRequest): string {
   const id = callerItermId(req);
   if (id) {
@@ -954,9 +974,13 @@ export function registerCoreHandlers(
    *   3. String → case-insensitive match against paiName or session name
    *
    * Calls typeIntoSession which writes text + Enter into the session's stdin.
+   *
+   * noReply: for automated beats that expect no answer. Nothing is queued
+   * to the mailbox, and no `[Session:...]` routing prefix is typed — see
+   * sendToSessionDelivery() for why both matter for a beat.
    */
   server.on("send_to_session", async (req) => {
-    const { target, message } = req.params as { target?: string; message?: string };
+    const { target, message, noReply = false } = req.params as { target?: string; message?: string; noReply?: boolean };
     if (!target) return { ok: false, error: "target is required" };
     if (!message) return { ok: false, error: "message is required" };
 
@@ -971,7 +995,7 @@ export function registerCoreHandlers(
      */
     {
       const { forwardToPeer } = await import("./peer-handlers.js");
-      const forwarded = await forwardToPeer(target, "send_to_session", { message });
+      const forwarded = await forwardToPeer(target, "send_to_session", { message, noReply });
       if (forwarded) {
         return forwarded.ok
           ? { ok: true, result: forwarded.result ?? { sent: true } }
@@ -1088,12 +1112,12 @@ export function registerCoreHandlers(
       const onLine = promptUnsentText(targetContent?.content ?? "") ?? "";
       const lineDecision = inputLineDecision({ text: onLine, sameForTicks: 1, idle: false });
       if (lineDecision.action !== "type") {
-        const evicted = depositToSessionMailbox(itermSessionId, senderLabel, message);
+        const evicted = noReply ? undefined : depositToSessionMailbox(itermSessionId, senderLabel, message);
         const reason = `input line holds '${onLine}'`;
         audit({
           action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
           outcome: "refused", body: message,
-          reason: `not typed — ${reason}`,
+          reason: `not typed — ${reason}`, meta: { noReply },
         });
         if (evicted) {
           audit({
@@ -1104,15 +1128,21 @@ export function registerCoreHandlers(
         }
         return {
           ok: false,
-          error: `not typed — ${reason}. Queued in ${resolvedName ?? target}'s mailbox instead; it can drain it with aibroker_receive.`,
+          error: noReply
+            ? `not typed — ${reason}. Dropped — noReply carries no mailbox fallback.`
+            : `not typed — ${reason}. Queued in ${resolvedName ?? target}'s mailbox instead; it can drain it with aibroker_receive.`,
         };
       }
     }
 
+    // What gets typed and whether it goes to the mailbox — see
+    // sendToSessionDelivery() for why noReply skips both.
+    const { typed: prefixedMessage, deposit: shouldDeposit } = sendToSessionDelivery(message, senderLabel, noReply);
+
     // Deposit into the target session's mailbox (structured receive). This is
     // what makes the message recoverable even when the typed copy is not seen:
     // the target can always drain it with aibroker_receive.
-    const evicted = depositToSessionMailbox(itermSessionId, senderLabel, message);
+    const evicted = shouldDeposit ? depositToSessionMailbox(itermSessionId, senderLabel, message) : undefined;
     if (evicted) {
       // A full mailbox used to drop its oldest message with no trace — the
       // same silent loss this mailbox exists to prevent, one level down.
@@ -1122,10 +1152,6 @@ export function registerCoreHandlers(
         reason: "mailbox full — oldest undrained message discarded to make room",
       });
     }
-
-    // Prefix with session routing tag so the receiving Claude knows to route the response back
-    // This is analogous to [Whazaa], [PAILot], [Telex] prefixes for other channels
-    const prefixedMessage = `[Session:${senderLabel}] ${message}`;
 
     // Confirm the target actually took it, rather than reporting success for a
     // write that landed in an input box and scrolled out of attention.
@@ -1151,14 +1177,14 @@ export function registerCoreHandlers(
     if (ack === "ok") {
       const eventId = audit({
         action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
-        outcome: "delivered", body: message,
+        outcome: "delivered", body: message, meta: { noReply },
       });
       // The recipient's next outgoing action can now be attributed to this one,
       // which is what turns isolated events into a traceable chain.
       noteInbound(resolvedName ?? target, eventId);
       return {
         ok: true,
-        result: { sent: true, delivered: true, queued: true, sessionId: itermSessionId, name: resolvedName },
+        result: { sent: true, delivered: true, queued: shouldDeposit, sessionId: itermSessionId, name: resolvedName },
       };
     }
 
@@ -1170,15 +1196,17 @@ export function registerCoreHandlers(
       : "typed but never observed leaving the input box — the target may be mid-task";
     const eventId = audit({
       action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
-      outcome: "queued", body: message, reason,
+      outcome: "queued", body: message, reason, meta: { noReply },
     });
     noteInbound(resolvedName ?? target, eventId);
     return {
       ok: true,
       result: {
-        sent: true, delivered: false, queued: true,
+        sent: true, delivered: false, queued: shouldDeposit,
         sessionId: itermSessionId, name: resolvedName,
-        note: `${reason}. It is in the session's mailbox and readable with aibroker_receive.`,
+        note: shouldDeposit
+          ? `${reason}. It is in the session's mailbox and readable with aibroker_receive.`
+          : `${reason}. Not queued — noReply carries no mailbox fallback.`,
       },
     };
   });
