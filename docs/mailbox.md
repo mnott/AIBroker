@@ -34,6 +34,21 @@ Retries default to **1** for live sessions. A redelivered message is a duplicate
 nobody downstream can tell apart from two real events — the default of three once
 delivered one message to a session three times.
 
+## No-reply beats
+
+`send_to_session` takes `noReply: true` for automated beats that expect no
+answer — PAI's session cache-keepalive is the caller. A beat is typed **bare**,
+without the `[Session:<sender>]` prefix, and **nothing is deposited**. Both
+halves matter: the prefix tells the receiving Claude to route a reply back to
+a sender that is not a registered session, and a mailbox copy would make the
+drain hook repeat that demand on the next real turn. Before this, idle
+sessions spent a turn and a tool call answering each beat.
+
+The result carries `queued: false`; a refused or unconfirmed beat is dropped
+with that said in the error or note, since a beat has no value later. The
+audit row records `meta.noReply`. The MCP tool does not expose the flag — it is
+an IPC-level option for daemons, not for conversation.
+
 ## Draining
 
 `hooks/drain-mailbox.mjs` runs as a `UserPromptSubmit` hook: it fires before the
