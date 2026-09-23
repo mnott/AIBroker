@@ -8,6 +8,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
+import { timeCall } from "../../core/call-timing.js";
 
 /**
  * Throttle identical failures so a persistent fault logs steadily, not per-poll —
@@ -68,6 +69,14 @@ export function runAppleScript(script: string, timeoutMs = 15_000): string | nul
 
   return result.stdout?.toString().trim() ?? null;
 }
+
+/**
+ * Plain-object indirection so tests can replace the osascript call without
+ * mocking node:child_process — a builtin's named export is a fixed snapshot
+ * taken once at module load, so reassigning it post-load (the usual mock
+ * technique) silently does nothing.
+ */
+export const _internal = { runAppleScript };
 
 export function stripItermPrefix(id: string | undefined): string | undefined {
   if (!id) return id;
@@ -311,7 +320,8 @@ export interface SessionSnapshot {
 function ttysRunningClaude(): Set<string> {
   const found = new Set<string>();
   try {
-    const out = execFileSync("ps", ["-ao", "tty=,command="], { encoding: "utf8", timeout: 10_000 });
+    const out = timeCall("iterm-core:ps-claude-scan", () =>
+      execFileSync("ps", ["-ao", "tty=,command="], { encoding: "utf8", timeout: 10_000 }));
     for (const line of out.split("\n")) {
       const m = line.match(/^\s*(\S+)\s+(.*)$/);
       if (!m) continue;
@@ -326,7 +336,27 @@ function ttysRunningClaude(): Set<string> {
   return found;
 }
 
-export function snapshotAllSessions(): SessionSnapshot[] {
+/**
+ * Reuse window for one enumeration, mirroring HybridSessionManager's own
+ * SYNC_COALESCE_MS (core/hybrid.ts) — same fix, same number, because this is
+ * the function that manager's own coalescing was built to protect. It only
+ * covers callers that go through `discover()`; every other caller (hub IPC
+ * `status`/`aibp_status`/`send_to_session`, PAILot's per-message session-name
+ * lookups, the MQTT "sessions"/"refresh" handler) calls this directly and was
+ * paying the full ~1.5-4s osascript+ps cost on every single request, back to
+ * back, which is what was blocking the daemon's one event loop.
+ */
+const SNAPSHOT_TTL_MS = 3_000;
+let cachedSnapshots: SessionSnapshot[] | null = null;
+let cachedAt = 0;
+
+/**
+ * True enumeration, always uncached. Split out so callers that must see a
+ * mutation they just made (e.g. a session removed 600ms ago) can bypass the
+ * memo via `snapshotAllSessions({ fresh: true })` instead of waiting out the
+ * TTL.
+ */
+function snapshotAllSessionsUncached(): SessionSnapshot[] {
   // Fetch id, name, tty, tab.title. Skip `profile name` (~0.6s) and
   // `is at shell prompt` (~3.3s) — both derived or irrelevant.
   const script = `
@@ -359,7 +389,7 @@ end tell`;
   // 4.05s and every enumeration returned empty, killing all session features
   // at once. Budget generously — this is a correctness floor, not a latency
   // target, and a slow answer beats a confidently wrong empty one.
-  const result = runAppleScript(script, 30_000);
+  const result = timeCall("iterm-core:snapshot-enum", () => _internal.runAppleScript(script, 30_000));
   if (!result) return [];
 
   const claudeTtys = ttysRunningClaude();
@@ -387,6 +417,20 @@ end tell`;
     });
   }
   return sessions;
+}
+
+/** Enumerate all iTerm2 sessions, reusing an answer up to SNAPSHOT_TTL_MS old. */
+export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnapshot[] {
+  const now = Date.now();
+  if (!opts.fresh && cachedSnapshots && now - cachedAt < SNAPSHOT_TTL_MS) return cachedSnapshots;
+  cachedSnapshots = snapshotAllSessionsUncached();
+  cachedAt = now;
+  return cachedSnapshots;
+}
+
+/** Force the next snapshotAllSessions() to re-enumerate rather than reuse. */
+export function invalidateSnapshotCache(): void {
+  cachedSnapshots = null;
 }
 
 /**

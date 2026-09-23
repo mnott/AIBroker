@@ -100,6 +100,15 @@ let mqttServer: Server | null = null;
 let bonjourInstance: any = null;
 let bonjourService: any = null;
 
+/** Returns "ip:port" for a connected client, or "unknown" if unavailable. */
+function remoteOf(client: any): string {
+  const addr = client?.conn?.remoteAddress;
+  if (!addr) return "unknown";
+  const ip = addr.startsWith("::ffff:") ? addr.slice(7) : addr;
+  const port = client?.conn?.remotePort;
+  return port ? `${ip}:${port}` : ip;
+}
+
 /** Set of currently connected MQTT client IDs. */
 const connectedClients = new Set<string>();
 
@@ -340,6 +349,133 @@ export function setMqttInboundHandler(handler: MqttInboundHandler): void {
 }
 
 /**
+ * Route one inbound publish from an app client to the hub.
+ * Exported (not inlined in startMqttBroker) so the topic-dispatch logic is
+ * testable without spinning up a real broker, TLS cert, and port.
+ */
+export function handleInboundPublish(packet: any, client: any): void {
+  // Ignore messages published by the broker itself (no client = server-side publish)
+  if (!client) return;
+
+  const topic = packet.topic as string;
+
+  // Reserved ids ("control", "device") must never fall into the session
+  // regex below — pailot/control/in matches it (sessionId="control") and
+  // steals hello/debug_state_response before their dedicated interception
+  // runs, forwarding them to the hub as an "unknown command". Check the
+  // fixed control/device topics first.
+
+  // Match pailot/{sessionId}/in — inbound text/voice/image from app
+  const sessionInMatch = topic.match(/^pailot\/([^/]+)\/in$/);
+  if (sessionInMatch && sessionInMatch[1] !== "control" && sessionInMatch[1] !== "device") {
+    try {
+      // Strip control characters (0x00-0x1F) except \t before parsing.
+      // Raw 0x0A and 0x0D are invalid inside JSON strings — the Flutter
+      // client occasionally emits them when serialising large pasted text.
+      // Escape them as \n / \r so JSON.parse accepts them and the resulting
+      // string preserves the original line breaks.
+      const raw = packet.payload.toString();
+      const sanitized = raw
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
+        .replace(/\r\n/g, "\\n")
+        .replace(/\n/g, "\\n")
+        .replace(/\r/g, "\\n");
+      const payload = JSON.parse(sanitized) as Record<string, unknown>;
+      const msgId = payload.msgId as string | undefined;
+
+      // Dedup
+      if (msgId) {
+        if (seenInboundIds.has(msgId)) return;
+        seenInboundIds.add(msgId);
+        evictOldIds();
+      }
+
+      const sessionId = sessionInMatch[1];
+      const type = (payload.type as string) ?? "text";
+      log(`[MQTT] <- ${type} from session ${sessionId.slice(0, 8)}...`);
+      inboundHandler?.(sessionId, type, payload);
+    } catch (err) {
+      const raw = packet.payload.toString();
+      log(`[MQTT] invalid inbound message on ${topic}: ${err} — payload: ${raw.slice(0, 200)}`);
+    }
+    return;
+  }
+
+  // Match pailot/device/token — APNs device token registration from app
+  if (topic === "pailot/device/token") {
+    try {
+      const raw = packet.payload.toString();
+      const sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+      const payload = JSON.parse(sanitized) as Record<string, unknown>;
+      const token = payload.token as string | undefined;
+      if (token) {
+        inboundHandler?.(undefined, "apns_token", { token });
+      }
+    } catch (err) {
+      log(`[MQTT] invalid device token message: ${err}`);
+    }
+    return;
+  }
+
+  // Match pailot/control/in — commands from app
+  if (topic === "pailot/control/in") {
+    try {
+      // Strip control characters (0x00-0x1F) except \t before parsing.
+      // Raw 0x0A and 0x0D are invalid inside JSON strings — the Flutter
+      // client occasionally emits them when serialising large pasted text.
+      // Escape them as \n / \r so JSON.parse accepts them and the resulting
+      // string preserves the original line breaks.
+      const raw = packet.payload.toString();
+      const sanitized = raw
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
+        .replace(/\r\n/g, "\\n")
+        .replace(/\n/g, "\\n")
+        .replace(/\r/g, "\\n");
+      const payload = JSON.parse(sanitized) as Record<string, unknown>;
+      const msgId = payload.msgId as string | undefined;
+
+      // Dedup
+      if (msgId) {
+        if (seenInboundIds.has(msgId)) return;
+        seenInboundIds.add(msgId);
+        evictOldIds();
+      }
+
+      const command = (payload.command as string) ?? (payload.type as string);
+
+      if (command === "hello") {
+        const args = (payload.args as Record<string, unknown>) ?? {};
+        log(`[MQTT] hello from ${client.id} at ${remoteOf(client)}: device=${args.device} os=${args.os} app=${args.app} route=${args.route} host=${args.host} attempt=${args.attempt}`);
+        return;
+      }
+
+      log(`[MQTT] <- command: ${command}`);
+
+      // Intercept debug_state_response — resolve pending promise, don't forward
+      if (command === "debug_state_response") {
+        const requestId = payload.requestId as string | undefined;
+        if (requestId && pendingDebugRequests.has(requestId)) {
+          const { resolve, timer } = pendingDebugRequests.get(requestId)!;
+          clearTimeout(timer);
+          pendingDebugRequests.delete(requestId);
+          resolve(payload);
+          log(`[MQTT] debug_state_response resolved (requestId=${requestId})`);
+        } else {
+          log(`[MQTT] debug_state_response: unknown requestId=${requestId ?? "(none)"}`);
+        }
+        return;
+      }
+
+      inboundHandler?.(undefined, "command", payload);
+    } catch (err) {
+      const raw = packet.payload.toString();
+      log(`[MQTT] invalid control message: ${err} — payload: ${raw.slice(0, 200)}`);
+    }
+    return;
+  }
+}
+
+/**
  * Start the embedded aedes MQTT broker.
  * @param version — daemon version string for status messages
  */
@@ -403,114 +539,7 @@ export async function startMqttBroker(version?: string): Promise<void> {
   broker = await AedesFactory.createBroker(aedesOpts);
 
   // --- Handle inbound messages from app clients ---
-  broker.on("publish", (packet: any, client: any) => {
-    // Ignore messages published by the broker itself (no client = server-side publish)
-    if (!client) return;
-
-    const topic = packet.topic as string;
-
-    // Match pailot/{sessionId}/in — inbound text/voice/image from app
-    const sessionInMatch = topic.match(/^pailot\/([^/]+)\/in$/);
-    if (sessionInMatch) {
-      try {
-        // Strip control characters (0x00-0x1F) except \t before parsing.
-        // Raw 0x0A and 0x0D are invalid inside JSON strings — the Flutter
-        // client occasionally emits them when serialising large pasted text.
-        // Escape them as \n / \r so JSON.parse accepts them and the resulting
-        // string preserves the original line breaks.
-        const raw = packet.payload.toString();
-        const sanitized = raw
-          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
-          .replace(/\r\n/g, "\\n")
-          .replace(/\n/g, "\\n")
-          .replace(/\r/g, "\\n");
-        const payload = JSON.parse(sanitized) as Record<string, unknown>;
-        const msgId = payload.msgId as string | undefined;
-
-        // Dedup
-        if (msgId) {
-          if (seenInboundIds.has(msgId)) return;
-          seenInboundIds.add(msgId);
-          evictOldIds();
-        }
-
-        const sessionId = sessionInMatch[1];
-        const type = (payload.type as string) ?? "text";
-        log(`[MQTT] <- ${type} from session ${sessionId.slice(0, 8)}...`);
-        inboundHandler?.(sessionId, type, payload);
-      } catch (err) {
-        const raw = packet.payload.toString();
-        log(`[MQTT] invalid inbound message on ${topic}: ${err} — payload: ${raw.slice(0, 200)}`);
-      }
-      return;
-    }
-
-    // Match pailot/device/token — APNs device token registration from app
-    if (topic === "pailot/device/token") {
-      try {
-        const raw = packet.payload.toString();
-        const sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
-        const payload = JSON.parse(sanitized) as Record<string, unknown>;
-        const token = payload.token as string | undefined;
-        if (token) {
-          inboundHandler?.(undefined, "apns_token", { token });
-        }
-      } catch (err) {
-        log(`[MQTT] invalid device token message: ${err}`);
-      }
-      return;
-    }
-
-    // Match pailot/control/in — commands from app
-    if (topic === "pailot/control/in") {
-      try {
-        // Strip control characters (0x00-0x1F) except \t before parsing.
-        // Raw 0x0A and 0x0D are invalid inside JSON strings — the Flutter
-        // client occasionally emits them when serialising large pasted text.
-        // Escape them as \n / \r so JSON.parse accepts them and the resulting
-        // string preserves the original line breaks.
-        const raw = packet.payload.toString();
-        const sanitized = raw
-          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
-          .replace(/\r\n/g, "\\n")
-          .replace(/\n/g, "\\n")
-          .replace(/\r/g, "\\n");
-        const payload = JSON.parse(sanitized) as Record<string, unknown>;
-        const msgId = payload.msgId as string | undefined;
-
-        // Dedup
-        if (msgId) {
-          if (seenInboundIds.has(msgId)) return;
-          seenInboundIds.add(msgId);
-          evictOldIds();
-        }
-
-        const command = (payload.command as string) ?? (payload.type as string);
-        log(`[MQTT] <- command: ${command}`);
-
-        // Intercept debug_state_response — resolve pending promise, don't forward
-        if (command === "debug_state_response") {
-          const requestId = payload.requestId as string | undefined;
-          if (requestId && pendingDebugRequests.has(requestId)) {
-            const { resolve, timer } = pendingDebugRequests.get(requestId)!;
-            clearTimeout(timer);
-            pendingDebugRequests.delete(requestId);
-            resolve(payload);
-            log(`[MQTT] debug_state_response resolved (requestId=${requestId})`);
-          } else {
-            log(`[MQTT] debug_state_response: unknown requestId=${requestId ?? "(none)"}`);
-          }
-          return;
-        }
-
-        inboundHandler?.(undefined, "command", payload);
-      } catch (err) {
-        const raw = packet.payload.toString();
-        log(`[MQTT] invalid control message: ${err} — payload: ${raw.slice(0, 200)}`);
-      }
-      return;
-    }
-  });
+  broker.on("publish", handleInboundPublish);
 
   // --- Delivery confirmation: log when broker delivers to a subscriber ---
   broker.on("delivered", (packet: any, client: any) => {
@@ -519,23 +548,16 @@ export async function startMqttBroker(version?: string): Promise<void> {
     log(`[TRACE] delivered to ${clientId} on ${topic}`);
   });
 
-  // --- Connection throttle: reject rapid reconnects from same client ---
-  const lastConnectTime = new Map<string, number>();
-  const CONNECT_THROTTLE_MS = 2000; // min 2s between connects from same client
+  // No connect throttle: closing a fast reconnect makes the app reconnect
+  // again and turns one duplicate into an endless connect/close flap. The
+  // app serializes its own connects, and aedes already evicts a stale
+  // session when a new connection arrives with the same client id.
 
   // --- Connection events ---
   broker.on("client", (client: any) => {
     const id = client?.id ?? "unknown";
-    const now = Date.now();
-    const last = lastConnectTime.get(id) ?? 0;
-    if (now - last < CONNECT_THROTTLE_MS && id !== "aibroker-loopback") {
-      log(`[MQTT] throttled rapid reconnect from ${id} (${now - last}ms since last)`);
-      client.close();
-      return;
-    }
-    lastConnectTime.set(id, now);
     connectedClients.add(id);
-    log(`[MQTT] client connected: ${id} (total: ${connectedClients.size})`);
+    log(`[MQTT] client connected: ${id} from ${remoteOf(client)} (total: ${connectedClients.size})`);
     // Clear the home-screen badge when a real PAILot app connects: resets the
     // in-memory counter AND sends a silent push so iOS repaints the icon to 0.
     if (id.startsWith("pailot")) {
@@ -546,11 +568,11 @@ export async function startMqttBroker(version?: string): Promise<void> {
   broker.on("clientDisconnect", (client: any) => {
     const id = client?.id ?? "unknown";
     connectedClients.delete(id);
-    log(`[MQTT] client disconnected: ${id} (total: ${connectedClients.size})`);
+    log(`[MQTT] client disconnected: ${id} from ${remoteOf(client)} (total: ${connectedClients.size})`);
   });
 
   broker.on("clientError", (client: any, err: Error) => {
-    log(`[MQTT] client error (${client?.id ?? "unknown"}): ${err.message}`);
+    log(`[MQTT] client error (${client?.id ?? "unknown"} from ${remoteOf(client)}): ${err.message}`);
   });
 
   // --- Start TLS server ---

@@ -10,6 +10,7 @@
 import { runAppleScript, withSessionAppleScript } from "../adapters/iterm/core.js";
 import { snapshotAllSessions } from "../transport/sync-facade.js";
 import { log } from "../core/log.js";
+import { timeCall } from "../core/call-timing.js";
 
 export interface SessionContent {
   sessionId: string;
@@ -21,10 +22,50 @@ export interface SessionContent {
 }
 
 /**
+ * Short-TTL memo, keyed by session, storing the largest `lines` window fetched
+ * recently. manage.ts's tick reads the same session's pane up to 4x per tick
+ * (hash/change detection, then arm()'s pre-type checks) — same osascript
+ * spawn, back to back, for content that has not had a chance to change.
+ * Mirrors adapters/iterm/core.ts's SNAPSHOT_TTL_MS memo, same 3s and same
+ * reasoning. A request for MORE lines than is cached still fetches fresh —
+ * this only collapses redundant re-reads, never truncates a caller's answer.
+ *
+ * `fresh: true` (manage.ts's post-keystroke read-backs) always bypasses it:
+ * those exist specifically to see what changed since the write that just
+ * happened, and a cached pre-write answer there would be silently wrong.
+ */
+const CONTENT_TTL_MS = 3_000;
+const MIN_CACHE_LINES = 100;
+const cache = new Map<string, { at: number; lines: number; result: SessionContent | null }>();
+
+function sliceToLines(content: SessionContent, lines: number): SessionContent {
+  const trimmed = content.content.split("\n").slice(-lines).join("\n");
+  return { ...content, content: trimmed, lineCount: trimmed ? trimmed.split("\n").length : 0 };
+}
+
+/**
  * Read terminal content from a specific iTerm2 session.
  * Returns the last N lines of terminal output + busy/idle flag.
  */
-export function readSessionContent(sessionId: string, lines = 100): SessionContent | null {
+export function readSessionContent(
+  sessionId: string,
+  lines = 100,
+  opts: { fresh?: boolean } = {},
+): SessionContent | null {
+  if (!opts.fresh) {
+    const cached = cache.get(sessionId);
+    if (cached && Date.now() - cached.at < CONTENT_TTL_MS && cached.lines >= lines) {
+      return cached.result ? sliceToLines(cached.result, lines) : null;
+    }
+  }
+
+  const fetchLines = Math.max(lines, MIN_CACHE_LINES);
+  const result = readSessionContentUncached(sessionId, fetchLines);
+  cache.set(sessionId, { at: Date.now(), lines: fetchLines, result });
+  return result ? sliceToLines(result, lines) : null;
+}
+
+function readSessionContentUncached(sessionId: string, lines: number): SessionContent | null {
   // AppleScript: get contents, name, atPrompt for a specific session
   const script = withSessionAppleScript(
     sessionId,
@@ -52,7 +93,7 @@ export function readSessionContent(sessionId: string, lines = 100): SessionConte
     'return "NOT_FOUND"',
   );
 
-  const result = runAppleScript(script);
+  const result = timeCall("session-content:read", () => runAppleScript(script));
   if (!result || result === "NOT_FOUND") return null;
 
   const tabIdx = result.indexOf("\t");

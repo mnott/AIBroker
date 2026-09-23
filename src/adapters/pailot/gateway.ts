@@ -39,7 +39,7 @@ import {
 } from "../../core/state.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, createClaudeSession, killSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
-import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession } from "../iterm/core.js";
+import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, invalidateSnapshotCache } from "../iterm/core.js";
 import { pasteTextIntoSession, snapshotAllSessions, typeIntoSession } from "../../transport/sync-facade.js";
 import { hybridManager } from "../../core/hybrid.js";
 import {
@@ -448,7 +448,7 @@ end tell`)?.trim() ?? "";
   handleSessionsCommand(ws);
 }
 
-function handleSessionsCommand(ws: WebSocket): void {
+function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): void {
   if (!hybridManager) {
     sendTo(ws, { type: "sessions", sessions: [] });
     return;
@@ -457,7 +457,7 @@ function handleSessionsCommand(ws: WebSocket): void {
   // Prune visual sessions whose iTerm2 tabs have been closed.
   // ONLY prune if snapshotAllSessions returns results — an empty result
   // likely means AppleScript failed, not that all sessions are gone.
-  const liveSnapshots = enrichedSnapshots();
+  const liveSnapshots = discoverLiveSessions(opts);
   if (liveSnapshots.length > 0) {
     const liveIds = new Set(liveSnapshots.map(s => s.id));
     hybridManager.pruneDeadVisualSessions(liveIds);
@@ -1165,7 +1165,7 @@ end tell`)?.trim() ?? "";
               return;
             case "refresh":
               // Force a fresh enumeration + prune + re-push (closed tabs drop here).
-              handleSessionsCommand(ws);
+              handleSessionsCommand(ws, { fresh: true });
               return;
             case "remove":
               handleRemoveCommand(ws, args);
@@ -1709,6 +1709,9 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
           hybridManager.removeByIndex(idx + 1);
           setTimeout(() => {
             try { if (sid) killSession(sid); } catch (e) { log(`[MQTT] killSession failed: ${e}`); }
+            // The kill just happened; the memoized enumeration (up to
+            // SNAPSHOT_TTL_MS old) can predate it and would resurrect the tab.
+            invalidateSnapshotCache();
             setTimeout(() => handleMqttCommand("sessions"), 600);
           }, 2000);
         } else {

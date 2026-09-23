@@ -34,8 +34,8 @@ export type LiveSession = ReturnType<typeof snapshotAllSessions>[0];
  * authoritative source is the persistent store — so a caller that skips this
  * step gets tab titles where it expects names.
  */
-export function discoverLiveSessions(): LiveSession[] {
-  const snaps = snapshotAllSessions();
+export function discoverLiveSessions(opts: { fresh?: boolean } = {}): LiveSession[] {
+  const snaps = snapshotAllSessions(opts);
   const persistentNames = getAllPersistentSessionNames();
   for (const snap of snaps) {
     snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);

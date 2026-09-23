@@ -25,6 +25,7 @@ import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { log } from "../core/log.js";
+import { timeCall } from "../core/call-timing.js";
 import { readSessionContent } from "./session-content.js";
 import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode } from "../transport/sync-facade.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
@@ -1460,10 +1461,11 @@ function processReading(tty: string): { isSession: boolean; pid: string | null }
   const dev = tty.replace(/^\/dev\//, "");
   let out = "";
   try {
-    out = execFileSync("/bin/ps", ["-t", dev, "-o", "pid=,ppid=,etime=,command="], {
-      encoding: "utf8",
-      timeout: 4_000,
-    });
+    out = timeCall("manage:ps-tty", () =>
+      execFileSync("/bin/ps", ["-t", dev, "-o", "pid=,ppid=,etime=,command="], {
+        encoding: "utf8",
+        timeout: 4_000,
+      }));
   } catch {
     // No processes on that tty, or ps refused. Either way nothing can be said.
     return { isSession: false, pid: null };
@@ -2267,9 +2269,9 @@ function seenInContent(content: string | undefined, fragment: string): boolean {
   return content.replace(/\s+/g, "").includes(fragment.replace(/\s+/g, ""));
 }
 
-function readPane(sessionId: string): string {
+function readPane(sessionId: string, opts: { fresh?: boolean } = {}): string {
   try {
-    return readSessionContent(sessionId, 60)?.content ?? "";
+    return readSessionContent(sessionId, 60, opts)?.content ?? "";
   } catch {
     return "";
   }
@@ -2383,7 +2385,7 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
     return false;
   }
   await sleep(300); // let the pane catch up before reading it back
-  const echoedLine = promptUnsentText(readPane(m.sessionId)) ?? "";
+  const echoedLine = promptUnsentText(readPane(m.sessionId, { fresh: true })) ?? "";
   if (!typedLineMatches(echoedLine, text)) {
     sendControlU(m.sessionId);
     note(m, `arm aborted: line read back as "${echoedLine.slice(0, 60)}" not "${text.slice(0, 60)}"`);
@@ -2394,7 +2396,7 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   // Typed is not sent, and sent is not received.
   for (let i = 0; i < 5; i++) {
     await sleep(2_000);
-    if (seenInContent(readPane(m.sessionId), fragment)) {
+    if (seenInContent(readPane(m.sessionId, { fresh: true }), fragment)) {
       m.lastRearmAt = Date.now();
       const carried = m.pending.length;
       m.pending = [];
