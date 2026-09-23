@@ -17,6 +17,7 @@
  *     setup-serve               Configure Tailscale Serve only
  */
 
+import "../core/env-bootstrap.js";
 import { startDaemon, DAEMON_SOCKET_PATH } from "./index.js";
 import { WatcherClient } from "../ipc/client.js";
 import { validateHubStatus } from "../ipc/validate.js";

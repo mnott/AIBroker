@@ -55,7 +55,23 @@ const TMUX_ENV: NodeJS.ProcessEnv = (() => {
   return e;
 })();
 
+/**
+ * The socket tmux would connect to for this process: $TMUX's first
+ * comma-separated field (path,pid,session) when attached inside tmux, else
+ * the default `$TMUX_TMPDIR/tmux-<uid>/default`.
+ */
+function tmuxSocketPath(): string {
+  const tmuxEnv = process.env.TMUX;
+  if (tmuxEnv) return tmuxEnv.split(",")[0]!;
+  return `${process.env.TMUX_TMPDIR || "/tmp"}/tmux-${process.getuid!()}/default`;
+}
+
 function runTmux(args: string[], timeoutMs = 4_000): string | null {
+  // No socket file, no server — spawning tmux just to have it fail is the
+  // per-call cost this function exists to avoid (every enumeration and every
+  // id routing goes through here).
+  if (!existsSync(tmuxSocketPath())) return null;
+
   const result = spawnSync(TMUX_BIN, args, {
     stdio: ["pipe", "pipe", "pipe"],
     timeout: timeoutMs,
@@ -64,8 +80,11 @@ function runTmux(args: string[], timeoutMs = 4_000): string | null {
   });
   if (result.status !== 0) {
     const stderr = (result.stderr ?? "").toString().trim();
-    // "no server running" is the normal state when no tmux is up — don't spam logs.
-    if (stderr && !stderr.includes("no server running")) log(`tmux ${args[0]} failed: ${stderr}`);
+    // "no server running" / "error connecting to" (missing socket file) are the
+    // normal states when no tmux is up — don't spam logs.
+    if (stderr && !stderr.includes("no server running") && !stderr.includes("error connecting to")) {
+      log(`tmux ${args[0]} failed: ${stderr}`);
+    }
     return null;
   }
   return result.stdout ?? "";
