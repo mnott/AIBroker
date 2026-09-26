@@ -390,7 +390,11 @@ end tell`;
   // at once. Budget generously — this is a correctness floor, not a latency
   // target, and a slow answer beats a confidently wrong empty one.
   const result = timeCall("iterm-core:snapshot-enum", () => _internal.runAppleScript(script, 30_000));
-  if (!result) return [];
+  if (!result) {
+    lastSnapshotOk = false;
+    return [];
+  }
+  lastSnapshotOk = true;
 
   const claudeTtys = ttysRunningClaude();
   const sessions: SessionSnapshot[] = [];
@@ -419,13 +423,39 @@ end tell`;
   return sessions;
 }
 
-/** Enumerate all iTerm2 sessions, reusing an answer up to SNAPSHOT_TTL_MS old. */
+/**
+ * Whether the LAST enumeration actually talked to iTerm, or fell back to `[]`
+ * because osascript errored. A dispatcher that reads an empty array as "no
+ * session, safe to launch" cannot tell a truly empty machine from an iTerm
+ * that failed to answer — this is the flag that lets it tell them apart.
+ * Never true while a failed `[]` sits in the cache — see snapshotAllSessions.
+ */
+let lastSnapshotOk = true;
+
+export function wasLastSnapshotReliable(): boolean {
+  return lastSnapshotOk;
+}
+
+/**
+ * Enumerate all iTerm2 sessions, reusing an answer up to SNAPSHOT_TTL_MS old.
+ *
+ * A failed enumeration (osascript error/timeout) is NEVER memoized: it used to
+ * be cached the same as a real `[]`, so one bad poll made every session
+ * "not found" for the full TTL window — observed live, `send_to_session`
+ * reported an empty session list for a target that a listing seconds later
+ * (past the TTL) showed as one of 14 live sessions. A failure now leaves the
+ * previous good snapshot in place (or null, if there was none), so the next
+ * call retries iTerm instead of replaying the failure.
+ */
 export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnapshot[] {
   const now = Date.now();
   if (!opts.fresh && cachedSnapshots && now - cachedAt < SNAPSHOT_TTL_MS) return cachedSnapshots;
-  cachedSnapshots = snapshotAllSessionsUncached();
-  cachedAt = now;
-  return cachedSnapshots;
+  const result = snapshotAllSessionsUncached();
+  if (lastSnapshotOk) {
+    cachedSnapshots = result;
+    cachedAt = now;
+  }
+  return result;
 }
 
 /** Force the next snapshotAllSessions() to re-enumerate rather than reuse. */

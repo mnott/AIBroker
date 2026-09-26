@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/dispatch.test.ts — the task-bus transport contract.
  *
@@ -7,14 +8,23 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync, readdirSync, utimesSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   dispatch,
   findSessionForProject,
+  redriveQueuedDispatches,
   TASK_PREFIX,
   type DispatchDeps,
 } from "../src/daemon/dispatch.js";
 import type { PaiProject } from "../src/daemon/pai-projects.js";
+
+// The redrive freshness gate fetches the trailer's task through the real
+// token-protected path; without a token every lookup fails "no authorisation"
+// (transient) and the gate can never be exercised.
+const { saveToken } = await import("../src/daemon/todoist-oauth.js");
+saveToken({ access_token: "tok", token_type: "Bearer", obtained_at: new Date().toISOString() });
 
 const project = (over: Partial<PaiProject> = {}): PaiProject => ({
   name: "whazaa",
@@ -32,6 +42,7 @@ function deps(over: Partial<DispatchDeps> = {}): DispatchDeps {
   return {
     resolve: async () => project(),
     sessions: () => [],
+    sessionsReliable: () => true,
     deliver: async () => "ok",
     launch: async () => { throw new Error("launch should not have been called"); },
     waitReady: async () => true,
@@ -423,4 +434,369 @@ test("delivery is attempted exactly once against a live session", async () => {
     deliver: async (_id, _b, _t, _io, retries) => { attempts = retries ?? 3; return "ok"; },
   }));
   assert.equal(attempts, 1, "dispatch must ask for a single attempt on a live session");
+});
+
+// ── unreliable enumeration must not read as "target absent" ────────────────
+//
+// Real fault, 2026-09-23: an osascript hiccup made iTerm enumeration return
+// [] for one 3s window. dispatch() read that as "Jobs Matthias has no live
+// session" and launched one — into a live Claude pane. An empty array from a
+// FAILED enumeration must be treated as unknown, not as confirmed-absent.
+
+test("a failed enumeration refuses to spawn, and reports unreachable not unlaunchable", async () => {
+  const r = await dispatch("whazaa", "x", {}, deps({
+    sessions: () => [],
+    sessionsReliable: () => false,
+    launch: async () => { throw new Error("must not launch on an unverified enumeration"); },
+  }));
+  assert.equal(r.outcome, "unreachable");
+  assert.match(r.reason, /enumeration failed/i);
+});
+
+test("a genuinely empty but RELIABLE enumeration still spawns (unchanged behaviour)", async () => {
+  const r = await dispatch("whazaa", "x", {}, deps({
+    sessions: () => [],
+    sessionsReliable: () => true,
+    launch: async () => ({ itermSessionId: "NEW" }),
+  }));
+  assert.equal(r.outcome, "spawned");
+});
+
+test("an unreliable enumeration also blocks --no-spawn from reporting a confident 'skipped'", async () => {
+  const r = await dispatch("whazaa", "x", { noSpawn: true }, deps({
+    sessions: () => [],
+    sessionsReliable: () => false,
+  }));
+  assert.equal(r.outcome, "unreachable");
+});
+
+// ── queued dispatches persist to disk and are redriven on daemon start ─────
+//
+// Real fault, 2026-09-23: a dispatch typed into a live session ("queued")
+// never ran, and nothing on disk recorded that it had ever been attempted —
+// so nothing could redrive it after the daemon restarted twice in the next
+// five minutes.
+
+function queuedDir(): string {
+  return join(homedir(), ".aibroker", "queued-dispatches");
+}
+
+function cleanQueuedDir(): void {
+  try { rmSync(queuedDir(), { recursive: true, force: true }); } catch { /* fine */ }
+}
+
+test("a queued (typed, unacked) dispatch is recorded on disk", async () => {
+  cleanQueuedDir();
+  const r = await dispatch("whazaa", "run the sweep", {}, deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => "no-ack",
+  }));
+  assert.equal(r.outcome, "queued");
+  const m = r.reason.match(/Recorded at (\S+queued-dispatches\S+\.json)/);
+  assert.ok(m, `expected a queued-dispatches record path in: ${r.reason}`);
+  const record = JSON.parse(readFileSync(m[1], "utf8"));
+  assert.equal(record.project, "whazaa");
+  assert.equal(record.message, "run the sweep");
+  cleanQueuedDir();
+});
+
+test("a fully delivered dispatch leaves no queued record behind", async () => {
+  cleanQueuedDir();
+  await dispatch("whazaa", "x", {}, deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => "ok",
+  }));
+  assert.deepEqual(readdirSync(queuedDir(), { withFileTypes: false }).filter((n) => n.endsWith(".json")), []);
+});
+
+test("redrive: a stale queued record is retried once and removed on success", async () => {
+  cleanQueuedDir();
+  const first = await dispatch("whazaa", "run the sweep", {}, deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => "no-ack",
+  }));
+  const m = first.reason.match(/Recorded at (\S+queued-dispatches\S+\.json)/);
+  assert.ok(m);
+  const path = m[1];
+  // Back-date it past the redrive grace period so it reads as possibly lost.
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  utimesSync(path, old, old);
+
+  let redelivered: string | null = null;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async (_id, body) => { redelivered = body; return "ok"; },
+  }));
+
+  assert.ok(redelivered?.includes("run the sweep"));
+  assert.deepEqual(readdirSync(queuedDir(), { withFileTypes: false }).filter((n) => n.endsWith(".json")), []);
+  cleanQueuedDir();
+});
+
+test("redrive: a record still inside its grace window is left alone", async () => {
+  cleanQueuedDir();
+  const first = await dispatch("whazaa", "run the sweep", {}, deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => "no-ack",
+  }));
+  const m = first.reason.match(/Recorded at (\S+queued-dispatches\S+\.json)/);
+  assert.ok(m);
+
+  let redriven = false;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => { redriven = true; return "ok"; },
+  }));
+
+  assert.equal(redriven, false, "a fresh record is still inside its own delivery window");
+  cleanQueuedDir();
+});
+
+// ── a consumed dispatch must not be redelivered on restart ──────────────────
+//
+// Real fault, 2026-09-24: the 06:56 dispatch WAS read by its session (it is
+// in the transcript), but no record of that existed anywhere, so the 11:02
+// daemon restart retyped it — and that delivery wrote its own record, which
+// the NEXT restart would have redelivered, forever. The transcript is the
+// only ground truth of what a session received; it must gate the redrive.
+
+/** The transcript dir deps()'s default project resolves to ("/dev/ai/Whazaa"). */
+function transcriptDir(): string {
+  return join(homedir(), ".claude", "projects", "-dev-ai-Whazaa");
+}
+
+function cleanTranscripts(): void {
+  try { rmSync(join(homedir(), ".claude", "projects"), { recursive: true, force: true }); } catch { /* fine */ }
+}
+
+/** Queue a "run the sweep" dispatch and back-date its record past the grace window. */
+async function staleQueuedRecord(): Promise<{ path: string; createdAt: number }> {
+  const first = await dispatch("whazaa", "run the sweep", {}, deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => "no-ack",
+  }));
+  const m = first.reason.match(/Recorded at (\S+queued-dispatches\S+\.json)/);
+  assert.ok(m);
+  const path = m[1];
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  utimesSync(path, old, old);
+  return { path, createdAt: JSON.parse(readFileSync(path, "utf8")).createdAt };
+}
+
+/** One user entry in the project's transcript, as Claude Code writes it. */
+function transcriptEntry(text: string, at: number): string {
+  return JSON.stringify({
+    type: "user",
+    message: { role: "user", content: text },
+    timestamp: new Date(at).toISOString(),
+  }) + "\n";
+}
+
+test("redrive: a record the session already consumed is deleted, not redriven", async () => {
+  cleanQueuedDir();
+  cleanTranscripts();
+  const { createdAt } = await staleQueuedRecord();
+  mkdirSync(transcriptDir(), { recursive: true });
+  writeFileSync(join(transcriptDir(), "session-a.jsonl"), transcriptEntry(`${TASK_PREFIX} run the sweep`, createdAt + 60_000));
+
+  let redriven = false;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => { redriven = true; return "ok"; },
+  }));
+
+  assert.equal(redriven, false, "the session already received it — a redrive is a duplicate");
+  assert.deepEqual(readdirSync(queuedDir(), { withFileTypes: false }).filter((n) => n.endsWith(".json")), []);
+  cleanQueuedDir();
+  cleanTranscripts();
+});
+
+test("redrive: a truncated delivery still counts as consumed — the tail matches", async () => {
+  // Measured 2026-09-24: a ~5000-char body arrived with only its last ~700
+  // chars, starting mid-word. A head-only needle would call that unconsumed
+  // and redeliver a message the session demonstrably acted on.
+  cleanQueuedDir();
+  cleanTranscripts();
+  const body = `alpha-head-marker ${"fillerword ".repeat(120)}\nomega-tail-marker end`;
+  const first = await dispatch("whazaa", body, {}, deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => "no-ack",
+  }));
+  const m = first.reason.match(/Recorded at (\S+queued-dispatches\S+\.json)/);
+  assert.ok(m);
+  const path = m[1];
+  const createdAt = JSON.parse(readFileSync(path, "utf8")).createdAt;
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  utimesSync(path, old, old);
+  mkdirSync(transcriptDir(), { recursive: true });
+  // Head lost, tail intact: exactly the observed truncation.
+  writeFileSync(join(transcriptDir(), "session-a.jsonl"), transcriptEntry(`${TASK_PREFIX} ${body.slice(-700)}`, createdAt + 60_000));
+
+  let redriven = false;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => { redriven = true; return "ok"; },
+  }));
+
+  assert.equal(redriven, false, "the tail the session received is proof enough of consumption");
+  cleanQueuedDir();
+  cleanTranscripts();
+});
+
+test("redrive: a resolvable transcript WITHOUT the message is still redriven", async () => {
+  cleanQueuedDir();
+  cleanTranscripts();
+  const { createdAt } = await staleQueuedRecord();
+  mkdirSync(transcriptDir(), { recursive: true });
+  // Old activity only: an earlier identical sweep (before the record) and an
+  // unrelated later message. Neither counts — the record's delivery is absent.
+  writeFileSync(
+    join(transcriptDir(), "session-a.jsonl"),
+    transcriptEntry(`${TASK_PREFIX} run the sweep`, createdAt - 60_000) +
+    transcriptEntry(`${TASK_PREFIX} something else entirely`, createdAt + 60_000),
+  );
+
+  let redelivered: string | null = null;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async (_id, body) => { redelivered = body; return "ok"; },
+  }));
+
+  assert.ok(redelivered?.includes("run the sweep"), "a genuinely unconsumed record must be redriven");
+  assert.deepEqual(readdirSync(queuedDir(), { withFileTypes: false }).filter((n) => n.endsWith(".json")), []);
+  cleanQueuedDir();
+  cleanTranscripts();
+});
+
+test("redrive: with no resolvable transcript, one redrive — and never a second", async () => {
+  cleanQueuedDir();
+  cleanTranscripts(); // no ~/.claude/projects at all: consumption unknowable
+  const { path } = await staleQueuedRecord();
+
+  let deliveries = 0;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => { deliveries++; return "no-ack"; }, // busy again -> fresh queued record
+  }));
+
+  assert.equal(deliveries, 1, "the one redrive the record is owed");
+  const remaining = readdirSync(queuedDir(), { withFileTypes: false }).filter((n) => n.endsWith(".json"));
+  assert.equal(remaining.length, 1, "the redrive's own `queued` outcome is recorded");
+  const rec = JSON.parse(readFileSync(join(queuedDir(), remaining[0]), "utf8"));
+  assert.equal(rec.redriveCount, 1, "the fresh record is marked as already-redriven");
+  assert.equal(rec.message, "run the sweep");
+
+  // Next start: the marked record is dropped, not sent a second time.
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  utimesSync(join(queuedDir(), remaining[0]), old, old);
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => { deliveries++; return "ok"; },
+  }));
+
+  assert.equal(deliveries, 1, "a record that had its redrive is dropped, never redelivered");
+  assert.deepEqual(readdirSync(queuedDir(), { withFileTypes: false }).filter((n) => n.endsWith(".json")), []);
+  cleanQueuedDir();
+});
+
+// ── a queued todoist dispatch is only redriven while its task is current ────
+//
+// Real fault, 2026-09-24 (records 1790226222101/1790226253580): a dispatch sat
+// queued from 11:04 and was re-driven 4h later, long after the run it ordered
+// had happened and been completed. The `[todoist:<id>` trailer names the task,
+// and the task says whether the order is still wanted: closed means the
+// trigger is gone, a due date moved far past queueing means the occurrence
+// was completed since.
+
+/** Queue a trailer-carrying dispatch and back-date it past the grace window. */
+async function staleTrailerRecord(): Promise<void> {
+  const first = await dispatch("whazaa", "run the sweep\n\n[todoist:6110392821 in:proj-ingress]", {}, deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => "no-ack",
+  }));
+  const m = first.reason.match(/Recorded at (\S+queued-dispatches\S+\.json)/);
+  assert.ok(m);
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  utimesSync(m[1], old, old);
+}
+
+const todoistTask = (body: unknown, status = 200): typeof fetch =>
+  (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
+
+const noRecordsLeft = () =>
+  assert.deepEqual(readdirSync(queuedDir(), { withFileTypes: false }).filter((n) => n.endsWith(".json")), []);
+
+test("redrive: a record whose task is closed is dropped, not sent", async () => {
+  cleanQueuedDir();
+  cleanTranscripts();
+  await staleTrailerRecord();
+
+  let redriven = false;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => { redriven = true; return "ok"; },
+    todoistFetch: todoistTask({ error: "not found" }, 404),
+  }));
+
+  assert.equal(redriven, false, "the trigger is gone — the order is void");
+  noRecordsLeft();
+  cleanQueuedDir();
+});
+
+test("redrive: a record whose due advanced past its queueing is dropped, not sent", async () => {
+  cleanQueuedDir();
+  cleanTranscripts();
+  await staleTrailerRecord();
+
+  let redriven = false;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async () => { redriven = true; return "ok"; },
+    // Next occurrence, a day out: the trigger was completed since queueing.
+    todoistFetch: todoistTask({ content: "Job sweep", due: { date: new Date(Date.now() + 24 * 3600 * 1000).toISOString() } }),
+  }));
+
+  assert.equal(redriven, false, "the occurrence already ran — redriving duplicates it");
+  noRecordsLeft();
+  cleanQueuedDir();
+});
+
+test("redrive: a record whose task is still current IS sent, and the trailer's task is the one checked", async () => {
+  cleanQueuedDir();
+  cleanTranscripts();
+  await staleTrailerRecord();
+
+  const urls: string[] = [];
+  let redelivered: string | null = null;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async (_id, body) => { redelivered = body; return "ok"; },
+    todoistFetch: (async (input: unknown) => {
+      urls.push(String(input));
+      // Due an hour ago: the occurrence this dispatch belongs to is still the current one.
+      return new Response(JSON.stringify({ content: "Job sweep", due: { date: new Date(Date.now() - 3600 * 1000).toISOString() } }), { status: 200 });
+    }) as unknown as typeof fetch,
+  }));
+
+  assert.ok(redelivered?.includes("run the sweep"), "a current record must still be redriven");
+  assert.ok(urls[0]?.includes("/tasks/6110392821"), "the trailer's task is the one re-fetched");
+  noRecordsLeft();
+  cleanQueuedDir();
+});
+
+test("redrive: a fetch that errors does not drop the record — it is sent", async () => {
+  cleanQueuedDir();
+  cleanTranscripts();
+  await staleTrailerRecord();
+
+  let redelivered: string | null = null;
+  await redriveQueuedDispatches(deps({
+    sessions: () => live("Whazaa"),
+    deliver: async (_id, body) => { redelivered = body; return "ok"; },
+    todoistFetch: (async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch,
+  }));
+
+  assert.ok(redelivered?.includes("run the sweep"), "an unreadable task says nothing — the record survives");
+  noRecordsLeft();
+  cleanQueuedDir();
 });

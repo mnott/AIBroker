@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/a2a-agentish-extension.test.ts — AG2 declared as an A2A extension.
  *

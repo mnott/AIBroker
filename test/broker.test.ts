@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/broker.test.ts — Unit tests for BrokerMessage creation and routing types.
  *

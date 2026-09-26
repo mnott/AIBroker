@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/a2a-exposure.test.ts — the opt-in allowlist behind AgentCard.skills.
  *

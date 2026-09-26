@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/source-hygiene.test.ts — no invisible bytes in the source.
  *

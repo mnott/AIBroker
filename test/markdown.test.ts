@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/markdown.test.ts — Unit tests for markdown transforms.
  *

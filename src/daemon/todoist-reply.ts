@@ -31,6 +31,13 @@ export interface ParentTask {
   content: string;
   projectId: string;
   labels: string[];
+  /**
+   * The task's current due, when it has one. A resolved `reminder:fired` needs
+   * `is_recurring` for the trigger test and the date for the claim record —
+   * without them a reminder-dispatched run cannot be claimed, and its own
+   * completion later reads as a fresh human tick.
+   */
+  due?: { date?: string; is_recurring?: boolean };
 }
 
 /**
@@ -54,7 +61,7 @@ export async function fetchParentTask(
   const raw = await res.text();
   if (!res.ok) throw new Error(`task lookup failed with ${res.status}: ${raw.slice(0, 200)}`);
 
-  let t: { content?: string; project_id?: string; labels?: unknown[] };
+  let t: { content?: string; project_id?: string; labels?: unknown[]; due?: ParentTask["due"] };
   try {
     t = JSON.parse(raw) as typeof t;
   } catch {
@@ -64,6 +71,7 @@ export async function fetchParentTask(
     content: t.content ?? "",
     projectId: t.project_id ?? "",
     labels: Array.isArray(t.labels) ? t.labels.map(String) : [],
+    due: t.due,
   };
 }
 

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/tmux-no-socket.test.ts — runTmux must not spawn when no tmux server
  * is reachable.

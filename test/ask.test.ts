@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/ask.test.ts — probing a session for liveness.
  *

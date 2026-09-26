@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/status-command.test.ts — Unit tests for /status command formatting logic.
  *

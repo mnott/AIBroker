@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/dispatch-terminal.test.ts — the two screen heuristics dispatch relies on.
  *

@@ -29,7 +29,7 @@ import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText, handleM
 import { mqttRequestDebugState } from "../adapters/pailot/mqtt-broker.js";
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName, lookupPersistentName } from "../core/persistence.js";
-import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox } from "../core/state.js";
+import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox, peekSessionMailbox } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
@@ -37,7 +37,8 @@ import { readSessionContent, readAllSessionContent } from "./session-content.js"
 import { promptUnsentText, inputLineDecision } from "./manage.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames } from "../adapters/iterm/core.js";
-import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession } from "../transport/sync-facade.js";
+import type { SessionSnapshot } from "../adapters/iterm/core.js";
+import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { matchSession, resolveCallerSession } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
@@ -123,6 +124,19 @@ export function callerItermId(req: IpcRequest): string | undefined {
  * demand to reply that the sender can never see), and no `[Session:...]`
  * prefix is typed (the prefix tells the receiving Claude to route a reply
  * back to a sender, but a beat's label is not a registered session).
+ *
+ * When a message IS deposited, only a one-line pointer is typed — never the
+ * full body. Typing the full body and pressing Enter submits it as an
+ * ordinary prompt, which fires the target's own `hooks/drain-mailbox.mjs`
+ * UserPromptSubmit hook on that same submission. That hook drains the very
+ * message this call just deposited and re-injects it as a system-reminder —
+ * so the full content showed up twice in one turn: once as the typed prompt,
+ * once again from the mailbox. Reproduced live 2026-09-23 on both an idle and
+ * a busy target — not a busy-only race. A short pointer and the deposited
+ * body are different strings, so the hook's drain is the only place the full
+ * content appears, and a multi-line body is never typed into a live pane at
+ * all — the failure mode where only the last line survived typing cannot
+ * recur here because there is nothing but one line to type.
  */
 export function sendToSessionDelivery(
   message: string,
@@ -131,7 +145,7 @@ export function sendToSessionDelivery(
 ): { typed: string; deposit: boolean } {
   return noReply
     ? { typed: message, deposit: false }
-    : { typed: `[Session:${senderLabel}] ${message}`, deposit: true };
+    : { typed: `[Session:${senderLabel}] message in your mailbox — shown above if your drain hook ran, otherwise read with aibroker_receive`, deposit: true };
 }
 
 function callerLabel(req: IpcRequest): string {
@@ -142,10 +156,33 @@ function callerLabel(req: IpcRequest): string {
       const paiName = lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId);
       // Namespaced per the audit multi-writer contract: bare names collide
       // across producers once more than one writes to the trail.
-      return `session:${paiName ?? snap.name}`;
+      // snap.id, not snap.name: the raw iTerm name reflects the terminal's
+      // OWN dynamic title (spinner glyph + tab title for a Claude Code
+      // session — "◑ Generic session content (claude)"), not an identity.
+      return `session:${paiName ?? snap.id}`;
     }
   }
   return `session:${id ?? req.tmuxPane ?? req.sessionId ?? "unknown"}`;
+}
+
+/**
+ * The sender's identity for the mailbox "from" field and the `[Session:X]`
+ * prefix — bare, unlike callerLabel()'s `session:`-prefixed audit actor.
+ *
+ * paiName first, then the session's own stable id — never the raw iTerm
+ * name/title, which is the terminal's OWN dynamic display text (a spinner
+ * glyph plus tab title for a busy Claude Code session) and not an identity.
+ * A sender not found in the live snapshot (worker child process, or a bare
+ * CLI call with no pane at all) falls back to whatever id it claimed — for a
+ * worker that id is a fabricated, non-live marker (see ipc/client.ts), so it
+ * naturally fails to match any session and a reply to it is refused rather
+ * than silently reaching the wrong pane.
+ */
+export function resolveSenderLabel(req: IpcRequest, snapshots: SessionSnapshot[]): string {
+  const senderItermId = callerItermId(req);
+  const senderSnap = senderItermId ? snapshots.find((s) => s.id === senderItermId) : undefined;
+  if (senderSnap) return senderSnap.paiName ?? senderSnap.id;
+  return senderItermId ?? "unknown";
 }
 
 export function registerCoreHandlers(
@@ -980,9 +1017,10 @@ export function registerCoreHandlers(
    * sendToSessionDelivery() for why both matter for a beat.
    */
   server.on("send_to_session", async (req) => {
-    const { target, message, noReply = false } = req.params as { target?: string; message?: string; noReply?: boolean };
-    if (!target) return { ok: false, error: "target is required" };
+    const { target: targetParam, message, noReply = false } = req.params as { target?: string; message?: string; noReply?: boolean };
+    if (!targetParam) return { ok: false, error: "target is required" };
     if (!message) return { ok: false, error: "message is required" };
+    const target = targetParam;
 
     /**
      * `peer/session` goes to that machine, everything else stays here.
@@ -1003,37 +1041,30 @@ export function registerCoreHandlers(
       }
     }
 
-    const snapshots = snapshotAllSessions();
     // Enrich with persistent names so target-by-name matches a renamed session
     // (tmux names key on the durable @aibroker_id, not the volatile pane id).
-    const persistentNames = getAllPersistentSessionNames();
-    for (const snap of snapshots) {
-      snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
+    function withPersistentNames(snaps: ReturnType<typeof snapshotAllSessions>) {
+      const persistentNames = getAllPersistentSessionNames();
+      for (const snap of snaps) {
+        snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
+      }
+      return snaps;
     }
 
-    let itermSessionId: string | null = null;
-    let resolvedName: string | null = null;
-
-    const asNumber = parseInt(target, 10);
-    if (!Number.isNaN(asNumber) && String(asNumber) === target.trim()) {
-      // Numeric index (1-based)
-      const snap = snapshots[asNumber - 1];
-      if (snap) {
-        itermSessionId = snap.id;
-        resolvedName = snap.paiName ?? snap.name;
+    function resolveTarget(snaps: ReturnType<typeof snapshotAllSessions>): { id: string | null; name: string | null } {
+      const asNumber = parseInt(target, 10);
+      if (!Number.isNaN(asNumber) && String(asNumber) === target.trim()) {
+        // Numeric index (1-based)
+        const snap = snaps[asNumber - 1];
+        return snap ? { id: snap.id, name: snap.paiName ?? snap.name } : { id: null, name: null };
       }
-    } else if (/^[0-9A-Fa-f-]{20,}$/.test(target)) {
-      // Looks like an iTerm UUID — use directly if it exists
-      const snap = snapshots.find((s) => s.id === target);
-      if (snap) {
-        itermSessionId = snap.id;
-        resolvedName = snap.paiName ?? snap.name;
-      } else {
+      if (/^[0-9A-Fa-f-]{20,}$/.test(target)) {
+        // Looks like an iTerm UUID — use directly if it exists
+        const snap = snaps.find((s) => s.id === target);
+        if (snap) return { id: snap.id, name: snap.paiName ?? snap.name };
         // Trust the caller — they may have a valid ID not yet in the snapshot
-        itermSessionId = target;
-        resolvedName = target;
+        return { id: target, name: target };
       }
-    } else {
       // Name match, case-insensitive, preferring paiName over the raw name.
       //
       // Ranked rather than first-match. A substring search over every tab will
@@ -1049,17 +1080,64 @@ export function registerCoreHandlers(
       // `prefer` is what keeps a live Claude session ahead of a shell, and
       // substring is enabled here (unlike dispatch) because a human typing a
       // target expects "clickr" to find "Clickr (node)".
-      const best = matchSession([target], snapshots, {
+      const best = matchSession([target], snaps, {
         kinds: ["exact", "normalised", "substring"],
         prefer: (s) => (isClaudeSession(s.id) ? 1 : 0),
       });
-      if (best) {
-        itermSessionId = best.session.id;
-        resolvedName = best.label;
-      }
+      return best ? { id: best.session.id, name: best.label } : { id: null, name: null };
+    }
+
+    let snapshots = withPersistentNames(snapshotAllSessions());
+    let { id: itermSessionId, name: resolvedName } = resolveTarget(snapshots);
+
+    /*
+     * A failed/empty enumeration must not read as "no such session". Observed
+     * live: `send_to_session` reported target "AIBroker" not found, with an
+     * EMPTY session list, while that session was live — a listing seconds
+     * later (past the snapshot cache TTL) showed 14 sessions. Retry fresh a
+     * couple of times before giving up, since osascript failures are usually
+     * transient (iTerm busy, a slow poll).
+     */
+    for (let attempt = 0; !itermSessionId && !wasLastEnumerationReliable() && attempt < 2; attempt++) {
+      await new Promise((r) => setTimeout(r, 400));
+      snapshots = withPersistentNames(snapshotAllSessions({ fresh: true }));
+      ({ id: itermSessionId, name: resolvedName } = resolveTarget(snapshots));
     }
 
     if (!itermSessionId) {
+      // Still nothing — but if the enumeration itself never came back
+      // reliable, "not found" is a lie: iTerm never actually answered, so
+      // there is no evidence the target doesn't exist. Queue by the
+      // requested name instead of dropping it, using the id the session was
+      // last known under (persisted names survive an enumeration outage).
+      if (!wasLastEnumerationReliable()) {
+        const persistedId = Object.entries(getAllPersistentSessionNames())
+          .find(([, name]) => name.toLowerCase() === target.toLowerCase())?.[0];
+        if (persistedId) {
+          const senderLabel = resolveSenderLabel(req, snapshots);
+          const evicted = depositToSessionMailbox(persistedId, senderLabel, message);
+          if (evicted) {
+            audit({
+              action: "send", actor: `session:${evicted.from}`, target,
+              outcome: "evicted", body: evicted.content,
+              reason: "mailbox full — oldest undrained message discarded to make room",
+            });
+          }
+          audit({
+            action: "send", actor: `session:${senderLabel}`, target,
+            outcome: "queued", body: message,
+            reason: "iTerm enumeration was unreliable — could not confirm the session is live, queued by its last known id",
+          });
+          return {
+            ok: true,
+            result: {
+              sent: true, delivered: false, queued: true,
+              sessionId: persistedId, name: target,
+              note: "iTerm did not answer reliably, so this could not be typed. Queued in the session's mailbox by its last known name; readable with aibroker_receive once it's live.",
+            },
+          };
+        }
+      }
       return {
         ok: false,
         error: `Session "${target}" not found. Available sessions: ${snapshots.map((s, i) => `${i + 1}:${s.paiName ?? s.name}`).join(", ")}`,
@@ -1067,15 +1145,7 @@ export function registerCoreHandlers(
     }
 
     // Resolve the sender's name for the mailbox "from" label and the prefix.
-    // Takes the id from either field — see callerItermId for why that matters
-    // and what it looks like when it does not happen.
-    const senderItermId = callerItermId(req);
-    const senderSnap = senderItermId
-      ? snapshots.find((s) => s.id === senderItermId)
-      : undefined;
-    const senderLabel = senderSnap
-      ? (senderSnap.paiName ?? senderSnap.name)
-      : (senderItermId ?? "unknown");
+    const senderLabel = resolveSenderLabel(req, snapshots);
 
     // Refuse before depositing OR typing: if the target is a shell, the message
     // is not merely undeliverable, it is executable. Say so plainly rather than
@@ -1216,6 +1286,13 @@ export function registerCoreHandlers(
    *
    * Returns all pending messages deposited by send_to_session from other sessions.
    * The queue is cleared on read (drain semantics). Returns empty array if no messages.
+   * Destructive in one call — interactive callers (aibroker_receive) only.
+   *
+   * The drain-mailbox hook must NOT use this: its 1.5 s client timeout can fire
+   * after the daemon has already emptied the mailbox, losing the message (live
+   * 2026-09-25). The hook uses the two-phase pair below instead:
+   * session_mailbox_peek (read without clearing) → emit → session_mailbox_ack
+   * (clear what was peeked). A lost ack means redelivery, not loss.
    *
    * The caller's iTerm session ID is taken from req.itermSessionId (set by IPC server
    * from the session context) or from the explicit sessionId param as a fallback.
@@ -1223,16 +1300,45 @@ export function registerCoreHandlers(
    * iTerm2 session IDs in env vars have the form "w0t0p0:UUID". We normalize to just
    * the UUID so mailbox keys match snapshot IDs.
    */
-  server.on("session_mailbox_receive", async (req) => {
+  const mailboxSessionId = (req: IpcRequest): string | undefined => {
     const { sessionId: explicitSessionId } = req.params as { sessionId?: string };
     const rawId = req.itermSessionId ?? explicitSessionId ?? req.sessionId;
-    if (!rawId) {
+    if (!rawId) return undefined;
+    // Normalize "w0t0p0:UUID" → "UUID"
+    return rawId.includes(":") ? rawId.split(":").pop()! : rawId;
+  };
+
+  server.on("session_mailbox_receive", async (req) => {
+    const itermSessionId = mailboxSessionId(req);
+    if (!itermSessionId) {
       return { ok: false, error: "Cannot determine session ID — pass sessionId param or run inside an iTerm session" };
     }
-    // Normalize "w0t0p0:UUID" → "UUID"
-    const itermSessionId = rawId.includes(":") ? rawId.split(":").pop()! : rawId;
     const messages = drainSessionMailbox(itermSessionId);
     return { ok: true, result: { messages, sessionId: itermSessionId } };
+  });
+
+  /** Phase 1 of the hook's drain: return the pending messages WITHOUT clearing. */
+  server.on("session_mailbox_peek", async (req) => {
+    const itermSessionId = mailboxSessionId(req);
+    if (!itermSessionId) {
+      return { ok: false, error: "Cannot determine session ID — pass sessionId param or run inside an iTerm session" };
+    }
+    return { ok: true, result: { messages: peekSessionMailbox(itermSessionId), sessionId: itermSessionId } };
+  });
+
+  /**
+   * Phase 2 of the hook's drain: clear what was peeked, return how many went.
+   * An optional count clears only the oldest N, so a message deposited after
+   * the peek survives for the next one.
+   */
+  server.on("session_mailbox_ack", async (req) => {
+    const itermSessionId = mailboxSessionId(req);
+    if (!itermSessionId) {
+      return { ok: false, error: "Cannot determine session ID — pass sessionId param or run inside an iTerm session" };
+    }
+    const { count } = req.params as { count?: number };
+    const cleared = drainSessionMailbox(itermSessionId, count).length;
+    return { ok: true, result: { cleared, sessionId: itermSessionId } };
   });
 
   // ── Unified MCP Support ──

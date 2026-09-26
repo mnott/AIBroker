@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/agentish-expand.test.ts — `expand()`, AG2's decompress half.
  *

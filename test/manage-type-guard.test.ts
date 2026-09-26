@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/manage-type-guard.test.ts — the read-back-first typing sequence, as
  * two pure decisions.

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * The typed-goal invariant.
  *

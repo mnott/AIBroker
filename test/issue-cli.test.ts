@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/issue-cli.test.ts — the shell entry, and the one way it could go wrong.
  *

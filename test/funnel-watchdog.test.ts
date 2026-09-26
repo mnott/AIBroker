@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/funnel-watchdog.test.ts — when the watchdog is allowed to pull the lever.
  *

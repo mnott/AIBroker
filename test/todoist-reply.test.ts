@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/todoist-reply.test.ts — answering on the task.
  *

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/shell-injection.test.ts — writing into a shell is code execution.
  *

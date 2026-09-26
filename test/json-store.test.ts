@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/json-store.test.ts — durable state files must not delete themselves.
  *

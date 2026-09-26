@@ -186,11 +186,22 @@ export function listSessionMailboxes(): Array<{ sessionId: string; messages: Mai
   return [...sessionMailboxes.entries()].map(([sessionId, messages]) => ({ sessionId, messages }));
 }
 
-export function drainSessionMailbox(itermSessionId: string): MailboxMessage[] {
+/**
+ * Non-destructive read of one mailbox, for the two-phase drain
+ * (peek → emit → ack) the drain-mailbox hook uses. Copy, not the live queue,
+ * so the caller cannot mutate what a later ack will clear.
+ */
+export function peekSessionMailbox(itermSessionId: string): MailboxMessage[] {
+  const queue = sessionMailboxes.get(itermSessionId);
+  return queue ? [...queue] : [];
+}
+
+export function drainSessionMailbox(itermSessionId: string, count?: number): MailboxMessage[] {
   const queue = sessionMailboxes.get(itermSessionId);
   if (!queue || queue.length === 0) return [];
-  const messages = queue.splice(0);
-  return messages;
+  // An optional count clears only the oldest N: an ack for what a peek saw must
+  // not take a message deposited after that peek along with it.
+  return count === undefined ? queue.splice(0) : queue.splice(0, count);
 }
 
 // ── Message Dispatch ──

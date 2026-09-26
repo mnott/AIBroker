@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/manage-handover.test.ts — the handover-due decision, pinned against
  * what the investigation actually found.

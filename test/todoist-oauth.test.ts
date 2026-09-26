@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/todoist-oauth.test.ts — the OAuth landing the redirect URL serves.
  *

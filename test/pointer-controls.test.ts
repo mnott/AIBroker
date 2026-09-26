@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * Does the session still hold the screen, and whose decision was it?
  *

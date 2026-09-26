@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/agent-panel-ready.test.ts — a session running background agents is
  * still a live Claude prompt.

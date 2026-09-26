@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/inbound-signature.test.ts — proving a secret without being able to send it.
  *

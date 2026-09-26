@@ -142,6 +142,10 @@ function detectSessionId(): string | undefined {
 _resolvedSessionId = process.env.TMUX_PANE ?? process.env.ITERM_SESSION_ID?.split(":")[1] ?? detectSessionId();
 
 async function registerWithAibp(): Promise<void> {
+  // A worker child process inherits ITERM_SESSION_ID/TMUX_PANE from the pane
+  // it was spawned in — registering would join it to the pane owner's AIBP
+  // session channel under the owner's own identity. See getSessionId().
+  if (process.env.PAI_WORKER === "1") return;
   try {
     const pluginId = _resolvedSessionId ?? `mcp-${process.pid}`;
     const sessionEnvId = process.env.TMUX_PANE ?? process.env.ITERM_SESSION_ID?.split(":")[1] ?? _resolvedSessionId;
@@ -164,6 +168,12 @@ async function registerWithAibp(): Promise<void> {
 void registerWithAibp();
 
 function getSessionId(): string | undefined {
+  // A worker child process (PAI_WORKER=1) inherits the pane's env vars, so
+  // every check below would resolve to the pane OWNER's identity, not its
+  // own — observed live as a worker's aibroker_receive draining the pane
+  // owner's real mailbox. undefined here is deliberate: callers must not
+  // fall back to a guess that is actually someone else's session.
+  if (process.env.PAI_WORKER === "1") return undefined;
   // Inside tmux, the pane id is the authoritative per-session identity (it equals
   // the daemon's snapshot id for tmux sessions). It must win over any AIBP/iTerm
   // value, which would be the stale id of the tab that started the tmux server.
@@ -736,7 +746,7 @@ server.tool(
 
 server.tool(
   "aibroker_send_to_session",
-  "Send a message to another iTerm2 session by typing it into the session's terminal AND depositing it into that session's AIBP mailbox. The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can read structured messages via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message. The result distinguishes `delivered: true` (the target was observed taking it) from `delivered: false, queued: true` (typed but unconfirmed — the target is probably mid-task; the message is in its mailbox). Do not read ok:true as \"they have seen it\". Text to another Claude session is Agentish v2 (AG2); only text to the operator and to git is prose. `aibroker agentish spec` prints the format.",
+  "Send a message to another iTerm2 session by depositing it into that session's AIBP mailbox and typing a one-line pointer into its terminal (the full body is never typed — the target's own UserPromptSubmit hook drains the mailbox and shows it once; typing the full body too would show it twice). The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can also read it directly via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message. The result distinguishes `delivered: true` (the target was observed taking the typed pointer) from `delivered: false, queued: true` (typed but unconfirmed — the target is probably mid-task; the message is in its mailbox regardless). Do not read ok:true as \"they have seen it\". Text to another Claude session is Agentish v2 (AG2); only text to the operator and to git is prose. `aibroker agentish spec` prints the format.",
   {
     target: z.string().min(1).describe("Session to send to: index (1-based), name substring, or iTerm2 session UUID"),
     message: z.string().min(1).describe("The raw message content. Do NOT include a [Session:...] prefix — the hub auto-prepends [Session:SENDER_NAME] for routing."),
@@ -744,7 +754,10 @@ server.tool(
   async ({ target, message }) => {
     try {
       const r = await hub.call_raw("send_to_session", { target, message }) as any;
-      return ok(`Sent to session "${r.name ?? target}".`);
+      const name = r.name ?? target;
+      if (r.delivered) return ok(`Delivered to session "${name}" — typed pointer observed submitted.`);
+      if (r.queued) return ok(`Queued for session "${name}" — ${r.note ?? "not confirmed delivered; it is in the mailbox."}`);
+      return ok(`Sent to session "${name}", but not confirmed and not queued — ${r.note ?? "no mailbox fallback (noReply)."}`);
     } catch (e) { return err(e); }
   },
 );

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/inbound-echo.test.ts — do not hand a session its own footprint.
  *

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/a2a-listener.test.ts — the shared HTTP listener must come up when
  * A2A is configured, whether or not Todoist is.

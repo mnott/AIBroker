@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/media.test.ts — Unit tests for media utility functions.
  *

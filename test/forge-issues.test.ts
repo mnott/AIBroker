@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/forge-issues.test.ts — the tracker, for a session that receives from it.
  *

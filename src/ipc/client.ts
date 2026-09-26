@@ -78,7 +78,25 @@ export class WatcherClient {
   private readonly socketPath: string;
 
   constructor(socketPath: string) {
-    this.sessionId = process.env.TERM_SESSION_ID ?? "unknown-session";
+    /*
+     * A worker child process (`pai worker run`, PAI_WORKER=1) inherits
+     * TERM_SESSION_ID/ITERM_SESSION_ID/TMUX_PANE from the pane it was spawned
+     * in — same env, same tty, so nothing here can tell it apart from the pane
+     * owner by inspection. Observed live: a worker's `send_to_session` calls
+     * were audited as `actor: "session:AIBroker"`, the pane owner's own name,
+     * and its `aibroker_receive` drained the pane owner's real mailbox before
+     * the pane owner's own session ever saw the messages in it.
+     *
+     * A worker gets a fabricated id instead of the inherited one — distinct
+     * per process, and never matching any live session, so a reply to it
+     * fails rather than silently reaching the wrong pane. Hyphen, not colon:
+     * callerItermId() strips everything before a colon (the iTerm
+     * `w0t0p0:UUID` format), which would otherwise eat "worker" and leave a
+     * bare pid.
+     */
+    this.sessionId = process.env.PAI_WORKER === "1"
+      ? `worker-${process.pid}`
+      : (process.env.TERM_SESSION_ID ?? "unknown-session");
     this.socketPath = socketPath;
   }
 
@@ -236,9 +254,12 @@ export class WatcherClient {
           method,
           params,
         };
-        const itermId = process.env.ITERM_SESSION_ID;
+        // Same reasoning as the constructor: a worker must never claim the
+        // pane's inherited env-var identity.
+        const isWorker = process.env.PAI_WORKER === "1";
+        const itermId = isWorker ? undefined : process.env.ITERM_SESSION_ID;
         if (itermId) request.itermSessionId = itermId;
-        if (process.env.TMUX_PANE) request.tmuxPane = process.env.TMUX_PANE;
+        if (!isWorker && process.env.TMUX_PANE) request.tmuxPane = process.env.TMUX_PANE;
         const tty = callerTty();
         if (tty) request.callerTty = tty;
         socket!.write(JSON.stringify(request) + "\n");

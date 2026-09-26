@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/snapshot-cache.test.ts — snapshotAllSessions() must not run the
  * osascript enumeration on every call.
@@ -12,7 +13,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { snapshotAllSessions, invalidateSnapshotCache, _internal } from "../src/adapters/iterm/core.js";
+import { snapshotAllSessions, invalidateSnapshotCache, wasLastSnapshotReliable, _internal } from "../src/adapters/iterm/core.js";
 
 const APPLESCRIPT_OUTPUT = ["session-1", "claude (node)", "/dev/ttys001", "My Session"].join("\t");
 
@@ -59,5 +60,39 @@ test("invalidateSnapshotCache() forces the next call to re-enumerate", () => {
     assert.equal(stub.calls(), 2, "invalidation must not be satisfied by the stale cache");
   } finally {
     stub.restore();
+  }
+});
+
+// ── a failed enumeration must not look identical to a confirmed empty one ──
+//
+// Real fault, 2026-09-23: osascript errored, snapshotAllSessions() returned
+// [] (its only failure signal), and a caller a layer up read that as "this
+// project has no live session" and launched one into a live Claude pane.
+
+test("a null osascript result is reported as an unreliable enumeration", () => {
+  const original = _internal.runAppleScript;
+  _internal.runAppleScript = () => null;
+  try {
+    invalidateSnapshotCache();
+    const sessions = snapshotAllSessions({ fresh: true });
+    assert.deepEqual(sessions, []);
+    assert.equal(wasLastSnapshotReliable(), false);
+  } finally {
+    _internal.runAppleScript = original;
+  }
+});
+
+test("a genuine answer (even an empty session list) is reported as reliable", () => {
+  const original = _internal.runAppleScript;
+  // Truthy but parses to zero sessions — distinct from osascript's own failure
+  // sentinel (`null`), which is what "unreliable" must actually mean here.
+  _internal.runAppleScript = () => " ";
+  try {
+    invalidateSnapshotCache();
+    const sessions = snapshotAllSessions({ fresh: true });
+    assert.deepEqual(sessions, []);
+    assert.equal(wasLastSnapshotReliable(), true);
+  } finally {
+    _internal.runAppleScript = original;
   }
 });

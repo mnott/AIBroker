@@ -21,7 +21,14 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const sandbox = mkdtempSync(join(tmpdir(), "aibroker-test-home-"));
+/**
+ * Idempotent: the npm-test preload and the first import of a directly-run test
+ * file must land on the SAME sandbox, or the two would split homes mid-run.
+ * Reuse the existing one whenever it is already under tmpdir().
+ */
+const prior = process.env.AIBROKER_TEST_HOME;
+const sandbox =
+  prior && prior.startsWith(tmpdir()) ? prior : mkdtempSync(join(tmpdir(), "aibroker-test-home-"));
 
 process.env.HOME = sandbox;
 process.env.USERPROFILE = sandbox;

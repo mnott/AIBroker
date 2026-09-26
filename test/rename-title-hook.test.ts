@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/rename-title-hook.test.ts — pins the fix for the daemon typing
  * `/rename <name>` into the operator's own input line and racing their

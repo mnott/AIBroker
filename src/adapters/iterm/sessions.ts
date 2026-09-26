@@ -10,6 +10,7 @@ import { basename } from "node:path";
 
 import {
   runAppleScript,
+  _internal,
   isItermRunning,
   isClaudeRunningInSession,
   isItermSessionAlive,
@@ -252,7 +253,30 @@ export function getSessionList(): Array<{
  * case already used.
  */
 function openSessionScript(command: string): string {
-  const write = command ? `write text "${command.replace(/"/g, '\\"')}"` : "";
+  // Guard the write, inside the SAME AppleScript call that resolves the
+  // target session — not as a separate check beforehand, which would leave a
+  // window between "looks safe" and "type it" for the target to start running
+  // something in. `create tab`/`create window` normally hand back a session
+  // that has never run anything, so this should be a no-op in the common
+  // case; it exists for the uncommon one, where tab creation silently reuses
+  // or fails to isolate a session that is already running Claude — the
+  // "typed a launch command into a live Claude pane" failure. `is at shell
+  // prompt` is iTerm's own foreground-process check, the same primitive
+  // isClaudeRunningInSession() uses elsewhere to decide it is unsafe to write.
+  // A brand-new tab's shell has not sourced its shell-integration hook yet —
+  // measured 2026-09-23: `is at shell prompt` reads busy for up to ~1s after
+  // `create tab` on this machine, settling to true around 0.8s. A guard that
+  // checked immediately would refuse every launch, not just the unsafe ones.
+  // A session that is genuinely occupied (Claude or anything else) never
+  // settles to shell-prompt no matter how long this waits, which is exactly
+  // what keeps the guard meaningful after the delay.
+  const write = command
+    ? `delay 1.5
+          if not (is at shell prompt) then
+            return "busy:" & id
+          end if
+          write text "${command.replace(/"/g, '\\"')}"`
+    : "";
   // One place to describe "a brand-new window, which comes with a session".
   const viaNewWindow = `set targetWindow to (create window with default profile)
     if targetWindow is missing value then error "iTerm2 would not create a window" number -1728
@@ -293,9 +317,21 @@ function openSessionScript(command: string): string {
 end tell`;
 }
 
+/** A launch write refused because the target turned out not to be a fresh shell. */
+function rejectIfBusy(result: string | null, label: string): string | null {
+  if (result && result.startsWith("busy:")) {
+    log(
+      `${label}: refused to write into session ${result.slice(5)} — it is not at a shell prompt ` +
+      `(Claude or another program is running there), so nothing was typed.`,
+    );
+    return null;
+  }
+  return result;
+}
+
 export function createClaudeSession(command = "claude"): string | null {
   try {
-    return runAppleScript(openSessionScript(command)) ?? null;
+    return rejectIfBusy(_internal.runAppleScript(openSessionScript(command)) ?? null, "createClaudeSession");
   } catch (err) {
     log("Failed to create session:", String(err));
     return null;
@@ -304,7 +340,7 @@ export function createClaudeSession(command = "claude"): string | null {
 
 export function createTerminalTab(command?: string): string | null {
   try {
-    return runAppleScript(openSessionScript(command ?? "")) ?? null;
+    return rejectIfBusy(_internal.runAppleScript(openSessionScript(command ?? "")) ?? null, "createTerminalTab");
   } catch (err) {
     log("Failed to create terminal tab:", String(err));
     return null;

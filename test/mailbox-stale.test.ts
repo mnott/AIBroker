@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/mailbox-stale.test.ts — "queued" is an instant, not a duration.
  *

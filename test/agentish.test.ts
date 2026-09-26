@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/agentish.test.ts — AG2 validator and CLI.
  *

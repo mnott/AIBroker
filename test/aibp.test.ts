@@ -1,3 +1,4 @@
+import "./home-guard.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as envelope from "../src/aibp/envelope.js";

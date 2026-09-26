@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/a2a-schema.test.ts — the vendored-subset validator, checked against
  * a hand-built valid AgentCard/Task and against shapes known to be wrong.

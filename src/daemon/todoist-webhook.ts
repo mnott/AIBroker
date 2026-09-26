@@ -43,6 +43,10 @@ import { audit } from "./audit.js";
 import { handleOAuthCallback } from "./todoist-oauth.js";
 import { handleA2A, a2aConfigured, type A2AContext } from "../a2a/server.js";
 import { funnelHostname } from "./funnel-watchdog.js";
+import {
+  queuePendingEvent, removePendingEvent, bumpPendingEvent, listPendingEvents,
+  PENDING_MAX_AGE_MS, type PendingEvent,
+} from "./todoist-pending.js";
 
 const __a2a_dirname = dirname(fileURLToPath(import.meta.url));
 function a2aPackageVersion(): string {
@@ -663,6 +667,114 @@ async function handleInbound(
 const HOOK_PREFIX = "/hook/";
 
 /**
+ * Transient (network blip, timeout, 5xx, 429) vs permanent (404, 401/403 —
+ * the task or the grant is actually gone). `fetchParentTask` encodes an HTTP
+ * status in its message for anything that reached Todoist; anything without
+ * one — "fetch failed", a timeout, DNS — never got an answer at all, so it
+ * cannot mean "no such task" and is treated as transient.
+ */
+export function isTransientTodoistError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const status = /task lookup failed with (\d+)/.exec(msg)?.[1];
+  if (!status) return true;
+  const code = Number(status);
+  return code === 429 || code >= 500;
+}
+
+type ResolveOutcome = { ok: true } | { ok: false; transient: boolean; reason: string };
+
+/** One attempt at resolving the parent, mutating `event.event_data` in place on success. */
+async function resolveParentOnce(
+  event: TodoistEvent, kind: "reminder" | "comment", parentId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ResolveOutcome> {
+  try {
+    const { fetchParentTask } = await import("./todoist-reply.js");
+    const parent = await fetchParentTask(parentId, fetchImpl);
+    event.event_data = {
+      ...event.event_data,
+      id: parentId,
+      project_id: parent.projectId,
+      labels: parent.labels,
+      // A reminder has no text of its own, and routing needs some: the
+      // task IS the instruction here, so its title is the content. A
+      // comment brings its own text and keeps it — the title is only the
+      // context that text makes sense in.
+      //
+      // The reminder branch also carries `due`: a reminder on a recurring
+      // trigger must be claimable as one, and isTrigger() reads due.is_recurring
+      // off the merged event data.
+      ...(kind === "reminder"
+        ? { content: parent.content, due: parent.due }
+        : { description: parent.content ? `(comment on "${parent.content}")` : "" }),
+    };
+    return { ok: true };
+  } catch (err) {
+    const reason = `could not resolve the task a ${kind} belongs to — ${err instanceof Error ? err.message : String(err)}`;
+    return { ok: false, transient: isTransientTodoistError(err), reason };
+  }
+}
+
+/** Spread over ~1 minute: enough to ride out a blocked event loop or a short outage. */
+const INLINE_RETRY_DELAYS_MS = [5_000, 15_000, 40_000];
+
+/**
+ * The inline attempts a live request gets before its event is handed to the
+ * disk queue. A permanent error (or the last attempt) returns immediately;
+ * `sleep` is injected so tests do not wait a minute for it.
+ */
+export async function resolveParentWithRetry(
+  event: TodoistEvent, kind: "reminder" | "comment", parentId: string,
+  delaysMs: number[] = INLINE_RETRY_DELAYS_MS,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+  fetchImpl: typeof fetch = fetch,
+): Promise<ResolveOutcome> {
+  for (let attempt = 0; ; attempt++) {
+    const result = await resolveParentOnce(event, kind, parentId, fetchImpl);
+    if (result.ok || !result.transient || attempt >= delaysMs.length) return result;
+    await sleep(delaysMs[attempt]);
+  }
+}
+
+/**
+ * Drain the disk queue: one resolve attempt per pending event, no inline
+ * backoff — the interval between sweeps already spaces attempts out. Runs
+ * once shortly after the listener starts (covers a daemon restart) and again
+ * on every tick after that (covers an outage longer than the inline retries).
+ */
+export async function sweepPendingEvents(
+  cfg: WebhookConfig, deps: WebhookDeps, fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  for (const p of listPendingEvents()) {
+    const ageMs = Date.now() - Date.parse(p.firstSeenAt);
+    if (ageMs > PENDING_MAX_AGE_MS) {
+      removePendingEvent(p.key);
+      audit({
+        action: "webhook", actor: "todoist", target: "aibroker", outcome: "ignored",
+        reason: `${p.lastError} — still unresolved after ${Math.round(ageMs / 3600_000)}h, giving up`,
+        meta: { event: p.event.event_name, taskId: p.parentId },
+      });
+      log(`todoist-webhook: giving up on a ${p.kind} for ${p.parentId}, unresolved after ${Math.round(ageMs / 3600_000)}h`);
+      continue;
+    }
+    const result = await resolveParentOnce(p.event, p.kind, p.parentId, fetchImpl);
+    if (result.ok) {
+      removePendingEvent(p.key);
+      await processResolvedEvent(p.event, cfg, deps);
+    } else if (!result.transient) {
+      removePendingEvent(p.key);
+      audit({
+        action: "webhook", actor: "todoist", target: "aibroker", outcome: "ignored",
+        reason: result.reason, meta: { event: p.event.event_name, taskId: p.parentId },
+      });
+      log(`todoist-webhook: ${result.reason}`);
+    } else {
+      bumpPendingEvent(p.key, result.reason);
+    }
+  }
+}
+
+/**
  * `cfg` is null when Todoist itself is not configured (or was refused —
  * see the empty-ingress case in `startTodoistWebhook`). The listener still
  * comes up whenever A2A needs it; every Todoist-shaped path below falls
@@ -799,235 +911,251 @@ export function createWebhookServer(cfg: WebhookConfig | null, deps: WebhookDeps
           });
           return;
         }
-        try {
-          const { fetchParentTask } = await import("./todoist-reply.js");
-          const parent = await fetchParentTask(parentId);
-          event.event_data = {
-            ...event.event_data,
-            id: parentId,
-            project_id: parent.projectId,
-            labels: parent.labels,
-            // A reminder has no text of its own, and routing needs some: the
-            // task IS the instruction here, so its title is the content. A
-            // comment brings its own text and keeps it — the title is only the
-            // context that text makes sense in.
-            ...(isReminder
-              ? { content: parent.content }
-              : { description: parent.content ? `(comment on "${parent.content}")` : "" }),
-          };
-        } catch (err) {
-          const reason = `could not resolve the task a ${kind} belongs to — ${err instanceof Error ? err.message : String(err)}`;
-          audit({
-            action: "webhook", actor: "todoist", target: "aibroker",
-            outcome: "ignored", reason, meta: { event: event.event_name, taskId: parentId },
-          });
-          log(`todoist-webhook: ${reason}`);
+        const result = await resolveParentWithRetry(event, kind, parentId);
+        if (!result.ok) {
+          if (result.transient) {
+            // A daemon restart mid-retry must not lose this either, so it goes
+            // to disk, not just to another in-process timer.
+            queuePendingEvent({ key, event, kind, parentId, lastError: result.reason });
+            audit({
+              action: "webhook", actor: "todoist", target: "aibroker", outcome: "queued",
+              reason: `${result.reason} — queued for retry`, meta: { event: event.event_name, taskId: parentId },
+            });
+            log(`todoist-webhook: ${result.reason} — queued for retry`);
+          } else {
+            audit({
+              action: "webhook", actor: "todoist", target: "aibroker",
+              outcome: "ignored", reason: result.reason, meta: { event: event.event_name, taskId: parentId },
+            });
+            log(`todoist-webhook: ${result.reason}`);
+          }
           return;
         }
       }
 
-      // A comment written on a MIRROR entry is meant for the real task.
-      //
-      // The mirror is where the reader's attention is, so replying there rather
-      // than on the source is the natural mistake — and Todoist has no way to
-      // deep-link an individual comment that would make the source easier to
-      // reach. Carry it across instead of losing it in a project nothing reads.
-      // Checked before routing: the mirror project is deliberately NOT an
-      // ingress project, so routing would refuse this and say nothing useful.
-      if (event.event_name === "note:added") {
-        const { mirrorProjectId, mirrorBack } = await import("./todoist-mirror.js");
-        const mirror = mirrorProjectId();
-        if (mirror && String(event.event_data?.project_id ?? "") === mirror) {
-          const r = await mirrorBack({
-            taskId: String(event.event_data?.id ?? ""),
-            text: String((event.event_data as { content?: string })?.content ?? ""),
-            projectId: mirror,
-          });
-          audit({
-            action: "webhook", actor: "todoist", target: "aibroker",
-            outcome: r.carried ? "carried-back" : "ignored",
-            reason: r.reason ?? "comment on a mirror entry carried to its source task",
-          });
-          return;
-        }
-      }
-
-      const isComment = event.event_name === "note:added";
-      const parentId = String(event.event_data?.id ?? "");
-      const { ownerOf, rememberOwner } = await import("./todoist-owners.js");
-      // Grants made since the daemon started take effect now, not at the next
-      // restart. A project created and granted while you are using the system
-      // has to work immediately, or the grant is indistinguishable from a
-      // project that routes nowhere.
-      const { applyGrants, expandThroughSubtree } = await import("./todoist-ingress.js");
-      let live = applyGrants(cfg);
-
-      // A sub-project is a folder, not a second owner. Before this, organising
-      // tasks into "Task Bus / Archive" moved them outside the
-      // allowlist and every one was refused — silently, and precisely when
-      // someone tidied up. Only ancestors granted WITH a subtree flag apply, so
-      // nothing becomes an ingress that nobody granted.
-      const eventProject = String(event.event_data?.project_id ?? "");
-      if (eventProject && !live.ingressProjectIds.has(eventProject)) {
-        try {
-          const { projectTree, ancestorsOf } = await import("./todoist-projects.js");
-          const tree = await projectTree();
-          live = expandThroughSubtree(live, eventProject, ancestorsOf(eventProject, tree), {
-            name: tree.get(eventProject)?.name,
-            known: await (deps.knownOwners?.() ?? []),
-          });
-        } catch (err) {
-          log(`todoist-webhook: subtree lookup failed — ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-      const decision = route(
-        event,
-        live,
-        await (deps.knownOwners?.() ?? []),
-        isComment ? ownerOf(parentId) : undefined,
-      );
-      const who = event.initiator?.email ?? event.initiator?.full_name ?? "todoist";
-
-      if (decision.nearMiss) {
-        // Recorded whether or not the task was delivered: the point is that
-        // something was asked for and not honoured.
-        log(`todoist-webhook: near miss — ${decision.nearMiss}`);
-      }
-
-      // A completion has nothing to dispatch, but it is not nothing. The
-      // comment thread on a ticked task leaves every list at that moment, so a
-      // configured hook gets its chance before this is recorded as "ignored" —
-      // and its exit code decides what the record says.
-      let hook: { ran: boolean; ok: boolean; detail?: string } = { ran: false, ok: true };
-      if (event.event_name === "item:completed") {
-        const { runCompletedHook } = await import("./todoist-completed-hook.js");
-        hook = await runCompletedHook(String(event.event_data?.id ?? ""));
-      }
-
-      if (!decision.act) {
-        audit({
-          action: "webhook", actor: `todoist:${who}`, target: "aibroker",
-          outcome: hook.ran ? (hook.ok ? "archived" : "hook-failed") : "ignored",
-          reason: hook.ran
-            ? (hook.ok ? `${decision.reason} — completion hook ran` : `${decision.reason} — completion hook FAILED: ${hook.detail}`)
-            : decision.reason,
-          meta: {
-            event: event.event_name,
-            task: (event.event_data?.content as string) ?? undefined,
-            nearMiss: decision.nearMiss,
-          },
-        });
-        return;
-      }
-
-      // Claim a trigger before dispatching, and release it if the dispatch
-      // does not land. Honouring another runner's claim is only half an
-      // interlock: a path that dispatches and leaves the task unclaimed lets
-      // the next poller see an advanced due date with nothing on it, conclude
-      // the box was ticked, and run the same sweep again.
-      const claiming = event.event_name === "item:completed" && isTrigger(event.event_data ?? {});
-      if (claiming) {
-        try {
-          const { setTaskLabel } = await import("./todoist-reply.js");
-          await setTaskLabel(decision.taskId, RUNNING_LABEL, true);
-          audit({
-            action: "todoist-claim", actor: "aibroker", target: `todoist:task:${decision.taskId}`,
-            outcome: "claimed",
-          });
-          // Remember when, so a claim nobody comes back for can be released.
-          const { recordClaim } = await import("./todoist-claims.js");
-          recordClaim(
-            decision.taskId,
-            undefined,
-            // Todoist has already advanced the due date by the time a completion
-            // reaches us, so this is the NEXT occurrence — the point past which
-            // a surviving claim would block the very trigger it guards.
-            (event.event_data?.due as { date?: string } | undefined)?.date,
-          );
-        } catch (err) {
-          // Audited, not just logged. A successful claim and a failed one used
-          // to be indistinguishable from outside — the label was simply absent,
-          // and the only record was a line in a log file nobody reads until
-          // something has already gone wrong downstream. The dispatch still
-          // proceeds: the claim is a hint, and refusing to run the sweep
-          // because a label write failed would be the worse trade.
-          const reason = err instanceof Error ? err.message : String(err);
-          audit({
-            action: "todoist-claim", actor: "aibroker", target: `todoist:task:${decision.taskId}`,
-            outcome: "failed",
-            reason: `${reason} — dispatching UNCLAIMED, a poller may read this tick as a fresh request`,
-          });
-          log(`todoist-webhook: could not claim ${decision.taskId} — ${reason}`);
-        }
-      }
-
-      try {
-        // The id rides along so the session can answer on the task it came
-        // from. Without it the reply has nowhere to go but a terminal the
-        // asker is not looking at.
-        // Warn when the title is not unique in its project. Two tasks with the
-        // same name are indistinguishable in a list, so an answer posted on one
-        // looks — to whoever is watching the other — exactly like being ignored.
-        // The session is told, so it can say which id it answered on.
-        let twins = 0;
-        if (!isComment && !claiming) {
-          try {
-            const { countTasksWithTitle } = await import("./todoist-reply.js");
-            twins = await countTasksWithTitle(
-              String(event.event_data?.project_id ?? ""),
-              String(event.event_data?.content ?? ""),
-            );
-          } catch { /* a lookup failure must not block a delivery */ }
-        }
-        const twinWarning = twins > 1
-          ? `\n\n[note: ${twins} open tasks in this project share this title — say which id you answered on]`
-          : "";
-
-        // The project rides along with the task id. A session asked to file a
-        // follow-up otherwise has to guess which project is "its own", and a
-        // guess from its alias creates a second project the user never sees.
-        const fromProject = String(event.event_data?.project_id ?? "");
-        const delivered = `${decision.body}${twinWarning}\n\n[todoist:${decision.taskId}${fromProject ? ` in:${fromProject}` : ""}]`;
-        const r = await deps.deliver(decision.project, delivered,
-          isComment ? { prefix: "[Task:comment]" } : undefined);
-        // Remember who took it, so a later comment reaches the same session.
-        // Recorded on the way out and only on a real delivery: a task nobody
-        // accepted has no owner to inherit.
-        if (!isComment && r.outcome === "delivered") rememberOwner(decision.taskId, decision.project);
-
-        // Release a claim the dispatch did not earn. "queued" keeps it — the
-        // work IS in flight, the session is simply mid-turn — but a trigger
-        // that never reached anyone must go back to being tickable, or the
-        // button is dead until someone removes the label by hand.
-        if (claiming && r.outcome !== "delivered" && r.outcome !== "queued" && r.outcome !== "spawned") {
-          try {
-            const { setTaskLabel } = await import("./todoist-reply.js");
-            await setTaskLabel(decision.taskId, RUNNING_LABEL, false);
-            const { forgetClaim } = await import("./todoist-claims.js");
-            forgetClaim(decision.taskId);
-            log(`todoist-webhook: released ${RUNNING_LABEL} on ${decision.taskId} — dispatch was ${r.outcome}`);
-          } catch { /* the claim is a hint, not a lock; a stuck one is visible */ }
-        }
-        audit({
-          action: "webhook", actor: `todoist:${who}`, target: r.session || decision.project,
-          outcome: r.outcome, body: decision.body, reason: r.reason,
-          meta: {
-            event: event.event_name, taskId: decision.taskId,
-            rule: decision.rule, nearMiss: decision.nearMiss,
-            duplicateTitles: twins > 1 ? twins : undefined,
-          },
-        });
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        audit({
-          action: "webhook", actor: `todoist:${who}`, target: decision.project,
-          outcome: "failed", body: decision.body, reason,
-          meta: { event: event.event_name, taskId: decision.taskId },
-        });
-        log(`todoist-webhook: delivery failed — ${reason}`);
-      }
+      await processResolvedEvent(event, cfg, deps);
     })();
   });
+}
+
+/**
+ * Everything that happens once an event carries what routing needs — either
+ * because it always did (item:added, item:completed, project:deleted), or
+ * because `resolveParentWithRetry`/the pending-event sweep just resolved it.
+ * The one function both the live request path and the disk-queue retry call,
+ * so a fix here covers every event kind that reaches it, not just reminders.
+ */
+async function processResolvedEvent(event: TodoistEvent, cfg: WebhookConfig, deps: WebhookDeps): Promise<void> {
+  // A comment written on a MIRROR entry is meant for the real task.
+  //
+  // The mirror is where the reader's attention is, so replying there rather
+  // than on the source is the natural mistake — and Todoist has no way to
+  // deep-link an individual comment that would make the source easier to
+  // reach. Carry it across instead of losing it in a project nothing reads.
+  // Checked before routing: the mirror project is deliberately NOT an
+  // ingress project, so routing would refuse this and say nothing useful.
+  if (event.event_name === "note:added") {
+    const { mirrorProjectId, mirrorBack } = await import("./todoist-mirror.js");
+    const mirror = mirrorProjectId();
+    if (mirror && String(event.event_data?.project_id ?? "") === mirror) {
+      const r = await mirrorBack({
+        taskId: String(event.event_data?.id ?? ""),
+        text: String((event.event_data as { content?: string })?.content ?? ""),
+        projectId: mirror,
+      });
+      audit({
+        action: "webhook", actor: "todoist", target: "aibroker",
+        outcome: r.carried ? "carried-back" : "ignored",
+        reason: r.reason ?? "comment on a mirror entry carried to its source task",
+      });
+      return;
+    }
+  }
+
+  const isComment = event.event_name === "note:added";
+  const parentId = String(event.event_data?.id ?? "");
+  const { ownerOf, rememberOwner } = await import("./todoist-owners.js");
+  // Grants made since the daemon started take effect now, not at the next
+  // restart. A project created and granted while you are using the system
+  // has to work immediately, or the grant is indistinguishable from a
+  // project that routes nowhere.
+  const { applyGrants, expandThroughSubtree } = await import("./todoist-ingress.js");
+  let live = applyGrants(cfg);
+
+  // A sub-project is a folder, not a second owner. Before this, organising
+  // tasks into "Task Bus / Archive" moved them outside the
+  // allowlist and every one was refused — silently, and precisely when
+  // someone tidied up. Only ancestors granted WITH a subtree flag apply, so
+  // nothing becomes an ingress that nobody granted.
+  const eventProject = String(event.event_data?.project_id ?? "");
+  if (eventProject && !live.ingressProjectIds.has(eventProject)) {
+    try {
+      const { projectTree, ancestorsOf } = await import("./todoist-projects.js");
+      const tree = await projectTree();
+      live = expandThroughSubtree(live, eventProject, ancestorsOf(eventProject, tree), {
+        name: tree.get(eventProject)?.name,
+        known: await (deps.knownOwners?.() ?? []),
+      });
+    } catch (err) {
+      log(`todoist-webhook: subtree lookup failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const decision = route(
+    event,
+    live,
+    await (deps.knownOwners?.() ?? []),
+    isComment ? ownerOf(parentId) : undefined,
+  );
+  const who = event.initiator?.email ?? event.initiator?.full_name ?? "todoist";
+
+  if (decision.nearMiss) {
+    // Recorded whether or not the task was delivered: the point is that
+    // something was asked for and not honoured.
+    log(`todoist-webhook: near miss — ${decision.nearMiss}`);
+  }
+
+  // A completion has nothing to dispatch, but it is not nothing. The
+  // comment thread on a ticked task leaves every list at that moment, so a
+  // configured hook gets its chance before this is recorded as "ignored" —
+  // and its exit code decides what the record says.
+  let hook: { ran: boolean; ok: boolean; detail?: string } = { ran: false, ok: true };
+  if (event.event_name === "item:completed") {
+    const { runCompletedHook } = await import("./todoist-completed-hook.js");
+    hook = await runCompletedHook(String(event.event_data?.id ?? ""));
+  }
+
+  if (!decision.act) {
+    audit({
+      action: "webhook", actor: `todoist:${who}`, target: "aibroker",
+      outcome: hook.ran ? (hook.ok ? "archived" : "hook-failed") : "ignored",
+      reason: hook.ran
+        ? (hook.ok ? `${decision.reason} — completion hook ran` : `${decision.reason} — completion hook FAILED: ${hook.detail}`)
+        : decision.reason,
+      meta: {
+        event: event.event_name,
+        task: (event.event_data?.content as string) ?? undefined,
+        nearMiss: decision.nearMiss,
+      },
+    });
+    return;
+  }
+
+  // Claim a trigger before dispatching, and release it if the dispatch
+  // does not land. Honouring another runner's claim is only half an
+  // interlock: a path that dispatches and leaves the task unclaimed lets
+  // the next poller see an advanced due date with nothing on it, conclude
+  // the box was ticked, and run the same sweep again.
+  //
+  // A `reminder:fired` dispatch must claim too (incident 6hccprFMww4pX3M9,
+  // 24./25.09): the session it reaches finishes with `pai task done`, and that
+  // completion arriving on an UNCLAIMED recurring trigger is indistinguishable
+  // from a human tick — route() dispatched the same sweep a second time. With
+  // the claim set, route() sees pai-running and ignores the run's own
+  // completion, exactly as it already does for the poller path.
+  const claiming = (event.event_name === "item:completed" || event.event_name === "reminder:fired")
+    && isTrigger(event.event_data ?? {});
+  if (claiming) {
+    try {
+      const { setTaskLabel } = await import("./todoist-reply.js");
+      await setTaskLabel(decision.taskId, RUNNING_LABEL, true);
+      audit({
+        action: "todoist-claim", actor: "aibroker", target: `todoist:task:${decision.taskId}`,
+        outcome: "claimed",
+      });
+      // Remember when, so a claim nobody comes back for can be released.
+      const { recordClaim } = await import("./todoist-claims.js");
+      recordClaim(
+        decision.taskId,
+        undefined,
+        // Todoist has already advanced the due date by the time a completion
+        // reaches us, so this is the NEXT occurrence — the point past which
+        // a surviving claim would block the very trigger it guards. A
+        // reminder's due is the occurrence being run NOW; claimDeadline's
+        // two-hour floor is what keeps that from expiring the claim early.
+        (event.event_data?.due as { date?: string } | undefined)?.date,
+      );
+    } catch (err) {
+      // Audited, not just logged. A successful claim and a failed one used
+      // to be indistinguishable from outside — the label was simply absent,
+      // and the only record was a line in a log file nobody reads until
+      // something has already gone wrong downstream. The dispatch still
+      // proceeds: the claim is a hint, and refusing to run the sweep
+      // because a label write failed would be the worse trade.
+      const reason = err instanceof Error ? err.message : String(err);
+      audit({
+        action: "todoist-claim", actor: "aibroker", target: `todoist:task:${decision.taskId}`,
+        outcome: "failed",
+        reason: `${reason} — dispatching UNCLAIMED, a poller may read this tick as a fresh request`,
+      });
+      log(`todoist-webhook: could not claim ${decision.taskId} — ${reason}`);
+    }
+  }
+
+  try {
+    // The id rides along so the session can answer on the task it came
+    // from. Without it the reply has nowhere to go but a terminal the
+    // asker is not looking at.
+    // Warn when the title is not unique in its project. Two tasks with the
+    // same name are indistinguishable in a list, so an answer posted on one
+    // looks — to whoever is watching the other — exactly like being ignored.
+    // The session is told, so it can say which id it answered on.
+    let twins = 0;
+    if (!isComment && !claiming) {
+      try {
+        const { countTasksWithTitle } = await import("./todoist-reply.js");
+        twins = await countTasksWithTitle(
+          String(event.event_data?.project_id ?? ""),
+          String(event.event_data?.content ?? ""),
+        );
+      } catch { /* a lookup failure must not block a delivery */ }
+    }
+    const twinWarning = twins > 1
+      ? `\n\n[note: ${twins} open tasks in this project share this title — say which id you answered on]`
+      : "";
+
+    // The project rides along with the task id. A session asked to file a
+    // follow-up otherwise has to guess which project is "its own", and a
+    // guess from its alias creates a second project the user never sees.
+    const fromProject = String(event.event_data?.project_id ?? "");
+    const delivered = `${decision.body}${twinWarning}\n\n[todoist:${decision.taskId}${fromProject ? ` in:${fromProject}` : ""}]`;
+    const r = await deps.deliver(decision.project, delivered,
+      isComment ? { prefix: "[Task:comment]" } : undefined);
+    // Remember who took it, so a later comment reaches the same session.
+    // Recorded on the way out and only on a real delivery: a task nobody
+    // accepted has no owner to inherit.
+    if (!isComment && r.outcome === "delivered") rememberOwner(decision.taskId, decision.project);
+
+    // Release a claim the dispatch did not earn. "queued" keeps it — the
+    // work IS in flight, the session is simply mid-turn — but a trigger
+    // that never reached anyone must go back to being tickable, or the
+    // button is dead until someone removes the label by hand.
+    if (claiming && r.outcome !== "delivered" && r.outcome !== "queued" && r.outcome !== "spawned") {
+      try {
+        const { setTaskLabel } = await import("./todoist-reply.js");
+        await setTaskLabel(decision.taskId, RUNNING_LABEL, false);
+        const { forgetClaim } = await import("./todoist-claims.js");
+        forgetClaim(decision.taskId);
+        log(`todoist-webhook: released ${RUNNING_LABEL} on ${decision.taskId} — dispatch was ${r.outcome}`);
+      } catch { /* the claim is a hint, not a lock; a stuck one is visible */ }
+    }
+    audit({
+      action: "webhook", actor: `todoist:${who}`, target: r.session || decision.project,
+      outcome: r.outcome, body: decision.body, reason: r.reason,
+      meta: {
+        event: event.event_name, taskId: decision.taskId,
+        rule: decision.rule, nearMiss: decision.nearMiss,
+        duplicateTitles: twins > 1 ? twins : undefined,
+      },
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    audit({
+      action: "webhook", actor: `todoist:${who}`, target: decision.project,
+      outcome: "failed", body: decision.body, reason,
+      meta: { event: event.event_name, taskId: decision.taskId },
+    });
+    log(`todoist-webhook: delivery failed — ${reason}`);
+  }
 }
 
 /** Read config from the environment. Returns null when not configured. */
@@ -1109,6 +1237,20 @@ export function startTodoistWebhook(deps: WebhookDeps): Server | null {
   const bind = process.env.TODOIST_WEBHOOK_BIND ?? "127.0.0.1";
 
   const server = createWebhookServer(cfg, deps);
+
+  // Retries what a live request could not: shortly after start (a daemon
+  // restart must not strand what was already queued) and on every tick after
+  // that (an outage longer than the inline backoff in resolveParentWithRetry).
+  if (cfg) {
+    const liveCfg = cfg;
+    const sweep = () => {
+      void sweepPendingEvents(liveCfg, deps).catch((e) =>
+        log(`todoist-webhook: pending-event sweep failed — ${e instanceof Error ? e.message : String(e)}`));
+    };
+    setTimeout(sweep, 20_000).unref();
+    setInterval(sweep, 60_000).unref();
+  }
+
   if (cfg && bind !== "127.0.0.1" && bind !== "localhost") {
     log(`todoist-webhook: WARNING binding ${bind}, not loopback — this puts an execution ingress ` +
         `directly on the network. Prefer loopback with a TLS proxy (Tailscale Funnel, Cloudflare Tunnel, Caddy) in front.`);

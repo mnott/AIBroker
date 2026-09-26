@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/mime.test.ts — Unit tests for MIME type lookup.
  *

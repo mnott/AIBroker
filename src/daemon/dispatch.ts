@@ -29,9 +29,12 @@
  */
 
 import { mkdirSync, writeFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { snapshotAllSessions } from "../transport/sync-facade.js";
+import { saveJson, loadJson } from "../core/json-store.js";
+import { audit } from "./audit.js";
+import { snapshotAllSessions, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import {
   findCuratedPaiProject,
   launchResolvedPaiProject,
@@ -96,6 +99,13 @@ export interface DispatchOptions {
    * adjust what it already has.
    */
   prefix?: string;
+  /**
+   * INTERNAL — set only by redriveQueuedDispatches. Marks this dispatch as the
+   * one redrive a queued record gets, so the fresh record a `queued` outcome
+   * writes is generation-counted and never redriven again. Not part of the
+   * public surface.
+   */
+  redriveCount?: number;
 }
 
 /**
@@ -106,9 +116,20 @@ export interface DispatchOptions {
 export interface DispatchDeps {
   resolve: (name: string) => Promise<PaiProject | undefined>;
   sessions: () => { id: string; name: string; paiName: string | null }[];
+  /**
+   * Did `sessions()` actually enumerate, or fall back to `[]` after a failed
+   * osascript call? An empty array means two different things and only this
+   * tells them apart — see the spawn-gate below.
+   */
+  sessionsReliable: () => boolean;
   deliver: (sessionId: string, body: string, timeoutMs: number, io?: TerminalIO, retries?: number) => Promise<AckResult>;
   launch: (project: PaiProject, opts?: { initialPrompt?: string }) => Promise<{ itermSessionId: string }>;
   waitReady: (sessionId: string, timeoutMs: number) => Promise<boolean>;
+  /**
+   * INTERNAL — Todoist fetch used only by the redrive freshness gate, so tests
+   * can drive it without the network. Defaults to the global fetch.
+   */
+  todoistFetch?: typeof fetch;
   /** Read a session's screen, to confirm Claude still owns the tty. */
   capture: (sessionId: string) => string | null;
   /** Clock for the shared budget; injectable so budget maths is testable. */
@@ -266,6 +287,7 @@ export async function submitAndConfirm(
 const realDeps: DispatchDeps = {
   resolve: findCuratedPaiProject,
   sessions: liveSessions,
+  sessionsReliable: wasLastEnumerationReliable,
   deliver: submitAndConfirm,
   capture: (id) => realIO.capture(id),
   now: () => Date.now(),
@@ -346,15 +368,27 @@ export async function dispatch(
       };
     }
 
+    // Write-ahead: a record on disk BEFORE the type, not after. `queued` means
+    // the text left our hands for Claude Code's own in-terminal queue, which we
+    // cannot see into — if that queue drops it (pane closed, session killed
+    // mid-turn, daemon restarted and nobody re-checked) there was previously
+    // NOTHING anywhere recording that this dispatch ever happened. Deleted
+    // below the moment delivery is actually confirmed; kept otherwise so
+    // redriveQueuedDispatches() has something to find.
+    const queuedRecordPath = writeQueuedRecord(projectName, label, message, opts.prefix, opts.redriveCount);
+
     // One attempt, never three. The text is already in a live session's input
     // box; typing it again does not retry, it duplicates — one trigger became
     // three full job sweeps on 2026-08-01. Retries belong to the spawn path
     // below, where an earlier attempt may genuinely never have landed.
     const res = await deps.deliver(existing.id, body, deliverTimeoutMs(), undefined, 1);
     if (res === "ok") {
+      deleteQueuedRecord(queuedRecordPath);
       return { outcome: "delivered", project: label, session: existing.label, reason: "" };
     }
     if (res === "unreadable") {
+      // Never typed — nothing was queued anywhere, so there is nothing to redrive.
+      deleteQueuedRecord(queuedRecordPath);
       return {
         outcome: "unreachable",
         project: label,
@@ -373,7 +407,27 @@ export async function dispatch(
       session: existing.label,
       reason:
         `Typed into live session "${existing.label}", which was still working and had not read it ` +
-        `within the window. This is delivery, not failure — do NOT retry.`,
+        `within the window. This is delivery, not failure — do NOT retry. Recorded at ${queuedRecordPath} ` +
+        `in case it turns out to have been lost; redriven once on the next daemon start.`,
+    };
+  }
+
+  // Enumeration itself may have failed rather than truthfully found nothing —
+  // an osascript hiccup returns `[]` indistinguishable from an empty machine.
+  // Reading that as "target absent" spawns a session next to one that already
+  // exists, or — worse — the write for that spawn can land on whatever pane
+  // happened to be current, which is exactly how a launch command ends up
+  // typed into a live Claude pane instead of a fresh shell. Unknown is not
+  // absent: report it as a transient failure so the caller retries instead of
+  // either giving up (`unlaunchable`) or launching blind.
+  if (!deps.sessionsReliable()) {
+    return {
+      outcome: "unreachable",
+      project: label,
+      session: "",
+      reason:
+        `Session enumeration failed, so whether "${label}" already has a live session could not be ` +
+        `confirmed. Not launching one on an unverified "no session" — retry once enumeration recovers.`,
     };
   }
 
@@ -534,5 +588,340 @@ function pruneWorkOrders(dir: string): void {
   } catch {
     // Housekeeping must never cost a dispatch. A directory that cannot be read
     // is a reason to skip the sweep, not to fail the work order.
+  }
+}
+
+// ── queued-dispatch persistence ─────────────────────────────────────────────
+//
+// "queued" means the body was typed into a live session's input box and Claude
+// Code's own turn-queue is now the only place holding it — we cannot see into
+// that queue, so we cannot confirm it ran. On 2026-09-23 one of these was
+// typed, never ran, and there was no record anywhere that it had ever been
+// attempted: not a work-order file (those are written only on the spawn path),
+// not anything else. This is the record that was missing.
+
+interface QueuedDispatchRecord {
+  /** The name dispatch() was originally called with — re-resolved on redrive. */
+  project: string;
+  label: string;
+  /** Raw message, NOT prefixed — redrive calls dispatch() again, which prefixes it itself. */
+  message: string;
+  prefix?: string;
+  createdAt: number;
+  /**
+   * Set when this record was written BY a redrive, not by a fresh dispatch.
+   * A record that has already had its one redrive is dropped on the next
+   * start rather than sent again — see redriveQueuedDispatches.
+   */
+  redriveCount?: number;
+}
+
+const QUEUED_DIR = join(homedir(), ".aibroker", "queued-dispatches");
+
+/** Persist a queued dispatch before it is typed. Returns the record's path. */
+function writeQueuedRecord(
+  project: string,
+  label: string,
+  message: string,
+  prefix?: string,
+  redriveCount?: number,
+): string {
+  const path = join(QUEUED_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+  const record: QueuedDispatchRecord = { project, label, message, prefix, createdAt: Date.now() };
+  if (redriveCount !== undefined) record.redriveCount = redriveCount;
+  try {
+    saveJson(path, record, { backup: false });
+  } catch (err) {
+    log(`dispatch: could not persist queued-dispatch record for "${label}": ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return path;
+}
+
+function deleteQueuedRecord(path: string): void {
+  try { unlinkSync(path); } catch { /* already gone, or never written */ }
+}
+
+/**
+ * How long a queued (typed-but-unacked) dispatch is left alone before it is
+ * treated as possibly lost. Long enough that a genuinely busy Claude turn has
+ * finished and consumed it — the sweeps this exists for run for minutes, not
+ * hours — short enough to catch a same-morning daemon restart like 2026-09-23's
+ * (07:37 dispatch, 07:42/07:44 restarts, never redriven because nothing
+ * persisted the attempt).
+ */
+const QUEUED_REDRIVE_GRACE_MS = 5 * 60 * 1000;
+
+// ── was a queued dispatch in fact consumed? ────────────────────────────────
+//
+// Real fault, 2026-09-24: a dispatch typed into a busy session at 06:56 was
+// read and handled by that session minutes later — it is in its transcript —
+// but the queued record stayed on disk, because nothing marks a record
+// consumed. Every daemon restart then re-typed the same message into the same
+// session (the 11:02 restart delivered it a second time), and THAT delivery
+// wrote its own record, so each restart meant one more duplicate, forever.
+// The transcript is the ground truth of what a session actually received, so
+// it is what decides whether a redrive is a recovery or a duplicate.
+
+/**
+ * Substrings that identify `message` inside a transcript entry.
+ *
+ * Both ends, not just the head: a long body delivered into a busy input box
+ * can lose its head (measured 2026-09-24: ~700 of ~5000 chars survived, and
+ * they were the tail), so a head-only needle would miss exactly the deliveries
+ * that most need finding. Drawn from single lines and capped, so a needle
+ * never spans a newline.
+ */
+function transcriptNeedles(message: string): string[] {
+  const lines = message.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  if (!lines.length) return [];
+  return [...new Set([lines[0].slice(0, 80), lines[lines.length - 1].slice(-80)])];
+}
+
+/**
+ * Does the target project's transcript already hold this message?
+ *
+ *   true      — a user message created after the record contains a distinctive
+ *               slice of it: the session received it, redelivering duplicates.
+ *   false     — transcript resolvable, message absent: a redrive is warranted.
+ *   undefined — no transcript could be resolved (no curated project, no
+ *               rootPath, no ~/.claude/projects dir for it): cannot tell.
+ */
+async function queuedDispatchConsumed(
+  record: QueuedDispatchRecord,
+  deps: DispatchDeps,
+): Promise<boolean | undefined> {
+  if (typeof record.createdAt !== "number") return undefined;
+  const needles = transcriptNeedles(record.message);
+  if (!needles.length) return undefined;
+  const project = await deps.resolve(record.project).catch(() => undefined);
+  const rootPath = project?.rootPath;
+  if (!rootPath) return undefined;
+  // Same encoding Claude Code uses for ~/.claude/projects/<dir>: every
+  // non-alphanumeric in the cwd becomes a dash — measured against real dirs
+  // ("/Users/x/.claude" -> "-Users-x--claude"). The five newest transcripts
+  // cover every session that could have consumed it recently.
+  const dir = join(homedir(), ".claude", "projects", rootPath.replace(/[^a-zA-Z0-9]/g, "-"));
+  let files: string[];
+  try {
+    files = readdirSync(dir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({ f, m: statSync(join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m)
+      .slice(0, 5)
+      .map((e) => e.f);
+  } catch {
+    return undefined;
+  }
+  if (!files.length) return undefined;
+
+  // grep for the JSON-ESCAPED spelling: a needle containing a quote never
+  // appears verbatim in a JSONL line, only as its escaped form. Whole-file
+  // scans, because the consumed entry can sit far above a busy session's tail.
+  const patterns = needles.flatMap((n) => ["-e", JSON.stringify(n).slice(1, -1)]);
+  for (const f of files) {
+    let hits: string;
+    try {
+      hits = execFileSync("/usr/bin/grep", ["-F", ...patterns, join(dir, f)], {
+        encoding: "utf8",
+        timeout: 10_000,
+        maxBuffer: 32 * 1024 * 1024,
+      });
+    } catch {
+      continue; // no match in this file (grep exits 1) — next transcript
+    }
+    for (const line of hits.split("\n")) {
+      if (!line.trim()) continue;
+      let entry: any;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue; // truncated by a concurrent write — skip it
+      }
+      // Typed-in text only. Tool results are user-type entries too and can
+      // echo the body (a session reading the record file itself), which is
+      // a mention, not a delivery.
+      if (entry?.type !== "user") continue;
+      const content = entry.message?.content;
+      const text = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content.filter((c: any) => c?.type === "text").map((c: any) => c.text).join("\n")
+          : "";
+      if (!text) continue;
+      const at = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+      if (Number.isNaN(at) || at < record.createdAt) continue;
+      if (needles.some((n) => text.includes(n))) return true;
+    }
+  }
+  return false;
+}
+
+// ── a queued todoist dispatch must still be current ─────────────────────────
+//
+// Real fault, 2026-09-24 (records 1790226222101/1790226253580): a dispatch sat
+// queued for 4h and was then re-driven, long after the run it asked for had
+// happened and been completed. A todoist dispatch's `[todoist:<id>` trailer
+// names the task it came from, and that task says whether the order is still
+// wanted: unfetchable means the trigger is closed, and a due date moved far
+// past the queueing moment means the occurrence was completed since.
+
+/** How far the due date may legitimately sit past queueing: a trigger fires ON its due time, so anything further is a new occurrence. */
+const REDRIVE_DUE_TOLERANCE_MS = 60 * 60 * 1000;
+
+const TODOIST_TRAILER = /\[todoist:(\d+)(?:\s+in:[^\]]*)?\]/;
+
+/**
+ * Why this record's todoist task makes a redrive stale, or undefined when the
+ * dispatch is still current — or cannot be judged, which must NOT drop it.
+ */
+async function staleTodoistTrailer(
+  record: QueuedDispatchRecord,
+  fetchImpl: typeof fetch,
+): Promise<string | undefined> {
+  const taskId = TODOIST_TRAILER.exec(record.message)?.[1];
+  if (!taskId) return undefined;
+  try {
+    const { fetchParentTask } = await import("./todoist-reply.js");
+    const parent = await fetchParentTask(taskId, fetchImpl);
+    const due = parent.due?.date ? Date.parse(parent.due.date) : NaN;
+    if (Number.isFinite(due) && due > record.createdAt + REDRIVE_DUE_TOLERANCE_MS) {
+      return `task ${taskId} is due ${parent.due?.date}, well past the ${new Date(record.createdAt).toISOString()} it was queued at — the occurrence advanced, the run already happened`;
+    }
+    return undefined;
+  } catch (err) {
+    // A fetch that never got an answer says nothing about the task: keep the
+    // record. Only a definitive "gone" (404/401/…, per the webhook's own
+    // transient/permanent classifier) is evidence the trigger is closed.
+    const { isTransientTodoistError } = await import("./todoist-webhook.js");
+    if (isTransientTodoistError(err)) return undefined;
+    return `task ${taskId} is no longer fetchable (${err instanceof Error ? err.message : String(err)}) — closed since the dispatch was queued`;
+  }
+}
+
+/**
+ * Re-attempt every queued dispatch still on disk from before this start.
+ * Call once, at daemon startup.
+ *
+ * Not provably exactly-once: if the original typed input was in fact consumed
+ * moments after its own delivery window closed, this can deliver a second
+ * copy — the same risk `dispatch()`'s single-attempt rule accepts for a normal
+ * retry. The alternative is what actually happened: a dispatch typed into a
+ * live session, never run, nothing anywhere to say so, and no way to recover
+ * it. A record aged past the grace period is stronger evidence of loss than of
+ * a slow turn.
+ *
+ * Bounded, not a retry loop: a record whose todoist task has since closed or
+ * completed is dropped as stale, a record whose transcript shows the session
+ * already received it is deleted as consumed, a record that has already had
+ * its one redrive is dropped without sending, and whatever this pass leaves
+ * behind (still `queued`, `unreachable`, `unlaunchable`) is dropped after one
+ * audited attempt rather than kept for the next restart, so a daemon that
+ * restarts repeatedly cannot turn this into a duplicate-dispatch storm.
+ */
+export async function redriveQueuedDispatches(deps: DispatchDeps = realDeps): Promise<void> {
+  let names: string[];
+  try {
+    names = readdirSync(QUEUED_DIR).filter((n) => n.endsWith(".json"));
+  } catch {
+    return; // directory does not exist yet — nothing was ever queued
+  }
+  const cutoff = Date.now() - QUEUED_REDRIVE_GRACE_MS;
+  for (const name of names) {
+    const path = join(QUEUED_DIR, name);
+    let record: QueuedDispatchRecord;
+    try {
+      if (statSync(path).mtimeMs >= cutoff) continue; // still inside its own delivery window
+      const loaded = loadJson<QueuedDispatchRecord>(path);
+      if (loaded.status !== "ok") {
+        deleteQueuedRecord(path);
+        continue;
+      }
+      record = loaded.data;
+    } catch {
+      continue;
+    }
+
+    // Second generation, one chance only. This record was written BY a redrive
+    // whose transcript could not be checked; sending it again would make every
+    // restart one more duplicate of the same work order.
+    if ((record.redriveCount ?? 0) >= 1) {
+      log(
+        `dispatch: dropping queued dispatch for "${record.label}" — already redriven once ` +
+        `(from ${new Date(record.createdAt).toISOString()}) and never confirmed, not sending it again`,
+      );
+      audit({
+        action: "dispatch-redrive",
+        actor: "aibroker:daemon-start",
+        target: record.project,
+        outcome: "dropped",
+        body: record.message,
+        reason: "already redriven once and never confirmed — dropped rather than risk another duplicate",
+        meta: { project: record.project, originallyQueuedAt: record.createdAt, redriveCount: record.redriveCount },
+      });
+      deleteQueuedRecord(path);
+      continue;
+    }
+
+    // Still current? A todoist-trailer dispatch names its task; if that task
+    // has since been completed (due advanced) or closed, re-driving would
+    // resurrect a run that already happened. Checked before the transcript
+    // scan: one task lookup is cheaper than grepping five transcripts, and it
+    // answers first when both would apply.
+    const stale = await staleTodoistTrailer(record, deps.todoistFetch ?? fetch);
+    if (stale) {
+      log(`dispatch: dropping queued dispatch for "${record.label}" — ${stale}`);
+      audit({
+        action: "dispatch-redrive",
+        actor: "aibroker:daemon-start",
+        target: record.project,
+        outcome: "dropped",
+        body: record.message,
+        reason: stale,
+        meta: { project: record.project, originallyQueuedAt: record.createdAt },
+      });
+      deleteQueuedRecord(path);
+      continue;
+    }
+
+    // Consumed already? The transcript says whether the session ever read it.
+    const consumed = await queuedDispatchConsumed(record, deps);
+    if (consumed) {
+      log(`dispatch: queued dispatch for "${record.label}" already consumed, not redriving`);
+      audit({
+        action: "dispatch-redrive",
+        actor: "aibroker:daemon-start",
+        target: record.project,
+        outcome: "consumed",
+        body: record.message,
+        reason: "found in the target project's transcript after the record was written — the first delivery landed",
+        meta: { project: record.project, originallyQueuedAt: record.createdAt },
+      });
+      deleteQueuedRecord(path);
+      continue;
+    }
+
+    log(
+      `dispatch: redriving queued dispatch for "${record.label}" left over from ` +
+      `${new Date(record.createdAt).toISOString()} (${path})`,
+    );
+    const result = await dispatch(
+      record.project,
+      record.message,
+      { prefix: record.prefix, redriveCount: 1 },
+      deps,
+    );
+    audit({
+      action: "dispatch-redrive",
+      actor: "aibroker:daemon-start",
+      target: result.session || record.project,
+      outcome: result.outcome,
+      body: record.message,
+      reason: result.reason || undefined,
+      meta: { project: result.project, originallyQueuedAt: record.createdAt },
+    });
+    // Delete unconditionally: `delivered`/`spawned` need no further record, and
+    // a fresh `queued` result already wrote ITS OWN record above — marked
+    // redriveCount so the next start drops it instead of redelivering.
+    deleteQueuedRecord(path);
   }
 }
