@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/todoist-ingress.test.ts — granting a project the right to execute.
  *

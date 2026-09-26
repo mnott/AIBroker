@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/persistence.test.ts — the session registry and voice config must not
  * delete themselves either.

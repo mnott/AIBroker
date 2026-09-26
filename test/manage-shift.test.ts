@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/manage-shift.test.ts — reading a night's work out of one sentence.
  *

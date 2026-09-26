@@ -13,10 +13,14 @@
  * anything queued is injected as context on the very next turn rather than
  * whenever someone thinks to check.
  *
- * DRAINING IS DESTRUCTIVE — the daemon empties the mailbox as it reads it — so
- * this must not swallow what it cannot deliver. If the output cannot be
- * emitted, the messages are written to ~/.aibroker/undelivered.jsonl rather
- * than lost, which is the whole failure this hook exists to end.
+ * Delivery is two-phase for the same reason: a destructive read here lost a
+ * message live on 2026-09-25 (daemon drained, hook's 1.5 s reply timeout
+ * fired, nothing emitted). So this hook PEEKS (non-destructive), emits, and
+ * only then ACKs the daemon to clear. Any timeout along the way leaves the
+ * messages queued for the next prompt — a duplicate redelivery, never a loss.
+ * If the output cannot be emitted at all, the messages are additionally
+ * written to ~/.aibroker/undelivered.jsonl rather than lost, which is the
+ * whole failure this hook exists to end.
  *
  * Silent when there is nothing waiting, and silent on every error: a hook that
  * fails loudly on every prompt is a hook someone disables.
@@ -27,7 +31,9 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const SOCKET = "/tmp/aibroker.sock";
+// AIBROKER_HOOK_SOCKET is a test seam: it lets tests point the hook at a fake
+// daemon socket instead of the live one. Production never sets it.
+const SOCKET = process.env.AIBROKER_HOOK_SOCKET ?? "/tmp/aibroker.sock";
 const TIMEOUT_MS = 1500;
 const UNDELIVERED = join(homedir(), ".aibroker", "undelivered.jsonl");
 
@@ -59,10 +65,22 @@ function call(method, params) {
   });
 }
 
+// A worker child process (PAI_WORKER=1) inherits TERM_SESSION_ID/
+// ITERM_SESSION_ID/TMUX_PANE from the pane it runs inside, so sessionId()
+// below would resolve to the pane OWNER's id, not its own — draining is
+// destructive, so this would empty the owner's real mailbox on the worker's
+// own prompts before the owner ever saw the messages in it. Observed live
+// 2026-09-23: a worker's reply to "AIBroker" was recorded as delivered but
+// never surfaced in the real AIBroker session, and aibroker_receive there
+// found nothing.
+if (process.env.PAI_WORKER === "1") process.exit(0);
+
 const id = sessionId();
 if (!id) process.exit(0);
 
-const res = await call("session_mailbox_receive", { sessionId: id });
+// Phase 1: peek, non-destructive. A timeout here emits nothing and the
+// messages stay queued — delivered on the next prompt instead of lost.
+const res = await call("session_mailbox_peek", { sessionId: id });
 const messages = res?.ok ? (res.result?.messages ?? []) : [];
 if (messages.length === 0) process.exit(0);
 
@@ -85,13 +103,21 @@ const out =
   lines.join("\n\n") +
   `\n</system-reminder>`;
 
+let emitted = true;
 try {
   process.stdout.write(out + "\n");
 } catch (e) {
-  // The drain already emptied the mailbox. Losing them here would be the exact
-  // silent drop this hook was written to stop.
+  emitted = false;
+  // The mailbox is NOT cleared on a peek, so the messages stay queued — but a
+  // queue nobody drains is undelivered, not pending, so they are recorded here
+  // too. Losing them would be the exact silent drop this hook was written to stop.
   try {
     mkdirSync(join(homedir(), ".aibroker"), { recursive: true });
     appendFileSync(UNDELIVERED, messages.map((m) => JSON.stringify({ ...m, failedAt: new Date().toISOString(), error: String(e) })).join("\n") + "\n");
   } catch { /* nothing left to try */ }
 }
+
+// Phase 2, only after a successful emit: ack the daemon to clear what was
+// peeked. Best-effort — a timeout here leaves the messages queued and they are
+// re-delivered on the next prompt. A duplicate is acceptable; a loss is not.
+if (emitted) await call("session_mailbox_ack", { sessionId: id, count: messages.length });

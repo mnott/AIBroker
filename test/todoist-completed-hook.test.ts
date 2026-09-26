@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/todoist-completed-hook.test.ts — doing something when a box is ticked.
  *

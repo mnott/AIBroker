@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/issue-links.test.ts — a report that names an issue must link to it.
  *

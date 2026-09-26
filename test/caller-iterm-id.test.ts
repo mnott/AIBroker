@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/caller-iterm-id.test.ts — the sender's name, when only one field carries it.
  *
@@ -72,9 +73,28 @@ test("noReply: typed bare, no [Session:] prefix, and nothing is deposited", () =
   assert.equal(r.deposit, false);
 });
 
-test("default (noReply absent/false): unchanged — prefixed and deposited", () => {
+test("default (noReply absent/false): a one-line pointer is typed, not the body — deposited", () => {
+  // The bug this pins: typing the full body AND depositing it means the
+  // target's drain-mailbox UserPromptSubmit hook fires on that very
+  // submission and re-shows the same content a second time in one turn.
+  // Reproduced live 2026-09-23. The pointer must never contain the message
+  // body, or a long/multi-line body defeats the fix by leaking back in.
   const r = sendToSessionDelivery("run the sweep", "PAI", false);
-  assert.equal(r.typed, "[Session:PAI] run the sweep");
-  assert.ok(r.typed.startsWith("[Session:"));
+  assert.ok(r.typed.startsWith("[Session:PAI]"));
+  assert.ok(!r.typed.includes("run the sweep"), "typed text must not repeat the body");
+  assert.equal(r.typed.split("\n").length, 1, "typed text must be a single line");
+  assert.equal(r.deposit, true);
+});
+
+test("an 8-line AG2 body: typed stays one line, nothing to lose a head from", () => {
+  // FAULT 4 (2026-09-23): an 8-line message to a busy target was reported to
+  // arrive with only its last line. Typing a multi-line body into a busy
+  // pane was never actually observed dropping lines in live testing here —
+  // but this call no longer types the body at all, so there is nothing left
+  // for that failure mode to act on regardless of pane or busy state.
+  const body = Array.from({ length: 8 }, (_, i) => `line${i + 1} of 8`).join("\n");
+  const r = sendToSessionDelivery(body, "PAI", false);
+  assert.equal(r.typed.split("\n").length, 1);
+  assert.ok(!r.typed.includes("line8 of 8"));
   assert.equal(r.deposit, true);
 });

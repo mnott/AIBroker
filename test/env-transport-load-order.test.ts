@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/env-transport-load-order.test.ts — AIBROKER_TRANSPORT set only via
  * ~/.aibroker/env (never the shell env node starts with) must still gate

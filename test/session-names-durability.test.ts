@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/session-names-durability.test.ts
  *

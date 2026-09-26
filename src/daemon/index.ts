@@ -322,6 +322,17 @@ export async function startDaemon(options?: {
     startManagerLoop();
   }
 
+  // A dispatch typed into a live session but never confirmed ("queued") is
+  // recorded on disk before the type happens — see dispatch.ts. Redrive them
+  // once here, deferred so iTerm enumeration has a chance to warm up first
+  // rather than racing the very osascript flakiness that can cause a lost
+  // dispatch in the first place.
+  setTimeout(() => {
+    import("./dispatch.js")
+      .then(({ redriveQueuedDispatches }) => redriveQueuedDispatches())
+      .catch((err) => log(`dispatch: queued-redrive failed to start — ${err instanceof Error ? err.message : String(err)}`));
+  }, 10_000).unref();
+
   startTodoistWebhook({
     deliver: async (project, body, opts) => {
       const { dispatch } = await import("./dispatch.js");

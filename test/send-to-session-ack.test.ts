@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/send-to-session-ack.test.ts — ok:true must not mean "typed".
  *

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/hybrid-discovery.test.ts — the session list may not answer "none"
  * without having looked.

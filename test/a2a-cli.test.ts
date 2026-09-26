@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/a2a-cli.test.ts — the parts of `aibroker a2a` that do not require a
  * live daemon or a real `tailscale` binary: URL resolution, token

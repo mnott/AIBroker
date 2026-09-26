@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/todoist-owners.test.ts — a comment reaches the session doing the work.
  *

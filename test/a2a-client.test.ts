@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/a2a-client.test.ts — the client against a real handleA2A server on
  * loopback. Exercises the same client this project's own `aibroker a2a`

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/sessions-pinned.test.ts — a deliberate directory must survive a sighting.
  *

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/agentish-stats-real-log.test.ts — proof against the real log, not a
  * fixture built to make a point.

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/local-time.test.ts — evidence is printed on the reader's clock.
  *

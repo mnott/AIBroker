@@ -64,12 +64,16 @@ function tmuxToSnapshot(s: ManagedSession): SessionSnapshot {
   };
 }
 
-/** Enumerate sessions across all permitted transports, availability checked live. */
-export function snapshotAllSessions(): SessionSnapshot[] {
+/**
+ * Enumerate sessions across all permitted transports, availability checked live.
+ * `fresh` bypasses iTerm's short-lived cache — forwarded verbatim, see
+ * adapters/iterm/core.ts. tmux's `listSessions()` has no such cache to bypass.
+ */
+export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnapshot[] {
   // Query tmux first (returns [] if no server is running). This is the LIVE
   // availability check — a server that appears post-boot is seen immediately.
   const tmuxSessions = allowTmux ? tmuxTransport.listSessions() : [];
-  let itermSessions: SessionSnapshot[] = allowIterm ? iterm.snapshotAllSessions() : [];
+  let itermSessions: SessionSnapshot[] = allowIterm ? iterm.snapshotAllSessions(opts) : [];
 
   if (allowIterm && tmuxSessions.length) {
     // De-dup nesting: an iTerm/Terminal tab running `tmux attach` is just a
@@ -81,6 +85,16 @@ export function snapshotAllSessions(): SessionSnapshot[] {
   }
 
   return [...itermSessions, ...tmuxSessions.map(tmuxToSnapshot)];
+}
+
+/**
+ * Whether the LAST snapshotAllSessions() call actually enumerated iTerm,
+ * rather than getting an osascript failure back as an indistinguishable `[]`.
+ * tmux has no such failure mode here — `listSessions()` returning `[]` means
+ * "no server", which is a real answer, not a dropped one.
+ */
+export function wasLastEnumerationReliable(): boolean {
+  return allowIterm ? iterm.wasLastSnapshotReliable() : true;
 }
 
 /**

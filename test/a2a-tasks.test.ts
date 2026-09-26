@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/a2a-tasks.test.ts — the Task store's idempotency, threading, bound
  * and expiry guarantees. Every test gets its own file under the sandboxed

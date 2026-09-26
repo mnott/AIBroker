@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/subscribe-issues.test.ts — binding a tracker to the calling session.
  *

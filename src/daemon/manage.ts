@@ -1138,6 +1138,42 @@ export function promptHasUnsentText(content: string): boolean {
 }
 
 /**
+ * Floor for {@link paneLooksIdle}: never call a pane idle before it has sat
+ * this long unchanged, no matter how empty it looks — a pane can be static
+ * for a few seconds between real turns too.
+ */
+export const PANE_IDLE_FLOOR_MS = 5 * 60_000;
+
+// Claude Code's own working indicator: "Word… (12s · ↓ ...)" or
+// "Word… (1m 3s · ↓ ...)". A finished turn reads "Word for Xm Ys · done
+// H:MM ..." with no "…" before a paren, so it never matches this.
+const SPINNER_RE = /…\s*\(\d+(?:m\s*\d+)?s/;
+
+// promptUnsentText() treats the terminal's own "queued messages" hint as no
+// text (it isn't something an operator typed), but for idleness it means the
+// opposite: messages are still waiting to run, so the pane is not idle.
+const QUEUED_HINT_RE = /❯\s*press up to edit/i;
+
+/**
+ * Escape hatch for the arm gate ONLY. sessionIsWorking() reads any transcript
+ * activity within WORKING_RECENT_MS as "working", which holds for a session
+ * whose turn has already ended but which is running a long background shell
+ * (e.g. `pai worker run`) that keeps streaming progress into the transcript
+ * for up to an hour. This looks at the pane instead: quiet long enough,
+ * nothing typed, nothing spinning.
+ */
+export function paneLooksIdle(paneText: string, quietMs: number, floorMs = PANE_IDLE_FLOOR_MS): boolean {
+  if (quietMs < floorMs) return false;
+  if (promptUnsentText(paneText) !== null) return false;
+
+  const lastLines = paneText.split("\n").slice(-8).join("\n");
+  if (QUEUED_HINT_RE.test(lastLines)) return false;
+  if (SPINNER_RE.test(lastLines)) return false;
+
+  return true;
+}
+
+/**
  * Expand the date tokens in a handover path, against the clock right now.
  *
  * Deliberately resolved at the moment of use. A managed session is meant to
@@ -2028,6 +2064,94 @@ export function writeStandingRules(text: string, path = RULES_FILE): void {
 const GOAL_MAX_CHARS = 3800;
 
 /**
+ * The most a LINE TYPED AT A SESSION may be, in characters — much stricter
+ * than GOAL_MAX_CHARS above, and for a different reason.
+ *
+ * Proven from a live transcript on 2026-09-24: on Claude Code 2.1.280,
+ * pasting text over roughly this length gets converted into a
+ * `<pasted_content>` attachment instead of typed input, so a leading `/goal`
+ * is never read as a slash command — the whole thing lands as one plain
+ * message ("[Pasted text #N]"), the session answers "Noted.", and no goal is
+ * set at all. A ~1,150-char line failed this way that night; a ~900-char
+ * line of the same shape still typed correctly on Claude Code 2.1.267 the
+ * night before. 700 leaves headroom under both observed points.
+ */
+const GOAL_LINE_MAX_CHARS = 700;
+
+/** `/goal` plus whichever of the given bits are non-empty, one line, no doubled spaces. */
+function assembleGoalLine(agentish: string, objective: string, rulesPointer: string, screenGrant: string): string {
+  const bits = [agentish, objective, rulesPointer, screenGrant].filter((s) => s.length > 0);
+  return oneLine(`/goal ${bits.join(" ")}`);
+}
+
+/** Cut `s` to at most `max` characters, breaking at a word and marking the cut. */
+function truncateAtWord(s: string, max: number): string {
+  if (max <= 0) return "…";
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max - 1);
+  const lastSpace = cut.lastIndexOf(" ");
+  return `${lastSpace > 0 ? cut.slice(0, lastSpace) : cut}…`;
+}
+
+/**
+ * The fitted goal line, and the (possibly shortened) objective that ended up
+ * in it — the latter is what a caller must use to verify the arming landed,
+ * since the fragment it waits for has to be a real substring of what was
+ * actually typed.
+ *
+ * Shrinks in the order a reader can spare things: the AG2 header first (it
+ * says nothing the session doesn't already know after its first arming), then
+ * the rules pointer down to its shortest form, then the screen grant down to
+ * just the time, and only as a last resort the objective itself — which is
+ * the one thing nobody asked to have shortened, so it is never dropped
+ * entirely, only trimmed at a word boundary.
+ */
+function fitGoal(
+  parts: { objective: string; agentish: string; rulesPointer: string; screenGrant?: string },
+  max: number,
+): { line: string; objective: string } {
+  const { objective } = parts;
+  const agentish = parts.agentish;
+  let rulesPointer = parts.rulesPointer;
+  let screenGrant = parts.screenGrant ?? "";
+
+  let line = assembleGoalLine(agentish, objective, rulesPointer, screenGrant);
+  if (line.length <= max) return { line, objective };
+
+  line = assembleGoalLine("", objective, rulesPointer, screenGrant);
+  if (line.length <= max) return { line, objective };
+
+  if (rulesPointer) {
+    rulesPointer = "Rules: read ~/.aibroker/manage-rules.txt first.";
+    line = assembleGoalLine("", objective, rulesPointer, screenGrant);
+    if (line.length <= max) return { line, objective };
+  }
+
+  if (screenGrant) {
+    const time = screenGrant.match(/until\s+(\d{1,2}:\d{2})/i)?.[1];
+    if (time) screenGrant = `Screen: yours until ${time}.`;
+    line = assembleGoalLine("", objective, rulesPointer, screenGrant);
+    if (line.length <= max) return { line, objective };
+  }
+
+  const overhead = assembleGoalLine("", "", rulesPointer, screenGrant).length;
+  const fittedObjective = truncateAtWord(objective, max - overhead - 1);
+  return { line: assembleGoalLine("", fittedObjective, rulesPointer, screenGrant), objective: fittedObjective };
+}
+
+/**
+ * Pure wrapper around {@link fitGoal} for callers that only want the line —
+ * pinned by test/manage-goal-line-fit.test.ts so the shrink order above
+ * cannot drift without a failing test.
+ */
+export function fitGoalLine(
+  parts: { objective: string; agentish: string; rulesPointer: string; screenGrant?: string },
+  max: number,
+): string {
+  return fitGoal(parts, max).line;
+}
+
+/**
  * `until 08:00` — an END, rather than a length.
  *
  * The two are not interchangeable in use, even though either can be converted
@@ -2218,8 +2342,17 @@ function screenStatus(m: ManagedSession, now = Date.now()): string {
   return `screen: granted until ${at(lease.until)}, but ${describeControls(tool, now).replace(/^screen: /, "")} — renewing`;
 }
 
-/** The text actually typed at the session. Short goal, context by reference. */
-function goalText(m: ManagedSession): string {
+/**
+ * The text actually typed at the session, and the fragment to look for
+ * afterwards to know it landed.
+ *
+ * Short goal, context by reference — and, since GOAL_LINE_MAX_CHARS, always
+ * a pointer to the rules rather than the rules themselves: inlining a real
+ * standing-rules paragraph cannot fit a 700-char paste-safe budget anyway, so
+ * there is no case left where trying the longer composeGoal() inline form
+ * first would help.
+ */
+function goalText(m: ManagedSession): { text: string; fragment: string } {
   const extra = m.pending.length ? ` OPERATOR, since you were last armed: ${m.pending.join(" ")}` : "";
   // The screen rule has to ride along with EVERY arming. Delivered once, it
   // lasts only until the session next reads a goal — and the goal is what tells
@@ -2248,12 +2381,16 @@ function goalText(m: ManagedSession): string {
   // AG2 goes first, ahead of the objective and the standing rules, on every
   // arming — not once at setup. A managed session works unattended for hours
   // and a reminder given only at the start does not survive a compaction or a
-  // `/clear`. This is folded into composeGoal's own objective argument, not
-  // spliced in afterwards, so the ordering it produces (task, then rules,
-  // then right-now context) still holds with AG2 simply riding in front of
-  // the task. What a managed session sends the operator, and what it commits
+  // `/clear`. What a managed session sends the operator, and what it commits
   // to git, stays prose either way — AG2 is only how agents talk to agents.
-  return composeGoal(`${AG2_SPEC} ${m.objective}`, rules, hands, extra, standingRulesSource());
+  const rulesPointer = rules
+    ? `FIRST, before anything else: read ${standingRulesSource()} and follow every rule in it for the whole of this work — they are not optional and they are not summarised here.`
+    : "";
+  const fit = fitGoal(
+    { objective: `${m.objective}${extra}`, agentish: AG2_SPEC, rulesPointer, screenGrant: hands },
+    GOAL_LINE_MAX_CHARS,
+  );
+  return { text: fit.line, fragment: fit.objective.slice(0, 40) };
 }
 
 /**
@@ -2282,8 +2419,7 @@ async function sleep(ms: number): Promise<void> {
 }
 
 async function arm(m: ManagedSession, reason: string): Promise<boolean> {
-  const text = goalText(m);
-  const fragment = m.objective.slice(0, 40);
+  const { text, fragment } = goalText(m);
 
   /**
    * NEVER TYPE A GOAL INTO A BARE SHELL.
@@ -3170,9 +3306,12 @@ async function tick(): Promise<void> {
     // an arming can never see it land. Logged at most once every 5 minutes
     // (the skip itself runs every tick regardless) so a session in a long
     // turn does not fill its own history with the same line.
-    if (working) {
+    if (working && !paneLooksIdle(content, now - m.lastChangeAt)) {
       if (!m.busyNotedAt || now - m.busyNotedAt >= 5 * 60_000) {
-        note(m, `busy — transcript moved <${Math.round(WORKING_RECENT_MS / 1000)}s ago; not arming`);
+        note(
+          m,
+          `busy — transcript moved <${Math.round(WORKING_RECENT_MS / 1000)}s ago and pane not idle; not arming`,
+        );
         m.busyNotedAt = now;
         dirty = true;
       }
@@ -3260,6 +3399,23 @@ export interface ManageResult {
   ok: boolean;
   message: string;
   managed?: boolean;
+}
+
+/**
+ * The off path's one job: make the session stop being managed, under every key
+ * it may be filed under.
+ *
+ * managers.json is keyed by sessionId, and a relaunched pane gets a new one —
+ * so `delete state[resolveSession(name)]` removes nothing (or a different,
+ * newer entry) while the stale same-name entry survives and keeps arming the
+ * session the operator just stopped. Returns the stale keys it removed so the
+ * caller can name them in the log.
+ */
+export function stopManaging(s: Record<string, ManagedSession>, sessionId: string, name: string): string[] {
+  const stale = Object.keys(s).filter((k) => k !== sessionId && s[k].name === name);
+  delete s[sessionId];
+  for (const k of stale) delete s[k];
+  return stale;
 }
 
 /**
@@ -3500,9 +3656,14 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
   }
 
   if (word === "off" || word === "stop") {
-    if (!existing) return { ok: true, message: `${name} was not being managed`, managed: false };
-    delete state[sessionId];
+    // Under a dead pane id the entry is still there, just not under the id
+    // resolveSession returned — "was not being managed" is only true when no
+    // key carries this name at all.
+    const somewhere = !!existing || Object.keys(state).some((k) => state[k].name === name);
+    if (!somewhere) return { ok: true, message: `${name} was not being managed`, managed: false };
+    const stale = stopManaging(state, sessionId, name);
     saveState(state);
+    if (stale.length) log(`[manage:${name}] removed stale key(s) ${stale.join(", ")} — the pane was relaunched`);
     log(`[manage:${name}] stopped by the operator`);
     return { ok: true, message: `stopped managing ${name}`, managed: false };
   }

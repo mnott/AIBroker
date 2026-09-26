@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * A handover path that keeps up with the calendar.
  *

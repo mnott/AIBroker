@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/router.test.ts — Unit tests for MessageRouter.
  *

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/audit.test.ts — the cross-session trail.
  *

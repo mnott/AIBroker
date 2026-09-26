@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/todoist-claims.test.ts — releasing a claim nobody came back for.
  *

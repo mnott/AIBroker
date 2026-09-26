@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/manage-blocked.test.ts — telling a stuck permission prompt from a
  * busy session.

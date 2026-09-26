@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/validate.test.ts — Unit tests for IPC runtime validation.
  *

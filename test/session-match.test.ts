@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/session-match.test.ts — one resolver, three former behaviours.
  *

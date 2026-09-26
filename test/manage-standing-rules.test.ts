@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/manage-standing-rules.test.ts — how to work, written once.
  *

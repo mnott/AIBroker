@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/agentish-stats.test.ts — is AG2 actually cheaper, on real traffic.
  *

@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * A catch-up reply a phone can actually receive.
  *

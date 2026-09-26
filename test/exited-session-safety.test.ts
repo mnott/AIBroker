@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/exited-session-safety.test.ts — never type into a shell.
  *

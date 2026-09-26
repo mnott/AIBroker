@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/message-queue.test.ts — Unit tests for persistent PAILot message queue.
  *

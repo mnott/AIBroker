@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/sessions-manifest.test.ts — restore-manifest merge semantics.
  *

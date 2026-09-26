@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * pailot/control/in must reach the dedicated control branch, not the
  * session-id regex (which used to match "control" as a session id and

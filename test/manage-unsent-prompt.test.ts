@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * Reading the input line.
  *

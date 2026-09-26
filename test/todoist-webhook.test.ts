@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/todoist-webhook.test.ts — the Todoist inbound channel.
  *

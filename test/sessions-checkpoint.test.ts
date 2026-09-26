@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/sessions-checkpoint.test.ts — verified checkpoint delivery.
  *

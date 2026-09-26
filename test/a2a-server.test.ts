@@ -1,3 +1,4 @@
+import "./home-guard.js";
 /**
  * test/a2a-server.test.ts — handleA2A end to end, over a real loopback
  * socket, with a fake `deliver` standing in for a session mailbox.
