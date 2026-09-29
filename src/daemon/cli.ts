@@ -19,6 +19,10 @@
 
 import "../core/env-bootstrap.js";
 import { startDaemon, DAEMON_SOCKET_PATH } from "./index.js";
+
+// iTerm exports this into its shells; a child carrying it registers as iTerm2 and misroutes AppleScript.
+delete process.env.__CFBundleIdentifier;
+
 import { WatcherClient } from "../ipc/client.js";
 import { validateHubStatus } from "../ipc/validate.js";
 import { createAdapter } from "./create-adapter.js";

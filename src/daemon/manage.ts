@@ -28,6 +28,7 @@ import { log } from "../core/log.js";
 import { timeCall } from "../core/call-timing.js";
 import { readSessionContent } from "./session-content.js";
 import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode, wasLastEnumerationReliable } from "../transport/sync-facade.js";
+import { findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
@@ -2663,12 +2664,39 @@ function beat(): void {
 const DIALOG_EVERY_TICKS = 3;
 let tickCount = 0;
 
+/** A failure must last this long, continuously, before the operator is paged. */
+export const ENUMERATION_ALERT_AFTER_MS = 120_000;
+
+export interface EnumerationEpisode {
+  /** When the current failure episode began; null while reliable. */
+  since: number | null;
+  /** Whether an alert went out for this episode. */
+  alerted: boolean;
+}
+
 /**
- * Whether the operator has already been told about the current iTerm
- * enumeration failure — set once per episode, cleared on recovery, so a
- * standing fault alerts once rather than every 20s tick.
+ * Pure decision for one tick: a transient failure (an osascript hitting the
+ * LaunchServices window) clears within a tick or two and must not page anyone;
+ * only a sustained one alerts, once, and only that one earns a recovery line.
  */
-let enumerationAlarmArmed = false;
+export function enumerationStep(
+  ep: EnumerationEpisode,
+  now: number,
+  reliable: boolean,
+): { ep: EnumerationEpisode; action: "none" | "alert" | "recovered"; downMs: number } {
+  if (reliable) {
+    const downMs = ep.since === null ? 0 : now - ep.since;
+    return { ep: { since: null, alerted: false }, action: ep.alerted ? "recovered" : "none", downMs };
+  }
+  const since = ep.since ?? now;
+  const downMs = now - since;
+  if (!ep.alerted && downMs >= ENUMERATION_ALERT_AFTER_MS) {
+    return { ep: { since, alerted: true }, action: "alert", downMs };
+  }
+  return { ep: { since, alerted: ep.alerted }, action: "none", downMs };
+}
+
+let enumerationEpisode: EnumerationEpisode = { since: null, alerted: false };
 
 function answerBlockingDialogs(): void {
   if (Object.keys(state).length === 0) return;
@@ -2696,15 +2724,24 @@ async function tick(): Promise<void> {
   // empty machine — reported "ok" with 0 sessions is exactly the silent
   // failure this exists to catch. Reuses the flag every `sessions`/`status`
   // caller already sets; no separate probe.
-  if (!wasLastEnumerationReliable()) {
-    if (!enumerationAlarmArmed) {
-      enumerationAlarmArmed = true;
-      alertOperator("iTerm session enumeration is failing (AppleScript errors) — the session list may be empty or stale until this clears.");
-      log("[manage] iTerm enumeration unreliable — alerted the operator");
+  const reliable = wasLastEnumerationReliable();
+  if (!reliable && enumerationEpisode.since === null) log("[manage] iTerm enumeration unreliable — episode started, alerting only if it lasts");
+  const step = enumerationStep(enumerationEpisode, now, reliable);
+  enumerationEpisode = step.ep;
+  if (step.action === "alert") {
+    let text = "iTerm session enumeration is failing (AppleScript errors) for over 2 minutes — the session list may be empty or stale until this clears.";
+    const impostors = findItermBundleIdImpostors();
+    if (impostors.length) {
+      const named = impostors.map((i) => `pid ${i.pid} (${i.executablePath})`).join(", ");
+      text += ` Found ${named} registered under iTerm's bundle id — a process spawned with iTerm's __CFBundleIdentifier; killing it restores enumeration.`;
     }
-  } else if (enumerationAlarmArmed) {
-    enumerationAlarmArmed = false;
-    log("[manage] iTerm enumeration recovered");
+    alertOperator(text);
+    log(`[manage] iTerm enumeration unreliable — alerted the operator${impostors.length ? ` (impostors: ${impostors.map((i) => i.pid).join(", ")})` : ""}`);
+  } else if (step.action === "recovered") {
+    alertOperator(`iTerm session enumeration recovered after ${Math.round(step.downMs / 1000)}s.`);
+    log("[manage] iTerm enumeration recovered — alerted the operator");
+  } else if (reliable && step.downMs > 0) {
+    log(`[manage] iTerm enumeration recovered after ${Math.round(step.downMs / 1000)}s — no alert sent`);
   }
 
   if (++tickCount % DIALOG_EVERY_TICKS === 0) {

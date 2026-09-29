@@ -436,6 +436,62 @@ export function wasLastSnapshotReliable(): boolean {
   return lastSnapshotOk;
 }
 
+export interface ItermBundleIdImpostor {
+  pid: number;
+  executablePath: string;
+}
+
+const REAL_ITERM_SUFFIX = "/iTerm.app/Contents/MacOS/iTerm2";
+
+/**
+ * Parser half of findItermBundleIdImpostors(), split out for testing without
+ * a subprocess. `lsappinfo list` entries look like:
+ *   125) "iTerm2" ASN:0x0-0x412ec2ab: (in front)
+ *       bundleID="com.googlecode.iterm2"
+ *       executable path="/Applications/iTerm.app/Contents/MacOS/iTerm2"
+ *       pid = 66665 ...
+ * A child launched with iTerm's exported __CFBundleIdentifier registers under
+ * the same bundle id from a different executable — that mismatch is the tell.
+ */
+export function parseLsappinfoImpostors(text: string): ItermBundleIdImpostor[] {
+  const impostors: ItermBundleIdImpostor[] = [];
+  const entries = text.split(/\n(?=[ \t]*\d+\)\s)/);
+  for (const entry of entries) {
+    const bundleMatch = entry.match(/bundleID="([^"]*)"/);
+    if (!bundleMatch || bundleMatch[1] !== "com.googlecode.iterm2") continue;
+    const pathMatch = entry.match(/executable path="([^"]*)"/);
+    const pidMatch = entry.match(/pid\s*=\s*(\d+)/);
+    if (!pathMatch || !pidMatch) continue;
+    const executablePath = pathMatch[1];
+    if (executablePath.endsWith(REAL_ITERM_SUFFIX)) continue;
+    impostors.push({ pid: parseInt(pidMatch[1], 10), executablePath });
+  }
+  return impostors;
+}
+
+/**
+ * Processes registered with LaunchServices under iTerm2's bundle id but NOT
+ * running iTerm's own executable — e.g. an osascript/helper child that
+ * inherited iTerm's __CFBundleIdentifier env var. While registered, `tell
+ * application "iTerm2"` can be routed to the impostor instead, which answers
+ * with -600/-1708 and takes enumeration down. Diagnostic only: never kills
+ * anything, never throws — on any error this is "found nothing" to a caller
+ * that already treats [] as the safe default.
+ */
+export function findItermBundleIdImpostors(): ItermBundleIdImpostor[] {
+  try {
+    const result = spawnSync("/usr/bin/lsappinfo", ["list"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 3_000,
+      encoding: "utf8",
+    });
+    if (result.status !== 0 || result.error || !result.stdout) return [];
+    return parseLsappinfoImpostors(result.stdout);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Enumerate all iTerm2 sessions, reusing an answer up to SNAPSHOT_TTL_MS old.
  *

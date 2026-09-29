@@ -36,7 +36,7 @@ import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-project
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { promptUnsentText, inputLineDecision } from "./manage.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
-import { clearAllPaiNames } from "../adapters/iterm/core.js";
+import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { matchSession, resolveCallerSession } from "../core/session-match.js";
@@ -238,14 +238,20 @@ export function registerCoreHandlers(
     // A failed osascript enumeration reads identically to a truly empty
     // machine unless this says otherwise — see wasLastEnumerationReliable().
     const enumerationFailed = !wasLastEnumerationReliable();
+    let enumerationDetail: string | undefined;
+    if (enumerationFailed) {
+      enumerationDetail = "iTerm AppleScript enumeration failed; list may be incomplete";
+      const impostors = findItermBundleIdImpostors();
+      if (impostors.length) {
+        enumerationDetail += ` — found ${impostors.map((i) => `pid ${i.pid} (${i.executablePath})`).join(", ")} registered under iTerm's bundle id`;
+      }
+    }
     return {
       ok: true,
       result: {
         sessions,
         enumerationFailed,
-        ...(enumerationFailed
-          ? { enumerationDetail: "iTerm AppleScript enumeration failed; list may be incomplete" }
-          : {}),
+        ...(enumerationFailed ? { enumerationDetail } : {}),
       },
     };
   });

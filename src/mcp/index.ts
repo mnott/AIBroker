@@ -23,6 +23,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+
+// iTerm exports this into its shells; a child carrying it registers as iTerm2 and misroutes AppleScript.
+delete process.env.__CFBundleIdentifier;
+
 import { execSync } from "node:child_process";
 import { missingIssueLink } from "./issue-links.js";
 import { statSync } from "node:fs";
