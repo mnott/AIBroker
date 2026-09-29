@@ -114,6 +114,8 @@ export interface ValidatedHubStatus {
   adapters: string[];
   activeSessions: number;
   activeSession: string | null;
+  /** Permitted transports of the running daemon, e.g. `tmux (linux)`. */
+  transport: string;
   adapterHealth: Record<string, AdapterHealth>;
 }
 
@@ -122,7 +124,7 @@ export interface ValidatedHubStatus {
  */
 export function validateHubStatus(raw: unknown): ValidatedHubStatus {
   if (!isObject(raw)) {
-    return { version: "unknown", status: "down", adapters: [], activeSessions: 0, activeSession: null, adapterHealth: {} };
+    return { version: "unknown", status: "down", adapters: [], activeSessions: 0, activeSession: null, transport: "unknown", adapterHealth: {} };
   }
 
   const adapters = Array.isArray(raw.adapters)
@@ -147,6 +149,7 @@ export function validateHubStatus(raw: unknown): ValidatedHubStatus {
     adapters,
     activeSessions: num(raw, "activeSessions", 0),
     activeSession: typeof raw.activeSession === "string" ? raw.activeSession : null,
+    transport: str(raw, "transport", "unknown"),
     adapterHealth,
   };
 }

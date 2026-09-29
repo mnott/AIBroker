@@ -26,6 +26,7 @@ import {
   itermViewerSessionId,
   snapshotAllSessions as snapshotAllTransports,
 } from "../../transport/sync-facade.js";
+import { itermInPlay } from "../../transport/policy.js";
 import { normaliseLabel } from "../../core/session-match.js";
 import { log } from "../../core/log.js";
 import {
@@ -41,6 +42,7 @@ import { saveSessionRegistry, getAllPersistentSessionNames, lookupPersistentName
 // ── Session Variable Helpers ──
 
 function setItermSessionProperty(itermSessionId: string, body: string): void {
+  if (!itermInPlay()) return;
   try {
     const script = withSessionAppleScript(
       itermSessionId,
@@ -62,6 +64,7 @@ export function setItermSessionVar(itermSessionId: string, name: string): void {
 }
 
 export function setItermTabName(itermSessionId: string, name: string): void {
+  if (!itermInPlay()) return;
   // Fire-and-forget: rename the tab via iTerm2's native WebSocket API.
   // This sets the persistent title override (same as double-click rename).
   import("./iterm2-api.js").then(({ iterm2SetTabTitle }) =>
@@ -72,6 +75,7 @@ export function setItermTabName(itermSessionId: string, name: string): void {
 }
 
 export function setItermBadge(itermSessionId: string, text: string): void {
+  if (!itermInPlay()) return;
   // Write badge escape sequence to the session's tty device.
   // Must go to terminal output stream (not stdin via "write text").
   try {
@@ -104,6 +108,7 @@ export function setItermBadge(itermSessionId: string, text: string): void {
  * session as an unexplained failure.
  */
 export function revealItermSession(itermSessionId: string): boolean {
+  if (!itermInPlay()) return false;
   try {
     const result = execSync(
       `osascript -e 'tell application "iTerm2"
@@ -131,6 +136,7 @@ export function revealItermSession(itermSessionId: string): boolean {
 }
 
 export function getItermSessionVar(itermSessionId: string): string | null {
+  if (!itermInPlay()) return null;
   try {
     const script = withSessionAppleScript(
       itermSessionId,

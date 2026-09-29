@@ -96,6 +96,9 @@ function detectSessionId(): string | undefined {
   const envId = process.env.ITERM_SESSION_ID?.split(":")[1];
   if (envId) return envId;
 
+  // Steps 2-3 exist only to ask iTerm which tab owns our tty; there is no iTerm off macOS.
+  if (process.platform !== "darwin") return undefined;
+
   // 2. Walk process tree to find the TTY of our ancestor shell
   try {
     // Get the TTY of our parent's parent (claude → zsh → tty)

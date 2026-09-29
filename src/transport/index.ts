@@ -5,6 +5,7 @@
  * setups (e.g. tmux nested inside iTerm, where env alone would guess wrong).
  *
  *   AIBROKER_TRANSPORT=tmux|iterm   → force a specific transport
+ *   else not macOS                   → tmux  (no iTerm exists)
  *   else $TMUX set + tmux server up → tmux  (you're inside tmux)
  *   else TERM_PROGRAM=iTerm.app      → iterm
  *   else tmux server up              → tmux  (headless / SSH)
@@ -15,8 +16,9 @@ import { log } from "../core/log.js";
 import { ItermTransport } from "./iterm.js";
 import { TmuxTransport } from "./tmux.js";
 import type { SessionTransport, TransportKind } from "./session-transport.js";
+import { itermInPlay } from "./policy.js";
 
-export type { ManagedSession, SendOptions, SessionTransport, TransportKind } from "./session-transport.js";
+export type { LaunchOptions, LaunchResult, ManagedSession, SendOptions, SessionTransport, TransportKind } from "./session-transport.js";
 export { ItermTransport } from "./iterm.js";
 export { TmuxTransport } from "./tmux.js";
 
@@ -36,6 +38,11 @@ export function selectTransport(): SessionTransport {
   if (override === "tmux" || override === "iterm") {
     log(`transport: forced via AIBROKER_TRANSPORT=${override}`);
     return build(override);
+  }
+
+  if (!itermInPlay()) {
+    log(`transport: tmux (${process.platform}, no iTerm)`);
+    return build("tmux");
   }
 
   const tmux = new TmuxTransport();

@@ -14,6 +14,7 @@
 import type { Backend, APIBackendConfig, BackendHealth } from "../types/backend.js";
 import { log } from "../core/log.js";
 import { homedir } from "os";
+import { resolveBin } from "../core/bins.js";
 import { spawn } from "child_process";
 
 /** Live status of a session's current deliver() call */
@@ -303,7 +304,7 @@ export class APIBackend implements Backend {
       }
 
       // Resolve Claude CLI binary path — shell aliases aren't available in spawn()
-      const claudeBin = `${homedir()}/.local/bin/claude`;
+      const claudeBin = resolveBin("claude");
 
       for await (const event of query({
         prompt: message,

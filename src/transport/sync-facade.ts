@@ -12,6 +12,7 @@
  *   AIBROKER_TRANSPORT=tmux   → tmux only
  *   AIBROKER_TRANSPORT=multi  → both (subject to availability)
  *   unset / anything else     → AUTO: enumerate whatever is available right now
+ *                               (non-macOS: tmux only — see policy.ts)
  *
  * AUTO is the default and is safe: on a Mac with no tmux server it resolves to
  * iTerm-only (byte-identical to the pre-transport behaviour — verified). The
@@ -32,11 +33,10 @@ import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { ItermTransport } from "./iterm.js";
 import { TmuxTransport } from "./tmux.js";
 import type { ManagedSession } from "./session-transport.js";
-import { isClaudeReady } from "./screen.js";
+import { isClaudeReady, isClaudeTitleIdle, isClaudeFrameIdle } from "./screen.js";
 import { audit } from "../daemon/audit.js";
 import { log } from "../core/log.js";
-
-const override = (process.env.AIBROKER_TRANSPORT ?? "").trim().toLowerCase();
+import { transportPolicy } from "./policy.js";
 
 const tmuxTransport = new TmuxTransport();
 const itermTransport = new ItermTransport();
@@ -46,21 +46,49 @@ const itermTransport = new ItermTransport();
 // the daemon launched is picked up immediately — no restart required. Likewise,
 // iTerm yields nothing on a headless box (osascript absent), so AUTO degrades
 // cleanly to tmux-only there.
-const allowIterm = override !== "tmux";
-const allowTmux = override !== "iterm";
+const { allowIterm, allowTmux } = transportPolicy();
 
-function tmuxToSnapshot(s: ManagedSession): SessionSnapshot {
+const IDLE_TTL_MS = 2_000;
+const idleCache = new Map<string, { at: number; idle: boolean }>();
+
+/**
+ * tmux only sees the foreground command, so idle comes from the pane CONTENT
+ * (`aibroker launch` pins the title, so Claude's ✳ marker never shows). Only
+ * claude/node panes are captured, cached briefly; the ✳ title is the fallback
+ * when capture fails.
+ */
+export function tmuxAtPrompt(
+  s: ManagedSession,
+  capture: (id: string, lines: number) => string | null = (id, n) => tmuxTransport.capture(id, n),
+): boolean {
+  if (!s.busy) return true;
+  if (!/^(claude|node)$/.test(s.command ?? "")) return false;
+  const hit = idleCache.get(s.id);
+  const now = Date.now();
+  if (hit && now - hit.at < IDLE_TTL_MS) return hit.idle;
+  const frame = capture(s.id, 40);
+  const idle = frame == null ? isClaudeTitleIdle(s.tabTitle) : isClaudeFrameIdle(frame);
+  idleCache.set(s.id, { at: now, idle });
+  return idle;
+}
+
+export function tmuxToSnapshot(s: ManagedSession): SessionSnapshot {
   return {
     id: s.id,
     name: s.name,
     profileName: "Default",
     tabTitle: s.tabTitle,
     tty: s.tty ?? "",
-    atPrompt: !s.busy,
+    atPrompt: tmuxAtPrompt(s),
+    // A claude foreground command is a Claude session, idle or not: without
+    // this an idle pane (atPrompt) with no chosen name was listed as "shell".
+    isClaude: s.command === "claude" ? true : undefined,
     // paiName merged from the persistent store by callers, exactly as for iTerm.
     paiName: null,
     // Durable id so persistent-name lookups survive %N churn across tmux restarts.
     aibrokerId: s.aibrokerId,
+    cwd: s.cwd ?? null,
+    transport: "tmux",
   };
 }
 
@@ -103,7 +131,7 @@ export function wasLastEnumerationReliable(): boolean {
  * A "%N" is unambiguously tmux; otherwise check whether a live tmux pane carries
  * that @aibroker_id (iTerm GUIDs won't match → routed to iTerm).
  */
-function routeToTmux(id: string): boolean {
+export function routeToTmux(id: string): boolean {
   if (!allowTmux) return false;
   if (!allowIterm) return true; // tmux is the only permitted transport
   if (id.startsWith("%")) return true;
@@ -267,4 +295,7 @@ export function itermViewerSessionId(tmuxPaneId: string): string | null {
   return iterm.snapshotAllSessions().find((s) => s.tty === tty)?.id ?? null;
 }
 
-log(`sync-facade: transports permitted = [${[allowIterm ? "iterm" : null, allowTmux ? "tmux" : null].filter(Boolean).join(", ")}] (availability checked live per enumeration)`);
+/** Daemon-only diagnostic: module-load logging would leak into every CLI verb's stderr. */
+export function logTransportPolicy(): void {
+  log(`sync-facade: transports permitted = [${[allowIterm ? "iterm" : null, allowTmux ? "tmux" : null].filter(Boolean).join(", ")}] (availability checked live per enumeration)`);
+}

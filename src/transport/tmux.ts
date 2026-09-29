@@ -19,7 +19,9 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { log } from "../core/log.js";
-import type { ManagedSession, SendOptions, SessionTransport, TransportKind } from "./session-transport.js";
+import { resolveBin } from "../core/bins.js";
+import { claudeArgs } from "./session-transport.js";
+import type { LaunchOptions, LaunchResult, ManagedSession, SendOptions, SessionTransport, TransportKind } from "./session-transport.js";
 
 /** Foreground process names that mean "at a shell prompt" (idle), not running a program. */
 const SHELL_COMMANDS = new Set(["zsh", "-zsh", "bash", "-bash", "sh", "-sh", "fish", "-fish"]);
@@ -38,6 +40,9 @@ function resolveTmuxBin(): string {
   return "tmux";
 }
 const TMUX_BIN = resolveTmuxBin();
+
+/** Where `aibroker launch` opens windows when the caller is not inside tmux. */
+export const DETACHED_SESSION = "aibroker";
 
 /**
  * tmux transliterates non-ASCII output to "_" under a C/POSIX locale — which is
@@ -71,7 +76,11 @@ function runTmux(args: string[], timeoutMs = 4_000): string | null {
   // per-call cost this function exists to avoid (every enumeration and every
   // id routing goes through here).
   if (!existsSync(tmuxSocketPath())) return null;
+  return spawnTmux(args, timeoutMs);
+}
 
+/** Like runTmux without the socket gate: launching is the one call that may START the server. */
+function spawnTmux(args: string[], timeoutMs = 4_000): string | null {
   const result = spawnSync(TMUX_BIN, args, {
     stdio: ["pipe", "pipe", "pipe"],
     timeout: timeoutMs,
@@ -82,7 +91,7 @@ function runTmux(args: string[], timeoutMs = 4_000): string | null {
     const stderr = (result.stderr ?? "").toString().trim();
     // "no server running" / "error connecting to" (missing socket file) are the
     // normal states when no tmux is up — don't spam logs.
-    if (stderr && !stderr.includes("no server running") && !stderr.includes("error connecting to")) {
+    if (stderr && !stderr.includes("no server running") && !stderr.includes("error connecting to") && !stderr.includes("can't find session")) {
       log(`tmux ${args[0]} failed: ${stderr}`);
     }
     return null;
@@ -138,13 +147,13 @@ export class TmuxTransport implements SessionTransport {
   }
 
   listSessions(): ManagedSession[] {
-    const fmt = ["#{pane_id}", "#{pane_current_command}", "#{pane_title}", "#{pane_tty}", "#{@aibroker_id}"].join(FIELD_SEP);
+    const fmt = ["#{pane_id}", "#{pane_current_command}", "#{pane_title}", "#{pane_tty}", "#{@aibroker_id}", "#{pane_current_path}"].join(FIELD_SEP);
     const out = runTmux(["list-panes", "-a", "-F", fmt]);
     if (out == null) return [];
 
     const sessions: ManagedSession[] = [];
     for (const line of out.split("\n").filter(Boolean)) {
-      const [paneId, cmd, title, tty, existingId] = line.split(FIELD_SEP);
+      const [paneId, cmd, title, tty, existingId, path] = line.split(FIELD_SEP);
       if (!paneId) continue;
 
       // Scheme B: ensure a durable id exists for this pane.
@@ -165,6 +174,8 @@ export class TmuxTransport implements SessionTransport {
         busy: !SHELL_COMMANDS.has(cmd ?? ""),
         transport: this.kind,
         aibrokerId,
+        cwd: path && path.length > 0 ? path : null,
+        command: cmd || null,
       });
     }
     return sessions;
@@ -226,7 +237,8 @@ export class TmuxTransport implements SessionTransport {
   capture(id: string, lines?: number): string | null {
     const pane = this.paneFor(id);
     if (pane == null) return null;
-    const args = ["capture-pane", "-t", pane, "-p"];
+    // -J joins wrapped lines so a long line reads as one, not as fragments.
+    const args = ["capture-pane", "-t", pane, "-p", "-J"];
     if (lines && lines > 0) args.push("-S", `-${lines}`);
     return runTmux(args);
   }
@@ -278,5 +290,47 @@ export class TmuxTransport implements SessionTransport {
     const pane = this.paneFor(id);
     if (pane == null) return false;
     return runTmux(["select-pane", "-t", pane, "-T", title]) != null;
+  }
+
+  /**
+   * Open `claude` in `opts.dir` as a new tmux window. Inside tmux ($TMUX set) it
+   * lands in the caller's current session; otherwise in a detached session named
+   * `aibroker`, created on first use. Window name and pane title are `opts.name`,
+   * and the pane gets its durable @aibroker_id straight away, so the hub can
+   * address it by name on its very next enumeration. `io` lets tests replace tmux.
+   */
+  launch(
+    opts: LaunchOptions,
+    io: { exec?: (args: string[]) => string | null; env?: NodeJS.ProcessEnv; claudeBin?: string } = {},
+  ): LaunchResult | null {
+    const exec = io.exec ?? spawnTmux;
+    const env = io.env ?? process.env;
+    const argv = ["--", io.claudeBin ?? resolveBin("claude"), ...claudeArgs(opts)];
+    const pane = ["-c", opts.dir, "-n", opts.name, "-P", "-F", "#{pane_id}"];
+
+    let out: string | null = null;
+    let where = "";
+    let attach: string | undefined;
+    if (env.TMUX) {
+      out = exec(["new-window", ...pane, ...argv]);
+      where = `window "${opts.name}" in the current tmux session`;
+    }
+    if (out == null) {
+      where = `window "${opts.name}" in tmux session "${DETACHED_SESSION}"`;
+      attach = `tmux attach -t ${DETACHED_SESSION}`;
+      out = exec(["has-session", "-t", `=${DETACHED_SESSION}`]) != null
+        ? exec(["new-window", "-t", `${DETACHED_SESSION}:`, ...pane, ...argv])
+        : exec(["new-session", "-d", "-s", DETACHED_SESSION, ...pane, ...argv]);
+    }
+    const paneId = out?.trim();
+    if (!paneId) return null;
+
+    const id = randomUUID();
+    exec(["set-option", "-p", "-t", paneId, "@aibroker_id", id]);
+    exec(["select-pane", "-t", paneId, "-T", opts.name]);
+    // Claude retitles its terminal; keep the name the session is addressed by
+    // (pane option exists from tmux 3.5 — older servers reject it, harmlessly).
+    exec(["set-option", "-p", "-t", paneId, "allow-set-title", "off"]);
+    return { id, transport: this.kind, where, attach };
   }
 }

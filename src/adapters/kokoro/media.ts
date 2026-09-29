@@ -12,14 +12,12 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 
 import { log } from "../../core/log.js";
+import { resolveWhisperBin } from "../../core/bins.js";
 
 const execFileAsync = promisify(execFile);
 
-/** Absolute path to the Whisper CLI binary. */
-export const WHISPER_BIN =
-  ["/opt/homebrew/bin/whisper", "/usr/local/bin/whisper", "whisper"].find(
-    (p) => p === "whisper" || existsSync(p),
-  ) ?? "whisper";
+/** @deprecated Frozen at import time; call resolveWhisperBin() at the point of use. */
+export const WHISPER_BIN = resolveWhisperBin();
 
 /** Whisper model (overridable via env). */
 export const WHISPER_MODEL =
@@ -84,7 +82,7 @@ export async function transcribeAudio(
     log(`Transcribing ${audioPath} (model=${WHISPER_MODEL})...`);
 
     await execFileAsync(
-      WHISPER_BIN,
+      resolveWhisperBin(),
       [audioPath, "--model", WHISPER_MODEL, "--output_format", "txt", "--output_dir", tmpdir(), "--verbose", "False"],
       {
         timeout: 120_000,

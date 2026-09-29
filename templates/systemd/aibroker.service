@@ -1,0 +1,22 @@
+# systemd --user unit for the AIBroker hub. `aibroker setup` fills the two
+# @…@ markers (absolute node + installed cli.js, PATH and AIBROKER_* from the
+# invoking shell) and writes the result to ~/.config/systemd/user/.
+#
+# `start` runs in the foreground (there is no daemonize mode), which is what
+# Type=simple wants. Keep it running after logout: sudo loginctl enable-linger $USER
+[Unit]
+Description=AIBroker hub
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@EXEC_START@
+# Optional file: KEY=value lines, same file the daemon reads itself on macOS.
+EnvironmentFile=-%h/.aibroker/env
+@ENVIRONMENT@
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

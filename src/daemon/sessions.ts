@@ -27,16 +27,21 @@
  *   repoint NAME PATH                         set where a session should reopen
  *   forget NAME                               drop an entry
  *   prune [--older-than DAYS] [--dry-run]     drop entries not seen in a while
- *   install | uninstall                       manage the 5-min snapshot LaunchAgent
+ *   install | uninstall                       manage the 5-min snapshot LaunchAgent / systemd user timer
  */
 import { execFileSync, execSync } from "node:child_process";
-import { writeFileSync, readFileSync, existsSync, mkdirSync, copyFileSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, mkdirSync, copyFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { WatcherClient } from "../ipc/client.js";
 import { captureSession, typeIntoSession } from "../transport/sync-facade.js";
+import { selectTransport } from "../transport/index.js";
+import type { LaunchOptions, LaunchResult } from "../transport/index.js";
+import { fileURLToPath } from "node:url";
 import { DAEMON_SOCKET_PATH } from "./index.js";
+import { tightenLog } from "../core/private-file.js";
+import { serviceEnv, plistEnvEntries } from "../core/service-env.js";
 import { pruneSessionNames } from "../core/persistence.js";
 
 const HOME = homedir();
@@ -44,12 +49,12 @@ const AIBROKER_DIR = join(HOME, ".aibroker");
 const MANIFEST = join(AIBROKER_DIR, "session-restore.json");
 const MANIFEST_BAK = `${MANIFEST}.bak`;
 const AGENT_LABEL = "com.aibroker.sessions-snapshot";
-const AGENT_PLIST = join(HOME, "Library", "LaunchAgents", `${AGENT_LABEL}.plist`);
+const AGENT_LOG = join(HOME, ".aibroker", "sessions-snapshot.log");
 
 /** Entries unseen this long are prune candidates. Never auto-pruned. */
 const DEFAULT_PRUNE_DAYS = 30;
 
-interface DaemonSession { sessionId: string; name?: string; paiName?: string; kind?: string; }
+interface DaemonSession { sessionId: string; name?: string; paiName?: string; kind?: string; cwd?: string | null; transport?: string; atPrompt?: boolean; }
 
 interface Entry {
   name: string;
@@ -163,16 +168,6 @@ function cwdForTty(tty: string): string | null {
   }
   return null;
 }
-
-/** PAI-style launch: --name label + advance-entered "/Name <name>\ngo". */
-function launchCmd(cwd: string, name: string): string {
-  const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-  const ansiC = name.replace(/'/g, "");
-  const prompt = `$'/Name ${ansiC}\\\\ngo'`; // \\n survives AppleScript literal -> \n -> zsh newline
-  return `cd ${sq(cwd)} && claude --name ${sq(name)} --dangerously-skip-permissions ${prompt}`;
-}
-
-function osascript(osa: string): void { execFileSync("osascript", ["-e", osa]); }
 
 function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -319,14 +314,20 @@ async function doSnapshot(): Promise<{ merged: Entry[]; seen: number } | null> {
   }
 
   const known = readManifest().entries;
-  const ttys = ttyMap();
+  // iTerm rows need the AppleScript tty→cwd walk; tmux rows carry their cwd, so a
+  // tmux-only host never runs osascript or lsof.
+  let ttys: Record<string, string> | null = null;
   const now = new Date().toISOString();
   const fresh: Entry[] = [];
   for (const s of sessions) {
     if (s.kind !== "claude") continue;
-    const tty = ttys[s.sessionId];
-    if (!tty) continue;
-    const cwd = cwdForTty(tty);
+    let cwd = s.cwd ?? null;
+    if (!cwd) {
+      ttys ??= ttyMap();
+      const tty = ttys[s.sessionId];
+      if (!tty) continue;
+      cwd = cwdForTty(tty);
+    }
     if (!cwd) continue;
     const name = s.paiName || knownNameForCwd(known, cwd) || basename(cwd);
     fresh.push({ name, cwd, lastSeen: now, addedAt: now });
@@ -350,6 +351,31 @@ async function doSnapshot(): Promise<{ merged: Entry[]; seen: number } | null> {
   return { merged, seen: sessions.filter((s) => s.kind === "claude").length };
 }
 
+export interface RestoreDeps {
+  launch: (opts: LaunchOptions) => LaunchResult | null;
+  exists: (path: string) => boolean;
+  sleep: () => void;
+  out: (line: string) => void;
+  err: (line: string) => void;
+}
+
+/** Reopen entries through the active transport's launch — the same path `aibroker launch` takes. */
+export function restoreEntries(entries: Entry[], dryRun: boolean, deps: RestoreDeps): number {
+  let n = 0;
+  for (const e of entries) {
+    if (!e?.cwd || !e?.name) continue;
+    if (!deps.exists(e.cwd)) { deps.err(`  skip (missing dir): ${e.cwd}`); continue; }
+    if (dryRun) { deps.out(`  would open  ${e.name.padEnd(24)} ${e.cwd}`); n++; continue; }
+    const res = deps.launch({ dir: e.cwd, name: e.name, resume: true });
+    if (!res) { deps.err(`  failed to open ${e.name} (${e.cwd})`); continue; }
+    deps.out(`  reopened ${e.name.padEnd(24)} ${e.cwd}  [${res.transport} ${res.id}]`);
+    n++;
+    deps.sleep(); // stagger so the host/claude don't stampede
+  }
+  deps.out(dryRun ? `Would reopen ${n} session(s).` : `Reopened ${n} session(s).`);
+  return n;
+}
+
 async function doRestore(opts: { dryRun: boolean; only?: string }): Promise<void> {
   if (!existsSync(MANIFEST)) {
     console.error(`No manifest at ${MANIFEST} — run 'aibroker sessions snapshot' first.`);
@@ -357,25 +383,24 @@ async function doRestore(opts: { dryRun: boolean; only?: string }): Promise<void
   }
   let entries = readManifest().entries;
   if (opts.only) entries = entries.filter((e) => e.name.toLowerCase().includes(opts.only!.toLowerCase()));
-  let n = 0;
-  for (const e of entries) {
-    if (!e?.cwd || !e?.name) continue;
-    if (!existsSync(e.cwd)) { console.error(`  skip (missing dir): ${e.cwd}`); continue; }
-    if (opts.dryRun) { console.log(`  would open  ${e.name.padEnd(24)} ${e.cwd}`); n++; continue; }
-    const esc = launchCmd(e.cwd, e.name).replace(/"/g, '\\"');
-    osascript(`tell application "iTerm2"
-  activate
-  if (count of windows) = 0 then create window with default profile
-  tell current window
-    set newTab to (create tab with default profile)
-    tell current session of newTab to write text "${esc}"
-  end tell
-end tell`);
-    console.log(`  reopened ${e.name.padEnd(24)} ${e.cwd}`);
-    n++;
-    execSync("sleep 1"); // stagger so iTerm/claude don't stampede
+  restoreEntries(entries, opts.dryRun, {
+    launch: (o) => selectTransport().launch(o),
+    exists: existsSync,
+    sleep: () => execSync("sleep 1"),
+    out: (l) => console.log(l),
+    err: (l) => console.error(l),
+  });
+}
+
+/** `aibroker sessions` — what the daemon sees right now. */
+async function doLive(): Promise<void> {
+  const rows = await liveSessions();
+  if (rows === null) { console.error("Daemon unreachable — is it running? (aibroker status)"); process.exitCode = 1; return; }
+  if (!rows.length) { console.log("(no sessions)"); return; }
+  for (const r of rows) {
+    const name = r.paiName ?? r.name ?? r.sessionId;
+    console.log(`  ${name.padEnd(24)} ${(r.transport ?? "iterm").padEnd(5)} ${r.kind === "claude" ? (r.atPrompt ? "at-prompt" : "busy     ") : "shell    "} ${r.cwd ?? ""}`);
   }
-  console.log(opts.dryRun ? `Would reopen ${n} session(s).` : `Reopened ${n} session(s).`);
 }
 
 export type AckResult = "ok" | "no-ack" | "no-settle" | "unreadable";
@@ -556,7 +581,77 @@ function doPrune(opts: { days: number; dryRun: boolean }): void {
   console.log(`Dropped ${stale.length}; ${keep.length} remain.`);
 }
 
-function installAgent(): void {
+const TIMER_NAME = "aibroker-sessions-snapshot";
+
+export interface AgentIo {
+  platform: NodeJS.Platform;
+  home: string;
+  uid: number;
+  execPath: string;
+  /** Absolute path of dist/daemon/cli.js — the entry the systemd unit runs. */
+  cliPath: string;
+  env: NodeJS.ProcessEnv;
+  run: (cmd: string) => void;
+  log: string;
+  out: (line: string) => void;
+}
+
+const defaultAgentIo = (): AgentIo => ({
+  platform: process.platform,
+  home: HOME,
+  uid: process.getuid?.() ?? 0,
+  execPath: process.execPath,
+  cliPath: fileURLToPath(new URL("./cli.js", import.meta.url)),
+  env: process.env,
+  run: (cmd) => { execSync(cmd, { stdio: "ignore" }); },
+  log: AGENT_LOG,
+  out: (l) => console.log(l),
+});
+
+/** One systemd word: quoted when it holds spaces/quotes, with `%` doubled (specifiers). */
+const sdQuote = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
+
+/** systemd user service + timer that run `sessions snapshot` every 5 minutes. */
+export function renderSnapshotUnits(io: Pick<AgentIo, "execPath" | "cliPath" | "env" | "log">): { service: string; timer: string } {
+  const envLines = Object.entries(serviceEnv(io.env)).map(([k, v]) => `Environment=${sdQuote(`${k}=${v}`)}`).join("\n");
+  const service = `[Unit]
+Description=AIBroker sessions snapshot
+
+[Service]
+Type=oneshot
+${envLines}
+ExecStart=${sdQuote(io.execPath)} ${sdQuote(io.cliPath)} sessions snapshot
+StandardOutput=append:${io.log}
+StandardError=append:${io.log}
+`;
+  const timer = `[Unit]
+Description=AIBroker sessions snapshot, every 5 minutes
+
+[Timer]
+OnActiveSec=10s
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+`;
+  return { service, timer };
+}
+
+export function installAgent(io: AgentIo = defaultAgentIo()): void {
+  mkdirSync(dirname(io.log), { recursive: true });
+  tightenLog(io.log);
+  if (io.platform !== "darwin") {
+    const dir = join(io.home, ".config", "systemd", "user");
+    const units = renderSnapshotUnits(io);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${TIMER_NAME}.service`), units.service);
+    writeFileSync(join(dir, `${TIMER_NAME}.timer`), units.timer);
+    io.run("systemctl --user daemon-reload");
+    io.run(`systemctl --user enable --now ${TIMER_NAME}.timer`);
+    io.out(`Installed ${TIMER_NAME}.timer (snapshot every 5 min) -> ${dir}`);
+    return;
+  }
+  const envEntries = plistEnvEntries(serviceEnv(io.env));
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -564,40 +659,49 @@ function installAgent(): void {
     <key>Label</key><string>${AGENT_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${process.execPath}</string>
+        <string>${io.execPath}</string>
         <string>/usr/local/bin/aibroker</string>
         <string>sessions</string>
         <string>snapshot</string>
     </array>
     <key>EnvironmentVariables</key>
-    <dict><key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+    <dict>${envEntries}</dict>
     <key>StartInterval</key><integer>300</integer>
     <key>RunAtLoad</key><true/>
-    <key>StandardOutPath</key><string>/tmp/aibroker-sessions-snapshot.log</string>
-    <key>StandardErrorPath</key><string>/tmp/aibroker-sessions-snapshot.log</string>
+    <key>StandardOutPath</key><string>${io.log}</string>
+    <key>StandardErrorPath</key><string>${io.log}</string>
 </dict>
 </plist>
 `;
-  mkdirSync(dirname(AGENT_PLIST), { recursive: true });
-  writeFileSync(AGENT_PLIST, plist);
-  const uid = process.getuid?.() ?? 0;
-  try { execSync(`launchctl bootout gui/${uid}/${AGENT_LABEL} 2>/dev/null`); } catch { /* not loaded */ }
-  execSync(`launchctl bootstrap gui/${uid} ${AGENT_PLIST}`);
-  console.log(`Installed ${AGENT_LABEL} (snapshot every 5 min) -> ${AGENT_PLIST}`);
+  const plistPath = join(io.home, "Library", "LaunchAgents", `${AGENT_LABEL}.plist`);
+  mkdirSync(dirname(plistPath), { recursive: true });
+  writeFileSync(plistPath, plist);
+  try { io.run(`launchctl bootout gui/${io.uid}/${AGENT_LABEL} 2>/dev/null`); } catch { /* not loaded */ }
+  io.run(`launchctl bootstrap gui/${io.uid} ${plistPath}`);
+  io.out(`Installed ${AGENT_LABEL} (snapshot every 5 min) -> ${plistPath}`);
 }
 
-function uninstallAgent(): void {
-  const uid = process.getuid?.() ?? 0;
-  try { execSync(`launchctl bootout gui/${uid}/${AGENT_LABEL} 2>/dev/null`); } catch { /* not loaded */ }
-  try { execSync(`rm -f "${AGENT_PLIST}"`); } catch { /* gone */ }
-  console.log(`Removed ${AGENT_LABEL}.`);
+export function uninstallAgent(io: AgentIo = defaultAgentIo()): void {
+  if (io.platform !== "darwin") {
+    try { io.run(`systemctl --user disable --now ${TIMER_NAME}.timer`); } catch { /* not enabled */ }
+    const dir = join(io.home, ".config", "systemd", "user");
+    rmSync(join(dir, `${TIMER_NAME}.timer`), { force: true });
+    rmSync(join(dir, `${TIMER_NAME}.service`), { force: true });
+    try { io.run("systemctl --user daemon-reload"); } catch { /* no user bus */ }
+    io.out(`Removed ${TIMER_NAME}.timer.`);
+    return;
+  }
+  try { io.run(`launchctl bootout gui/${io.uid}/${AGENT_LABEL} 2>/dev/null`); } catch { /* not loaded */ }
+  rmSync(join(io.home, "Library", "LaunchAgents", `${AGENT_LABEL}.plist`), { force: true });
+  io.out(`Removed ${AGENT_LABEL}.`);
 }
 
 function usage(): void {
-  console.log(`aibroker sessions — snapshot/restore/checkpoint open Claude sessions
+  console.log(`aibroker sessions — list, snapshot, restore and checkpoint open Claude sessions
 
+  (no subcommand)                             list what the daemon sees now: name, transport, state, dir
   snapshot                                    merge open sessions (name + dir) into the manifest
-  restore    [--dry-run] [--only NAME]        reopen every session in its own iTerm2 tab
+  restore    [--dry-run] [--only NAME]        reopen every session in its own tmux window / iTerm2 tab
   checkpoint [--message M] [--only NAME] [--dry-run] [--timeout SECONDS]
                                               ask every open session to persist state and WAIT
                                               for each to finish (default message: "pause session",
@@ -606,7 +710,7 @@ function usage(): void {
   repoint NAME PATH                           set where a session should reopen
   forget NAME                                 drop an entry from the manifest
   prune      [--older-than DAYS] [--dry-run]  drop entries not seen in DAYS (default ${DEFAULT_PRUNE_DAYS})
-  install | uninstall                         manage the 5-min auto-snapshot LaunchAgent (${AGENT_LABEL})
+  install | uninstall                         manage the 5-min auto-snapshot (launchd agent ${AGENT_LABEL}, or systemd user timer on Linux)
 
 The manifest is a registry, not a mirror: closing a session does NOT remove it.
 Entries leave only via 'forget' or 'prune'. Every write keeps a .bak.
@@ -629,6 +733,8 @@ export async function runSessions(args: string[]): Promise<void> {
 }
 
 async function dispatch(args: string[]): Promise<void> {
+  // launchd appends to the agent log; re-tighten it on every run.
+  if (existsSync(AGENT_LOG)) tightenLog(AGENT_LOG);
   const [sub, ...rest] = args;
   const has = (f: string) => rest.includes(f);
   const val = (f: string) => { const i = rest.indexOf(f); return i >= 0 ? rest[i + 1] : undefined; };
@@ -696,7 +802,8 @@ async function dispatch(args: string[]): Promise<void> {
       break;
     case "install": installAgent(); break;
     case "uninstall": uninstallAgent(); break;
-    case "help": case "--help": case "-h": case undefined: usage(); break;
+    case undefined: case "live": await doLive(); break;
+    case "help": case "--help": case "-h": usage(); break;
     default:
       console.error(`Unknown: aibroker sessions ${sub}`);
       usage();

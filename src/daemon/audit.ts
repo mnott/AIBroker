@@ -42,6 +42,7 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { log } from "../core/log.js";
+import { appendPrivate, writePrivate } from "../core/private-file.js";
 
 /**
  * Overridable so tests never append to the real trail. An audit log polluted
@@ -151,7 +152,7 @@ function spillBody(body: string): { preview: string; ref: string; bytes: number 
   try {
     mkdirSync(bodyDir(), { recursive: true });
     const p = join(bodyDir(), `${ref}.txt`);
-    if (!existsSync(p)) writeFileSync(p, body, "utf-8");
+    if (!existsSync(p)) writePrivate(p, body);
   } catch (err) {
     log(`audit: could not spill body ${ref.slice(0, 12)} (${err instanceof Error ? err.message : String(err)})`);
   }
@@ -188,7 +189,7 @@ export function audit(e: Omit<AuditEvent, "id" | "ts"> & { id?: string }): strin
   try {
     mkdirSync(AUDIT_DIR, { recursive: true });
     rotateIfNeeded();
-    appendFileSync(AUDIT_FILE, JSON.stringify(event) + "\n", "utf-8");
+    appendPrivate(AUDIT_FILE, JSON.stringify(event) + "\n");
   } catch (err) {
     log(`audit: failed to record ${e.action} (${err instanceof Error ? err.message : String(err)})`);
   }

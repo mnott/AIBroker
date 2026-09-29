@@ -6,7 +6,9 @@
  *   aibroker start              Start the daemon
  *   aibroker start --socket /tmp/aibroker.sock
  *   aibroker status             Query daemon status
- *   aibroker stop               Send SIGTERM to daemon
+ *   aibroker stop|restart       Stop/restart via the service, IPC shutdown or daemon.pid
+ *   aibroker launch <dir|pai-project> [--name N]   Open a Claude session (tmux window / iTerm tab)
+ *   aibroker send <name> <text>  Type a message into a session
  *   aibroker create-adapter <name> [--display-name <Name>] [--output <dir>]
  *                               Scaffold a new adapter from the built-in template
  *   aibroker ota <subcommand>   OTA install hub (Docker + Tailscale Serve)
@@ -18,6 +20,7 @@
  */
 
 import "../core/env-bootstrap.js";
+import { silenceLog } from "../core/log.js";
 import { startDaemon, DAEMON_SOCKET_PATH } from "./index.js";
 
 // iTerm exports this into its shells; a child carrying it registers as iTerm2 and misroutes AppleScript.
@@ -25,6 +28,7 @@ delete process.env.__CFBundleIdentifier;
 
 import { WatcherClient } from "../ipc/client.js";
 import { validateHubStatus } from "../ipc/validate.js";
+import { formatHubStatus } from "./status-format.js";
 import { createAdapter } from "./create-adapter.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -48,6 +52,10 @@ if (args.includes("--version") || args.includes("-v")) {
   process.exit(0);
 }
 
+// Only the daemon (start / no verb) owns the log sink; every other verb is an
+// interactive CLI whose output must not carry [aibroker ...] diagnostics.
+if (command !== "start" && command !== undefined) silenceLog();
+
 switch (command) {
   case "start":
   case undefined:
@@ -60,23 +68,7 @@ switch (command) {
       const raw = await client.call_raw("status", {});
       const status = validateHubStatus(raw);
 
-      console.log(`AIBroker Hub v${status.version}`);
-      if (status.status !== "ok") {
-        console.log(`  Status:         ${status.status}${status.detail ? ` — ${status.detail}` : ""}`);
-      }
-      console.log(`  Active session: ${status.activeSession ?? "(none)"}`);
-      console.log(`  Sessions:       ${status.activeSessions}`);
-      console.log(`  Adapters:       ${status.adapters.join(", ") || "(none)"}`);
-
-      if (Object.keys(status.adapterHealth).length > 0) {
-        console.log("\n  Adapter Health:");
-        for (const [name, h] of Object.entries(status.adapterHealth)) {
-          const icon = h.status === "ok" ? "●" : h.status === "degraded" ? "◐" : "○";
-          const detail = h.detail ? ` — ${h.detail}` : "";
-          const msgs = `↓${h.stats.messagesReceived} ↑${h.stats.messagesSent}`;
-          console.log(`    ${icon} ${name}: ${h.status} (${h.connectionStatus}) ${msgs}${detail}`);
-        }
-      }
+      for (const line of formatHubStatus(status)) console.log(line);
     } catch (err) {
       console.error("Daemon not running:", err instanceof Error ? err.message : String(err));
       process.exit(1);
@@ -84,32 +76,11 @@ switch (command) {
     break;
   }
 
-  case "stop": {
-    const client = new WatcherClient(DAEMON_SOCKET_PATH);
-    try {
-      // Send a ping to confirm it's running, then signal stop
-      await client.call_raw("ping", {});
-      // The daemon listens for SIGTERM — find its PID via the socket
-      const { execSync } = await import("node:child_process");
-      // lsof to find the daemon process listening on the socket
-      try {
-        const output = execSync(`lsof -U 2>/dev/null | grep ${DAEMON_SOCKET_PATH}`, { encoding: "utf-8" });
-        const pid = output.split(/\s+/)[1];
-        if (pid) {
-          process.kill(parseInt(pid, 10), "SIGTERM");
-          console.log(`Sent SIGTERM to daemon (PID ${pid})`);
-        } else {
-          console.error("Could not determine daemon PID");
-          process.exit(1);
-        }
-      } catch {
-        console.error("Could not find daemon process. Is it running?");
-        process.exit(1);
-      }
-    } catch (err) {
-      console.error("Daemon not running:", err instanceof Error ? err.message : String(err));
-      process.exit(1);
-    }
+  // Service first, then IPC `shutdown`, then daemon.pid — no lsof (daemon-control.ts).
+  case "stop":
+  case "restart": {
+    const { runStopRestart } = await import("./daemon-control.js");
+    await runStopRestart(command);
     break;
   }
 
@@ -125,6 +96,24 @@ switch (command) {
       console.error("Daemon not running:", err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
+    break;
+  }
+
+  case "setup": {
+    const { runSetup } = await import("./setup.js");
+    await runSetup(rest);
+    break;
+  }
+
+  case "uninstall": {
+    const { runUninstall } = await import("./setup.js");
+    await runUninstall(rest);
+    break;
+  }
+
+  case "doctor": {
+    const { runDoctor } = await import("./doctor.js");
+    await runDoctor(rest);
     break;
   }
 
@@ -197,6 +186,12 @@ switch (command) {
   case "launch": {
     const { runLaunch } = await import("./launch-cli.js");
     await runLaunch(rest);
+    break;
+  }
+
+  case "send": {
+    const { runSend } = await import("./send-cli.js");
+    await runSend(rest);
     break;
   }
 
@@ -327,8 +322,13 @@ switch (command) {
     console.log("Commands:");
     console.log("  start              Start the daemon (default)");
     console.log("  status             Show daemon status and adapter health");
-    console.log("  stop               Stop the running daemon");
+    console.log("  stop | restart     Stop or restart the daemon (service, IPC shutdown, or daemon.pid)");
+    console.log("  launch <dir|proj>  Open a Claude session there [--name N]: tmux window or iTerm tab");
+    console.log("  send <name> <text> Type a message into a session, by name");
     console.log("  ping               Quick heartbeat check");
+    console.log("  setup              Install service, MCP entry, hooks, env (--no-service --no-mcp --no-hooks --dry-run --force)");
+    console.log("  doctor             Check the install; non-zero exit on a required failure");
+    console.log("  uninstall          Remove what setup added (--purge also deletes ~/.aibroker)");
     console.log("  create-adapter     Scaffold a new adapter project");
     console.log("  ota <sub>          OTA hub: up|down|status|logs|setup-serve");
     console.log("  sessions <sub>     Session backup: snapshot|restore|checkpoint|list|install");
@@ -344,6 +344,6 @@ switch (command) {
 
   default:
     console.error(`Unknown command: ${command}`);
-    console.error("Usage: aibroker [start|status|stop|ping|create-adapter|ota|sessions|dispatch|ask|audit|inbound|issue|agentish|help]");
+    console.error("Usage: aibroker [start|status|stop|restart|launch|send|ping|setup|doctor|uninstall|create-adapter|ota|sessions|dispatch|ask|audit|inbound|issue|agentish|help]");
     process.exit(1);
 }

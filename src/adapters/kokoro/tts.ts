@@ -13,11 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { log } from "../../core/log.js";
+import { resolveFfmpegBin, localPlayerCommand } from "../../core/bins.js";
 
-const FFMPEG =
-  ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"].find(
-    (p) => p === "ffmpeg" || existsSync(p),
-  ) ?? "ffmpeg";
 
 export type KokoroVoice =
   | "af_heart" | "af_alloy" | "af_aoede" | "af_bella" | "af_jessica"
@@ -68,6 +65,7 @@ async function ensureInitialized(): Promise<void> {
 export async function textToVoiceNote(text: string, voice?: string): Promise<Buffer> {
   if (!text?.trim()) throw new Error("TTS: text must not be empty");
 
+  const FFMPEG = resolveFfmpegBin();
   if (FFMPEG === "ffmpeg" && !existsSync("/usr/bin/ffmpeg")) {
     log("Warning: ffmpeg not found at known Homebrew paths; falling back to bare 'ffmpeg'.");
   }
@@ -112,7 +110,7 @@ export async function textToVoiceNote(text: string, voice?: string): Promise<Buf
 }
 
 /**
- * Synthesize text and play locally via afplay.
+ * Synthesize text and play locally (afplay on macOS, paplay/aplay/ffplay elsewhere).
  */
 export async function speakLocally(text: string, voice?: string): Promise<void> {
   if (!text?.trim()) throw new Error("TTS: text must not be empty");
@@ -131,7 +129,15 @@ export async function speakLocally(text: string, voice?: string): Promise<void> 
   const wavPath = join(tmpdir(), `aibroker-speak-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`);
   writeFileSync(wavPath, float32ToWav(speakAudio, speakSampleRate));
 
-  const child = spawn("afplay", [wavPath], { stdio: "ignore", detached: true });
+  const player = localPlayerCommand();
+  if (!player) {
+    log("Speak: no local audio player (need paplay, aplay or ffplay) — audio not played");
+    try { unlinkSync(wavPath); } catch { /* ignore */ }
+    return;
+  }
+  const child = spawn(player[0], [...player.slice(1), wavPath], { stdio: "ignore", detached: true });
+  // A player that vanishes between resolution and spawn is an 'error' event, not a throw.
+  child.on("error", (err) => log(`Speak: ${player[0]} failed — ${err.message}`));
   child.on("close", () => {
     try { unlinkSync(wavPath); } catch { /* ignore */ }
   });

@@ -41,14 +41,15 @@ import { existsSync } from "node:fs";
 import { Resolver } from "node:dns/promises";
 import https from "node:https";
 import { log } from "../core/log.js";
+import { resolveBin } from "../core/bins.js";
 import { audit } from "./audit.js";
 
 /** Public resolvers, tried in order. The local one cannot be trusted here. */
 const PUBLIC_RESOLVERS = ["1.1.1.1", "8.8.8.8"];
 
 /**
- * Where `tailscale` might live, best first. The daemon's PATH under launchd is
- * minimal, so these are absolute.
+ * The `tailscale` CLI is found with resolveBin (Homebrew, /usr/local/bin, PATH —
+ * the launchd PATH is minimal), and the app bundle is the last resort.
  *
  * ORDER MATTERS, and not for the reason it usually does. The macOS app ships a
  * single binary that behaves as the GUI or as the CLI, and invoking it inside
@@ -58,11 +59,7 @@ const PUBLIC_RESOLVERS = ["1.1.1.1", "8.8.8.8"];
  * Prefer it; the bundle stays as a last resort for a machine that has no
  * wrapper.
  */
-const TAILSCALE_CANDIDATES = [
-  "/usr/local/bin/tailscale",
-  "/opt/homebrew/bin/tailscale",
-  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-];
+const TAILSCALE_APP_BUNDLE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 
 const HEALTHY_INTERVAL_MS = 5 * 60_000;
 /** Once a probe fails, look again soon — to confirm or clear it quickly. */
@@ -192,7 +189,9 @@ export function decide(
 
 /** The `tailscale` binary, or undefined when it is not installed here. */
 export function tailscaleBinary(): string | undefined {
-  return TAILSCALE_CANDIDATES.find((p) => existsSync(p));
+  const resolved = resolveBin("tailscale");
+  if (resolved !== "tailscale") return resolved;
+  return existsSync(TAILSCALE_APP_BUNDLE) ? TAILSCALE_APP_BUNDLE : undefined;
 }
 
 export interface CliResult { ok: boolean; stdout?: string; error?: string; }

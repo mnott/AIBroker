@@ -150,6 +150,7 @@ export {
   WHISPER_BIN,
   WHISPER_MODEL,
 } from "./adapters/kokoro/media.js";
+export { resolveBin, resolveWhisperBin, resolveFfmpegBin, resolveSoxBin } from "./core/bins.js";
 
 // ── Adapters > PAILot Gateway ──
 export {

@@ -35,6 +35,34 @@ export interface ManagedSession {
    * This is the key the persistent paiName store should use across transports.
    */
   aibrokerId: string | null;
+  /** Working directory of the pane's foreground process, if the host reports one (tmux). */
+  cwd?: string | null;
+  /** Foreground command of the pane (tmux `pane_current_command`). */
+  command?: string | null;
+}
+
+export interface LaunchOptions {
+  dir: string;
+  /** Window/tab name and pane title; also what the session is addressed by. */
+  name: string;
+  /** PAI-style start: `--name`, skip-permissions and a `/Name <name>` + `go` prompt (session restore). */
+  resume?: boolean;
+}
+
+export interface LaunchResult {
+  /** The id the hub uses for this session (`@aibroker_id` on tmux, the GUID on iTerm). */
+  id: string;
+  transport: TransportKind;
+  /** Human-readable place it opened, e.g. `window "api" in tmux session "work"`. */
+  where: string;
+  /** Command that attaches to it, when the session opened detached. */
+  attach?: string;
+}
+
+/** Arguments after the `claude` binary. Pure, so every transport starts a session the same way. */
+export function claudeArgs(opts: LaunchOptions): string[] {
+  if (!opts.resume) return [];
+  return ["--name", opts.name, "--dangerously-skip-permissions", `/Name ${opts.name}\ngo`];
 }
 
 export interface SendOptions {
@@ -64,4 +92,9 @@ export interface SessionTransport {
   isBusy(id: string): boolean;
   /** Set the session's title (used for the sticky paiName display). */
   setTitle(id: string, title: string): boolean;
+  /**
+   * Open a new Claude Code session in `opts.dir`. Returns null when the host
+   * refused. iTerm implements it with the tab launcher `sessions restore` used.
+   */
+  launch(opts: LaunchOptions): LaunchResult | null;
 }

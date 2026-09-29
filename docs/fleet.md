@@ -128,8 +128,10 @@ would then match work to both the machine and the role, and "ask the large agent
 on the big machine" would be addressable rather than a convention someone has to
 remember.
 
-**Linux.** The session transport is already portable — tmux implements the whole
-interface with no platform gate — so agents on Linux are close. What remains
-macOS-only is screen control and the iTerm-specific discovery paths. The natural
-split is Macs for anything that must be *looked at*, Linux for anything that only
-has to be built and tested.
+**Linux.** Done for the hub: it runs on Linux with tmux as the session host and
+never calls AppleScript there (proved by `npm run test:linux`; see
+[linux.md](linux.md)). Still macOS-only is anything that must be *looked at*:
+image screenshots (`/ss` replies with pane text on tmux), pointer and dialog
+control, iTerm tab visuals, and launching sessions. The natural split stands:
+Macs for anything that must be looked at, Linux for anything that only has to be
+built and tested.

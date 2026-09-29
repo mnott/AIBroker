@@ -29,6 +29,7 @@ import { timeCall } from "../core/call-timing.js";
 import { readSessionContent } from "./session-content.js";
 import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { findItermBundleIdImpostors } from "../adapters/iterm/core.js";
+import { processCwd } from "../core/bins.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
@@ -1229,11 +1230,7 @@ function repoRootForSession(sessionId: string): string | undefined {
 
 function repoRootFor(pid: string): string | null {
   try {
-    const cwdOut = execFileSync("/usr/sbin/lsof", ["-p", pid, "-a", "-d", "cwd", "-Fn"], {
-      encoding: "utf8",
-      timeout: 4_000,
-    });
-    const cwd = cwdOut.split("\n").find((l) => l.startsWith("n"))?.slice(1);
+    const cwd = processCwd(pid);
     if (!cwd) return null;
     const root = execFileSync("/usr/bin/env", ["git", "-C", cwd, "rev-parse", "--show-toplevel"], {
       encoding: "utf8",
@@ -1582,15 +1579,7 @@ export function usageFromLines(lines: string[]): number | undefined {
  * call per session per tick rather than once per caller.
  */
 function sessionCwd(claudePid: string): string | null {
-  try {
-    const cwdOut = execFileSync("/usr/sbin/lsof", ["-p", claudePid, "-a", "-d", "cwd", "-Fn"], {
-      encoding: "utf8",
-      timeout: 4_000,
-    });
-    return cwdOut.split("\n").find((l) => l.startsWith("n"))?.slice(1) ?? null;
-  } catch {
-    return null;
-  }
+  return processCwd(claudePid);
 }
 
 /**

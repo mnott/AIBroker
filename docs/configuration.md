@@ -171,35 +171,32 @@ The `enabledMcpjsonServers` array in `~/.claude/settings.json` controls which MC
 
 ## launchd Service
 
-AIBroker runs as a launchd service for automatic startup at login. The plist references `~/.aibroker/env` for environment configuration.
+`aibroker setup` writes and loads this LaunchAgent for you, with the absolute node binary, the installed `cli.js`, and the PATH and `AIBROKER_*` variables of the shell you ran it from. If `~/Library/LaunchAgents/com.aibroker.daemon.plist` already exists it is left alone unless you pass `--force`; `aibroker setup --dry-run` shows what would differ. On Linux the equivalent is a `systemd --user` unit, see [linux.md](linux.md).
 
-Typical plist location: `~/Library/LaunchAgents/com.aibroker.daemon.plist`
+The plist references `~/.aibroker/env` for environment configuration, which the daemon loads itself. What `setup` generates looks like this (edit by hand only if you must):
+
+Location: `~/Library/LaunchAgents/com.aibroker.daemon.plist`
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "...">
 <plist version="1.0">
 <dict>
-  <key>Label</key>
-  <string>com.aibroker.daemon</string>
+  <key>Label</key><string>com.aibroker.daemon</string>
   <key>ProgramArguments</key>
   <array>
     <string>/path/to/node</string>
-    <string>/path/to/AIBroker/dist/daemon/index.js</string>
+    <string>/path/to/aibroker/dist/daemon/cli.js</string>
+    <string>start</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>AIBROKER_ENV_FILE</key>
-    <string>/Users/yourname/.aibroker/env</string>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>/Users/yourname</string>
   </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/tmp/aibroker.log</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/aibroker-err.log</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/yourname/.aibroker/daemon.log</string>
+  <key>StandardErrorPath</key><string>/Users/yourname/.aibroker/daemon.log</string>
 </dict>
 </plist>
 ```
@@ -239,4 +236,4 @@ Set `PAILOT_DEBUG=1` in `~/.aibroker/env` for verbose PAILot logging:
 
 Logs include every raw inbound MQTT payload (truncated to 200 chars), voice message receipt, audio file paths and byte counts. The log path `/tmp/pailot-ws-debug.log` is historical — the transport is MQTT.
 
-Hub daemon logs go to stdout/stderr (captured by launchd at `/tmp/aibroker.log`).
+Hub daemon logs go to stdout/stderr: `~/.aibroker/daemon.log` under a plist written by `aibroker setup`, the journal (`journalctl --user -u aibroker`) under systemd.

@@ -153,3 +153,24 @@ export function hasBeenSubmitted(frame: string, needle: string): boolean {
   const stillTyped = inputBoxLines(frame).some((l) => flatten(l).includes(needle.slice(0, 24)));
   return !stillTyped && flatten(frame).includes(needle);
 }
+
+/**
+ * Claude Code marks its own idle state in the pane title: `✳ <name>` at rest,
+ * a braille spinner glyph while working. tmux only knows the foreground
+ * command (always `claude`/`node`), so the title is the idle signal there.
+ */
+export function isClaudeTitleIdle(title: string | null | undefined): boolean {
+  return /^✳/.test(title ?? "");
+}
+
+/**
+ * Is this frame Claude at rest? A live input box, nothing queued in it, and no
+ * "esc to interrupt" hint in the last rows (Claude draws it only while working).
+ */
+export function isClaudeFrameIdle(frame: string): boolean {
+  // "esc to interrupt" is drawn above the box (spinner row) or in Claude's own
+  // footer row under it, so the tail is searched whole; a custom statusline
+  // below the box does not affect the box lookup, which is structural.
+  const tail = frame.split("\n").filter((l) => l.trim().length > 0).slice(-12).join("\n");
+  return isClaudeReady(frame) && isInputBoxEmpty(frame) && !/esc to interrupt/i.test(tail);
+}

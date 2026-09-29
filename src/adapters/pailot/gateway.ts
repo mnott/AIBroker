@@ -22,13 +22,15 @@ import { tmpdir, homedir } from "node:os";
 
 const DEBUG_LOG = process.env.PAILOT_DEBUG ? "/tmp/pailot-ws-debug.log" : null;
 function dbg(msg: string): void {
-  if (DEBUG_LOG) appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  if (DEBUG_LOG) appendPrivate(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
 }
 import { randomUUID } from "node:crypto";
+import { appendPrivate } from "../../core/private-file.js";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { log } from "../../core/log.js";
-import { WHISPER_BIN, WHISPER_MODEL } from "../kokoro/media.js";
+import { WHISPER_MODEL } from "../kokoro/media.js";
+import { resolveWhisperBin, resolveFfmpegBin } from "../../core/bins.js";
 import {
   setMessageSource,
   activeItermSessionId,
@@ -1019,7 +1021,7 @@ export async function transcribeAndRoute(
     log(`[PAILot] Voice note saved (${buffer.length} bytes), running Whisper...`);
 
     await execFileAsync(
-      WHISPER_BIN,
+      resolveWhisperBin(),
       [audioFile, "--model", WHISPER_MODEL, "--output_format", "txt", "--output_dir", tmpdir(), "--verbose", "False"],
       {
         timeout: 120_000,
@@ -1460,7 +1462,7 @@ export async function broadcastVoice(
     const oggPath = join(tmpdir(), `pailot-conv-${uid}.ogg`);
     const m4aPath = join(tmpdir(), `pailot-conv-${uid}.m4a`);
     writeFileSync(oggPath, audioBuffer);
-    await execFileAsync("/opt/homebrew/bin/ffmpeg", [
+    await execFileAsync(resolveFfmpegBin(), [
       "-y", "-i", oggPath, "-c:a", "aac", "-b:a", "128k",
       "-af", "apad=pad_dur=0.3", // Pad 300ms silence to prevent truncation
       m4aPath,

@@ -25,7 +25,7 @@
  * here instead, once, so every reader inherits it.
  */
 
-import { snapshotAllSessions, wasLastSnapshotReliable } from "../adapters/iterm/core.js";
+import { snapshotAllSessions, wasLastEnumerationReliable as wasLastSnapshotReliable } from "../transport/sync-facade.js";
 import { getAllPersistentSessionNames, lookupPersistentName } from "./persistence.js";
 
 export type LiveSession = ReturnType<typeof snapshotAllSessions>[0];

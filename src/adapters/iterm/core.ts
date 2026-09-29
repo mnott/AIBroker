@@ -9,6 +9,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
 import { timeCall } from "../../core/call-timing.js";
+import { itermInPlay } from "../../transport/policy.js";
 
 /**
  * Throttle identical failures so a persistent fault logs steadily, not per-poll —
@@ -41,6 +42,8 @@ function logThrottled(key: string, message: string): void {
 // default trades a rare slow call for a silent wrong answer. iTerm AppleScript
 // cost scales with open sessions and scrollback, both of which grow over time.
 export function runAppleScript(script: string, timeoutMs = 15_000): string | null {
+  // No osascript off macOS — not a failure, so nothing to log or throttle.
+  if (process.platform !== "darwin") return null;
   const result = spawnSync("osascript", [], {
     input: script,
     stdio: ["pipe", "pipe", "pipe"],
@@ -197,6 +200,7 @@ export function isClaudeRunningInSession(sessionId: string): boolean {
 }
 
 export function isItermRunning(): boolean {
+  if (!itermInPlay()) return false;
   const result = spawnSync("pgrep", ["-x", "iTerm2"], {
     stdio: ["pipe", "pipe", "pipe"],
     timeout: 3_000,
@@ -214,6 +218,7 @@ export function isItermSessionAlive(sessionId: string): boolean {
 }
 
 export function isScreenLocked(): boolean {
+  if (process.platform !== "darwin") return false;
   try {
     const result = spawnSync(
       "sh",
@@ -273,6 +278,10 @@ export interface SessionSnapshot {
    * on this when present so a tmux session keeps its name across %N churn.
    */
   aibrokerId?: string | null;
+  /** Working directory, when the host reports it (tmux). Absent on iTerm. */
+  cwd?: string | null;
+  /** Host this row came from; absent means iTerm. */
+  transport?: "iterm" | "tmux";
   /**
    * Whether a Claude is actually running on this terminal, read from the
    * process table. Undefined when that could not be read — a caller must then
@@ -357,6 +366,12 @@ let cachedAt = 0;
  * TTL.
  */
 function snapshotAllSessionsUncached(): SessionSnapshot[] {
+  // iTerm is not in play (tmux transport / non-macOS): an empty answer, and a
+  // reliable one — "no iTerm sessions" is true, not a dropped enumeration.
+  if (!itermInPlay()) {
+    lastSnapshotOk = true;
+    return [];
+  }
   // Fetch id, name, tty, tab.title. Skip `profile name` (~0.6s) and
   // `is at shell prompt` (~3.3s) — both derived or irrelevant.
   const script = `
@@ -479,6 +494,7 @@ export function parseLsappinfoImpostors(text: string): ItermBundleIdImpostor[] {
  * that already treats [] as the safe default.
  */
 export function findItermBundleIdImpostors(): ItermBundleIdImpostor[] {
+  if (!itermInPlay()) return [];
   try {
     const result = spawnSync("/usr/bin/lsappinfo", ["list"], {
       stdio: ["pipe", "pipe", "pipe"],

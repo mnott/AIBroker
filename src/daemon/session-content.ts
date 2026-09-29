@@ -1,14 +1,15 @@
 /**
- * daemon/session-content.ts — Read terminal content from iTerm2 sessions.
+ * daemon/session-content.ts — Read terminal content from iTerm2 / tmux sessions.
  *
- * Uses AppleScript to read the visible + scrollback content from iTerm2 tabs.
+ * Uses AppleScript (iTerm2) or capture-pane (tmux) to read visible + scrollback content.
  * Also detects busy/idle state via `is at shell prompt`.
  *
  * Part of Session Orchestration (Phase 1, v0.7).
  */
 
 import { _internal, withSessionAppleScript } from "../adapters/iterm/core.js";
-import { snapshotAllSessions } from "../transport/sync-facade.js";
+import { snapshotAllSessions, routeToTmux, captureSession, isClaudeRunningInSession } from "../transport/sync-facade.js";
+import { getAllPersistentSessionNames, lookupPersistentName } from "../core/persistence.js";
 import { log } from "../core/log.js";
 import { timeCall } from "../core/call-timing.js";
 
@@ -65,7 +66,26 @@ export function readSessionContent(
   return result ? sliceToLines(result, lines) : null;
 }
 
+/** tmux path: `capture-pane -p -J -S -<lines>` through the transport, no AppleScript. */
+function readTmuxContent(sessionId: string, lines: number): SessionContent | null {
+  const raw = timeCall("session-content:read", () => captureSession(sessionId, lines));
+  if (raw === null) return null;
+  // capture-pane pads the visible area with blank rows; they are not content.
+  const content = raw.replace(/\s+$/, "");
+  const snap = snapshotAllSessions().find((s) => s.id === sessionId);
+  return {
+    sessionId,
+    name: snap?.name ?? sessionId,
+    content,
+    lineCount: content ? content.split("\n").length : 0,
+    atPrompt: snap ? snap.atPrompt : !isClaudeRunningInSession(sessionId),
+    paiName: lookupPersistentName(getAllPersistentSessionNames(), sessionId, snap?.aibrokerId),
+  };
+}
+
 function readSessionContentUncached(sessionId: string, lines: number): SessionContent | null {
+  if (routeToTmux(sessionId)) return readTmuxContent(sessionId, lines);
+
   // AppleScript: get contents, name, atPrompt for a specific session
   const script = withSessionAppleScript(
     sessionId,

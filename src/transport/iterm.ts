@@ -18,10 +18,20 @@ import {
   typeIntoSession,
   withSessionAppleScript,
 } from "../adapters/iterm/core.js";
-import type { ManagedSession, SendOptions, SessionTransport, TransportKind } from "./session-transport.js";
+import type { LaunchOptions, LaunchResult, ManagedSession, SendOptions, SessionTransport, TransportKind } from "./session-transport.js";
 
 function escapeForAppleScript(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+/** Shell line typed into a fresh tab. `resume` is the PAI-style restore start. */
+export function itermLaunchLine(opts: LaunchOptions): string {
+  if (!opts.resume) return `cd ${sq(opts.dir)} && claude`;
+  const ansiC = opts.name.replace(/'/g, "");
+  const prompt = `$'/Name ${ansiC}\\\\ngo'`; // \\n survives AppleScript literal -> \n -> zsh newline
+  return `cd ${sq(opts.dir)} && claude --name ${sq(opts.name)} --dangerously-skip-permissions ${prompt}`;
 }
 
 export class ItermTransport implements SessionTransport {
@@ -70,5 +80,22 @@ export class ItermTransport implements SessionTransport {
     const ok = runAppleScript(script) === "ok";
     if (!ok) log(`iterm setTitle: failed for ${id}`);
     return ok;
+  }
+
+  launch(opts: LaunchOptions): LaunchResult | null {
+    const esc = itermLaunchLine(opts).replace(/"/g, '\\"');
+    const id = runAppleScript(`tell application "iTerm2"
+  activate
+  if (count of windows) = 0 then create window with default profile
+  tell current window
+    set newTab to (create tab with default profile)
+    tell current session of newTab
+      write text "${esc}"
+      return id of it
+    end tell
+  end tell
+end tell`);
+    if (!id) return null;
+    return { id: id.trim(), transport: this.kind, where: "new iTerm2 tab" };
   }
 }

@@ -12,23 +12,15 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 
 import { log } from "../../core/log.js";
+import { resolveSoxBin, resolveWhisperBin } from "../../core/bins.js";
 
 const execFileAsync = promisify(execFile);
 
-/** Absolute path to the Whisper CLI binary. */
-export const WHISPER_BIN =
-  ["/opt/homebrew/bin/whisper", "/usr/local/bin/whisper", "whisper"].find(
-    (p) => p === "whisper" || existsSync(p),
-  ) ?? "whisper";
+/** @deprecated Frozen at import time; call resolveWhisperBin() at the point of use. */
+export const WHISPER_BIN = resolveWhisperBin();
 
 /** Whisper model name (overridable via AIBROKER_WHISPER_MODEL env). */
 export const WHISPER_MODEL = process.env.AIBROKER_WHISPER_MODEL ?? process.env.MSGBRIDGE_WHISPER_MODEL ?? process.env.WHAZAA_WHISPER_MODEL ?? "small";
-
-/** Absolute path to the sox binary. */
-const SOX_BIN =
-  ["/opt/homebrew/bin/sox", "/usr/local/bin/sox", "sox"].find(
-    (p) => p === "sox" || existsSync(p),
-  ) ?? "sox";
 
 /**
  * Record audio from the default Mac microphone using sox.
@@ -47,7 +39,7 @@ export async function recordFromMic(maxDurationSec = 60): Promise<string> {
 
   try {
     await execFileAsync(
-      SOX_BIN,
+      resolveSoxBin(),
       [
         "-d", "-r", "16000", "-c", "1", "-b", "16",
         wavPath,
@@ -98,7 +90,7 @@ export async function transcribeLocalAudio(audioPath: string): Promise<string> {
     log(`Dictation: transcribing ${audioPath} (model=${WHISPER_MODEL})...`);
 
     await execFileAsync(
-      WHISPER_BIN,
+      resolveWhisperBin(),
       [audioPath, "--model", WHISPER_MODEL, "--output_format", "txt", "--output_dir", outDir, "--verbose", "False"],
       {
         timeout: 120_000,

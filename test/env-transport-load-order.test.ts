@@ -35,6 +35,8 @@ test("AIBROKER_TRANSPORT from the env file is loaded before sync-facade evaluate
       [
         `import ${JSON.stringify(join(projectRoot, "src/core/env-bootstrap.js"))};`,
         `import ${JSON.stringify(join(projectRoot, "src/transport/sync-facade.js"))};`,
+        `import { logTransportPolicy } from ${JSON.stringify(join(projectRoot, "src/transport/sync-facade.js"))};`,
+        "logTransportPolicy();",
       ].join("\n"),
     );
 
@@ -49,11 +51,8 @@ test("AIBROKER_TRANSPORT from the env file is loaded before sync-facade evaluate
 
     assert.equal(result.status, 0, `probe process failed: ${result.stderr}`);
 
-    const loadedLine = result.stderr.indexOf("Loaded 1 env var(s)");
-    const permittedLine = result.stderr.indexOf("transports permitted = [iterm]");
-    assert.notEqual(loadedLine, -1, `expected env-load log line, got:\n${result.stderr}`);
-    assert.notEqual(permittedLine, -1, `expected iterm-only permitted line, got:\n${result.stderr}`);
-    assert.ok(loadedLine < permittedLine, "env file must load before sync-facade evaluates the override");
+    assert.match(result.stderr, /transports permitted = \[iterm\]/, `expected iterm-only permitted line, got:
+${result.stderr}`);
   } finally {
     rmSync(fakeHome, { recursive: true, force: true });
   }

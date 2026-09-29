@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Stand-in for Claude Code: draws the same input box (rule, ❯ line, rule, status)
+# and appends every line it reads to $STANDIN_LOG.
+# Re-exec as "claude" so the pane's foreground command reads like the real thing (not "bash").
+[ -z "${STANDIN_REEXEC:-}" ] && STANDIN_REEXEC=1 exec -a claude bash "$0" "$@"
+LOG="${STANDIN_LOG:-/tmp/standin-received.txt}"
+transcript=()
+draw() {
+  printf '\033[2J\033[H'
+  for l in "${transcript[@]}"; do printf '%s\n' "$l"; done
+  printf '%s\n' "────────────────────────────────────────────────────────────"
+  printf '❯ \n'
+  printf '%s\n' "────────────────────────────────────────────────────────────"
+  printf '  stand-in claude\n'
+  printf '\033[3A\033[3G'
+}
+: > "$LOG"
+while true; do
+  draw
+  IFS= read -r line || exit 0
+  printf '%s\n' "$line" >> "$LOG"
+  transcript+=("❯ $line" "⏺ received")
+done

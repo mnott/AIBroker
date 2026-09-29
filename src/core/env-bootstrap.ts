@@ -11,12 +11,7 @@
  * guarantees the env file is loaded before those modules' top-level reads.
  */
 
-import { join } from "node:path";
-import { homedir } from "node:os";
 import { loadEnvFile } from "./env.js";
-import { log } from "./log.js";
 
-const loaded = loadEnvFile();
-if (loaded > 0) {
-  log(`Loaded ${loaded} env var(s) from ${join(homedir(), ".aibroker", "env")}`);
-}
+// No logging here: this runs in every CLI verb, and the daemon logs the load itself.
+loadEnvFile();

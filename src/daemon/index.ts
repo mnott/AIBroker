@@ -8,6 +8,8 @@
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { unlinkSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { writePrivate } from "../core/private-file.js";
+import { terminalPluginId } from "../transport/policy.js";
 import { randomUUID } from "node:crypto";
 import { setLogPrefix, log } from "../core/log.js";
 import { extForMime } from "../core/mime.js";
@@ -37,7 +39,7 @@ import { AibpBridge } from "../aibp/bridge.js";
 import { findClaudeSession } from "../adapters/iterm/core.js";
 import { reassertPersistentTitles } from "../adapters/iterm/sessions.js";
 import { ITERM_UUID_KEY, pruneSessionNames, setHolderLivenessProbe } from "../core/persistence.js";
-import { typeIntoSession, isClaudeRunningInSession, snapshotAllSessions } from "../transport/sync-facade.js";
+import { typeIntoSession, isClaudeRunningInSession, snapshotAllSessions, logTransportPolicy } from "../transport/sync-facade.js";
 import { activeItermSessionId, setActiveItermSessionId, setLastRoutedSessionId } from "../core/state.js";
 import { pruneStaleContexts } from "./image-context.js";
 
@@ -92,6 +94,7 @@ export async function startDaemon(options?: {
   // needing them in the plist or shell profile.
   const loaded = loadEnvFile(appDir);
   if (loaded > 0) log(`Loaded ${loaded} env var(s) from ${join(appDir, "env")}`);
+  logTransportPolicy();
 
   // Initialize session management
   const apiBackend = new APIBackend({
@@ -223,8 +226,9 @@ export async function startDaemon(options?: {
       void hubCommandHandler(text, aibpMsg.ts, ctx);
     }
   });
-  // Register iTerm2 as a terminal plugin — makes it addressable via AIBP.
-  // Messages sent to terminal:iterm are typed into the active iTerm session.
+  // Register the terminal host as a plugin — makes it addressable via AIBP.
+  // The id follows the transport (terminal:iterm, or terminal:tmux on hosts without iTerm);
+  // messages sent to it are typed into the active session.
   // Keyboard control commands are registered as terminal-owned AIBP commands.
   const terminalCommands = [
     { name: "cc", description: "Send Ctrl+C to active session", args: "" },
@@ -237,7 +241,7 @@ export async function startDaemon(options?: {
     { name: "right", description: "Send Right arrow to active session", args: "" },
     { name: "pick", description: "Select menu option N", args: "<N> [text]" },
   ];
-  aibpBridge.registerTerminal("iterm", (aibpMsg) => {
+  aibpBridge.registerTerminal(terminalPluginId(), (aibpMsg) => {
     if (aibpMsg.type === "TEXT") {
       const content = (aibpMsg.payload as { content: string }).content;
       // Determine target session from AIBP message source address
@@ -622,9 +626,14 @@ export async function startDaemon(options?: {
   console.log(`  AppDir:  ${appDir}`);
   console.log(`  AIBP:    ${aibpBridge.listPlugins().join(", ") || "(no plugins yet)"}`);
 
+  // pidfile: the last-resort way for `aibroker stop` to find this process (no lsof)
+  const pidFile = join(appDir, "daemon.pid");
+  writePrivate(pidFile, `${process.pid}\n`);
+
   // Graceful shutdown — ensure socket cleanup even on abrupt exit
   const shutdown = (signal: string) => {
     console.log(`\n[aibroker] ${signal} received. Stopping.`);
+    try { unlinkSync(pidFile); } catch { /* already gone */ }
     adapterRegistry.stopHealthPolling();
     flushQueue();
     stopMqttBroker();
@@ -635,10 +644,16 @@ export async function startDaemon(options?: {
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+  // `aibroker stop` without a service: answer first, then stop.
+  ipcServer.on("shutdown", async () => {
+    setImmediate(() => shutdown("IPC shutdown"));
+    return { ok: true, result: { stopping: true } };
+  });
   // Clean up on uncaught exceptions too
   process.on("uncaughtException", (err) => {
     console.error(`[aibroker] Uncaught exception:`, err);
     try { unlinkSync(socketPath); } catch { /* ignore */ }
+    try { unlinkSync(pidFile); } catch { /* ignore */ }
     process.exit(1);
   });
 

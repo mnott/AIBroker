@@ -20,6 +20,8 @@ import {
   withSessionAppleScript,
 } from "../adapters/iterm/core.js";
 import { listClaudeSessions } from "../adapters/iterm/sessions.js";
+import { snapshotAllSessions as snapshotAllTransportSessions, routeToTmux, captureSession } from "../transport/sync-facade.js";
+import { itermInPlay } from "../transport/policy.js";
 import { log } from "../core/log.js";
 import {
   activeClientId,
@@ -59,6 +61,42 @@ end tell`,
   if (result.status !== 0 || result.signal) return null;
   const stdout = result.stdout?.toString().trim() ?? "";
   return stdout || null;
+}
+
+/**
+ * The tmux pane this command targets, or null when it targets an iTerm tab
+ * (or nothing). Where iTerm is not in play at all, an unaddressed /ss falls
+ * back to the first live pane — there is no other kind of session to pick.
+ */
+function tmuxTargetFor(ctx: CommandContext): string | null {
+  const activeEntry = activeClientId ? sessionRegistry.get(activeClientId) : undefined;
+  const id = stripItermPrefix(ctx.sessionId ?? (activeItermSessionId || undefined) ?? activeEntry?.itermSessionId);
+  if (id) return routeToTmux(id) ? id : null;
+  return itermInPlay() ? null : snapshotAllTransportSessions()[0]?.id ?? null;
+}
+
+/** /ss on tmux: there is no window to photograph, so reply with the pane's text. */
+async function handleTmuxScreenshot(ctx: CommandContext, paneId: string): Promise<void> {
+  const raw = captureSession(paneId, 60);
+  if (raw === null) {
+    await ctx.reply("Could not read the tmux pane — it may have closed.");
+    return;
+  }
+  const text = raw
+    .split("\n")
+    .filter((l) => !/^[─━═┄┈╌╍┅┉]{3,}\s*$/.test(l.trim()))
+    .filter((l) => l.trim() !== "")
+    .slice(-50)
+    .join("\n");
+  if (!text) {
+    await ctx.reply("The tmux pane is empty.");
+    return;
+  }
+  if (ctx.source !== "pailot") broadcastText(`Terminal capture:\n\n${text}`);
+  const maxLen = 4000;
+  const trimmed = text.length > maxLen ? "...\n" + text.slice(-maxLen) : text;
+  await ctx.reply(`*Terminal capture (tmux):*\n\n\`\`\`\n${trimmed}\n\`\`\``);
+  log("/ss: tmux pane text sent");
 }
 
 async function handleTextScreenshot(ctx: CommandContext): Promise<void> {
@@ -180,6 +218,7 @@ function capturePngForWindow(windowId: string): Buffer {
  * and the caller decides what to do (e.g. fall back to a text alert).
  */
 export async function captureSessionPng(sessionId: string): Promise<{ buffer: Buffer; mime: string } | null> {
+  if (routeToTmux(sessionId)) return null; // no window to photograph; the caller falls back to text
   try {
     const windowId = resolveWindowIdForSession(sessionId);
     if (!windowId) return null;
@@ -210,6 +249,9 @@ export async function handleScreenshot(ctx: CommandContext): Promise<void> {
 }
 
 async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
+  const tmuxPane = tmuxTargetFor(ctx);
+  if (tmuxPane) return handleTmuxScreenshot(ctx, tmuxPane);
+
   // Content-unchanged optimization: skip text fallback for non-PAILot sources
   // PAILot always gets a real screenshot (window capture is fast)
   const currentContent = getActiveSessionContent();

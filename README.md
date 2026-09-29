@@ -62,40 +62,24 @@ Type these in any channel — WhatsApp, Telegram, PAILot, or terminal:
 
 ## Quick Start
 
-Tell Claude Code:
-
-> Clone https://github.com/mnott/AIBroker and set it up for me
-
-Or manually:
-
-### 1. Install
-
 ```bash
-git clone https://github.com/mnott/AIBroker
-cd AIBroker
-npm install
-npm run build
+npm install -g aibroker
+aibroker setup      # service + MCP registration + Claude Code hooks + ~/.aibroker/env
+aibroker doctor     # every check green, or it says exactly what to fix
 ```
 
-### 2. Configure the MCP server
+`aibroker setup` is idempotent and prints what it did per step; `--dry-run` shows the plan and writes nothing, `--no-service`, `--no-mcp` and `--no-hooks` skip a step. `aibroker uninstall` removes the service, the MCP entry and the hooks it added, and keeps `~/.aibroker` unless you pass `--purge`.
 
-Add to `~/.claude.json` under `mcpServers`:
+The hub owns the IPC socket at `/tmp/aibroker.sock` and the PAILot WebSocket gateway on port 8765.
 
-```json
-"aibroker": {
-  "type": "stdio",
-  "command": "node",
-  "args": ["/path/to/AIBroker/dist/mcp/index.js"]
-}
-```
+| | macOS | Linux |
+|---|---|---|
+| Service | LaunchAgent `com.aibroker.daemon` (an existing plist is left alone unless `--force`) | `systemd --user` unit `aibroker.service`; run `sudo loginctl enable-linger $USER` once so it survives logout |
+| Session host | iTerm2 (tmux optional) | tmux |
+| Prerequisites | Node.js 22+, iTerm2, ffmpeg | Node.js 22+, tmux, ffmpeg |
+| Guide | [docs/macos.md](docs/macos.md) | [docs/linux.md](docs/linux.md) — no macOS needed anywhere |
 
-### 3. Start the daemon
-
-```bash
-aibroker start
-```
-
-The daemon runs as a macOS launchd service (`com.aibroker.daemon`). It owns the IPC socket at `/tmp/aibroker.sock` and the PAILot WebSocket gateway on port 8765.
+From a source checkout instead: `git clone https://github.com/mnott/AIBroker && cd AIBroker && npm install && npm run build && node dist/daemon/cli.js setup`.
 
 ### 4. Session backup across reboots (optional)
 
@@ -103,7 +87,7 @@ The daemon runs as a macOS launchd service (`com.aibroker.daemon`). It owns the 
 aibroker sessions install
 ```
 
-Installs a LaunchAgent (`com.aibroker.sessions-snapshot`) that records your open Claude sessions (name + directory) every 5 minutes. Around a reboot:
+Installs a LaunchAgent (`com.aibroker.sessions-snapshot`, macOS) that records your open Claude sessions (name + directory) every 5 minutes. Around a reboot:
 
 ```bash
 aibroker sessions checkpoint   # before: tells each open session to persist its state
@@ -207,14 +191,16 @@ The format is deliberately plain JSONL: greppable with the tools already on the 
 ```bash
 # WhatsApp
 npm install -g whazaa
-whazaa watch
+whazaa setup                 # pair the phone (QR code), once
+whazaa service start         # run the watcher as a service (LaunchAgent on macOS, systemd user unit on Linux)
 
 # Telegram
-npm install -g telex
-telex watch
+npm install -g @tekmidian/telex
+telex setup                  # log in to Telegram, once
+telex service start
 ```
 
-Once connected, messages from your phone route to Claude and replies come back automatically.
+`<bin> service start|stop|status|unit` manages the background service; see [macos.md](docs/macos.md) and [linux.md](docs/linux.md). Once connected, messages from your phone route to Claude and replies come back automatically.
 
 ---
 
@@ -473,6 +459,8 @@ Addressing is explicit: `hub:machine-b/session:abc` routes through the bridge to
 | [protocol.md](docs/protocol.md) | AIBP protocol specification |
 | [plugins.md](docs/plugins.md) | Plugin types, registration, capabilities |
 | [routing.md](docs/routing.md) | Message routing logic and channel system |
+| [macos.md](docs/macos.md) | macOS: LaunchAgent, iTerm2 + tmux, permissions, troubleshooting |
+| [linux.md](docs/linux.md) | Linux: install to daily use with tmux and systemd, PAI (SQLite or Postgres in Docker), messengers, Tailscale, testing, what stays macOS-only |
 | [sessions.md](docs/sessions.md) | Session management and lifecycle |
 | [commands.md](docs/commands.md) | Slash command reference |
 | [agentish.md](docs/agentish.md) | AG2: the wire format sessions use to talk to each other |

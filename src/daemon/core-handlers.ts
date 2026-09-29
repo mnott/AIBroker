@@ -51,6 +51,7 @@ import { fileURLToPath } from "node:url";
 import { addRoute, findRoute, noteOwnWrite } from "./inbound.js";
 import { issueOp, whoAmI, READ_VERBS, WRITE_VERBS, type IssueVerb } from "./forge-issues.js";
 import { funnelHostname } from "./funnel-watchdog.js";
+import { transportLabel } from "../transport/policy.js";
 import {
   ISSUE_FIELDS,
   parseRepoUrl,
@@ -228,6 +229,8 @@ export function registerCoreHandlers(
         tabTitle: s.tabTitle,
         paiName,
         atPrompt: s.atPrompt,
+        transport: s.transport ?? "iterm",
+        cwd: s.cwd ?? null,
         // Measured first, guessed only when there is no measurement: a pane
         // running the launcher is titled like a node process and is not a
         // session, which is how the picker came to list itself.
@@ -336,6 +339,7 @@ export function registerCoreHandlers(
         version: HUB_VERSION,
         status: enumerationOk ? "ok" : "degraded",
         ...(enumerationOk ? {} : { detail: "iTerm AppleScript session enumeration is failing; session list may be stale or incomplete" }),
+        transport: transportLabel(),
         adapters: registry.list().map(a => a.name),
         activeSessions: live.length,
         activeSession: activeSnap
@@ -438,7 +442,7 @@ export function registerCoreHandlers(
   });
 
   /**
-   * speak — Play text locally via afplay (no network delivery).
+   * speak — Play text locally (no network delivery).
    */
   server.on("speak", async (req) => {
     const { text, voice } = req.params as { text?: string; voice?: string };
@@ -824,7 +828,7 @@ export function registerCoreHandlers(
 
     if (sessionId) {
       const content = readSessionContent(sessionId, lineCount);
-      if (!content) return { ok: false, error: `Session ${sessionId} not found in iTerm2` };
+      if (!content) return { ok: false, error: `Session ${sessionId} not found` };
 
       const contentHash = hashContent(content.content);
       const changed = statusCache.hasChanged(sessionId, contentHash);
