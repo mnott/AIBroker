@@ -301,3 +301,8 @@ From `MEMORY.md`:
 Dev repo:   ~/dev/ai/AIBroker                  (builds, git ops)
 Cloud repo: ~/Cloud/Development/ai/AIBroker    (synced)
 ```
+
+
+## Hard Rule
+
+AIBroker never imports `@whiskeysockets/baileys`, `telegram`/`gramjs`, `better-sqlite3`, `qrcode`, or any transport-specific SDK. Platform-specific dependencies belong in the adapter packages.

@@ -207,3 +207,16 @@ The mesh design deliberately separates protocol from transport:
 This means the same AIBP messages that flow over Unix sockets locally can flow over any network transport with no changes to the routing layer. The bridge `sendFn` is the only transport-specific code.
 
 The fallback behavior (any bridge plugin if the specific one is not found) allows a hub with a single uplink to route to multiple remote hubs through that uplink, which can then forward locally.
+
+
+## Overview (moved from the README)
+
+Two AIBroker instances on different machines can exchange messages through AIBP bridge plugins. A message from PAILot on Machine A can reach a Claude session on Machine B:
+
+```
+Machine A                          Machine B
+─────────                          ─────────
+PAILot ──► Hub A ──bridge──► Hub B ──► Claude Session
+```
+
+Addressing is explicit: `hub:machine-b/session:abc` routes through the bridge to the remote hub. See [docs/mesh.md](mesh.md).

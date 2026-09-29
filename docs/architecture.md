@@ -205,3 +205,53 @@ In AIBroker:
 - The **bridge** plugin is the IRC server link (connecting two hub instances, like two IRC servers in a network)
 
 This analogy is intentional. IRC's design is proven at scale for message routing with explicit addressing, and it maps cleanly onto the AIBroker problem domain.
+
+
+## Overview (moved from the README)
+
+```
+  Your Phone                   AIBroker Daemon                   Claude Code
+  ──────────                   ───────────────                   ──────────
+  WhatsApp  ───► Whazaa  ──┐                                ┌──► Session 1 (iTerm)
+  Telegram  ───► Telex   ──┤   Hub (IPC + AIBP routing)    ├──► Session 2 (iTerm)
+  PAILot    ───► WS:8765 ──┤   TTS · STT · Screenshots     ├──► Session 3 (iTerm)
+  Your App  ───► Adapter ──┘   Image Gen · Session Mgmt    └──► Headless (API)
+```
+
+**AIBroker is the runtime.** Adapters are thin transport plugins — they handle the network connection and nothing else. All intelligence lives in the hub: command parsing, message routing, media pipelines, session orchestration.
+
+### AIBP Protocol
+
+Internally, all messages flow through AIBP (AIBroker Protocol) — an IRC-inspired routing layer with explicit source/destination addressing, typed channels, and plugin registration.
+
+```
+Plugin A ──message──► #session:abc ──fan-out──► Plugin B, Plugin C, Plugin D
+```
+
+Every plugin declares its type and capabilities:
+
+| Plugin Type | Examples | Capabilities |
+|------------|----------|-------------|
+| `transport` | Whazaa, Telex | TEXT, VOICE, IMAGE, FILE |
+| `terminal` | iTerm2 | TEXT, COMMAND |
+| `mobile` | PAILot | TEXT, VOICE, IMAGE, TYPING, STATUS |
+| `mcp` | Claude Code sessions | TEXT, VOICE, IMAGE, COMMAND |
+| `bridge` | Remote hubs | TEXT, VOICE, IMAGE, COMMAND, FILE |
+
+Messages carry explicit `src` and `dst` addresses — no guessing which session should receive what. Cross-session messaging, mesh networking between machines, and channel fan-out all work through the same protocol.
+
+### Inspecting the Protocol
+
+Use `/aibp` from any channel (WhatsApp, Telegram, PAILot) or the `aibroker_aibp_status` MCP tool from Claude Code to see the live state of the routing infrastructure:
+
+```
+/aibp              → combined overview (sessions, plugins, channels, peers)
+/aibp plugins      → registered plugins with type, status, capabilities
+/aibp channels     → active channels with members and activity
+/aibp commands     → all commands grouped by owning plugin
+/aibp peers        → mesh network peers
+```
+
+`/status` and `/st` are shortcuts for `/aibp status`.
+
+For the full protocol spec, see [docs/protocol.md](protocol.md).

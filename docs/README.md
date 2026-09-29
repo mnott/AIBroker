@@ -108,4 +108,37 @@ thirteen files still described PAILot as a WebSocket gateway, five months after
 it moved to MQTT. If you change a transport, a port, a topic or a delivery
 guarantee, grep `docs/` for the old fact before you finish. Diagrams count.
 
-See [Notes/TODO.md](../Notes/TODO.md) for what is implemented vs. what is planned.
+
+## Full document table (moved from the README)
+
+| Document | What it covers |
+|----------|---------------|
+| [architecture.md](architecture.md) | System design, component interactions, data flow |
+| [protocol.md](protocol.md) | AIBP protocol specification |
+| [plugins.md](plugins.md) | Plugin types, registration, capabilities |
+| [routing.md](routing.md) | Message routing logic and channel system |
+| [macos.md](macos.md) | macOS: LaunchAgent, iTerm2 + tmux, permissions, troubleshooting |
+| [linux.md](linux.md) | Linux: install to daily use with tmux and systemd, PAI (SQLite or Postgres in Docker), messengers, Tailscale, testing, what stays macOS-only |
+| [sessions.md](sessions.md) | Session management and lifecycle |
+| [commands.md](commands.md) | Slash command reference |
+| [agentish.md](agentish.md) | AG2: the wire format sessions use to talk to each other |
+| [a2a-agentish-extension.md](a2a-agentish-extension.md) | AG2 declared as an A2A protocol extension (definition + helpers, no transport) |
+| [a2a.md](a2a.md) | A2A v0.3.0 transport: expose sessions as skills for outside agents to task, and task outside agents from a session |
+| [mcp-tools.md](mcp-tools.md) | All 42 MCP tools with parameters |
+| [adapters.md](adapters.md) | Adapter development guide |
+| [pailot.md](pailot.md) | PAILot iOS app integration |
+| [task-manager-as-interface.md](task-manager-as-interface.md) | Todoist as the front door to AI: what it feels like, what it will not do |
+| [todoist.md](todoist.md) | Todoist inbound channel: webhook setup, routing, security model, the comment mirror |
+| [channels.md](channels.md) | The model every inbound path shares — read first for anything inbound |
+| [inbound.md](inbound.md) | Generic `POST /hook/<route>` endpoint, and subscribing a session to a repository's issues |
+| [outbound.md](outbound.md) | Acting in external systems through a platform's own actions |
+| [mailbox.md](mailbox.md) | Durable per-session queue and confirmed delivery |
+| [session-watchdog.md](session-watchdog.md) | Keeping a long autonomous session running: one goal at a time, context rollover, and the failures that shaped it |
+| [audit.md](audit.md) | What is recorded, and how to read it |
+| [mesh.md](mesh.md) | Multi-machine mesh networking |
+| [ipc.md](ipc.md) | IPC protocol and message format |
+| [tts-stt.md](tts-stt.md) | Voice pipeline details |
+| [use-cases.md](use-cases.md) | End-to-end message flow diagrams |
+| [protocol-landscape.md](protocol-landscape.md) | How AIBP relates to A2A, MCP, and other standards |
+| [configuration.md](configuration.md) | Configuration reference |
+| [development.md](development.md) | Development setup and testing |

@@ -392,3 +392,16 @@ Claude Code ◄── chats list
 ```
 
 See [mcp-tools.md](./mcp-tools.md) for the complete list of MCP tools and which ones use `adapter_call`.
+
+
+## Bring Your Own Messenger
+
+AIBroker adapters are standalone npm packages. A scaffold generator handles all the IPC wiring, MCP registration, and hub integration. You implement two things: how to connect and how to send.
+
+```bash
+aibroker create-adapter my-signal
+cd my-signal
+npm install
+```
+
+Full guide: [docs/adapters.md](adapters.md)

@@ -536,3 +536,22 @@ todoist_mirror
 
 See [channels.md](./channels.md) for the model this shares with the other
 inbound paths.
+
+
+## File work from your phone or watch (optional)
+
+```bash
+tailscale funnel --bg --https=443 --set-path=/todoist http://127.0.0.1:8766/todoist
+```
+
+> **Port 443, and no port in the callback URL.** Todoist *silently* refuses any
+> webhook URL carrying a port: the form accepts it, activation appears to do
+> nothing, and the status stays *Not configured* forever with no error anywhere.
+> `--https=8443` will look like it worked and never deliver a single event.
+
+Add a task in Todoist and it reaches the session that owns it — no polling, because Todoist pushes. Set a **reminder** rather than a due date to schedule work: `reminder:fired` is a webhook event, a task merely becoming due is not.
+
+This is an execution ingress, so it is narrow by construction: every request must carry a valid HMAC signature, only explicitly allowlisted projects can reach a session, and an empty allowlist accepts nothing rather than everything. Todoist's Inbox cannot be shared, which is what makes quick capture from a watch safe.
+
+What it feels like to use: **[docs/task-manager-as-interface.md](task-manager-as-interface.md)**.
+Full setup, routing rules and the security model: **[docs/todoist.md](todoist.md)**.

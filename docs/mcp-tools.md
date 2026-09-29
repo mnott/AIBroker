@@ -760,3 +760,33 @@ Drain the queue of incoming PAILot messages.
 - [pailot.md](./pailot.md) — PAILot gateway, MQTT topics and APNs
 - [tts-stt.md](./tts-stt.md) — Kokoro TTS and Whisper STT pipeline
 - [sessions.md](./sessions.md) — Session orchestration with `session_content` / `cache_status`
+
+
+## Overview (moved from the README)
+
+AIBroker exposes 42 MCP tools through a single unified server. Claude uses these automatically based on message routing rules — you don't need to call them manually.
+
+### Message Routing
+
+When a message arrives with a prefix, Claude knows where it came from and replies through the matching channel:
+
+| Prefix | Source | Claude replies with |
+|--------|--------|-------------------|
+| `[Whazaa]` | WhatsApp text | `whatsapp_send` |
+| `[Whazaa:voice]` | WhatsApp voice note | `whatsapp_tts` |
+| `[Telex]` | Telegram text | `telegram_send` |
+| `[Telex:voice]` | Telegram voice note | `telegram_tts` |
+| `[PAILot]` | PAILot app text | `pailot_send` |
+| `[PAILot:voice]` | PAILot app voice | `pailot_tts` |
+| _(no prefix)_ | Terminal keyboard | Terminal only |
+
+### Tool Categories
+
+| Category | Tools | What they do |
+|----------|-------|-------------|
+| `whatsapp_*` | send, tts, contacts, chats, history, login, status | WhatsApp messaging and management |
+| `telegram_*` | send, tts, contacts, chats, history, login, status | Telegram messaging and management |
+| `pailot_*` | send, tts, receive | PAILot app communication |
+| `aibroker_*` | status, sessions, switch, discover, speak, dictate, generate_image, ... | Hub-level operations |
+
+For the complete reference, see [docs/mcp-tools.md](mcp-tools.md).

@@ -562,3 +562,17 @@ Set `PAILOT_DEBUG=1` to enable verbose debug logging to `/tmp/pailot-ws-debug.lo
 - Every raw inbound MQTT payload (truncated)
 - Voice message receipt and base64 length
 - Audio file save path and byte count
+
+
+## PAILot Companion App (overview)
+
+PAILot is a native iOS app that connects to AIBroker over WebSocket. It provides:
+
+- **Session management** — switch between Claude sessions, start new ones, end old ones
+- **Voice messages** — record and send, receive voice replies with chain playback
+- **Typing indicators** — see when Claude is processing
+- **Message history** — persistent chat with text and voice
+- **Offline queuing** — messages buffer on the server when you're disconnected, drain on reconnect
+- **Session isolation** — the gateway tracks which session each client is viewing and only delivers matching messages, preventing cross-session content bleed
+
+PAILot connects to `ws://your-mac:8765`. See [docs/pailot.md](pailot.md).
