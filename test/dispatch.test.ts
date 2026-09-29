@@ -439,7 +439,7 @@ test("delivery is attempted exactly once against a live session", async () => {
 // ── unreliable enumeration must not read as "target absent" ────────────────
 //
 // Real fault, 2026-09-23: an osascript hiccup made iTerm enumeration return
-// [] for one 3s window. dispatch() read that as "Jobs Matthias has no live
+// [] for one 3s window. dispatch() read that as "Jobs Alpha has no live
 // session" and launched one — into a live Claude pane. An empty array from a
 // FAILED enumeration must be treated as unknown, not as confirmed-absent.
 

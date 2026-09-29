@@ -115,6 +115,11 @@ aibroker restart                  # or: stop / start
   statuslines below Claude's input box are fine.
 - Claude sessions you start yourself in tmux are found too; `aibroker launch` is
   simply the convenient way.
+- Closing a terminal window does not end a session: tmux keeps the pane running
+  detached, and the hub (and PAILot) keep listing it. End it by quitting Claude
+  (`/exit`) or with `tmux kill-window -t <session>:<window>`; `tmux ls` shows
+  what is still running, including the detached `aibroker` session that
+  `aibroker launch` creates outside tmux.
 - `aibroker stop` / `restart` drive the systemd unit when it is installed,
   otherwise they ask the daemon to shut down over its socket, with a pidfile
   (`~/.aibroker/daemon.pid`, 0600) as the last resort.

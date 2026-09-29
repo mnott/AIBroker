@@ -4,7 +4,7 @@ import "./home-guard.js";
  * already running something (Claude included).
  *
  * Real fault, 2026-09-23: a scheduled dispatch found no live session for
- * "Jobs Matthias" (enumeration had briefly failed) and fell through to
+ * "Jobs Alpha" (enumeration had briefly failed) and fell through to
  * launchResolvedPaiProject() -> createClaudeSession(), which landed its
  * `claude --name ... $'/Name ...'` launch command in the project's own
  * already-running Claude pane instead of a fresh shell.
