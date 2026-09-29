@@ -19,13 +19,18 @@
  * "did not look" unless the code refuses to say "none" without looking.
  *
  * So discovery lives here, both readers call it, and nobody has to remember to
- * populate anything first.
+ * populate anything first. HybridManager grew its own "keep the known list on
+ * a bad enumeration" guard directly; every OTHER caller of this function was
+ * still getting the raw `[]` an unreadable iTerm produces. The guard belongs
+ * here instead, once, so every reader inherits it.
  */
 
-import { snapshotAllSessions } from "../adapters/iterm/core.js";
+import { snapshotAllSessions, wasLastSnapshotReliable } from "../adapters/iterm/core.js";
 import { getAllPersistentSessionNames, lookupPersistentName } from "./persistence.js";
 
 export type LiveSession = ReturnType<typeof snapshotAllSessions>[0];
+
+let lastGoodSnapshots: LiveSession[] = [];
 
 /**
  * Live sessions, with their PAI names filled in.
@@ -33,14 +38,27 @@ export type LiveSession = ReturnType<typeof snapshotAllSessions>[0];
  * `snapshotAllSessions()` has returned `paiName: null` since 0.7.10 — the
  * authoritative source is the persistent store — so a caller that skips this
  * step gets tab titles where it expects names.
+ *
+ * A failed enumeration (`wasLastSnapshotReliable()` false) replays the last
+ * good list instead of the `[]` iTerm hands back on an osascript fault — an
+ * unreadable machine must not read as an empty one (see file header).
  */
 export function discoverLiveSessions(opts: { fresh?: boolean } = {}): LiveSession[] {
   const snaps = snapshotAllSessions(opts);
   const persistentNames = getAllPersistentSessionNames();
-  for (const snap of snaps) {
-    snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
+
+  if (wasLastSnapshotReliable()) {
+    for (const snap of snaps) {
+      snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
+    }
+    lastGoodSnapshots = snaps;
+    return snaps;
   }
-  return snaps;
+
+  return lastGoodSnapshots.map((snap) => ({
+    ...snap,
+    paiName: lookupPersistentName(persistentNames, snap.id, snap.aibrokerId),
+  }));
 }
 
 /**
