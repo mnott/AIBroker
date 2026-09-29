@@ -57,6 +57,9 @@ switch (command) {
       const status = validateHubStatus(raw);
 
       console.log(`AIBroker Hub v${status.version}`);
+      if (status.status !== "ok") {
+        console.log(`  Status:         ${status.status}${status.detail ? ` — ${status.detail}` : ""}`);
+      }
       console.log(`  Active session: ${status.activeSession ?? "(none)"}`);
       console.log(`  Sessions:       ${status.activeSessions}`);
       console.log(`  Adapters:       ${status.adapters.join(", ") || "(none)"}`);

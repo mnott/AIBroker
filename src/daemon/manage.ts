@@ -27,7 +27,7 @@ import { homedir } from "node:os";
 import { log } from "../core/log.js";
 import { timeCall } from "../core/call-timing.js";
 import { readSessionContent } from "./session-content.js";
-import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode } from "../transport/sync-facade.js";
+import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
@@ -2663,6 +2663,13 @@ function beat(): void {
 const DIALOG_EVERY_TICKS = 3;
 let tickCount = 0;
 
+/**
+ * Whether the operator has already been told about the current iTerm
+ * enumeration failure — set once per episode, cleared on recovery, so a
+ * standing fault alerts once rather than every 20s tick.
+ */
+let enumerationAlarmArmed = false;
+
 function answerBlockingDialogs(): void {
   if (Object.keys(state).length === 0) return;
   for (const d of listDialogs()) {
@@ -2684,6 +2691,21 @@ async function tick(): Promise<void> {
   const now = Date.now();
   let dirty = false;
   beat();
+
+  // A failed osascript enumeration returns [] identically to a genuinely
+  // empty machine — reported "ok" with 0 sessions is exactly the silent
+  // failure this exists to catch. Reuses the flag every `sessions`/`status`
+  // caller already sets; no separate probe.
+  if (!wasLastEnumerationReliable()) {
+    if (!enumerationAlarmArmed) {
+      enumerationAlarmArmed = true;
+      alertOperator("iTerm session enumeration is failing (AppleScript errors) — the session list may be empty or stale until this clears.");
+      log("[manage] iTerm enumeration unreliable — alerted the operator");
+    }
+  } else if (enumerationAlarmArmed) {
+    enumerationAlarmArmed = false;
+    log("[manage] iTerm enumeration recovered");
+  }
 
   if (++tickCount % DIALOG_EVERY_TICKS === 0) {
     try {

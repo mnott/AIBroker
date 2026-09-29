@@ -26,6 +26,12 @@ export interface SessionCandidate {
   id: string;
   name: string;
   paiName?: string | null;
+  /**
+   * Measured "a Claude process owns this tty" (ps scan), undefined when the
+   * measurement could not be made. `prefer` rankings use it to keep a live
+   * holder of a name ahead of a same-name shell tab.
+   */
+  isClaude?: boolean;
 }
 
 /** How a name was matched, weakest last. Reported so a fuzzy hit is visible. */
@@ -80,7 +86,7 @@ export function labelOf(s: SessionCandidate): string {
 export function normaliseLabel(s: string): string {
   return s
     .toLowerCase()
-    .replace(/\s*\((?:node|-?[a-z]*sh|python\d*|bash)\)\s*$/i, "")
+    .replace(/\s*\((?:node|claude|-?[a-z]*sh|python\d*|bash)\)\s*$/i, "")
     .replace(/^[^\p{L}\p{N}]+/u, "")
     .replace(/[\s_-]+/g, " ")
     .trim();
@@ -100,25 +106,35 @@ export interface MatchOptions {
   prefer?: (s: SessionCandidate) => number;
 }
 
+export interface MatchHit {
+  session: SessionCandidate;
+  label: string;
+  kind: MatchKind;
+  score: number;
+}
+
 /**
- * Resolve any of `references` to a session.
+ * EVERY session the references resolve to, best first.
  *
- * Substring is opt-in for a reason: a project called `sl` would otherwise match
- * every session whose title happens to contain those letters, and for dispatch
- * a wrong match spawns nothing and delivers to the wrong place instead.
+ * A name is not a promise only one tab ever carries it. On 2026-09-26 a second
+ * tab registered a name a live session already held, and the single-hit
+ * resolver handed back the newcomer — which later sat at a shell while the real
+ * session was never asked. Callers that are about to deliver probe the whole
+ * list and take the first one that answers; matchSession() below remains the
+ * "just give me one" read.
  */
-export function matchSession(
+export function matchAllSessions(
   references: string[],
   sessions: SessionCandidate[],
   opts: MatchOptions = {},
-): { session: SessionCandidate; label: string; kind: MatchKind } | null {
+): MatchHit[] {
   const kinds = opts.kinds ?? ["exact", "normalised"];
   const prefer = opts.prefer ?? (() => 0);
 
   const refs = references.filter(Boolean).map((r) => ({ raw: r.toLowerCase(), norm: normaliseLabel(r) }));
-  if (refs.length === 0) return null;
+  if (refs.length === 0) return [];
 
-  let best: { session: SessionCandidate; label: string; kind: MatchKind; score: number } | null = null;
+  const hits: MatchHit[] = [];
 
   for (const s of sessions) {
     const label = labelOf(s);
@@ -137,9 +153,26 @@ export function matchSession(
     if (!kind) continue;
 
     // Preference dominates: 100 leaves room for every match kind beneath it.
-    const score = prefer(s) * 100 + KIND_RANK[kind];
-    if (!best || score > best.score) best = { session: s, label, kind, score };
+    hits.push({ session: s, label, kind, score: prefer(s) * 100 + KIND_RANK[kind] });
   }
 
+  // Stable descending: equal scores keep enumeration order, which is what the
+  // single-hit resolver did before this existed.
+  return hits.sort((a, b) => b.score - a.score);
+}
+
+/**
+ * Resolve any of `references` to a session.
+ *
+ * Substring is opt-in for a reason: a project called `sl` would otherwise match
+ * every session whose title happens to contain those letters, and for dispatch
+ * a wrong match spawns nothing and delivers to the wrong place instead.
+ */
+export function matchSession(
+  references: string[],
+  sessions: SessionCandidate[],
+  opts: MatchOptions = {},
+): { session: SessionCandidate; label: string; kind: MatchKind } | null {
+  const best = matchAllSessions(references, sessions, opts)[0];
   return best ? { session: best.session, label: best.label, kind: best.kind } : null;
 }

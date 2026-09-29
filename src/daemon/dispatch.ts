@@ -56,7 +56,7 @@ import {
   type TerminalIO,
 } from "./terminal-screen.js";
 import { log } from "../core/log.js";
-import { matchSession } from "../core/session-match.js";
+import { matchAllSessions } from "../core/session-match.js";
 
 export type DispatchOutcome =
   | "delivered"
@@ -115,7 +115,7 @@ export interface DispatchOptions {
  */
 export interface DispatchDeps {
   resolve: (name: string) => Promise<PaiProject | undefined>;
-  sessions: () => { id: string; name: string; paiName: string | null }[];
+  sessions: () => { id: string; name: string; paiName: string | null; isClaude?: boolean }[];
   /**
    * Did `sessions()` actually enumerate, or fall back to `[]` after a failed
    * osascript call? An empty array means two different things and only this
@@ -166,40 +166,60 @@ export {
 } from "./terminal-screen.js";
 
 /**
- * Find a running session for `project`.
+ * Every running session for `project`, the one most likely to receive first.
  *
  * Matches the project's display name, canonical name and every curated alias,
  * case-insensitively — session labels and aliases disagree on capitalisation
  * often enough that an exact match silently spawns a duplicate tab.
+ *
+ * More than one session can legitimately carry the name: a stale tab that
+ * registered the name while the real session held it keeps answering to it
+ * until its binding is pruned (2026-09-26: both daily sweeps parked on exactly
+ * that corpse while the live session was never probed). So this returns ALL
+ * same-name hits, a measured-Claude one first, and the caller works down the
+ * list until a session answers.
  */
-export function findSessionForProject(
+export function findSessionsForProject(
   project: PaiProject,
-  sessions: { id: string; name: string; paiName: string | null }[],
-): { id: string; label: string } | null {
+  sessions: { id: string; name: string; paiName: string | null; isClaude?: boolean }[],
+): { id: string; label: string }[] {
   // Exact and separator-folded only — never substring. A project called `sl`
   // would otherwise match any session whose title contains those letters, and
   // here a wrong match does not spawn, it delivers work to the wrong session.
-  const hit = matchSession(
+  return matchAllSessions(
     [project.displayName, project.name, project.slug, ...project.names],
     sessions,
-    { kinds: ["exact", "normalised"] },
-  );
-  return hit ? { id: hit.session.id, label: hit.label } : null;
+    {
+      kinds: ["exact", "normalised"],
+      // A measured Claude pane outranks a measured shell; no measurement is a
+      // tie broken by enumeration order, which is the old single-hit behavior.
+      prefer: (s) => (s.isClaude === true ? 2 : s.isClaude === false ? 0 : 1),
+    },
+  ).map((h) => ({ id: h.session.id, label: h.label }));
+}
+
+/** The single best session for `project` — see findSessionsForProject. */
+export function findSessionForProject(
+  project: PaiProject,
+  sessions: { id: string; name: string; paiName: string | null; isClaude?: boolean }[],
+): { id: string; label: string } | null {
+  return findSessionsForProject(project, sessions)[0] ?? null;
 }
 
 /** Enumerate live sessions with their persistent (PAI) names resolved. */
-function liveSessions(): { id: string; name: string; paiName: string | null }[] {
+function liveSessions(): { id: string; name: string; paiName: string | null; isClaude?: boolean }[] {
   const snaps = snapshotAllSessions();
   const persistent = getAllPersistentSessionNames();
   return snaps.map((s) => ({
     id: s.id,
     name: s.name,
     paiName: lookupPersistentName(persistent, s.id, s.aibrokerId),
+    isClaude: s.isClaude,
   }));
 }
 
 /** A live session with its persistent PAI name resolved. */
-export interface LiveSession { id: string; name: string; paiName: string | null }
+export interface LiveSession { id: string; name: string; paiName: string | null; isClaude?: boolean }
 
 /**
  * Wait until a freshly launched session can ACCEPT input.
@@ -340,7 +360,8 @@ export async function dispatch(
   const body = `${opts.prefix ?? TASK_PREFIX} ${message}`;
 
   // ── already running? ──
-  const existing = findSessionForProject(project, deps.sessions());
+  const candidates = findSessionsForProject(project, deps.sessions());
+  const existing = candidates[0] ?? null;
   if (existing) {
     if (left() <= 0) {
       return {
@@ -356,17 +377,38 @@ export async function dispatch(
     // EXECUTES what it is sent. Task bodies are multi-line and full of
     // backticks, so this is the difference between a failed delivery and
     // running fragments of a task description as commands.
-    const frame = deps.capture(existing.id);
-    if (frame !== null && !isClaudeReady(frame)) {
+    //
+    // Several sessions can answer to one name (a stale tab that stole it, a
+    // leftover binding), and on 2026-09-26/27 the first one being a corpse was
+    // read as the name itself being dead — the caller parked both daily sweeps
+    // while the live holder of the name was never probed. So EVERY same-name
+    // session is probed and the first one showing a live Claude takes the work;
+    // only "none of them is running Claude" is the final verdict.
+    let ready: { id: string; label: string } | null = null;
+    let sawShell: { id: string; label: string } | null = null;
+    for (const c of candidates) {
+      const frame = deps.capture(c.id);
+      if (frame === null) continue; // unreadable: not evidence either way
+      if (isClaudeReady(frame)) { ready = c; break; }
+      sawShell ??= c;
+    }
+    if (!ready && sawShell) {
       return {
         outcome: "unreachable",
         project: label,
-        session: existing.label,
+        session: sawShell.label,
         reason:
-          `Session "${existing.label}" is no longer running Claude — its terminal is at a shell ` +
-          `prompt. Nothing was sent, because a shell would execute the message rather than read it.`,
+          `Session "${sawShell.label}" is no longer running Claude — its terminal is at a shell ` +
+          `prompt. Nothing was sent, because a shell would execute the message rather than read it.` +
+          (candidates.length > 1
+            ? ` All ${candidates.length} sessions answering to "${existing.label}" were probed; none is running Claude.`
+            : ""),
       };
     }
+    // Every probe unreadable: fall through and attempt delivery to the first
+    // candidate, as the single-hit guard always did — its own unreadable
+    // outcome is the honest report then.
+    const target = ready ?? existing;
 
     // Write-ahead: a record on disk BEFORE the type, not after. `queued` means
     // the text left our hands for Claude Code's own in-terminal queue, which we
@@ -381,10 +423,10 @@ export async function dispatch(
     // box; typing it again does not retry, it duplicates — one trigger became
     // three full job sweeps on 2026-08-01. Retries belong to the spawn path
     // below, where an earlier attempt may genuinely never have landed.
-    const res = await deps.deliver(existing.id, body, deliverTimeoutMs(), undefined, 1);
+    const res = await deps.deliver(target.id, body, deliverTimeoutMs(), undefined, 1);
     if (res === "ok") {
       deleteQueuedRecord(queuedRecordPath);
-      return { outcome: "delivered", project: label, session: existing.label, reason: "" };
+      return { outcome: "delivered", project: label, session: target.label, reason: "" };
     }
     if (res === "unreadable") {
       // Never typed — nothing was queued anywhere, so there is nothing to redrive.
@@ -392,7 +434,7 @@ export async function dispatch(
       return {
         outcome: "unreachable",
         project: label,
-        session: existing.label,
+        session: target.label,
         reason: `Live session found but ${ackReason(res)}.`,
       };
     }
@@ -404,9 +446,9 @@ export async function dispatch(
     return {
       outcome: "queued",
       project: label,
-      session: existing.label,
+      session: target.label,
       reason:
-        `Typed into live session "${existing.label}", which was still working and had not read it ` +
+        `Typed into live session "${target.label}", which was still working and had not read it ` +
         `within the window. This is delivery, not failure — do NOT retry. Recorded at ${queuedRecordPath} ` +
         `in case it turns out to have been lost; redriven once on the next daemon start.`,
     };

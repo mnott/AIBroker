@@ -19,7 +19,14 @@ import {
   stripItermPrefix,
   withSessionAppleScript,
   snapshotAllSessions,
+  type SessionSnapshot,
 } from "./core.js";
+import {
+  setSessionTitle,
+  itermViewerSessionId,
+  snapshotAllSessions as snapshotAllTransports,
+} from "../../transport/sync-facade.js";
+import { normaliseLabel } from "../../core/session-match.js";
 import { log } from "../../core/log.js";
 import {
   sessionRegistry,
@@ -139,6 +146,80 @@ export function getItermSessionVar(itermSessionId: string): string | null {
   } catch {
     return null;
   }
+}
+
+// ── Name Authority ──
+// A user-chosen name outranks every generated one. Claude Code's auto-titler
+// re-stamps the tab title on every turn, so a name set once by the rename
+// handler survives only until that turn — unless the daemon gets the last
+// word. That is reassertPersistentTitles, run from an interval in the daemon.
+
+/**
+ * Re-write chosen names onto tabs whose title has materially diverged.
+ *
+ * "Materially" is judged after normaliseLabel() strips the benign decorations
+ * (spinner glyph prefix, "(node)"/"(claude)" process suffix): a busy marker on
+ * the right name is not divergence, an auto-title "Name-smooth-fiddle" is.
+ * Case and separators already fold, so only a real takeover triggers a write.
+ *
+ * Setters are injectable so tests observe the writes instead of performing
+ * them; the production defaults are exactly what the rename handler uses.
+ * Returns the count actually re-pinned — 0 means every surface already agrees.
+ */
+export function reassertPersistentTitles(
+  deps: {
+    sessions?: SessionSnapshot[];
+    setTabName?: (id: string, name: string) => void;
+    setSessionVar?: (id: string, name: string) => void;
+    setBadge?: (id: string, name: string) => void;
+    setPaneTitle?: (id: string, name: string) => boolean;
+    viewerFor?: (paneId: string) => string | null;
+  } = {},
+): number {
+  const setTabName = deps.setTabName ?? setItermTabName;
+  const setSessionVar = deps.setSessionVar ?? setItermSessionVar;
+  const setBadge = deps.setBadge ?? setItermBadge;
+  const setPaneTitle = deps.setPaneTitle ?? setSessionTitle;
+  const viewerFor = deps.viewerFor ?? itermViewerSessionId;
+  const sessions = deps.sessions ?? snapshotAllTransports();
+
+  const names = getAllPersistentSessionNames();
+  let repinned = 0;
+  for (const s of sessions) {
+    const chosen = lookupPersistentName(names, s.id, s.aibrokerId);
+    if (!chosen) continue;
+    const title = s.tabTitle ?? s.name;
+    if (normaliseLabel(title) === normaliseLabel(chosen)) continue;
+
+    if (s.aibrokerId) {
+      // tmux-hosted: the pane title, plus — if an iTerm tab is viewing it —
+      // that tab, exactly the surfaces the rename handler touches.
+      setPaneTitle(s.id, chosen);
+      const viewer = viewerFor(s.id);
+      if (viewer) {
+        setSessionVar(viewer, chosen);
+        setTabName(viewer, chosen);
+        setBadge(viewer, chosen);
+      }
+    } else {
+      setSessionVar(s.id, chosen);
+      setTabName(s.id, chosen);
+      setBadge(s.id, chosen);
+    }
+    log(`Name authority: re-pinned "${chosen}" over tab title "${title}" (session ${s.id.slice(0, 8)})`);
+    repinned += 1;
+  }
+  return repinned;
+}
+
+/**
+ * The name an AUTO path (launch fallback, re-home default) may write: the
+ * chosen name if the session has one, else the generated fallback. Launch
+ * paths can be handed a reused live tab (see openSessionScript's busy guard),
+ * and a generated name must not displace what the user chose there.
+ */
+export function autoTabName(sessionId: string, fallback: string): string {
+  return lookupPersistentName(getAllPersistentSessionNames(), sessionId) ?? fallback;
 }
 
 // ── Session Resolution ──

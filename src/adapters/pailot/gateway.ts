@@ -37,7 +37,7 @@ import {
   setLastRoutedSessionId,
   getAibpBridge,
 } from "../../core/state.js";
-import { setItermSessionVar, setItermTabName, setItermBadge, createClaudeSession, killSession } from "../iterm/sessions.js";
+import { setItermSessionVar, setItermTabName, setItermBadge, autoTabName, createClaudeSession, killSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
 import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, invalidateSnapshotCache } from "../iterm/core.js";
 import { pasteTextIntoSession, snapshotAllSessions, typeIntoSession } from "../../transport/sync-facade.js";
@@ -554,6 +554,13 @@ end tell`);
   }
 
   if (newName) {
+    // Explicit rename: persist, or the daemon's chosen-name re-assert would
+    // revert it within a minute. A refused claim (name held by a live session)
+    // changes nothing — not the store, not the visuals, not the row's name.
+    if (!setPersistentSessionName(session.backendSessionId, newName).ok) {
+      sendTo(ws, { type: "error", message: `Name "${newName}" is held by another live session — nothing was changed.` });
+      return;
+    }
     session.name = newName;
     if (session.kind === "visual") {
       setItermSessionVar(session.backendSessionId, newName);
@@ -594,6 +601,13 @@ function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void
   const sessions = hybridManager.listSessions();
   const session = sessions.find(s => s.backendSessionId === sessionId);
   if (session) {
+    // Explicit rename: persist like the MQTT rename path does, or the
+    // chosen-name re-assert reverts it. A refused claim leaves everything as it
+    // was — the live holder keeps the name.
+    if (!setPersistentSessionName(sessionId, name).ok) {
+      sendTo(ws, { type: "error", message: `Name "${name}" is held by another live session — nothing was changed.` });
+      return;
+    }
     session.name = name;
     if (session.kind === "visual") {
       setItermSessionVar(sessionId, name);
@@ -708,13 +722,17 @@ function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}):
   // Launch via clc (the user's launcher: pins model + skip-perms so PAILot can
   // drive the session without a permission prompt). cd into path first if given.
   const command = path ? `cd ${path.replace(/"/g, '\\"')} && clc` : "clc";
-  const name = requestedName || (path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude");
+  const fallbackName = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
 
   const sessionId = createClaudeSession(command);
   if (!sessionId) {
     sendTo(ws, { type: "error", message: "Failed to create new session" });
     return;
   }
+
+  // createClaudeSession can be handed a reused live tab; a generated name
+  // must not displace a chosen one there.
+  const name = requestedName || autoTabName(sessionId, fallbackName);
 
   setItermSessionVar(sessionId, name);
   setItermTabName(sessionId, name);
@@ -1677,7 +1695,11 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         // Persist so the rename survives re-enumeration: enrichedSnapshots reads
         // paiName from ~/.aibroker/session-names.json and it wins over the tab
         // title — without this the name reverts on the next sessions refresh.
-        setPersistentSessionName(sessionId, name);
+        // A refused claim (name held by a live session) changes nothing.
+        if (!setPersistentSessionName(sessionId, name).ok) {
+          mqttPublishControl({ type: "error", message: `Name "${name}" is held by another live session — nothing was changed.` });
+          break;
+        }
         const sessions = hybridManager.listSessions();
         const session = sessions.find(s => s.backendSessionId === sessionId);
         if (session) {
@@ -1736,7 +1758,12 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
               setActiveItermSessionId(itermSessionId);
               setLastRoutedSessionId(itermSessionId);
             }
-            setPersistentSessionName(itermSessionId, projectDisplay);
+            // A launch may not steal a live session's name: a refused claim
+            // leaves the binding where it is and says so — the new tab still
+            // runs, it just does not own the name.
+            if (!setPersistentSessionName(itermSessionId, projectDisplay).ok) {
+              mqttPublishControl({ type: "error", message: `Name "${projectDisplay}" is held by another live session — launched, but not renamed.` });
+            }
             mqttPublishControl({ type: "session_switched", name: projectDisplay, sessionId: itermSessionId });
             handleMqttCommand("sessions");
           } catch (err) {
@@ -1749,10 +1776,12 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       if (createThrottled()) { handleMqttCommand("sessions"); break; }
       const path = args.path as string | undefined;
       const requestedName = typeof args.name === "string" ? args.name.trim() : "";
-      const name = requestedName || (path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude");
-      const command = claudeLaunchCommand(path ?? "~", name);
+      const fallbackName = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
+      const command = claudeLaunchCommand(path ?? "~", requestedName || fallbackName);
       const sessionId = createClaudeSession(command);
       if (!sessionId) { log("[MQTT] create: failed to create session"); break; }
+      // Same guard as the WS create: a reused live tab keeps its chosen name.
+      const name = requestedName || autoTabName(sessionId, fallbackName);
       setItermSessionVar(sessionId, name);
       setItermTabName(sessionId, name);
       setItermBadge(sessionId, name);
@@ -1764,7 +1793,9 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         setActiveItermSessionId(sessionId);
         setLastRoutedSessionId(sessionId);
       }
-      setPersistentSessionName(sessionId, name);
+      if (!setPersistentSessionName(sessionId, name).ok) {
+        mqttPublishControl({ type: "error", message: `Name "${name}" is held by another live session — launched, but not renamed.` });
+      }
       mqttPublishControl({ type: "session_switched", name, sessionId });
       handleMqttCommand("sessions");
       break;
@@ -1776,10 +1807,13 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       // iTerm tab — the session id is unchanged, so the app keeps following it.
       const rid = args.sessionId as string | undefined;
       const rpath = args.path as string | undefined;
+      if (!rid || !rpath) { handleMqttCommand("sessions"); break; }
+      // Re-home default name: autoTabName keeps a chosen name over the
+      // path-basename guess — re-homing re-topics a session, it does not
+      // unname it.
       const rname = (typeof args.name === "string" && args.name.trim())
         ? args.name.trim()
-        : (rpath ? rpath.split("/").filter(Boolean).pop() ?? "Session" : "Session");
-      if (!rid || !rpath) { handleMqttCommand("sessions"); break; }
+        : autoTabName(rid, rpath.split("/").filter(Boolean).pop() ?? "Session");
       typeIntoSession(rid, "/exit");
       // Wait for /exit to fully finalize (tab back at a shell prompt) before
       // relaunching, so the end-session work isn't cut short. Short initial delay
@@ -1791,7 +1825,9 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         setItermBadge(rid, rname);
         const s = hybridManager!.listSessions().find(x => x.backendSessionId === rid);
         if (s) s.name = rname;
-        setPersistentSessionName(rid, rname);
+        if (!setPersistentSessionName(rid, rname).ok) {
+          mqttPublishControl({ type: "error", message: `Name "${rname}" is held by another live session — re-homed, but the name stays with its holder.` });
+        }
         setActiveItermSessionId(rid);
         setLastRoutedSessionId(rid);
         mqttPublishControl({ type: "session_switched", name: rname, sessionId: rid });

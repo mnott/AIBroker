@@ -7,7 +7,7 @@
  * Part of Session Orchestration (Phase 1, v0.7).
  */
 
-import { runAppleScript, withSessionAppleScript } from "../adapters/iterm/core.js";
+import { _internal, withSessionAppleScript } from "../adapters/iterm/core.js";
 import { snapshotAllSessions } from "../transport/sync-facade.js";
 import { log } from "../core/log.js";
 import { timeCall } from "../core/call-timing.js";
@@ -93,7 +93,9 @@ function readSessionContentUncached(sessionId: string, lines: number): SessionCo
     'return "NOT_FOUND"',
   );
 
-  const result = timeCall("session-content:read", () => runAppleScript(script));
+  // _internal indirection, as in core.ts's own enumeration, so tests can
+  // replace the osascript call without mocking node:child_process.
+  const result = timeCall("session-content:read", () => _internal.runAppleScript(script));
   if (!result || result === "NOT_FOUND") return null;
 
   const tabIdx = result.indexOf("\t");

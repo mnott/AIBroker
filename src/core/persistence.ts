@@ -212,14 +212,66 @@ export function resetSessionNamesCache(): void {
 }
 
 /**
+ * What a claim on an already-held name found, so the caller can report it.
+ *
+ * `heldBy` is the live session id that owns the name — reported, not repaired
+ * here: only the caller knows whether its failure is worth a toast, an IPC
+ * error, or just a log line.
+ */
+export interface NameClaimResult {
+  ok: boolean;
+  heldBy?: string;
+}
+
+/**
+ * Is a store key a live session right now? Wired by the daemon at startup;
+ * "unknown" when unwired (CLI, tests) or when the enumeration has nothing to
+ * say — an empty or failed enumeration must not read as "every holder is gone".
+ *
+ *   "live"   — the id (or its aibrokerId) is in the current snapshot
+ *   "gone"   — the snapshot answered and does not contain it
+ *   "unknown" — no probe, or the enumeration came back empty/failed
+ */
+export type HolderLiveness = (key: string) => "live" | "gone" | "unknown";
+let _holderLiveness: HolderLiveness | null = null;
+
+/** Wire/unwire the liveness oracle the theft guard asks. Tests use this too. */
+export function setHolderLivenessProbe(fn: HolderLiveness | null): void {
+  _holderLiveness = fn;
+}
+
+/**
  * Persist a user-chosen name for an iTerm2 session.
  * @param itermSessionId - the raw iTerm2 session UUID (e.g. "942A4044-...")
  * @param name - the user-set name
+ *
+ * ONE NAME, ONE LIVE HOLDER. On 2026-09-26 21:07 a second iTerm tab registered
+ * over MCP under a name a live session had held since 2026-09-24; the store
+ * then mapped the name to both ids, a daemon restart bound it to the newcomer,
+ * and when that tab dropped to a shell the dispatcher probed the corpse,
+ * declared the name unreachable, and parked both daily sweeps — the real
+ * session was never tried. So a claim is refused while another LIVE session
+ * holds the name; succession requires the old holder to be verifiably gone,
+ * and a gone holder's binding is dropped rather than left to shadow the name.
+ * Unknown liveness keeps the old binding (it may still be live) and allows the
+ * write — resolution prefers the live holder either way.
  */
-export function setPersistentSessionName(itermSessionId: string, name: string): void {
+export function setPersistentSessionName(itermSessionId: string, name: string): NameClaimResult {
   const store = loadSessionNames();
+  const others = Object.entries(store).filter(([id, n]) => n === name && id !== itermSessionId);
+  if (_holderLiveness && others.length > 0) {
+    const liveHolder = others.find(([id]) => _holderLiveness!(id) === "live");
+    if (liveHolder) {
+      log(`Persisted names: refused to give "${name}" to ${itermSessionId.slice(0, 8)} — held by live session ${liveHolder[0].slice(0, 8)}`);
+      return { ok: false, heldBy: liveHolder[0] };
+    }
+    for (const [id] of others) {
+      if (_holderLiveness(id) === "gone") delete store[id];
+    }
+  }
   store[itermSessionId] = name;
   saveSessionNames();
+  return { ok: true };
 }
 
 /**
@@ -239,9 +291,18 @@ export function setPersistentSessionName(itermSessionId: string, name: string): 
  * reads identically to "every session ended", and pruning would erase every
  * name the user has ever assigned. So an empty set prunes nothing.
  *
+ * `opts.prunable` scopes WHICH keys may ever be dropped. The daemon's
+ * enumeration tick passes an iTerm-UUID test: durable-id keys (tmux
+ * @aibroker_id) survive a tmux server being down, so absence from one
+ * enumeration is not evidence about them. Keys the filter rejects are skipped
+ * entirely — no miss recorded, nothing removed.
+ *
  * Returns the number of entries removed, for the caller to log.
  */
-export function pruneSessionNames(liveIds: Iterable<string>): number {
+export function pruneSessionNames(
+  liveIds: Iterable<string>,
+  opts: { prunable?: (key: string) => boolean } = {},
+): number {
   const live = new Set(liveIds);
   if (live.size === 0) return 0;
 
@@ -265,6 +326,7 @@ export function pruneSessionNames(liveIds: Iterable<string>): number {
   let removed = 0;
 
   for (const id of Object.keys(store)) {
+    if (opts.prunable && !opts.prunable(id)) continue;
     if (live.has(id)) {
       delete misses[id];
       continue;
@@ -291,6 +353,14 @@ export function pruneSessionNames(liveIds: Iterable<string>): number {
  * is what happened.
  */
 const PRUNE_AFTER_CONSECUTIVE_MISSES = 3;
+
+/**
+ * A store key in iTerm's session-UUID shape. The daemon's enumeration tick
+ * prunes only keys that pass this: a tmux durable id (@aibroker_id) keys a
+ * name that is MEANT to outlive pane churn and server restarts, so absence
+ * from one enumeration says nothing about it.
+ */
+export const ITERM_UUID_KEY = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
 
 /**
  * Consecutive-miss counters, beside the store rather than inside it.

@@ -109,6 +109,8 @@ export function validateSessionList(raw: unknown): ValidatedSession[] {
 
 export interface ValidatedHubStatus {
   version: string;
+  status: "ok" | "degraded" | "down";
+  detail?: string;
   adapters: string[];
   activeSessions: number;
   activeSession: string | null;
@@ -120,7 +122,7 @@ export interface ValidatedHubStatus {
  */
 export function validateHubStatus(raw: unknown): ValidatedHubStatus {
   if (!isObject(raw)) {
-    return { version: "unknown", adapters: [], activeSessions: 0, activeSession: null, adapterHealth: {} };
+    return { version: "unknown", status: "down", adapters: [], activeSessions: 0, activeSession: null, adapterHealth: {} };
   }
 
   const adapters = Array.isArray(raw.adapters)
@@ -134,8 +136,14 @@ export function validateHubStatus(raw: unknown): ValidatedHubStatus {
     }
   }
 
+  const statusRaw = str(raw, "status", "ok");
+  const status = VALID_STATUSES.has(statusRaw) ? statusRaw as ValidatedHubStatus["status"] : "ok";
+  const detail = typeof raw.detail === "string" ? raw.detail : undefined;
+
   return {
     version: str(raw, "version", "unknown"),
+    status,
+    ...(detail ? { detail } : {}),
     adapters,
     activeSessions: num(raw, "activeSessions", 0),
     activeSession: typeof raw.activeSession === "string" ? raw.activeSession : null,

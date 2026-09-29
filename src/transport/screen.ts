@@ -19,6 +19,25 @@ export const SHELL_PROMPT = /[➜$%#»]\s*$/;
  */
 export const AGENT_PANEL = /^\s*(❯\s*)?⏺\s+main\b|^\s*[◯●◉]\s+\S+\s{2,}|^\s*↓\s+\d+\s+more\b|↑\/↓ to select/;
 
+/** Status-row furniture: box-drawing, the statusline glyphs, `·` separator runs. */
+const STATUS_FURNITURE = /[─│├└💎🧠🐝✳◐·]/;
+
+/**
+ * A line below the closing rule that actually looks like a shell prompt: short,
+ * bare of Claude's status furniture, and not part of the agents panel.
+ *
+ * The PAI statusline's usage row ends in a reset time (`7d: 1% → Sa. 08:00`)
+ * except right after a window rolls, when there is no suffix yet and the row
+ * ends bare `7d: 1%` — which SHELL_PROMPT matches perfectly. On 2026-09-27 both
+ * 07:00 sweep sessions were read as "at a shell" for exactly that, their tasks
+ * parked, and the day's runs silently never happened. Status rows are long and
+ * full of furniture, so they are not prompts; only a short bare line is.
+ */
+function looksLikeShellPrompt(l: string): boolean {
+  const bare = l.replace(/\s+/g, "");
+  return bare.length <= 20 && !STATUS_FURNITURE.test(l) && !AGENT_PANEL.test(l);
+}
+
 /** Collapse whitespace so wrapped and padded terminal text compares sanely. */
 export function flatten(s: string): string { return s.replace(/\s+/g, " ").trim(); }
 
@@ -54,9 +73,19 @@ export function isClaudeReady(frame: string): boolean {
   const below = lines.slice(lastRule + 1).filter((l) => !AGENT_PANEL.test(l));
   if (below.length > 8) return false;
 
-  // Belt and braces: an explicit prompt below the box means the shell has it.
-  for (const l of below) {
-    if (SHELL_PROMPT.test(l)) return false;
+  // Belt and braces: an explicit prompt below the box means the shell has it —
+  // but only a line that looks like a real prompt (see looksLikeShellPrompt),
+  // and only when the shell visibly owns the bottom of the screen: the prompt
+  // is the LAST non-empty line, with no live `❯` input row under the closing
+  // rule. A frame that still shows Claude's `❯` input box below the rule is
+  // Claude's own bottom, not a shell. (The agents panel's `❯ ⏺ main` header
+  // matches INPUT_LINE too; it is panel, not an input box, so it is excluded.)
+  const last = lines[lines.length - 1];
+  const liveInputBelow = lines
+    .slice(lastRule + 1)
+    .some((l) => INPUT_LINE.test(l) && !AGENT_PANEL.test(l));
+  if (!liveInputBelow && SHELL_PROMPT.test(last) && looksLikeShellPrompt(last)) {
+    return false;
   }
 
   return lines.some((l) => INPUT_LINE.test(l));

@@ -35,6 +35,8 @@ import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
 import { AibpBridge } from "../aibp/bridge.js";
 import { findClaudeSession } from "../adapters/iterm/core.js";
+import { reassertPersistentTitles } from "../adapters/iterm/sessions.js";
+import { ITERM_UUID_KEY, pruneSessionNames, setHolderLivenessProbe } from "../core/persistence.js";
 import { typeIntoSession, isClaudeRunningInSession, snapshotAllSessions } from "../transport/sync-facade.js";
 import { activeItermSessionId, setActiveItermSessionId, setLastRoutedSessionId } from "../core/state.js";
 import { pruneStaleContexts } from "./image-context.js";
@@ -107,6 +109,17 @@ export async function startDaemon(options?: {
   // from the same place, or they disagree and only one of them is believed.
   manager.setDiscovery(() => discoverLiveSessions().filter(isClaudeRelated));
   setHybridManager(manager);
+
+  // The name-theft guard's oracle: is a store key a session the enumeration can
+  // see? An empty/failed enumeration is "unknown", never "gone" — otherwise a
+  // hiccup would license exactly the theft this exists to refuse (2026-09-26:
+  // a second tab took a live session's name, and the parked sweeps the next
+  // morning traced back to that write).
+  setHolderLivenessProbe((key) => {
+    const snaps = snapshotAllSessions();
+    if (snaps.length === 0) return "unknown";
+    return snaps.some((s) => s.id === key || s.aibrokerId === key) ? "live" : "gone";
+  });
   router.setDefaultBackend(apiBackend);
 
   // Restore persisted state
@@ -388,6 +401,28 @@ export async function startDaemon(options?: {
       log(`todoist-mirror: reconciliation sweep every ${minutes} min (TODOIST_MIRROR_POLL_MINUTES)`);
     }
   }
+
+  // A chosen name is authority over the tab title, but Claude Code's
+  // auto-titler re-stamps the title every turn — so the daemon gets the last
+  // word, once a minute. Cheap by design: one cached enumeration plus name
+  // comparisons; writes happen only on real divergence (see
+  // reassertPersistentTitles).
+  //
+  // The same tick drops name bindings whose iTerm tab no longer exists. A
+  // binding to a closed tab serves nobody: it shadows the name, and dispatch
+  // once resolved "Jobs" to a corpse for two mornings straight (2026-09-27)
+  // while the live holder was never tried. pruneSessionNames itself refuses an
+  // empty live set and requires consecutive misses; only iTerm-UUID keys are
+  // eligible — durable-id keys outlive pane churn by design.
+  setInterval(() => {
+    reassertPersistentTitles();
+    const snaps = snapshotAllSessions();
+    const dropped = pruneSessionNames(
+      snaps.flatMap((s) => [s.id, ...(s.aibrokerId ? [s.aibrokerId] : [])]),
+      { prunable: (key) => ITERM_UUID_KEY.test(key) },
+    );
+    if (dropped > 0) log(`Name store: pruned ${dropped} binding(s) to tabs no longer enumerated`);
+  }, 60_000).unref();
 
   // Auto-discover adapters that were already running before the hub (re)started.
   // Probe well-known socket paths and register any that respond to "ping".

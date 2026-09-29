@@ -13,6 +13,7 @@
 import type { APIBackend } from "../backend/api.js";
 import { log } from "./log.js";
 import { activeItermSessionId } from "./state.js";
+import { wasLastEnumerationReliable } from "../transport/sync-facade.js";
 
 /**
  * How long one enumeration is reused for.
@@ -44,6 +45,12 @@ export interface HybridSession {
   createdAt: number;
   /** Backend-specific ID: "api-N" for API sessions, iTerm2 UUID for visual */
   backendSessionId: string;
+  /**
+   * Measured at the last discovery: a Claude process owns this tab's tty.
+   * Undefined when discovery could not measure it. Used to settle name
+   * collisions — see syncFromLive.
+   */
+  isClaude?: boolean;
 }
 
 export class HybridSessionManager {
@@ -52,7 +59,7 @@ export class HybridSessionManager {
   private readonly sessions: HybridSession[] = [];
   private _activeIndex = -1;
   private nextNum = 1;
-  private discover?: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null }>;
+  private discover?: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }>;
   /** True when the last attempt to look could not complete, so the list is last-known. */
   private lastDiscoveryFailed = false;
   /** When discovery last ran, so a burst of readers costs one enumeration. */
@@ -67,7 +74,7 @@ export class HybridSessionManager {
    * Where live sessions come from. Injected rather than imported so this stays
    * a registry rather than growing a dependency on a particular terminal.
    */
-  setDiscovery(fn: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null }>): void {
+  setDiscovery(fn: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }>): void {
     this.discover = fn;
   }
 
@@ -105,7 +112,7 @@ export class HybridSessionManager {
   }
 
   /** Register a visual (iTerm2) session. The transport creates the tab and passes the ID. */
-  registerVisualSession(name: string, cwd: string, itermSessionId: string): HybridSession {
+  registerVisualSession(name: string, cwd: string, itermSessionId: string, isClaude?: boolean): HybridSession {
     const session: HybridSession = {
       id: `h-${this.nextNum++}`,
       name,
@@ -113,6 +120,7 @@ export class HybridSessionManager {
       kind: "visual",
       createdAt: Date.now(),
       backendSessionId: itermSessionId,
+      isClaude,
     };
     this.sessions.push(session);
     this._activeIndex = this.sessions.length - 1;
@@ -195,19 +203,23 @@ export class HybridSessionManager {
     for (let i = this.sessions.length - 1; i >= 0; i--) {
       const s = this.sessions[i];
       if (s.kind === "visual" && !liveIds.has(s.backendSessionId)) {
-        this.sessions.splice(i, 1);
+        this.removeVisualAt(i);
         pruned++;
         log(`HybridManager: pruned dead visual session "${s.name}" (${s.backendSessionId.slice(0, 8)}...)`);
-        // Adjust active index
-        if (i < this._activeIndex) {
-          this._activeIndex--;
-        } else if (i === this._activeIndex) {
-          this._activeIndex = Math.min(this._activeIndex, this.sessions.length - 1);
-        }
       }
     }
     if (this.sessions.length === 0) this._activeIndex = -1;
     return pruned;
+  }
+
+  /** Drop the visual row at `i`, keeping the active index pointing at the same session. */
+  private removeVisualAt(i: number): void {
+    this.sessions.splice(i, 1);
+    if (i < this._activeIndex) {
+      this._activeIndex--;
+    } else if (i === this._activeIndex) {
+      this._activeIndex = Math.min(this._activeIndex, this.sessions.length - 1);
+    }
   }
 
   /** Update the name of a session identified by its backend ID. */
@@ -280,27 +292,58 @@ export class HybridSessionManager {
     const now = Date.now();
     if (now - this.lastSyncAt < this.coalesceMs) return;
     this.lastSyncAt = now;
-    let live: Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null }>;
+    let live: Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }>;
     try {
       live = this.discover();
-      this.lastDiscoveryFailed = false;
     } catch (e) {
       this.lastDiscoveryFailed = true;
       log(`HybridManager: discovery failed, keeping the known list — ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
+    // A failed osascript enumeration does not throw here — it returns []
+    // indistinguishable from a genuinely empty machine unless this is checked.
+    // Treating it as a real empty would prune every known session on a
+    // transient iTerm fault; see wasLastEnumerationReliable().
+    if (!wasLastEnumerationReliable()) {
+      this.lastDiscoveryFailed = true;
+      log("HybridManager: enumeration unreliable, keeping the known list");
+      return;
+    }
+    this.lastDiscoveryFailed = false;
 
     const liveIds = new Set(live.map((s) => s.id));
     this.pruneDeadVisualSessions(liveIds);
 
     const known = new Set(this.sessions.map((s) => s.backendSessionId));
-    const seen = new Set<string>();
+    // displayName -> index of the row holding it. First sighting wins UNLESS a
+    // later same-name tab is measured running Claude while the registered one
+    // is not: two tabs answering to one name must not bind it to the corpse.
+    // On 2026-09-26 a stale tab stole a live session's persisted name, the
+    // daemon restart bound the name to it, and both daily sweeps parked on the
+    // shell it became — the live holder was never registered under its name.
+    const seen = new Map<string, number>();
     const activeBefore = this.activeSession;
     for (const snap of live) {
       const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
-      if (seen.has(displayName)) continue;
-      seen.add(displayName);
-      if (!known.has(snap.id)) this.registerVisualSession(displayName, "", snap.id);
+      const held = seen.get(displayName);
+      if (held !== undefined) {
+        const holder = this.sessions[held];
+        if (snap.isClaude === true && holder?.isClaude !== true && holder?.kind === "visual") {
+          this.removeVisualAt(held);
+          this.registerVisualSession(displayName, "", snap.id, snap.isClaude);
+          seen.set(displayName, this.sessions.length - 1);
+        }
+        continue;
+      }
+      const registered = this.sessions.findIndex((s) => s.backendSessionId === snap.id);
+      if (registered >= 0) {
+        // Already in the registry (a gateway/command registration, or an earlier
+        // sync) — the row stays; only its claim on the name is recorded.
+        seen.set(displayName, registered);
+      } else {
+        this.registerVisualSession(displayName, "", snap.id, snap.isClaude);
+        seen.set(displayName, this.sessions.length - 1);
+      }
     }
     // registerVisualSession moves the selection to whatever it just added.
     // Discovery is not a selection, so put it back where the user left it —

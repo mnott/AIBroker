@@ -221,7 +221,11 @@ export function registerCoreHandlers(
       return {
         index: i + 1,
         sessionId: s.id,
-        name: s.name,
+        // A chosen name IS the session's name; the tab title (auto-titler,
+        // process string) is only what it falls back to. Raw title stays
+        // beside it so a lying display can be told from a lying name.
+        name: paiName ?? s.tabTitle ?? s.name,
+        tabTitle: s.tabTitle,
         paiName,
         atPrompt: s.atPrompt,
         // Measured first, guessed only when there is no measurement: a pane
@@ -231,7 +235,19 @@ export function registerCoreHandlers(
         active: s.id === activeItermSessionId,
       };
     });
-    return { ok: true, result: { sessions } };
+    // A failed osascript enumeration reads identically to a truly empty
+    // machine unless this says otherwise — see wasLastEnumerationReliable().
+    const enumerationFailed = !wasLastEnumerationReliable();
+    return {
+      ok: true,
+      result: {
+        sessions,
+        enumerationFailed,
+        ...(enumerationFailed
+          ? { enumerationDetail: "iTerm AppleScript enumeration failed; list may be incomplete" }
+          : {}),
+      },
+    };
   });
 
   server.on("switch", async (req) => {
@@ -304,11 +320,16 @@ export function registerCoreHandlers(
     const live = snapshotAllSessions();
     const persistentNames = getAllPersistentSessionNames();
     const activeSnap = live.find((s) => s.id === activeItermSessionId);
+    // Same reliability flag the `sessions` handler reports — the hub is only
+    // as healthy as its ability to see what is actually running.
+    const enumerationOk = wasLastEnumerationReliable();
 
     return {
       ok: true,
       result: {
         version: HUB_VERSION,
+        status: enumerationOk ? "ok" : "degraded",
+        ...(enumerationOk ? {} : { detail: "iTerm AppleScript session enumeration is failing; session list may be stale or incomplete" }),
         adapters: registry.list().map(a => a.name),
         activeSessions: live.length,
         activeSession: activeSnap
@@ -782,6 +803,19 @@ export function registerCoreHandlers(
 
     const lineCount = lines ?? 100;
 
+    // Display fields follow the same authority as the `sessions` handler: the
+    // chosen (persistent) name first, then the tab title, with the raw title
+    // kept in tabTitle. The content read reports the terminal's own process
+    // name, which is not what a human calls the session.
+    const snaps = new Map(snapshotAllSessions().map((s) => [s.id, s]));
+    const persistentNames = getAllPersistentSessionNames();
+    const display = (id: string, raw: { name: string; paiName: string | null }) => {
+      const snap = snaps.get(id);
+      const paiName = lookupPersistentName(persistentNames, id, snap?.aibrokerId) ?? raw.paiName;
+      const tabTitle = snap?.tabTitle ?? null;
+      return { name: paiName ?? tabTitle ?? raw.name, tabTitle, paiName };
+    };
+
     if (sessionId) {
       const content = readSessionContent(sessionId, lineCount);
       if (!content) return { ok: false, error: `Session ${sessionId} not found in iTerm2` };
@@ -799,6 +833,7 @@ export function registerCoreHandlers(
         result: {
           session: {
             ...content,
+            ...display(sessionId, content),
             contentHash,
             changed,
             cachedSummary: cached?.summary ?? null,
@@ -818,6 +853,7 @@ export function registerCoreHandlers(
 
       return {
         ...c,
+        ...display(c.sessionId, c),
         contentHash,
         changed,
         cachedSummary: cached?.summary ?? null,
@@ -1721,7 +1757,16 @@ export function registerCoreHandlers(
     if (req.tmuxPane) {
       const tmuxPane = req.tmuxPane;
       const durableId = aibrokerIdForPane(tmuxPane) ?? tmuxPane;
-      setPersistentSessionName(durableId, name);
+      // One name, one live holder: refused here while another live session owns
+      // it (2026-09-26 — a second tab took a live session's name, and the parked
+      // sweeps two mornings later traced back to exactly that write).
+      const claim = setPersistentSessionName(durableId, name);
+      if (!claim.ok) {
+        return {
+          ok: false,
+          error: `Name "${name}" is held by live session ${claim.heldBy?.slice(0, 8) ?? "unknown"} — release it there first (close that tab, or rename it).`,
+        };
+      }
       setSessionTitle(tmuxPane, name);
       manager.updateName(durableId, name);
 
@@ -1780,6 +1825,25 @@ export function registerCoreHandlers(
       );
     }
 
+    // One name, one live holder. The claim is checked BEFORE any surface is
+    // written: on 2026-09-26 21:07 a second tab registered a name a live session
+    // had held for days, the store then answered the name with both ids, and a
+    // daemon restart bound dispatch to the newcomer — which was at a shell by
+    // morning, so both daily sweeps parked without the real session ever being
+    // asked. Refused here, the existing holder keeps the name untouched.
+    let nameClaim: { ok: boolean; heldBy?: string } = { ok: true };
+    if (itermSessionId) {
+      nameClaim = setPersistentSessionName(itermSessionId, name);
+      if (!nameClaim.ok) {
+        log(`rename: refused — name "${name}" held by live session ${nameClaim.heldBy?.slice(0, 8)}`);
+        return {
+          ok: false,
+          error: `Name "${name}" is held by live session ${nameClaim.heldBy?.slice(0, 8) ?? "unknown"} — release it there first (close that tab, or rename it).`,
+        };
+      }
+      log(`Persisted name "${name}" for iTerm session ${itermSessionId.slice(0, 8)}`);
+    }
+
     // Update in hub's session manager
     if (itermSessionId) {
       // updateName searches by backendSessionId (iTerm2 UUID)
@@ -1787,13 +1851,6 @@ export function registerCoreHandlers(
     } else {
       const session = manager.activeSession;
       if (session) manager.updateName(session.id, name);
-    }
-
-    // Persist the user-chosen name so it survives daemon restarts and
-    // can be re-asserted after Claude Code's auto-title overwrites it.
-    if (itermSessionId) {
-      setPersistentSessionName(itermSessionId, name);
-      log(`Persisted name "${name}" for iTerm session ${itermSessionId.slice(0, 8)}`);
     }
 
     // Set iTerm2 visuals directly if we know the session

@@ -59,6 +59,7 @@ import {
   snapshotAllSessions,
 } from "../transport/sync-facade.js";
 import { log } from "../core/log.js";
+import { setPersistentSessionName } from "../core/persistence.js";
 import { statusCache } from "../core/status-cache.js";
 import { router } from "../core/router.js";
 import { deliverViaApi } from "../core/transport.js";
@@ -521,6 +522,13 @@ end tell`;
         }
 
         if (newName) {
+          // Explicit rename: persist, or the daemon's chosen-name re-assert
+          // reverts it within a minute. A refused claim (the name is held by
+          // another live session) changes nothing and says so.
+          if (!setPersistentSessionName(chosen.id, newName).ok) {
+            ctx.reply(`Name *${newName}* is held by another live session — nothing was changed.`).catch(() => {});
+            return;
+          }
           setItermSessionVar(chosen.id, newName);
           setItermTabName(chosen.id, newName);
           setItermBadge(chosen.id, newName);

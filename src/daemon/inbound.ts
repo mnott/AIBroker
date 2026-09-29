@@ -517,6 +517,8 @@ export interface DeliveryResult {
   ok: boolean;
   /** What happened, for the audit trail and the caller's 200 body. */
   detail: string;
+  /** Set when the failure is an absent owner session — queue it, don't give up. */
+  retry?: boolean;
 }
 
 /**
@@ -748,6 +750,130 @@ export async function deliverInbound(route: InboundRoute, payload: unknown): Pro
   return deliverBatch(route, [payload]);
 }
 
+/**
+ * The message-mode delivery attempt on its own: find a live pane for the
+ * owner, refuse a shell prompt, deposit and type. Split out from
+ * `deliverBatch` so the retry loop can run exactly this again later, against
+ * whatever session state exists at that later moment.
+ */
+async function attemptMessageDelivery(route: InboundRoute, body: string): Promise<DeliveryResult> {
+  const { matchSession } = await import("../core/session-match.js");
+  const { snapshotAllSessions, isClaudeSession } = await import("../transport/sync-facade.js");
+  const { getAllPersistentSessionNames, lookupPersistentName } = await import("../core/persistence.js");
+  const { depositToSessionMailbox } = await import("../core/state.js");
+
+  const snapshots = snapshotAllSessions();
+  const names = getAllPersistentSessionNames();
+  const candidates = snapshots.map((s) => ({
+    id: s.id,
+    name: lookupPersistentName(names, s.id, s.aibrokerId) ?? s.name,
+  }));
+  // Prefer a live Claude pane when the owner's name is also answered by a
+  // stale shell tab — same ranking as send_to_session.
+  const hit = matchSession([route.owner], candidates, { prefer: (s) => (isClaudeSession(s.id) ? 1 : 0) });
+  if (!hit) return { ok: false, retry: true, detail: `no live session matches owner "${route.owner}"` };
+  const target = hit.session;
+
+  // Same refusal as send_to_session: a shell would execute what a Claude
+  // prompt would merely read, and an inbound payload is the last thing that
+  // should ever reach a shell.
+  if (!isClaudeSession(target.id)) {
+    return { ok: false, detail: `session "${target.name}" is at a shell prompt, not a Claude prompt` };
+  }
+
+  depositToSessionMailbox(target.id, `inbound:${route.name}`, body);
+
+  // Typed as well as deposited, so a session sitting idle sees it now rather
+  // than at its next prompt. retries = 1 — a redelivered inbound message is
+  // a duplicate nobody can tell apart from two real events.
+  const { submitAndConfirm } = await import("./dispatch.js");
+  const ack = await submitAndConfirm(target.id, body, 15_000, undefined, 1);
+  return {
+    ok: true,
+    detail: ack === "ok"
+      ? `delivered to ${target.name}`
+      : `queued in ${target.name}'s mailbox (typing not confirmed: ${ack})`,
+  };
+}
+
+// --- retry for a session that is not there yet ----------------------------
+
+/**
+ * A batch that found no live pane for its owner, waiting for one to appear.
+ *
+ * Only the "no live session" case is queued here — a shell prompt is a
+ * deliberate refusal (see attemptMessageDelivery), not an absence, and
+ * retrying it would eventually type into a shell the moment someone opens a
+ * Claude prompt there without it being this route's owner.
+ */
+const RETRY_INTERVAL_MS = 30_000;
+const RETRY_GIVEUP_MS = 30 * 60_000;
+
+interface RetryBatch { route: InboundRoute; body: string; queuedAt: number }
+const retryQueues = new Map<string, RetryBatch[]>();
+const retryTimers = new Map<string, NodeJS.Timeout>();
+
+function queueForRetry(route: InboundRoute, body: string): void {
+  const owner = route.owner;
+  const q = retryQueues.get(owner) ?? [];
+  q.push({ route, body, queuedAt: Date.now() });
+  retryQueues.set(owner, q);
+  if (!retryTimers.has(owner)) scheduleRetry(owner);
+}
+
+function scheduleRetry(owner: string): void {
+  const timer = setTimeout(() => { void runRetry(owner); }, RETRY_INTERVAL_MS);
+  timer.unref?.();
+  retryTimers.set(owner, timer);
+}
+
+/** One attempt at the head of an owner's queue. Delivers in arrival order. */
+async function runRetry(owner: string): Promise<void> {
+  retryTimers.delete(owner);
+  const q = retryQueues.get(owner);
+  if (!q?.length) return;
+  const entry = q[0];
+  let result: DeliveryResult;
+  try {
+    result = await attemptMessageDelivery(entry.route, entry.body);
+  } catch (e) {
+    // A throwing attempt is a failed attempt, not a reason to stop retrying —
+    // an uncaught rejection here would leave this owner's queue stuck forever,
+    // since nothing downstream would reschedule the timer.
+    result = { ok: false, detail: e instanceof Error ? e.message : String(e) };
+  }
+
+  if (result.ok) {
+    q.shift();
+    audit({
+      action: "inbound", actor: `hook:${entry.route.name}`, target: `session:${owner}`,
+      outcome: "delivered", reason: result.detail,
+    });
+    log(`inbound: /hook/${entry.route.name} → ${owner}: ${result.detail} (retried)`);
+  } else if (Date.now() - entry.queuedAt > RETRY_GIVEUP_MS) {
+    q.shift();
+    audit({
+      action: "inbound", actor: `hook:${entry.route.name}`, target: `session:${owner}`,
+      outcome: "undelivered", reason: result.detail,
+    });
+    log(`inbound: /hook/${entry.route.name} → ${owner}: gave up after ${Math.round(RETRY_GIVEUP_MS / 60_000)}min — ${result.detail}`);
+  }
+  // Still absent and still within budget: left at the head of the queue, tried
+  // again next tick.
+
+  if (q.length) scheduleRetry(owner);
+  else retryQueues.delete(owner);
+}
+
+/** For tests: run one retry pass immediately, without waiting for the timer. */
+export async function __retryPendingNow(): Promise<void> {
+  for (const owner of [...retryQueues.keys()]) {
+    const t = retryTimers.get(owner);
+    if (t) { clearTimeout(t); retryTimers.delete(owner); }
+    await runRetry(owner);
+  }
+}
+
 async function deliverBatch(route: InboundRoute, payloads: unknown[]): Promise<DeliveryResult> {
   const payload = payloads[0];
   const body = composeDelivery(route, payloads);
@@ -765,39 +891,21 @@ async function deliverBatch(route: InboundRoute, payloads: unknown[]): Promise<D
       return { ok: true, detail: `filed as todoist task ${r.taskId}${grant ? "" : " (no project for owner — went to Inbox)"}` };
     }
 
-    const { matchSession } = await import("../core/session-match.js");
-    const { snapshotAllSessions, isClaudeSession } = await import("../transport/sync-facade.js");
-    const { getAllPersistentSessionNames, lookupPersistentName } = await import("../core/persistence.js");
-    const { depositToSessionMailbox } = await import("../core/state.js");
-
-    const snapshots = snapshotAllSessions();
-    const names = getAllPersistentSessionNames();
-    const candidates = snapshots.map((s) => ({
-      id: s.id,
-      name: lookupPersistentName(names, s.id, s.aibrokerId) ?? s.name,
-    }));
-    const hit = matchSession([route.owner], candidates);
-    if (!hit) return { ok: false, detail: `no live session matches owner "${route.owner}"` };
-    const target = hit.session;
-
-    // Same refusal as send_to_session: a shell would execute what a Claude
-    // prompt would merely read, and an inbound payload is the last thing that
-    // should ever reach a shell.
-    if (!isClaudeSession(target.id)) {
-      return { ok: false, detail: `session "${target.name}" is at a shell prompt, not a Claude prompt` };
+    const result = await attemptMessageDelivery(route, body);
+    if (!result.ok) {
+      // The webhook handler already audits its own "delivered"/"failed" for the
+      // immediate path; this is the entry that used to be missing entirely for
+      // a coalesced batch, whose flush is otherwise only logged. Written here,
+      // once, so both paths get it.
+      const retrying = result.retry === true;
+      audit({
+        action: "inbound", actor: `hook:${route.name}`, target: `session:${route.owner}`,
+        outcome: retrying ? "retrying" : "undelivered",
+        reason: result.detail,
+      });
+      if (retrying) queueForRetry(route, body);
     }
-
-    depositToSessionMailbox(target.id, `inbound:${route.name}`, body);
-
-    // Typed as well as deposited, so a session sitting idle sees it now rather
-    // than at its next prompt. retries = 1 — a redelivered inbound message is
-    // a duplicate nobody can tell apart from two real events.
-    const { submitAndConfirm } = await import("./dispatch.js");
-    const ack = await submitAndConfirm(target.id, body, 15_000, undefined, 1);
-    return {
-      ok: true,
-      detail: ack ? `delivered to ${target.name}` : `queued in ${target.name}'s mailbox (session busy)`,
-    };
+    return result;
   } catch (e) {
     return { ok: false, detail: e instanceof Error ? e.message : String(e) };
   }
