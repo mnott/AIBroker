@@ -20,7 +20,7 @@
  * says what it did. Everything requiring judgement stays with the person.
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, chmodSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -2054,19 +2054,18 @@ export function writeStandingRules(text: string, path = RULES_FILE): void {
 const GOAL_MAX_CHARS = 3800;
 
 /**
- * The most a LINE TYPED AT A SESSION may be, in characters — much stricter
- * than GOAL_MAX_CHARS above, and for a different reason.
+ * The most a LINE TYPED AT A SESSION may be, in characters.
  *
- * Proven from a live transcript on 2026-09-24: on Claude Code 2.1.280,
- * pasting text over roughly this length gets converted into a
- * `<pasted_content>` attachment instead of typed input, so a leading `/goal`
- * is never read as a slash command — the whole thing lands as one plain
- * message ("[Pasted text #N]"), the session answers "Noted.", and no goal is
- * set at all. A ~1,150-char line failed this way that night; a ~900-char
- * line of the same shape still typed correctly on Claude Code 2.1.267 the
- * night before. 700 leaves headroom under both observed points.
+ * Measured twice: above roughly 300 characters the prompt turns the typed
+ * `/goal` into a pasted attachment, Enter never submits it, and the text sits
+ * in the operator's input line while the log says "armed". Only a short line
+ * arms. Everything long goes to a brief file the line points at (see
+ * {@link buildGoalLine}); 250 leaves headroom under the measured point.
  */
-const GOAL_LINE_MAX_CHARS = 700;
+const GOAL_LINE_MAX_CHARS = 250;
+
+/** Where per-session briefs are written. */
+const BRIEF_DIR = join(homedir(), ".aibroker", "manage-briefs");
 
 /** `/goal` plus whichever of the given bits are non-empty, one line, no doubled spaces. */
 function assembleGoalLine(agentish: string, objective: string, rulesPointer: string, screenGrant: string): string {
@@ -2332,68 +2331,106 @@ function screenStatus(m: ManagedSession, now = Date.now()): string {
   return `screen: granted until ${at(lease.until)}, but ${describeControls(tool, now).replace(/^screen: /, "")} — renewing`;
 }
 
+/** A file-name-safe slug for a session, stable across armings. */
+export function briefSlug(m: Pick<ManagedSession, "name" | "sessionId">): string {
+  const slug = (m.name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return slug || m.sessionId.replace(/[^a-zA-Z0-9]+/g, "").slice(0, 40) || "session";
+}
+
 /**
- * The text actually typed at the session, and the fragment to look for
- * afterwards to know it landed.
- *
- * Short goal, context by reference — and, since GOAL_LINE_MAX_CHARS, always
- * a pointer to the rules rather than the rules themselves: inlining a real
- * standing-rules paragraph cannot fit a 700-char paste-safe budget anyway, so
- * there is no case left where trying the longer composeGoal() inline form
- * first would help.
+ * The line typed at the session: `/goal` plus a pointer to the brief, plus as
+ * much of the objective's first words as fits. Never longer than `max`.
  */
-function goalText(m: ManagedSession): { text: string; fragment: string } {
-  const extra = m.pending.length ? ` OPERATOR, since you were last armed: ${m.pending.join(" ")}` : "";
-  // The screen rule has to ride along with EVERY arming. Delivered once, it
-  // lasts only until the session next reads a goal — and the goal is what tells
-  // it what to do. So a standing rule that is not in the goal is a rule with a
-  // lifetime of one turn, and the next arming would send it back to clicking.
-  //
-  // The positive case has to ride along too, and for a sharper reason. Silence
-  // about the screen is not neutral: a session that has been careful with the
-  // operator's machine all night reads it as permission having quietly ended,
-  // and one of them announced it had handed the controls back while the grant
-  // on disk still had two hours on it. Saying the expiry out loud, every time,
-  // is what stops a session inventing one.
-  //
-  // `rules clear` is the operator saying objectives now carry only themselves,
-  // so the screen guidance goes with the rest of the standing prose and only
-  // the expiry rides along. The prohibition below is NOT shortened with it: a
-  // goal template that hands the screen over says nothing about the case where
-  // the screen is withheld, so that guidance exists nowhere else.
+export function buildGoalLine(briefPath: string, objective: string, max = GOAL_LINE_MAX_CHARS): string {
+  const head = `/goal Follow ${briefPath} until done`;
+  const room = max - head.length - 2;
+  const words = oneLine(objective);
+  return room >= 20 && words ? `${head}: ${truncateAtWord(words, room)}` : head;
+}
+
+/** Everything that does not fit on the typed line, as the file it points to. */
+export function buildBrief(parts: {
+  objective: string;
+  agentish: string;
+  rulesSource: string;
+  shiftRules: string;
+  hands: string;
+  pending: string[];
+}): string {
+  const sections: string[] = [];
+  if (parts.agentish) sections.push(`## Message format between agents\n\n${parts.agentish}`);
+  sections.push(`## Objective\n\n${parts.objective}`);
+  if (parts.shiftRules) sections.push(`## Shift rules\n\n${parts.shiftRules}`);
+  if (parts.rulesSource) {
+    sections.push(`## Standing rules\n\nFIRST, before anything else: read ${parts.rulesSource} and follow every rule in it for the whole of this work — they are not optional and they are not summarised here.`);
+  }
+  if (parts.hands.trim()) sections.push(`## Screen\n\n${parts.hands.trim()}`);
+  if (parts.pending.length) {
+    sections.push(`## Operator notes since you were last armed\n\n${parts.pending.map((p) => `- ${p}`).join("\n")}`);
+  }
+  return `${sections.join("\n\n")}\n`;
+}
+
+/**
+ * The line typed at the session, after rewriting its brief file (0600).
+ *
+ * Rewritten on every arming so standing rules, shift state, the screen grant
+ * and pending operator notes are always current; pending notes are consumed
+ * into the brief, not the line.
+ */
+function goalText(m: ManagedSession): { text: string } {
   const rules = readStandingRules();
+  // The screen rule rides along with EVERY arming: delivered once it lasts
+  // only until the session next reads a goal, and silence about the screen is
+  // read as permission having quietly ended. Now it lives in the brief.
   const hands = m.noScreen
-    ? " THE OPERATOR HAS THE SCREEN: do no screen or pointer work at all, and do not ask for it. Everything else continues as normal. Where something would need checking on screen, write down what would need checking instead of checking it."
+    ? "THE OPERATOR HAS THE SCREEN: do no screen or pointer work at all, and do not ask for it. Everything else continues as normal. Where something would need checking on screen, write down what would need checking instead of checking it."
     : (() => {
         const lease = screenLease(m, Date.now());
         return lease ? screenGrantedClause(lease.until, !rules) : "";
       })();
-  // AG2 goes first, ahead of the objective and the standing rules, on every
-  // arming — not once at setup. A managed session works unattended for hours
-  // and a reminder given only at the start does not survive a compaction or a
-  // `/clear`. What a managed session sends the operator, and what it commits
-  // to git, stays prose either way — AG2 is only how agents talk to agents.
-  const rulesPointer = rules
-    ? `FIRST, before anything else: read ${standingRulesSource()} and follow every rule in it for the whole of this work — they are not optional and they are not summarised here.`
-    : "";
-  const fit = fitGoal(
-    { objective: `${m.objective}${extra}`, agentish: AG2_SPEC, rulesPointer, screenGrant: hands },
-    GOAL_LINE_MAX_CHARS,
+  const shift = shiftObjective();
+  const path = join(BRIEF_DIR, `${briefSlug(m)}.md`);
+  mkdirSync(BRIEF_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path,
+    buildBrief({
+      objective: m.objective,
+      agentish: AG2_SPEC,
+      rulesSource: rules ? standingRulesSource() : "",
+      shiftRules: m.shift && m.objective !== shift ? shift : "",
+      hands,
+      pending: m.pending,
+    }),
+    { mode: 0o600 },
   );
-  return { text: fit.line, fragment: fit.objective.slice(0, 40) };
+  chmodSync(path, 0o600);
+  return { text: buildGoalLine(foldHome(path), m.objective) };
 }
 
 /**
- * Did it land? Look for the goal's own words in the transcript.
+ * Did it arm? Within a bounded wait the pane must show the goal marker with an
+ * empty input line. If our own line is still sitting in the input, it is
+ * cleared — never left in the operator's prompt — and the arm counts as failed.
  *
- * NOT "did the content change" — that was the first version and it could not
- * tell a goal that arrived from text stranded unsubmitted in the input line,
- * which is the exact failure it existed to catch. A session prints for a dozen
- * reasons; only the item's own words say the item is there.
+ * Text is not proof of a landing (a stranded line shows up in the transcript
+ * area too, which is what the earlier fragment check could not tell apart).
  */
-function seenInContent(content: string | undefined, fragment: string): boolean {
-  if (!content) return false;
-  return content.replace(/\s+/g, "").includes(fragment.replace(/\s+/g, ""));
+export async function confirmArmed(
+  typed: string,
+  deps: { readPane: () => string; sleep: (ms: number) => Promise<void>; clearInput: () => void },
+  waits = 5,
+  waitMs = 2_000,
+): Promise<boolean> {
+  let unsent: string | null = null;
+  for (let i = 0; i < waits; i++) {
+    await deps.sleep(waitMs);
+    const pane = deps.readPane();
+    unsent = promptUnsentText(pane);
+    if (GOAL_ACTIVE.test(pane) && !unsent) return true;
+  }
+  if (unsent && typedLineMatches(unsent, typed)) deps.clearInput();
+  return false;
 }
 
 function readPane(sessionId: string, opts: { fresh?: boolean } = {}): string {
@@ -2409,7 +2446,7 @@ async function sleep(ms: number): Promise<void> {
 }
 
 async function arm(m: ManagedSession, reason: string): Promise<boolean> {
-  const { text, fragment } = goalText(m);
+  const { text } = goalText(m);
 
   /**
    * NEVER TYPE A GOAL INTO A BARE SHELL.
@@ -2520,23 +2557,21 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   sendEnterKey(m.sessionId);
 
   // Typed is not sent, and sent is not received.
-  for (let i = 0; i < 5; i++) {
-    await sleep(2_000);
-    if (seenInContent(readPane(m.sessionId, { fresh: true }), fragment)) {
-      m.lastRearmAt = Date.now();
-      const carried = m.pending.length;
-      m.pending = [];
-      armingsSinceReport.set(m.sessionId, (armingsSinceReport.get(m.sessionId) ?? 0) + 1);
-      // The read-back above already confirmed the line held exactly what was
-      // typed before CR ever went out, so there is nothing left here to weld
-      // a goal onto — unlike before any of this guard existed, this note
-      // never has an "input line held X" case left to report.
-      note(m, `armed: ${reason}${carried ? ` (carrying ${carried} operator instruction${carried > 1 ? "s" : ""})` : ""}`);
-      return true;
-    }
+  const landed = await confirmArmed(text, {
+    readPane: () => readPane(m.sessionId, { fresh: true }),
+    sleep,
+    clearInput: () => sendControlU(m.sessionId),
+  });
+  if (landed) {
+    m.lastRearmAt = Date.now();
+    const carried = m.pending.length;
+    m.pending = [];
+    armingsSinceReport.set(m.sessionId, (armingsSinceReport.get(m.sessionId) ?? 0) + 1);
+    note(m, `armed: ${reason}${carried ? ` (carrying ${carried} operator instruction${carried > 1 ? "s" : ""})` : ""}`);
+    return true;
   }
 
-  notify(m, `typed but the objective's own words never appeared — treating as NOT armed (${reason})`);
+  notify(m, `typed but the goal never took (no active marker, or the line stayed in the input) — input cleared, treating as NOT armed (${reason})`);
   return false;
 }
 
@@ -3478,6 +3513,9 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `manage — keep a session working on a standing objective.\n\n` +
         `  <objective>   start managing, or once running, an instruction carried\n` +
         `                into the next arming ("do the tests before the docs")\n` +
+        `  start <text>  start managing, or REPLACE the objective when already managed\n` +
+        `  instruct <text>\n` +
+        `                a one-shot note for the next arming (same as plain text)\n` +
         `  status        what the session looks like right now, and what the\n` +
         `                manager has done. Also: state, what, info, show\n` +
         `  hands off     the operator needs the screen: stops visual work at once,\n` +
@@ -3618,8 +3656,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
 
     const { hours, visual, workers } = parseShift(rest);
     const until = Date.now() + hours * 3_600_000;
-    existing.objective = shiftObjective();
-    existing.pending = [];
+    if (!existing.objective.trim()) existing.objective = shiftObjective();
     existing.paused = false;
     existing.noScreen = !visual;
     existing.handsUntil = until;
@@ -3654,7 +3691,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
         `${name} is on shift for ${hours} hour(s), until ${ends}.\n` +
         `  ${visual ? "The screen is its own until then, and reverts by itself." : "No screen work — the operator has the machine."}\n` +
         screenLine +
-        `  Objective set to the tracker's open issues; the standing rules ride along with every arming.\n` +
+        `  ${existing.objective === shiftObjective() ? "Objective set to the tracker's open issues" : "Objective kept, the shift's issue-work rules go in the brief"}; the standing rules ride along with every arming.\n` +
         (workers > 1
           ? `  Asked for ${workers} workers. Only one runs today — worktrees and the claim protocol are designed but not built, and a second worker without them would share a checkout with the first.\n`
           : "") +
@@ -3725,7 +3762,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
    * rather than misleading once. That is the difference between an objective
    * and a message, and it is why this needs its own verb.
    */
-  const setMatch = arg.match(/^(?:set|objective|replace)\s+([\s\S]+)$/i);
+  const setMatch = arg.match(/^(?:set|objective|replace|start)\s+([\s\S]+)$/i);
   if (setMatch && existing) {
     const before = existing.objective;
     existing.objective = setMatch[1].trim();
@@ -4023,10 +4060,11 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
       };
     }
 
+    const objective = arg.match(/^start\s+([\s\S]+)$/i)?.[1].trim() ?? arg;
     const m: ManagedSession = {
       sessionId,
       name,
-      objective: arg,
+      objective,
       pending: [],
       history: [],
       // Give the session the benefit of the grace period rather than arming
@@ -4048,7 +4086,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
     return {
       ok: true,
       managed: true,
-      message: `managing ${name}. It will be re-armed with this objective whenever it stops:\n  ${arg}`,
+      message: `managing ${name}. It will be re-armed with this objective whenever it stops:\n  ${objective}`,
     };
   }
 
@@ -4058,8 +4096,9 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
     return { ok: true, managed: true, message: `${name} will be armed on the next tick` };
   }
 
-  existing.pending.push(arg);
-  note(existing, `operator: ${arg.slice(0, 80)}`);
+  const instruction = arg.match(/^instruct\s+([\s\S]+)$/i)?.[1].trim() ?? arg;
+  existing.pending.push(instruction);
+  note(existing, `operator: ${instruction.slice(0, 80)}`);
   saveState(state);
   return {
     ok: true,
