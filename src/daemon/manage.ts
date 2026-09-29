@@ -2653,39 +2653,8 @@ function beat(): void {
 const DIALOG_EVERY_TICKS = 3;
 let tickCount = 0;
 
-/** A failure must last this long, continuously, before the operator is paged. */
-export const ENUMERATION_ALERT_AFTER_MS = 120_000;
-
-export interface EnumerationEpisode {
-  /** When the current failure episode began; null while reliable. */
-  since: number | null;
-  /** Whether an alert went out for this episode. */
-  alerted: boolean;
-}
-
-/**
- * Pure decision for one tick: a transient failure (an osascript hitting the
- * LaunchServices window) clears within a tick or two and must not page anyone;
- * only a sustained one alerts, once, and only that one earns a recovery line.
- */
-export function enumerationStep(
-  ep: EnumerationEpisode,
-  now: number,
-  reliable: boolean,
-): { ep: EnumerationEpisode; action: "none" | "alert" | "recovered"; downMs: number } {
-  if (reliable) {
-    const downMs = ep.since === null ? 0 : now - ep.since;
-    return { ep: { since: null, alerted: false }, action: ep.alerted ? "recovered" : "none", downMs };
-  }
-  const since = ep.since ?? now;
-  const downMs = now - since;
-  if (!ep.alerted && downMs >= ENUMERATION_ALERT_AFTER_MS) {
-    return { ep: { since, alerted: true }, action: "alert", downMs };
-  }
-  return { ep: { since, alerted: ep.alerted }, action: "none", downMs };
-}
-
-let enumerationEpisode: EnumerationEpisode = { since: null, alerted: false };
+/** When the current iTerm enumeration failure began; null while reliable. Logged, never alerted. */
+let enumerationDownSince: number | null = null;
 
 function answerBlockingDialogs(): void {
   if (Object.keys(state).length === 0) return;
@@ -2714,23 +2683,13 @@ async function tick(): Promise<void> {
   // failure this exists to catch. Reuses the flag every `sessions`/`status`
   // caller already sets; no separate probe.
   const reliable = wasLastEnumerationReliable();
-  if (!reliable && enumerationEpisode.since === null) log("[manage] iTerm enumeration unreliable — episode started, alerting only if it lasts");
-  const step = enumerationStep(enumerationEpisode, now, reliable);
-  enumerationEpisode = step.ep;
-  if (step.action === "alert") {
-    let text = "iTerm session enumeration is failing (AppleScript errors) for over 2 minutes — the session list may be empty or stale until this clears.";
+  if (!reliable && enumerationDownSince === null) {
+    enumerationDownSince = now;
     const impostors = findItermBundleIdImpostors();
-    if (impostors.length) {
-      const named = impostors.map((i) => `pid ${i.pid} (${i.executablePath})`).join(", ");
-      text += ` Found ${named} registered under iTerm's bundle id — a process spawned with iTerm's __CFBundleIdentifier; killing it restores enumeration.`;
-    }
-    alertOperator(text);
-    log(`[manage] iTerm enumeration unreliable — alerted the operator${impostors.length ? ` (impostors: ${impostors.map((i) => i.pid).join(", ")})` : ""}`);
-  } else if (step.action === "recovered") {
-    alertOperator(`iTerm session enumeration recovered after ${Math.round(step.downMs / 1000)}s.`);
-    log("[manage] iTerm enumeration recovered — alerted the operator");
-  } else if (reliable && step.downMs > 0) {
-    log(`[manage] iTerm enumeration recovered after ${Math.round(step.downMs / 1000)}s — no alert sent`);
+    log(`[manage] iTerm enumeration unreliable — episode started${impostors.length ? ` (impostors: ${impostors.map((i) => i.pid).join(", ")})` : ""}`);
+  } else if (reliable && enumerationDownSince !== null) {
+    log(`[manage] iTerm enumeration recovered after ${Math.round((now - enumerationDownSince) / 1000)}s`);
+    enumerationDownSince = null;
   }
 
   if (++tickCount % DIALOG_EVERY_TICKS === 0) {

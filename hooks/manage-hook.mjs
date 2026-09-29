@@ -194,7 +194,10 @@ async function notify(body) {
   // part that answers "what is going on".
   const [head, ...tail] = body.split("\n");
   const script = `display notification "${esc(tail.join(" · ").slice(0, 240))}" with title "manage" subtitle "${esc(head.slice(0, 100))}"`;
-  await new Promise((res) => execFile("/usr/bin/osascript", ["-e", script], () => res()));
+  // The hook inherits iTerm's __CFBundleIdentifier through the session's shell; an osascript child that
+  // keeps it registers as iTerm2 (an impostor) while it runs and breaks iTerm scripting.
+  const { __CFBundleIdentifier: _drop, ...env } = process.env;
+  await new Promise((res) => execFile("/usr/bin/osascript", ["-e", script], { env }, () => res()));
 }
 
 await notify(text);

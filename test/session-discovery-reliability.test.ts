@@ -19,10 +19,10 @@ const row = (id: string, proc: string, tty: string, title: string) =>
   [id, proc, tty, title].join("\t");
 
 function stubEnumeration(lines: string[] | null) {
-  const original = _internal.runAppleScript;
-  _internal.runAppleScript = (script: string) =>
+  const original = _internal.runItermJxa;
+  _internal.runItermJxa = (script: string) =>
     script.includes("tab.title") ? (lines ? lines.join("\n") : null) : null;
-  return { restore: () => { _internal.runAppleScript = original; } };
+  return { restore: () => { _internal.runItermJxa = original; } };
 }
 
 test("a failed enumeration replays the last good list instead of []", () => {

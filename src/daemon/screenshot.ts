@@ -14,10 +14,10 @@ import { join } from "node:path";
 import { spawnSync, execSync } from "node:child_process";
 
 import {
-  runAppleScript,
+  runItermJxa,
   stripItermPrefix,
   snapshotAllSessions,
-  withSessionAppleScript,
+  withSessionJxa,
 } from "../adapters/iterm/core.js";
 import { listClaudeSessions } from "../adapters/iterm/sessions.js";
 import { snapshotAllSessions as snapshotAllTransportSessions, routeToTmux, captureSession } from "../transport/sync-facade.js";
@@ -41,25 +41,7 @@ function getActiveSessionContent(): string | null {
   );
   if (!itermId) return null;
 
-  const result = spawnSync("osascript", [], {
-    input: `tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if id of s is "${itermId}" then
-          return contents of s
-        end if
-      end repeat
-    end repeat
-  end repeat
-  return ""
-end tell`,
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: 10_000,
-  });
-
-  if (result.status !== 0 || result.signal) return null;
-  const stdout = result.stdout?.toString().trim() ?? "";
+  const stdout = runItermJxa(withSessionJxa(itermId, "          return aSession.contents();"), 10_000) ?? "";
   return stdout || null;
 }
 
@@ -123,27 +105,8 @@ async function handleTextScreenshot(ctx: CommandContext): Promise<void> {
     }
 
     for (const candidate of candidates) {
-      const script = `tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if id of s is "${candidate.id}" then
-          return contents of s
-        end if
-      end repeat
-    end repeat
-  end repeat
-  return "::NOT_FOUND::"
-end tell`;
-
-      const result = spawnSync("osascript", [], {
-        input: script,
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: 10_000,
-      });
-
-      const stdout = result.stdout?.toString().trim() ?? "";
-      if (result.signal === "SIGTERM" || result.status !== 0 || stdout === "::NOT_FOUND::" || stdout === "") continue;
+      const stdout = runItermJxa(withSessionJxa(candidate.id, "          return aSession.contents();", '"::NOT_FOUND::"'), 10_000) ?? "";
+      if (stdout === "::NOT_FOUND::" || stdout === "") continue;
 
       lastScreenshotContent = stdout;
 
@@ -182,12 +145,10 @@ end tell`;
  * the headless capture below. Returns "" if the session cannot be found.
  */
 function resolveWindowIdForSession(sessionId: string): string {
-  const script = withSessionAppleScript(
+  const result = runItermJxa(withSessionJxa(
     sessionId,
-    `          select aTab\n          return (id of aWindow as text)`,
-    'return ""',
-  );
-  const result = runAppleScript(script);
+    `          aTab.select();\n          return String(aWindow.id());`,
+  ));
   return result?.trim() ?? "";
 }
 
@@ -330,7 +291,7 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
 
     if (!windowId) {
       // Fallback: use frontmost window
-      const fb = runAppleScript(`tell application "iTerm2" to return (id of window 1 as text)`) ?? "";
+      const fb = runItermJxa("return String(app.windows()[0].id());") ?? "";
       windowId = fb.trim();
     }
 

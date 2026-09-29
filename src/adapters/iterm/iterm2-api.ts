@@ -18,6 +18,7 @@ import { createConnection } from "node:net";
 import http from "node:http";
 
 import { log } from "../../core/log.js";
+import { runItermJxa } from "./core.js";
 
 // ── Minimal protobuf encoder (hand-rolled for the specific messages we need) ──
 
@@ -164,10 +165,8 @@ function findTabIdForSession(buf: Buffer, targetSessionId: string): string | nul
 
 function getCookieAndKey(): { cookie: string; key: string } | null {
   try {
-    const result = execSync(
-      `osascript -e 'tell application "iTerm2" to request cookie and key for app named "AIBroker"'`,
-      { timeout: 5000, encoding: "utf-8" },
-    ).trim();
+    const result = runItermJxa(`  return app.requestCookie({ andKeyForAppNamed: "AIBroker" });`, 5_000)?.trim();
+    if (!result) return null;
     const [cookie, key] = result.split(" ");
     if (!cookie || !key) return null;
     return { cookie, key };

@@ -23,9 +23,9 @@ import { _internal } from "../src/adapters/iterm/core.js";
 import { createClaudeSession, createTerminalTab } from "../src/adapters/iterm/sessions.js";
 
 function stubAppleScript(result: string | null) {
-  const original = _internal.runAppleScript;
-  _internal.runAppleScript = () => result;
-  return () => { _internal.runAppleScript = original; };
+  const original = _internal.runItermJxa;
+  _internal.runItermJxa = () => result;
+  return () => { _internal.runItermJxa = original; };
 }
 
 test("createClaudeSession refuses a target that was not at a shell prompt", () => {

@@ -13,16 +13,13 @@ import { log } from "../core/log.js";
 import {
   isClaudeRunningInSession,
   pasteTextIntoSession,
-  runAppleScript,
+  runItermJxa,
   snapshotAllSessions,
   typeIntoSession,
-  withSessionAppleScript,
+  withSessionJxa,
 } from "../adapters/iterm/core.js";
 import type { LaunchOptions, LaunchResult, ManagedSession, SendOptions, SessionTransport, TransportKind } from "./session-transport.js";
 
-function escapeForAppleScript(s: string): string {
-  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
 
 const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
@@ -38,7 +35,7 @@ export class ItermTransport implements SessionTransport {
   readonly kind: TransportKind = "iterm";
 
   isAvailable(): boolean {
-    const out = runAppleScript('tell application "iTerm2" to count windows');
+    const out = runItermJxa('return String(app.windows().length);');
     return out != null && /^\d+$/.test(out.trim());
   }
 
@@ -63,8 +60,7 @@ export class ItermTransport implements SessionTransport {
   }
 
   capture(id: string): string | null {
-    const script = withSessionAppleScript(id, "          return (text of aSession)", 'return ""');
-    return runAppleScript(script);
+    return runItermJxa(withSessionJxa(id, "          return aSession.text();"));
   }
 
   isBusy(id: string): boolean {
@@ -72,29 +68,25 @@ export class ItermTransport implements SessionTransport {
   }
 
   setTitle(id: string, title: string): boolean {
-    const script = withSessionAppleScript(
+    const script = withSessionJxa(
       id,
-      `          set name of aSession to "${escapeForAppleScript(title)}"\n          return "ok"`,
-      'return "not_found"'
+      `          aSession.name = ${JSON.stringify(title)};\n          return "ok";`,
+      '"not_found"',
     );
-    const ok = runAppleScript(script) === "ok";
+    const ok = runItermJxa(script) === "ok";
     if (!ok) log(`iterm setTitle: failed for ${id}`);
     return ok;
   }
 
   launch(opts: LaunchOptions): LaunchResult | null {
+    // Same literal rules as the AppleScript it replaces: only `"` is escaped, so `\\\\n` in the line reaches the shell as `\\n`.
     const esc = itermLaunchLine(opts).replace(/"/g, '\\"');
-    const id = runAppleScript(`tell application "iTerm2"
-  activate
-  if (count of windows) = 0 then create window with default profile
-  tell current window
-    set newTab to (create tab with default profile)
-    tell current session of newTab
-      write text "${esc}"
-      return id of it
-    end tell
-  end tell
-end tell`);
+    const id = runItermJxa(`  app.activate();
+  if (app.windows().length === 0) app.createWindowWithDefaultProfile();
+  var newTab = app.currentWindow().createTabWithDefaultProfile();
+  var session = newTab.currentSession();
+  session.write({ text: "${esc}" });
+  return session.id();`);
     if (!id) return null;
     return { id: id.trim(), transport: this.kind, where: "new iTerm2 tab" };
   }

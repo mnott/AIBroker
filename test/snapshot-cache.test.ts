@@ -18,10 +18,10 @@ import { snapshotAllSessions, invalidateSnapshotCache, wasLastSnapshotReliable, 
 const APPLESCRIPT_OUTPUT = ["session-1", "claude (node)", "/dev/ttys001", "My Session"].join("\t");
 
 function stubAppleScript() {
-  const original = _internal.runAppleScript;
+  const original = _internal.runItermJxa;
   let calls = 0;
-  _internal.runAppleScript = (..._args: Parameters<typeof original>) => { calls++; return APPLESCRIPT_OUTPUT; };
-  return { calls: () => calls, restore: () => { _internal.runAppleScript = original; } };
+  _internal.runItermJxa = (..._args: Parameters<typeof original>) => { calls++; return APPLESCRIPT_OUTPUT; };
+  return { calls: () => calls, restore: () => { _internal.runItermJxa = original; } };
 }
 
 test("N back-to-back calls within the TTL cost exactly one enumeration", () => {
@@ -70,29 +70,29 @@ test("invalidateSnapshotCache() forces the next call to re-enumerate", () => {
 // project has no live session" and launched one into a live Claude pane.
 
 test("a null osascript result is reported as an unreliable enumeration", () => {
-  const original = _internal.runAppleScript;
-  _internal.runAppleScript = () => null;
+  const original = _internal.runItermJxa;
+  _internal.runItermJxa = () => null;
   try {
     invalidateSnapshotCache();
     const sessions = snapshotAllSessions({ fresh: true });
     assert.deepEqual(sessions, []);
     assert.equal(wasLastSnapshotReliable(), false);
   } finally {
-    _internal.runAppleScript = original;
+    _internal.runItermJxa = original;
   }
 });
 
 test("a genuine answer (even an empty session list) is reported as reliable", () => {
-  const original = _internal.runAppleScript;
+  const original = _internal.runItermJxa;
   // Truthy but parses to zero sessions — distinct from osascript's own failure
   // sentinel (`null`), which is what "unreliable" must actually mean here.
-  _internal.runAppleScript = () => " ";
+  _internal.runItermJxa = () => " ";
   try {
     invalidateSnapshotCache();
     const sessions = snapshotAllSessions({ fresh: true });
     assert.deepEqual(sessions, []);
     assert.equal(wasLastSnapshotReliable(), true);
   } finally {
-    _internal.runAppleScript = original;
+    _internal.runItermJxa = original;
   }
 });

@@ -243,7 +243,7 @@ export function registerCoreHandlers(
     const enumerationFailed = !wasLastEnumerationReliable();
     let enumerationDetail: string | undefined;
     if (enumerationFailed) {
-      enumerationDetail = "iTerm AppleScript enumeration failed; list may be incomplete";
+      enumerationDetail = "iTerm enumeration failed; list may be incomplete";
       const impostors = findItermBundleIdImpostors();
       if (impostors.length) {
         enumerationDetail += ` — found ${impostors.map((i) => `pid ${i.pid} (${i.executablePath})`).join(", ")} registered under iTerm's bundle id`;

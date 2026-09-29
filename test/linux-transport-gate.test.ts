@@ -37,9 +37,9 @@ test("AIBROKER_TRANSPORT overrides the platform default, case-insensitively", ()
 test("with tmux forced, iTerm enumeration never runs osascript and is reliable, not degraded", () => {
   const prev = process.env.AIBROKER_TRANSPORT;
   process.env.AIBROKER_TRANSPORT = "tmux";
-  const original = core._internal.runAppleScript;
+  const original = core._internal.runItermJxa;
   let calls = 0;
-  core._internal.runAppleScript = () => { calls++; return null; };
+  core._internal.runItermJxa = () => { calls++; return null; };
   try {
     core.invalidateSnapshotCache();
     assert.deepEqual(core.snapshotAllSessions({ fresh: true }), []);
@@ -48,7 +48,7 @@ test("with tmux forced, iTerm enumeration never runs osascript and is reliable, 
     assert.deepEqual(core.findItermBundleIdImpostors(), []);
     assert.equal(calls, 0);
   } finally {
-    core._internal.runAppleScript = original;
+    core._internal.runItermJxa = original;
     if (prev === undefined) delete process.env.AIBROKER_TRANSPORT; else process.env.AIBROKER_TRANSPORT = prev;
     core.invalidateSnapshotCache();
   }

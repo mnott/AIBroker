@@ -84,8 +84,9 @@ export type {
 // ── Adapters > iTerm2 ──
 export {
   runAppleScript,
+  runItermJxa,
   stripItermPrefix,
-  withSessionAppleScript,
+  withSessionJxa,
   sendKeystrokeToSession,
   sendEscapeSequenceToSession,
   findClaudeSession,

@@ -68,10 +68,10 @@ function wireProbeFromSnapshots() {
 
 /** Stub osascript: the enumeration query vs anything else. */
 function stubEnumeration(lines: string[]) {
-  const original = _internal.runAppleScript;
-  _internal.runAppleScript = (script: string) =>
+  const original = _internal.runItermJxa;
+  _internal.runItermJxa = (script: string) =>
     script.includes("tab.title") ? lines.join("\n") : null;
-  return { restore: () => { _internal.runAppleScript = original; } };
+  return { restore: () => { _internal.runItermJxa = original; } };
 }
 
 /** One enumeration row: id, process name, tty, tab title. */

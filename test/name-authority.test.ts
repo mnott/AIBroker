@@ -39,13 +39,13 @@ function registerAndCapture(): Map<string, IpcHandler> {
 
 /** Stub osascript: snapshot enumeration vs per-session content reads. */
 function stubAppleScript(snapshotLines: string[], contentLine: string) {
-  const original = _internal.runAppleScript;
-  _internal.runAppleScript = (script: string) => {
+  const original = _internal.runItermJxa;
+  _internal.runItermJxa = (script: string) => {
     if (script.includes("tab.title")) return snapshotLines.join("\n");
-    if (script.includes("contents of aSession")) return contentLine;
+    if (script.includes("aSession.contents()")) return contentLine;
     return null;
   };
-  return { restore: () => { _internal.runAppleScript = original; } };
+  return { restore: () => { _internal.runItermJxa = original; } };
 }
 
 // ── display surfaces: the chosen name is the session's name ────────────────

@@ -28,6 +28,7 @@ import { z } from "zod";
 delete process.env.__CFBundleIdentifier;
 
 import { execSync } from "node:child_process";
+import { runItermJxa } from "../adapters/iterm/core.js";
 import { missingIssueLink } from "./issue-links.js";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -117,22 +118,12 @@ function detectSessionId(): string | undefined {
 
     // 3. Ask iTerm which session owns this TTY
     // Use multiple -e flags since osascript doesn't handle \n in single -e strings
-    const result = execSync(
-      `osascript` +
-      ` -e 'tell application "iTerm2"'` +
-      ` -e '  repeat with w in windows'` +
-      ` -e '    repeat with t in tabs of w'` +
-      ` -e '      repeat with s in sessions of t'` +
-      ` -e '        if tty of s is "${tty}" then'` +
-      ` -e '          return id of s'` +
-      ` -e '        end if'` +
-      ` -e '      end repeat'` +
-      ` -e '    end repeat'` +
-      ` -e '  end repeat'` +
-      ` -e '  return ""'` +
-      ` -e 'end tell'`,
-      { encoding: "utf-8", timeout: 3000 },
-    ).trim();
+    const result = runItermJxa(`  var tty = ${JSON.stringify(tty)};
+  var found = "";
+  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+    if (!found && s.tty() === tty) found = s.id();
+  }); }); });
+  return found;`, 3_000)?.trim();
     return result || undefined;
   } catch {
     return undefined;

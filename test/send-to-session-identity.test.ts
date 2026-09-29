@@ -64,9 +64,9 @@ function req(fields: Partial<IpcRequest>): IpcRequest {
 test("A: an unreliable/empty enumeration retries and then queues by the persisted name, not \"not found\"", async () => {
   setPersistentSessionName("session-live-1", "AIBroker");
   invalidateSnapshotCache();
-  const original = _internal.runAppleScript;
+  const original = _internal.runItermJxa;
   // Every enumeration in this test fails — retries never see a live session.
-  _internal.runAppleScript = () => null;
+  _internal.runItermJxa = () => null;
   try {
     const handlers = registerAndCapture();
     const send = handlers.get("send_to_session")!;
@@ -81,7 +81,7 @@ test("A: an unreliable/empty enumeration retries and then queues by the persiste
     assert.equal(mailbox.length, 1);
     assert.equal(mailbox[0].content, "hello");
   } finally {
-    _internal.runAppleScript = original;
+    _internal.runItermJxa = original;
     invalidateSnapshotCache();
   }
 });
@@ -89,8 +89,8 @@ test("A: an unreliable/empty enumeration retries and then queues by the persiste
 test("A: a RELIABLE enumeration that genuinely has no match still reports \"not found\"", async () => {
   // The fix must not paper over a real absence — only an unreliable answer.
   invalidateSnapshotCache();
-  const original = _internal.runAppleScript;
-  _internal.runAppleScript = () => APPLESCRIPT_ONE_LIVE_SESSION; // answers, just has nobody named this
+  const original = _internal.runItermJxa;
+  _internal.runItermJxa = () => APPLESCRIPT_ONE_LIVE_SESSION; // answers, just has nobody named this
   try {
     const handlers = registerAndCapture();
     const send = handlers.get("send_to_session")!;
@@ -98,7 +98,7 @@ test("A: a RELIABLE enumeration that genuinely has no match still reports \"not 
     assert.equal(r.ok, false);
     assert.match((r as { ok: false; error: string }).error, /not found/);
   } finally {
-    _internal.runAppleScript = original;
+    _internal.runItermJxa = original;
     invalidateSnapshotCache();
   }
 });

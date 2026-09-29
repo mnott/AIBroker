@@ -9,7 +9,7 @@ import { execSync } from "node:child_process";
 import { basename } from "node:path";
 
 import {
-  runAppleScript,
+  runItermJxa,
   _internal,
   isItermRunning,
   isClaudeRunningInSession,
@@ -17,7 +17,7 @@ import {
   typeIntoSession,
   sendKeystrokeToSession,
   stripItermPrefix,
-  withSessionAppleScript,
+  withSessionJxa,
   snapshotAllSessions,
   type SessionSnapshot,
 } from "./core.js";
@@ -43,24 +43,12 @@ import { saveSessionRegistry, getAllPersistentSessionNames, lookupPersistentName
 
 function setItermSessionProperty(itermSessionId: string, body: string): void {
   if (!itermInPlay()) return;
-  try {
-    const script = withSessionAppleScript(
-      itermSessionId,
-      `          tell aSession\n            ${body}\n          end tell\n          return`,
-      ""
-    );
-    execSync(`osascript <<'APPLESCRIPT'\n${script}\nAPPLESCRIPT`, {
-      timeout: 5000,
-      shell: "/bin/bash",
-    });
-  } catch {
-    // silently ignore
-  }
+  runItermJxa(withSessionJxa(itermSessionId, `          ${body}\n          return "ok";`), 5_000);
 }
 
 export function setItermSessionVar(itermSessionId: string, name: string): void {
-  const escaped = name.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\n\r]/g, " ");
-  setItermSessionProperty(itermSessionId, `set variable named "user.paiName" to "${escaped}"`);
+  const value = JSON.stringify(name.replace(/[\n\r]/g, " "));
+  setItermSessionProperty(itermSessionId, `aSession.setVariable({ named: "user.paiName", to: ${value} });`);
 }
 
 export function setItermTabName(itermSessionId: string, name: string): void {
@@ -79,16 +67,10 @@ export function setItermBadge(itermSessionId: string, text: string): void {
   // Write badge escape sequence to the session's tty device.
   // Must go to terminal output stream (not stdin via "write text").
   try {
-    const tty = execSync(
-      `osascript -e 'tell application "iTerm2" to repeat with w in windows
-        repeat with t in tabs of w
-          repeat with s in sessions of t
-            if (unique ID of s) is "${itermSessionId}" then return tty of s
-          end repeat
-        end repeat
-      end repeat'`,
-      { timeout: 5000, encoding: "utf8", shell: "/bin/bash" },
-    ).trim();
+    const tty = (runItermJxa(
+      withSessionJxa(itermSessionId, `          return aSession.tty();`),
+      5_000,
+    ) ?? "").trim();
     if (!tty || !tty.startsWith("/dev/ttys")) return;
     const b64 = Buffer.from(text).toString("base64");
     execSync(`printf '\\033]1337;SetBadgeFormat=${b64}\\007' > ${tty}`, {
@@ -110,25 +92,11 @@ export function setItermBadge(itermSessionId: string, text: string): void {
 export function revealItermSession(itermSessionId: string): boolean {
   if (!itermInPlay()) return false;
   try {
-    const result = execSync(
-      `osascript -e 'tell application "iTerm2"
-        repeat with w in windows
-          repeat with t in tabs of w
-            repeat with s in sessions of t
-              if (unique ID of s) is "${itermSessionId.replace(/"/g, "")}" then
-                select w
-                select t
-                select s
-                activate
-                return "ok"
-              end if
-            end repeat
-          end repeat
-        end repeat
-        return "no"
-      end tell'`,
-      { timeout: 5000, encoding: "utf8", shell: "/bin/bash" },
-    ).trim();
+    const result = runItermJxa(withSessionJxa(
+      itermSessionId,
+      `          aWindow.select(); aTab.select(); aSession.select(); app.activate();\n          return "ok";`,
+      '"no"',
+    ), 5_000);
     return result === "ok";
   } catch {
     return false;
@@ -137,21 +105,11 @@ export function revealItermSession(itermSessionId: string): boolean {
 
 export function getItermSessionVar(itermSessionId: string): string | null {
   if (!itermInPlay()) return null;
-  try {
-    const script = withSessionAppleScript(
-      itermSessionId,
-      `          tell aSession\n            try\n              return (variable named "user.paiName")\n            on error\n              return ""\n            end try\n          end tell`,
-      'return ""'
-    );
-    const result = execSync(`osascript <<'APPLESCRIPT'\n${script}\nAPPLESCRIPT`, {
-      timeout: 5000,
-      encoding: "utf8",
-      shell: "/bin/bash",
-    }).trim();
-    return (result && result !== "missing value") ? result : null;
-  } catch {
-    return null;
-  }
+  const result = runItermJxa(withSessionJxa(
+    itermSessionId,
+    `          try { return aSession.variable({ named: "user.paiName" }) || ""; } catch (e) { return ""; }`,
+  ), 5_000);
+  return (result && result !== "missing value") ? result : null;
 }
 
 // ── Name Authority ──
@@ -238,26 +196,17 @@ export function findItermSessionForTermId(
     return stripItermPrefix(itermSessionIdHint) ?? itermSessionIdHint;
   }
 
-  const script = `
-tell application "iTerm2"
-  set output to ""
-  repeat with aWindow in windows
-    repeat with aTab in tabs of aWindow
-      repeat with aSession in sessions of aTab
-        set envVal to ""
-        try
-          tell aSession to set envVal to (variable named "TERM_SESSION_ID")
-        end try
-        if envVal is "${termSessionId.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" then
-          return id of aSession
-        end if
-      end repeat
-    end repeat
-  end repeat
-  return ""
-end tell`;
+  const script = `  var wanted = ${JSON.stringify(termSessionId)};
+  var found = "";
+  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+    if (found) return;
+    var v = "";
+    try { v = s.variable({ named: "TERM_SESSION_ID" }); } catch (e) {}
+    if (v === wanted) found = s.id();
+  }); }); });
+  return found;`;
 
-  const result = runAppleScript(script);
+  const result = runItermJxa(script);
   return (result && result.length > 0) ? result : null;
 }
 
@@ -357,51 +306,34 @@ function openSessionScript(command: string): string {
   // A session that is genuinely occupied (Claude or anything else) never
   // settles to shell-prompt no matter how long this waits, which is exactly
   // what keeps the guard meaningful after the delay.
+  // JXA: `app` is bound to the real iTerm process by runItermJxa.
+  const cmd = JSON.stringify(command);
   const write = command
-    ? `delay 1.5
-          if not (is at shell prompt) then
-            return "busy:" & id
-          end if
-          write text "${command.replace(/"/g, '\\"')}"`
+    ? `ObjC.import("Foundation");
+    $.NSThread.sleepForTimeInterval(1.5);
+    if (!session.isAtShellPrompt()) return "busy:" + session.id();
+    session.write({ text: ${cmd} });`
     : "";
-  // One place to describe "a brand-new window, which comes with a session".
-  const viaNewWindow = `set targetWindow to (create window with default profile)
-    if targetWindow is missing value then error "iTerm2 would not create a window" number -1728
-    tell targetWindow
-      tell current session
-        ${write}
-        return id
-      end tell
-    end tell`;
-  return `tell application "iTerm2"
-  set targetWindow to missing value
-  try
-    set targetWindow to current window
-  end try
-  if targetWindow is missing value and (count of windows) > 0 then
-    set targetWindow to item 1 of windows
-  end if
-  if targetWindow is missing value then
-    ${viaNewWindow}
-  else
-    set newTab to missing value
-    try
-      tell targetWindow
-        set newTab to (create tab with default profile)
-      end tell
-    end try
-    if newTab is missing value then
-      ${viaNewWindow}
-    else
-      tell newTab
-        tell current session
-          ${write}
-          return id
-        end tell
-      end tell
-    end if
-  end if
-end tell`;
+  return `  var session = null;
+  var targetWindow = null;
+  try { targetWindow = app.currentWindow(); targetWindow.id(); } catch (e) { targetWindow = null; }
+  if (!targetWindow) {
+    var all = app.windows();
+    if (all.length > 0) targetWindow = all[0];
+  }
+  var newTab = null;
+  if (targetWindow) {
+    try { newTab = targetWindow.createTabWithDefaultProfile(); } catch (e) { newTab = null; }
+  }
+  if (newTab) {
+    session = newTab.currentSession();
+  } else {
+    var created = app.createWindowWithDefaultProfile();
+    if (!created) throw new Error("iTerm2 would not create a window");
+    session = created.currentSession();
+  }
+  ${write}
+  return session.id();`;
 }
 
 /** A launch write refused because the target turned out not to be a fresh shell. */
@@ -418,7 +350,7 @@ function rejectIfBusy(result: string | null, label: string): string | null {
 
 export function createClaudeSession(command = "claude"): string | null {
   try {
-    return rejectIfBusy(_internal.runAppleScript(openSessionScript(command)) ?? null, "createClaudeSession");
+    return rejectIfBusy(_internal.runItermJxa(openSessionScript(command)) ?? null, "createClaudeSession");
   } catch (err) {
     log("Failed to create session:", String(err));
     return null;
@@ -427,7 +359,7 @@ export function createClaudeSession(command = "claude"): string | null {
 
 export function createTerminalTab(command?: string): string | null {
   try {
-    return rejectIfBusy(_internal.runAppleScript(openSessionScript(command ?? "")) ?? null, "createTerminalTab");
+    return rejectIfBusy(_internal.runItermJxa(openSessionScript(command ?? "")) ?? null, "createTerminalTab");
   } catch (err) {
     log("Failed to create terminal tab:", String(err));
     return null;
@@ -446,9 +378,5 @@ export async function restartSession(itermSessionId: string, command = "claude")
 }
 
 export function killSession(itermSessionId: string): void {
-  const script = withSessionAppleScript(
-    itermSessionId,
-    `          close aSession\n          return "ok"`,
-  );
-  runAppleScript(script);
+  runItermJxa(withSessionJxa(itermSessionId, `          aSession.close();\n          return "ok";`));
 }

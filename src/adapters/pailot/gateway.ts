@@ -41,7 +41,7 @@ import {
 } from "../../core/state.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, autoTabName, createClaudeSession, killSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
-import { runAppleScript, sendKeystrokeToSession, sendEscapeSequenceToSession, invalidateSnapshotCache } from "../iterm/core.js";
+import { runItermJxa, withSessionJxa, sendKeystrokeToSession, sendEscapeSequenceToSession, invalidateSnapshotCache } from "../iterm/core.js";
 import { pasteTextIntoSession, snapshotAllSessions, typeIntoSession } from "../../transport/sync-facade.js";
 import { hybridManager } from "../../core/hybrid.js";
 import {
@@ -400,13 +400,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
   }
 
   // No client preference (or client's session is gone) — ask iTerm2 which session is focused
-  const focusedId = runAppleScript(`tell application "iTerm2"
-  try
-    return id of current session of current tab of current window
-  on error
-    return ""
-  end try
-end tell`)?.trim() ?? "";
+  const focusedId = runItermJxa(`  try { return app.currentWindow().currentTab().currentSession().id(); } catch (e) { return ""; }`)?.trim() ?? "";
 
   if (focusedId) {
     // Find this session in the hybrid manager and activate it.
@@ -540,19 +534,7 @@ function handleSwitchCommand(ws: WebSocket, args: Record<string, unknown>): void
   // For visual sessions, also focus the iTerm2 tab
   if (session.kind === "visual") {
     setActiveItermSessionId(session.backendSessionId);
-    const escapedId = session.backendSessionId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-    runAppleScript(`tell application "iTerm2"
-  repeat with aWindow in windows
-    repeat with aTab in tabs of aWindow
-      repeat with aSession in sessions of aTab
-        if id of aSession is "${escapedId}" then
-          select aSession
-          return "focused"
-        end if
-      end repeat
-    end repeat
-  end repeat
-end tell`);
+    runItermJxa(withSessionJxa(session.backendSessionId, `          aSession.select();\n          return "focused";`));
   }
 
   if (newName) {
@@ -835,32 +817,10 @@ async function handleNavCommand(ws: WebSocket, args: Record<string, unknown>): P
     Escape: () => sendKeystrokeToSession(targetSession, 27),
     "ctrl-c": () => {
       // Send Ctrl+C (ETX, ASCII 3)
-      runAppleScript(`tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if id of s is "${targetSession}" then
-          tell s to write text (ASCII character 3)
-          return
-        end if
-      end repeat
-    end repeat
-  end repeat
-end tell`);
+      runItermJxa(withSessionJxa(targetSession, `          aSession.write({ text: String.fromCharCode(3), newline: false });\n          return "ok";`));
     },
     "ctrl+c": () => {
-      runAppleScript(`tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if id of s is "${targetSession}" then
-          tell s to write text (ASCII character 3)
-          return
-        end if
-      end repeat
-    end repeat
-  end repeat
-end tell`);
+      runItermJxa(withSessionJxa(targetSession, `          aSession.write({ text: String.fromCharCode(3), newline: false });\n          return "ok";`));
     },
   };
 
@@ -1113,13 +1073,7 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
           }
         }
         // Also set the active session based on current iTerm focus
-        const focusedId = runAppleScript(`tell application "iTerm2"
-  try
-    return id of current session of current tab of current window
-  on error
-    return ""
-  end try
-end tell`)?.trim() ?? "";
+        const focusedId = runItermJxa(`  try { return app.currentWindow().currentTab().currentSession().id(); } catch (e) { return ""; }`)?.trim() ?? "";
         if (focusedId) {
           const sessions = hybridManager.listSessions();
           const idx = sessions.findIndex(s => s.backendSessionId === focusedId);

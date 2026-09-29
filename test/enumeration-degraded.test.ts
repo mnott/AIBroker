@@ -36,10 +36,10 @@ const req = (method: string) => ({ id: "r", sessionId: "x", method, params: {} }
 
 test("a failed osascript enumeration marks sessions and status as degraded, then clears on recovery", async () => {
   const handlers = registerAndCapture();
-  const original = _internal.runAppleScript;
+  const original = _internal.runItermJxa;
   try {
     // ── failure ──
-    _internal.runAppleScript = () => null;
+    _internal.runItermJxa = () => null;
     invalidateSnapshotCache();
 
     const sessionsResult = (await handlers.get("sessions")!(req("sessions"))) as {
@@ -57,7 +57,7 @@ test("a failed osascript enumeration marks sessions and status as degraded, then
 
     // ── recovery ── (truthy but parses to zero sessions — distinct from the
     // failure sentinel `null`, same convention as snapshot-cache.test.ts)
-    _internal.runAppleScript = () => " ";
+    _internal.runItermJxa = () => " ";
     invalidateSnapshotCache();
 
     const sessionsAfter = (await handlers.get("sessions")!(req("sessions"))) as {
@@ -68,7 +68,7 @@ test("a failed osascript enumeration marks sessions and status as degraded, then
     const statusAfter = (await handlers.get("status")!(req("status"))) as { result: { status: string } };
     assert.equal(statusAfter.result.status, "ok");
   } finally {
-    _internal.runAppleScript = original;
+    _internal.runItermJxa = original;
     invalidateSnapshotCache();
   }
 });

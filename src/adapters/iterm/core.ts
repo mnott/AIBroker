@@ -37,17 +37,23 @@ function logThrottled(key: string, message: string): void {
   log(hidden > 0 ? `${message} (+${hidden} more in the last ${Math.round((now - prev) / 1000)}s)` : message);
 }
 
-// Default budget. Deliberately generous: exceeding it yields null, which every
-// caller turns into "nothing there" rather than "I could not tell", so a tight
-// default trades a rare slow call for a silent wrong answer. iTerm AppleScript
-// cost scales with open sessions and scrollback, both of which grow over time.
-export function runAppleScript(script: string, timeoutMs = 15_000): string | null {
-  // No osascript off macOS — not a failure, so nothing to log or throttle.
-  if (process.platform !== "darwin") return null;
-  const result = spawnSync("osascript", [], {
+/**
+ * Environment for any child that can touch AppKit. iTerm exports
+ * __CFBundleIdentifier into its shells; a child that inherits it registers with
+ * LaunchServices AS iTerm2 (an "impostor") for as long as it runs.
+ */
+export function cleanChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const { __CFBundleIdentifier: _drop, ...rest } = env;
+  return rest;
+}
+
+/** Run osascript with a script on stdin; null (and a throttled log line) on any failure. */
+function runOsascript(args: string[], script: string, timeoutMs: number): string | null {
+  const result = spawnSync("osascript", args, {
     input: script,
     stdio: ["pipe", "pipe", "pipe"],
     timeout: timeoutMs,
+    env: cleanChildEnv(),
   });
 
   if (result.status !== 0 || result.error) {
@@ -73,13 +79,80 @@ export function runAppleScript(script: string, timeoutMs = 15_000): string | nul
   return result.stdout?.toString().trim() ?? null;
 }
 
+// Default budget. Deliberately generous: exceeding it yields null, which every
+// caller turns into "nothing there" rather than "I could not tell", so a tight
+// default trades a rare slow call for a silent wrong answer. iTerm AppleScript
+// cost scales with open sessions and scrollback, both of which grow over time.
+// For OTHER apps only — iTerm is addressed through runItermJxa.
+export function runAppleScript(script: string, timeoutMs = 15_000): string | null {
+  // No osascript off macOS — not a failure, so nothing to log or throttle.
+  if (process.platform !== "darwin") return null;
+  return runOsascript([], script, timeoutMs);
+}
+
+export const REAL_ITERM_SUFFIX = "/iTerm.app/Contents/MacOS/iTerm2";
+
+/**
+ * Parser half of itermPid(), split out for testing. Input is `ps -Ao pid=,comm=`;
+ * only a process whose executable is iTerm's own is accepted, so a bundle-id
+ * impostor (osascript/helper that inherited __CFBundleIdentifier) is never picked.
+ */
+export function parseItermPid(psOutput: string): number | null {
+  for (const line of psOutput.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(.+?)\s*$/);
+    if (m && m[2].endsWith(REAL_ITERM_SUFFIX)) return parseInt(m[1], 10);
+  }
+  return null;
+}
+
+let cachedItermPid: number | null = null;
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Pid of the real iTerm (cached, re-resolved once that pid is gone); null when it is not running. */
+export function itermPid(): number | null {
+  if (process.platform !== "darwin") return null;
+  if (cachedItermPid !== null && pidAlive(cachedItermPid)) return cachedItermPid;
+  cachedItermPid = null;
+  const ps = spawnSync("ps", ["-Ao", "pid=,comm="], { encoding: "utf8", timeout: 5_000 });
+  if (ps.status !== 0 || !ps.stdout) return null;
+  cachedItermPid = parseItermPid(ps.stdout);
+  return cachedItermPid;
+}
+
+/** The JXA program run for a body: `app` is bound to the real iTerm process, the body returns a string. */
+export function buildItermJxa(pid: number, body: string): string {
+  return `(function () {\n  var app = Application(${pid});\n${body}\n})()`;
+}
+
+/**
+ * Run JXA against iTerm, addressed by PROCESS ID — never by name, bundle id or
+ * path, all of which LaunchServices resolves through the bundle-id registry
+ * that an impostor process poisons (-600 / -1708). The body sees `app` and
+ * must `return` a string. Same failure value as runAppleScript: null.
+ */
+export function runItermJxa(body: string, timeoutMs = 15_000): string | null {
+  const pid = itermPid();
+  if (pid === null) return null;
+  const out = runOsascript(["-l", "JavaScript"], buildItermJxa(pid, body), timeoutMs);
+  if (out === null) cachedItermPid = null; // maybe iTerm restarted; resolve afresh next time
+  return out;
+}
+
 /**
  * Plain-object indirection so tests can replace the osascript call without
  * mocking node:child_process — a builtin's named export is a fixed snapshot
  * taken once at module load, so reassigning it post-load (the usual mock
  * technique) silently does nothing.
  */
-export const _internal = { runAppleScript };
+export const _internal = { runAppleScript, runItermJxa };
 
 export function stripItermPrefix(id: string | undefined): string | undefined {
   if (!id) return id;
@@ -87,40 +160,47 @@ export function stripItermPrefix(id: string | undefined): string | undefined {
   return colonIdx >= 0 ? id.slice(colonIdx + 1) : id;
 }
 
-export function withSessionAppleScript(sessionId: string, body: string, fallback = 'return ""'): string {
-  const escaped = sessionId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  return `tell application "iTerm2"
-  repeat with aWindow in windows
-    repeat with aTab in tabs of aWindow
-      repeat with aSession in sessions of aTab
-        if id of aSession is "${escaped}" then
+/**
+ * JXA body that finds the session with this id and runs `body` on it.
+ * `body` sees `app`, `aWindow`, `aTab`, `aSession` and must `return` a string;
+ * `fallback` is a JS expression returned when no session matches.
+ */
+export function withSessionJxa(sessionId: string, body: string, fallback = '""'): string {
+  return `  var wanted = ${JSON.stringify(sessionId)};
+  var windows = app.windows();
+  for (var wi = 0; wi < windows.length; wi++) {
+    var aWindow = windows[wi];
+    var tabs = aWindow.tabs();
+    for (var ti = 0; ti < tabs.length; ti++) {
+      var aTab = tabs[ti];
+      var sessions = aTab.sessions();
+      for (var si = 0; si < sessions.length; si++) {
+        var aSession = sessions[si];
+        if (aSession.id() === wanted) {
 ${body}
-        end if
-      end repeat
-    end repeat
-  end repeat
-  ${fallback}
-end tell`;
+        }
+      }
+    }
+  }
+  return ${fallback};`;
+}
+
+/** Type raw text into a session as though typed, without a trailing newline. */
+function writeToSession(sessionId: string, textJs: string): boolean {
+  const body = withSessionJxa(
+    sessionId,
+    `          aSession.write({ text: ${textJs}, newline: false });\n          return "ok";`,
+    '"not_found"',
+  );
+  return runItermJxa(body) === "ok";
 }
 
 export function sendKeystrokeToSession(sessionId: string, asciiCode: number): boolean {
-  const script = withSessionAppleScript(
-    sessionId,
-    `          tell aSession to write text (ASCII character ${asciiCode}) newline no\n          return "ok"`,
-    'return "not_found"'
-  );
-  const result = runAppleScript(script);
-  return result === "ok";
+  return writeToSession(sessionId, `String.fromCharCode(${asciiCode})`);
 }
 
 export function sendEscapeSequenceToSession(sessionId: string, dirChar: string): boolean {
-  const script = withSessionAppleScript(
-    sessionId,
-    `          tell aSession to write text (ASCII character 27) & "[${dirChar}" newline no\n          return "ok"`,
-    'return "not_found"'
-  );
-  const result = runAppleScript(script);
-  return result === "ok";
+  return writeToSession(sessionId, JSON.stringify(`\x1b[${dirChar}`));
 }
 
 export function typeIntoSession(sessionId: string, text: string): boolean {
@@ -134,39 +214,17 @@ export function typeIntoSession(sessionId: string, text: string): boolean {
 }
 
 export function pasteTextIntoSession(sessionId: string, text: string): boolean {
-  // Escape for AppleScript string literal. Newlines must use concatenation with
-  // AppleScript's `linefeed` constant since \n isn't a valid escape in AppleScript.
-  const escaped = text
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\r\n/g, '" & return & "')
-    .replace(/\n/g, '" & linefeed & "')
-    .replace(/\r/g, '" & return & "');
-  const textScript = withSessionAppleScript(
-    sessionId,
-    `          tell aSession to write text "${escaped}" newline no\n          return "ok"`,
-    'return "not_found"'
-  );
-  return runAppleScript(textScript) === "ok";
+  return writeToSession(sessionId, JSON.stringify(text));
 }
 
 export function findClaudeSession(): string | null {
-  const script = `
-tell application "iTerm2"
-  set output to ""
-  repeat with aWindow in windows
-    repeat with aTab in tabs of aWindow
-      repeat with aSession in sessions of aTab
-        set sessionId to id of aSession
-        set sessionName to name of aSession
-        set output to output & sessionId & (ASCII character 9) & sessionName & linefeed
-      end repeat
-    end repeat
-  end repeat
-  return output
-end tell`;
+  const script = `  var out = "";
+  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+    out += s.id() + "\\t" + s.name() + "\\n";
+  }); }); });
+  return out;`;
 
-  const result = runAppleScript(script);
+  const result = runItermJxa(script);
   if (!result) return null;
 
   const lines = result.split("\n").filter(Boolean);
@@ -184,12 +242,12 @@ end tell`;
 }
 
 export function isClaudeRunningInSession(sessionId: string): boolean {
-  const script = withSessionAppleScript(
+  const script = withSessionJxa(
     sessionId,
-    `          if (is at shell prompt of aSession) then\n            return "shell"\n          else\n            return "running"\n          end if`,
-    'return "not_found"'
+    `          return aSession.isAtShellPrompt() ? "shell" : "running";`,
+    '"not_found"',
   );
-  const result = runAppleScript(script);
+  const result = runItermJxa(script);
   if (result === "running") return true;
   if (result === "shell") {
     log(`Session ${sessionId} is at shell prompt — Claude has exited.`);
@@ -209,12 +267,8 @@ export function isItermRunning(): boolean {
 }
 
 export function isItermSessionAlive(sessionId: string): boolean {
-  const script = withSessionAppleScript(
-    sessionId,
-    `          return "alive"`,
-    'return "gone"'
-  );
-  return runAppleScript(script) === "alive";
+  const script = withSessionJxa(sessionId, `          return "alive";`, '"gone"');
+  return runItermJxa(script) === "alive";
 }
 
 export function isScreenLocked(): boolean {
@@ -293,7 +347,7 @@ export interface SessionSnapshot {
 /**
  * snapshotAllSessions — Fast enumeration of all iTerm2 sessions.
  *
- * Single AppleScript pass: id, name, tty, tab.title per session.
+ * Single JXA pass: id, name, tty, tab.title per session.
  * ~1.5s for 16 sessions (vs >30s timeout with the old combined script).
  *
  * What is still dropped vs the original (kept out for speed):
@@ -374,28 +428,13 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
   }
   // Fetch id, name, tty, tab.title. Skip `profile name` (~0.6s) and
   // `is at shell prompt` (~3.3s) — both derived or irrelevant.
-  const script = `
-tell application "iTerm2"
-  set output to ""
-  repeat with aWindow in windows
-    repeat with aTab in tabs of aWindow
-      repeat with aSession in sessions of aTab
-        set sessionId to id of aSession
-        set sessionName to name of aSession
-        set sessionTty to tty of aSession
-        tell aSession
-          try
-            set tabTitle to (variable named "tab.title")
-          on error
-            set tabTitle to ""
-          end try
-        end tell
-        set output to output & sessionId & (ASCII character 9) & sessionName & (ASCII character 9) & sessionTty & (ASCII character 9) & tabTitle & linefeed
-      end repeat
-    end repeat
-  end repeat
-  return output
-end tell`;
+  const script = `  var out = "";
+  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+    var tabTitle = "";
+    try { tabTitle = s.variable({ named: "tab.title" }); } catch (e) {}
+    out += [s.id(), s.name(), s.tty(), tabTitle].join("\\t") + "\\n";
+  }); }); });
+  return out;`;
 
   // Timeout scales with the work: iTerm's AppleScript cost grows with the
   // number of open sessions, so a fixed budget silently expires as the user
@@ -404,7 +443,7 @@ end tell`;
   // 4.05s and every enumeration returned empty, killing all session features
   // at once. Budget generously — this is a correctness floor, not a latency
   // target, and a slow answer beats a confidently wrong empty one.
-  const result = timeCall("iterm-core:snapshot-enum", () => _internal.runAppleScript(script, 30_000));
+  const result = timeCall("iterm-core:snapshot-enum", () => _internal.runItermJxa(script, 30_000));
   if (!result) {
     lastSnapshotOk = false;
     return [];
@@ -456,8 +495,6 @@ export interface ItermBundleIdImpostor {
   executablePath: string;
 }
 
-const REAL_ITERM_SUFFIX = "/iTerm.app/Contents/MacOS/iTerm2";
-
 /**
  * Parser half of findItermBundleIdImpostors(), split out for testing without
  * a subprocess. `lsappinfo list` entries look like:
@@ -487,9 +524,9 @@ export function parseLsappinfoImpostors(text: string): ItermBundleIdImpostor[] {
 /**
  * Processes registered with LaunchServices under iTerm2's bundle id but NOT
  * running iTerm's own executable — e.g. an osascript/helper child that
- * inherited iTerm's __CFBundleIdentifier env var. While registered, `tell
- * application "iTerm2"` can be routed to the impostor instead, which answers
- * with -600/-1708 and takes enumeration down. Diagnostic only: never kills
+ * inherited iTerm's __CFBundleIdentifier env var. While registered, anything
+ * addressing iTerm by name or bundle id is routed to the impostor, which answers
+ * with -600/-1708 (iTerm itself is addressed by pid, so it is immune). Diagnostic only: never kills
  * anything, never throws — on any error this is "found nothing" to a caller
  * that already treats [] as the safe default.
  */
@@ -541,24 +578,12 @@ export function invalidateSnapshotCache(): void {
  * Does a single AppleScript pass over all sessions.
  */
 export function clearAllPaiNames(): number {
-  const script = `
-tell application "iTerm2"
-  set cleared to 0
-  repeat with aWindow in windows
-    repeat with aTab in tabs of aWindow
-      repeat with aSession in sessions of aTab
-        tell aSession
-          try
-            set variable named "user.paiName" to ""
-            set cleared to cleared + 1
-          end try
-        end tell
-      end repeat
-    end repeat
-  end repeat
-  return cleared
-end tell`;
+  const script = `  var cleared = 0;
+  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+    try { s.setVariable({ named: "user.paiName", to: "" }); cleared++; } catch (e) {}
+  }); }); });
+  return String(cleared);`;
   // Allow 10s since this iterates all sessions with variable writes
-  const result = runAppleScript(script, 10_000);
+  const result = runItermJxa(script, 10_000);
   return result ? parseInt(result, 10) || 0 : 0;
 }

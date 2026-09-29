@@ -1,13 +1,13 @@
 /**
  * daemon/session-content.ts — Read terminal content from iTerm2 / tmux sessions.
  *
- * Uses AppleScript (iTerm2) or capture-pane (tmux) to read visible + scrollback content.
+ * Uses JXA (iTerm2) or capture-pane (tmux) to read visible + scrollback content.
  * Also detects busy/idle state via `is at shell prompt`.
  *
  * Part of Session Orchestration (Phase 1, v0.7).
  */
 
-import { _internal, withSessionAppleScript } from "../adapters/iterm/core.js";
+import { _internal, withSessionJxa } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, routeToTmux, captureSession, isClaudeRunningInSession } from "../transport/sync-facade.js";
 import { getAllPersistentSessionNames, lookupPersistentName } from "../core/persistence.js";
 import { log } from "../core/log.js";
@@ -86,36 +86,21 @@ function readTmuxContent(sessionId: string, lines: number): SessionContent | nul
 function readSessionContentUncached(sessionId: string, lines: number): SessionContent | null {
   if (routeToTmux(sessionId)) return readTmuxContent(sessionId, lines);
 
-  // AppleScript: get contents, name, atPrompt for a specific session
-  const script = withSessionAppleScript(
+  // JXA: get contents, name, atPrompt for a specific session
+  const script = withSessionJxa(
     sessionId,
-    `          set sessionName to name of aSession
-          set isAtPrompt to (is at shell prompt of aSession)
-          tell aSession
-            try
-              set paiName to (variable named "user.paiName")
-            on error
-              set paiName to ""
-            end try
-          end tell
-          set rawContent to contents of aSession
-          -- Take last N lines
-          set AppleScript's text item delimiters to linefeed
-          set allLines to text items of rawContent
-          set lineCount to count of allLines
-          if lineCount > ${lines} then
-            set lastLines to items (lineCount - ${lines - 1}) thru lineCount of allLines
-          else
-            set lastLines to allLines
-          end if
-          set resultContent to lastLines as text
-          return sessionName & (ASCII character 9) & (isAtPrompt as text) & (ASCII character 9) & paiName & (ASCII character 9) & resultContent`,
-    'return "NOT_FOUND"',
+    `          var content = aSession.contents();
+          var paiName = "";
+          try { paiName = aSession.variable({ named: "user.paiName" }) || ""; } catch (e) {}
+          var allLines = content.split("\\n");
+          var lastLines = allLines.length > ${lines} ? allLines.slice(allLines.length - ${lines}) : allLines;
+          return [aSession.name(), String(aSession.isAtShellPrompt()), paiName, lastLines.join("\\n")].join("\\t");`,
+    '"NOT_FOUND"',
   );
 
   // _internal indirection, as in core.ts's own enumeration, so tests can
   // replace the osascript call without mocking node:child_process.
-  const result = timeCall("session-content:read", () => _internal.runAppleScript(script));
+  const result = timeCall("session-content:read", () => _internal.runItermJxa(script));
   if (!result || result === "NOT_FOUND") return null;
 
   const tabIdx = result.indexOf("\t");

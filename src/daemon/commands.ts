@@ -43,7 +43,8 @@ import {
   restartSession,
 } from "../adapters/iterm/sessions.js";
 import {
-  runAppleScript,
+  runItermJxa,
+  withSessionJxa,
   findClaudeSession,
   isScreenLocked,
   sendKeystrokeToSession,
@@ -160,18 +161,8 @@ export function createHubCommandHandler(): (
       // Paste failed — session might be frozen. Try to wake it by selecting
       // its tab and sending a no-op keystroke, then retry.
       log(`[deliver] paste failed for ${resolvedId.slice(0, 8)}, attempting wake...`);
-      runAppleScript(`tell application "iTerm2"
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if id of s is "${resolvedId}" then
-          select t
-          return "selected"
-        end if
-      end repeat
-    end repeat
-  end repeat
-end tell`);
+      runItermJxa(withSessionJxa(resolvedId, `          aTab.select();
+          return "selected";`));
       // Brief delay for iTerm to process the tab selection
       const { execSync: execSyncWake } = require("child_process");
       try { execSyncWake("sleep 0.3"); } catch {}
@@ -496,22 +487,11 @@ end tell`);
         return;
       }
       const chosen = sessions[num - 1];
-      const escapedSessionId = chosen.id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-      const focusScript = `
-tell application "iTerm2"
-  repeat with aWindow in windows
-    repeat with aTab in tabs of aWindow
-      repeat with aSession in sessions of aTab
-        if id of aSession is "${escapedSessionId}" then
-          select aSession
-          return "focused"
-        end if
-      end repeat
-    end repeat
-  end repeat
-  return "not_found"
-end tell`;
-      const focusResult = runAppleScript(focusScript);
+      const focusResult = runItermJxa(withSessionJxa(
+        chosen.id,
+        `          aSession.select();\n          return "focused";`,
+        '"not_found"',
+      ));
       if (focusResult === "focused") {
         setActiveItermSessionId(chosen.id);
         const regEntry = [...sessionRegistry.values()].find((e) => e.itermSessionId === chosen.id);
