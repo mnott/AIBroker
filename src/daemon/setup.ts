@@ -301,8 +301,10 @@ function serviceLinux(a: Act, opts: Opts): void {
   if (!enabled.ok) a.fails++;
   else if (old !== null && old !== unit) a.run("systemctl", ["--user", "restart", UNIT_NAME]);
   if (!s.which("loginctl")) return;
-  const linger = s.run("loginctl", ["show-user", s.user, "-p", "Linger"]);
-  if (/Linger=yes/.test(linger.out)) a.say("  linger: on (service survives logout)");
+  const lingerOn = () => /Linger=yes/.test(s.run("loginctl", ["show-user", s.user, "-p", "Linger"]).out);
+  // polkit lets a user enable linger for their own account; never sudo, never prompt
+  if (!lingerOn()) a.run("loginctl", ["--no-ask-password", "enable-linger", s.user]);
+  if (lingerOn()) a.say("  linger: on (service survives logout)");
   else a.say(`  linger: OFF, the service stops at logout. Run once: sudo loginctl enable-linger ${s.user}`);
 }
 

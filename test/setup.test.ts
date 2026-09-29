@@ -85,6 +85,42 @@ test("linux setup writes unit, env, mcp, hooks, runs systemctl, warns on linger"
   assert.match(f.out.join("\n"), /sudo loginctl enable-linger tester/);
 });
 
+const SHOW = "loginctl show-user tester -p Linger";
+const ENABLE = "loginctl --no-ask-password enable-linger tester";
+
+test("linger already on: no enable call", () => {
+  const f = fake("linux", ["systemctl", "loginctl"]);
+  f.results[SHOW] = { ok: true, out: "Linger=yes\n" };
+  setup(f.sys, opts(), say(f));
+  assert.ok(!f.calls.includes(ENABLE));
+  assert.match(f.out.join("\n"), /linger: on/);
+});
+
+test("linger off, enable succeeds: setup enables it without sudo", () => {
+  const f = fake("linux", ["systemctl", "loginctl"]);
+  f.results[SHOW] = { ok: true, out: "Linger=no\n" };
+  const run = f.sys.run;
+  f.sys.run = (cmd, args) => {
+    const r = run(cmd, args);
+    if ([cmd.replace("/usr/bin/", ""), ...args].join(" ") === ENABLE) f.results[SHOW] = { ok: true, out: "Linger=yes\n" };
+    return r;
+  };
+  setup(f.sys, opts(), say(f));
+  assert.ok(f.calls.includes(ENABLE));
+  assert.ok(!f.calls.some((c) => c.startsWith("sudo")));
+  assert.match(f.out.join("\n"), /linger: on \(service survives logout\)/);
+  assert.doesNotMatch(f.out.join("\n"), /sudo/);
+});
+
+test("linger off, enable refused: sudo advice", () => {
+  const f = fake("linux", ["systemctl", "loginctl"]);
+  f.results[SHOW] = { ok: true, out: "Linger=no\n" };
+  f.results[ENABLE] = { ok: false, out: "denied" };
+  setup(f.sys, opts(), say(f));
+  assert.ok(f.calls.includes(ENABLE));
+  assert.match(f.out.join("\n"), /sudo loginctl enable-linger tester/);
+});
+
 test("setup is idempotent: second run changes nothing and adds no duplicate hooks", () => {
   const f = fake("linux", ["systemctl", "loginctl"]);
   setup(f.sys, opts(), say(f));

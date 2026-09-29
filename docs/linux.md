@@ -77,7 +77,8 @@ overwritten; later backups get a timestamp. `--dry-run` prints the plan and
 writes nothing; `--no-service`, `--no-mcp`, `--no-hooks` skip a step.
 
 **Linger.** Without it, systemd stops user services when you log out. Setup
-never runs sudo; if linger is off it tells you to run, once:
+enables linger itself (`loginctl enable-linger`, no sudo, no prompt). Only if
+the system does not allow that does it print the command to run once:
 
 ```bash
 sudo loginctl enable-linger "$USER"
