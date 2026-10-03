@@ -9,9 +9,9 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveBin } from "../core/bins.js";
 import { plistEnvEntries, serviceEnv, xmlEscape } from "../core/service-env.js";
@@ -32,13 +32,29 @@ export interface Sys {
   run(cmd: string, args: string[]): { ok: boolean; out: string };
 }
 
+/**
+ * The first `node` on PATH that is the running binary, so a versioned path
+ * (Homebrew Cellar) becomes its stable alias. Falls back to execPath.
+ */
+export function stableNodePath(execPath: string, pathEnv: string, realpath: (p: string) => string): string {
+  try {
+    const want = realpath(execPath);
+    for (const dir of pathEnv.split(delimiter)) {
+      if (!dir) continue;
+      const cand = join(dir, "node");
+      try { if (realpath(cand) === want) return cand; } catch { /* not on this entry */ }
+    }
+  } catch { /* execPath unresolvable */ }
+  return execPath;
+}
+
 export function realSys(): Sys {
   const home = process.env.HOME || userInfo().homedir;
   return {
     home,
     platform: process.platform,
     env: process.env,
-    execPath: process.execPath,
+    execPath: stableNodePath(process.execPath, process.env.PATH ?? "", realpathSync),
     nodeVersion: process.version,
     pkgRoot: join(dirname(fileURLToPath(import.meta.url)), "..", ".."),
     user: userInfo().username,
@@ -441,10 +457,29 @@ export function uninstall(s: Sys, opts: Opts, say: Say = console.log): number {
   return a.fails;
 }
 
-export async function runSetup(argv: string[]): Promise<void> {
-  process.exitCode = setup(realSys(), parseOpts(argv)) ? 1 : 0;
+const FLAGS = {
+  setup: ["--no-service", "--no-mcp", "--no-hooks", "--dry-run", "--force"],
+  uninstall: ["--no-service", "--no-mcp", "--no-hooks", "--dry-run", "--purge"],
+};
+
+export const usage = (cmd: keyof typeof FLAGS) => `usage: aibroker ${cmd} [${FLAGS[cmd].join("] [")}] [--help]`;
+
+/** Help or a bad flag ends the command before anything is touched; returns the exit code, or null to proceed. */
+export function checkArgs(cmd: keyof typeof FLAGS, argv: string[], say: Say = console.log): number | null {
+  if (argv.includes("--help") || argv.includes("-h")) { say(usage(cmd)); return 0; }
+  const bad = argv.find((a) => !FLAGS[cmd].includes(a));
+  if (bad === undefined) return null;
+  say(`unknown option: ${bad}`);
+  say(usage(cmd));
+  return 1;
 }
 
-export async function runUninstall(argv: string[]): Promise<void> {
-  process.exitCode = uninstall(realSys(), parseOpts(argv)) ? 1 : 0;
+export async function runSetup(argv: string[], s?: Sys, say: Say = console.log): Promise<void> {
+  const early = checkArgs("setup", argv, say);
+  process.exitCode = early ?? (setup(s ?? realSys(), parseOpts(argv), say) ? 1 : 0);
+}
+
+export async function runUninstall(argv: string[], s?: Sys, say: Say = console.log): Promise<void> {
+  const early = checkArgs("uninstall", argv, say);
+  process.exitCode = early ?? (uninstall(s ?? realSys(), parseOpts(argv), say) ? 1 : 0);
 }

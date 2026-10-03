@@ -4,7 +4,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, wr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  HOOK_PLAN, cliJs, claudeJsonPath, envFilePath, mcpJs, parseOpts, plistPath, renderPlist, renderUnit, settingsPath, setup, uninstall, unitPath,
+  HOOK_PLAN, cliJs, claudeJsonPath, envFilePath, mcpJs, parseOpts, plistPath, renderPlist, renderUnit, settingsPath, setup, stableNodePath, uninstall, unitPath, runSetup, runUninstall,
   type Sys,
 } from "../src/daemon/setup.js";
 import { diagnose } from "../src/daemon/doctor.js";
@@ -287,4 +287,46 @@ test("doctor: old node, dangling mcp target, loose env file mode", async () => {
   assert.equal(byName(cs, "node")[0].level, "FAIL");
   assert.match(byName(cs, "mcp entry")[0].detail, /missing file/);
   assert.equal(byName(cs, "env file")[0].fix, `chmod 600 ${envFilePath(f.sys)}`);
+});
+
+for (const [name, run] of [["setup", runSetup], ["uninstall", runUninstall]] as const) {
+  for (const flag of ["--help", "-h"]) {
+    test(`${name} ${flag}: usage, no side effects`, async () => {
+      const f = fake("darwin", []);
+      await run([flag], f.sys, say(f));
+      assert.equal(process.exitCode, 0);
+      assert.match(f.out.join("\n"), new RegExp(`usage: aibroker ${name}.*--dry-run`));
+      assert.deepEqual(f.calls, []);
+      assert.equal(existsSync(settingsPath(f.sys)), false);
+      assert.equal(existsSync(plistPath(f.sys)), false);
+    });
+  }
+  test(`${name} unknown flag: error, no side effects`, async () => {
+    const f = fake("darwin", []);
+    await run(["--dryrun"], f.sys, say(f));
+    assert.equal(process.exitCode, 1);
+    assert.match(f.out.join("\n"), /unknown option: --dryrun/);
+    assert.match(f.out.join("\n"), /usage: aibroker/);
+    assert.deepEqual(f.calls, []);
+    assert.equal(existsSync(settingsPath(f.sys)), false);
+    assert.equal(existsSync(plistPath(f.sys)), false);
+    process.exitCode = 0;
+  });
+}
+
+test("stableNodePath: Cellar execPath maps to the PATH alias", () => {
+  const cellar = "/opt/homebrew/Cellar/node/26.7.0/bin/node";
+  const rp = (p: string) => {
+    if (p === cellar || p === "/opt/homebrew/bin/node") return cellar;
+    throw new Error("ENOENT");
+  };
+  assert.equal(stableNodePath(cellar, "/usr/bin:/opt/homebrew/bin", rp), "/opt/homebrew/bin/node");
+});
+
+test("stableNodePath: no matching entry returns execPath; first match wins", () => {
+  const exec = "/home/u/.nvm/v22/bin/node";
+  const rp = (p: string) => (p === exec || p === "/a/node" || p === "/b/node" ? exec : "/other");
+  assert.equal(stableNodePath(exec, "/usr/bin", () => { throw new Error("x"); }), exec);
+  assert.equal(stableNodePath(exec, "/usr/bin", (p) => (p === exec ? exec : "/other")), exec);
+  assert.equal(stableNodePath(exec, "/a:/b", rp), "/a/node");
 });
