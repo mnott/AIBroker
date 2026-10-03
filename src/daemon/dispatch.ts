@@ -136,7 +136,7 @@ export interface DispatchDeps {
   now: () => number;
 }
 
-/** A spawned Claude needs to boot and run its `/Name … go` preamble first. */
+/** A spawned Claude needs to boot and run its `/Name …` preamble first. */
 const DEFAULT_SPAWN_TIMEOUT_MS = 90_000;
 const DEFAULT_DELIVER_TIMEOUT_MS = 120_000;
 const READY_POLL_MS = 1_000;
@@ -225,14 +225,14 @@ export interface LiveSession { id: string; name: string; paiName: string | null;
  * Wait until a freshly launched session can ACCEPT input.
  *
  * Note "accept", not "be idle". A launched session immediately runs its
- * `/Name … go` preamble and stays busy for minutes; waiting for the screen to
+ * `/Name …` preamble and stays busy for minutes; waiting for the screen to
  * settle times out on a session that is perfectly healthy — which is exactly
  * what the first version did. Claude Code queues typed input while it works, so
  * idleness is the wrong gate.
  *
  * But "the box is drawn" was too weak. The preamble is typed into that box and
  * sits there unsubmitted while it is drawn, so a dispatcher that fired on the
- * first drawn box appended its work order to `/Name Voice Notes` and `go` —
+ * first drawn box appended its work order to `/Name Voice Notes` —
  * three inputs racing in one box, with the user's own typing landing in the
  * middle of it. Reported live on 2026-08-04.
  *
@@ -266,7 +266,7 @@ export async function waitForReady(
  *   present in the frame, AND no longer on the ❯ input line  ->  submitted
  *
  * That works identically whether the session is idle or busy, which is the
- * whole point for a freshly spawned session that is still running `go`.
+ * whole point for a freshly spawned session that is still running its preamble.
  */
 export async function submitAndConfirm(
   sessionId: string,
@@ -504,7 +504,7 @@ export async function dispatch(
   // Hand the work order over IN the launch, not by typing afterwards.
   //
   // See the long note in pai-projects.ts: a freshly launched session holds its
-  // `/Name … go` preamble as queued prompts that are not rendered anywhere, so
+  // `/Name …` preamble as queued prompts that are not rendered anywhere, so
   // "the session looks ready" is true for ~8 seconds before those prompts run.
   // Typing into that window interleaves the work order with the rename and the
   // resume. The queue is ordered and nothing else writes to it, so passing the

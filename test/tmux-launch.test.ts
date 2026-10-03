@@ -70,5 +70,5 @@ test("resume launches with --name, skip-permissions and the /Name prompt as sepa
   new TmuxTransport().launch({ ...opts, resume: true }, { exec: f.exec, env: {}, claudeBin });
   const ns = f.calls.find((c) => c[0] === "new-session")!;
   const tail = ns.slice(ns.indexOf("--") + 1);
-  assert.deepEqual(tail, [claudeBin, "--name", "api", "--dangerously-skip-permissions", "/Name api\ngo"]);
+  assert.deepEqual(tail, [claudeBin, "--name", "api", "--dangerously-skip-permissions", "/Name api"]);
 });

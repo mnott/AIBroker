@@ -27,7 +27,7 @@ const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 export function itermLaunchLine(opts: LaunchOptions): string {
   if (!opts.resume) return `cd ${sq(opts.dir)} && claude`;
   const ansiC = opts.name.replace(/'/g, "");
-  const prompt = `$'/Name ${ansiC}\\\\ngo'`; // \\n survives AppleScript literal -> \n -> zsh newline
+  const prompt = `$'/Name ${ansiC}'`;
   return `cd ${sq(opts.dir)} && claude --name ${sq(opts.name)} --dangerously-skip-permissions ${prompt}`;
 }
 

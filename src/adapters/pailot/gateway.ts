@@ -676,8 +676,8 @@ function whenAtShellPrompt(sessionId: string, cb: () => void, attempts = 30): vo
 /**
  * Build the shell command to launch Claude in `cwd`, replicating PAI's launcher:
  * `claude --name <name>` sets the session label, and the single initial-prompt
- * arg `$'/Name <name>\ngo'` advance-enters the /Name skill (tab + /resume label)
- * then `go` (resume) — deterministic, no timing. `--dangerously-skip-permissions`
+ * arg `$'/Name <name>'` advance-enters the /Name skill (tab + /resume label)
+ * — deterministic, no timing. `--dangerously-skip-permissions`
  * so PAILot can drive the session without permission prompts.
  */
 function claudeLaunchCommand(cwd: string, name: string): string {
@@ -685,8 +685,8 @@ function claudeLaunchCommand(cwd: string, name: string): string {
   const ansiC = name.replace(/'/g, "");                                // keep the $'...' simple
   // Double backslash: createClaudeSession embeds this in an AppleScript string
   // literal, which collapses `\\n` → `\n`; zsh's $'...' then turns `\n` into a
-  // real newline so `/Name <name>` and `go` become two queued inputs.
-  const prompt = `$'/Name ${ansiC}\\\\ngo'`;
+  // real newline (unused here: a single queued input).
+  const prompt = `$'/Name ${ansiC}'`;
   return `cd ${sq(cwd)} && claude --name ${sq(name)} --dangerously-skip-permissions ${prompt}`;
 }
 
