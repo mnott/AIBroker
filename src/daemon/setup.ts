@@ -111,20 +111,34 @@ const commandsIn = (settings: Json, event: string): string[] =>
   ((settings.hooks?.[event] ?? []) as HookGroup[]).flatMap((g) => (g.hooks ?? []).map((h) => h.command ?? ""));
 
 /** Wired already, from any install dir: same hook file under any hooks/ directory. */
+const isHookFile = (c: string, file: string) => c.includes(`/hooks/${file}`) || c.includes(`\\hooks\\${file}`);
 const hasHookFile = (settings: Json, event: string, file: string) =>
-  commandsIn(settings, event).some((c) => c.includes(`/hooks/${file}`) || c.includes(`\\hooks\\${file}`));
+  commandsIn(settings, event).some((c) => isHookFile(c, file));
 
-export function mergeHooks(settings: Json, s: Sys): { settings: Json; added: string[]; present: string[] } {
-  const next: Json = { ...settings, hooks: { ...(settings.hooks ?? {}) } };
+export function mergeHooks(settings: Json, s: Sys): { settings: Json; added: string[]; present: string[]; updated: string[] } {
+  const next: Json = { ...settings, hooks: structuredClone(settings.hooks ?? {}) };
   const added: string[] = [];
   const present: string[] = [];
+  const updated: string[] = [];
   for (const h of HOOK_PLAN) {
-    if (hasHookFile(next, h.event, h.file)) { present.push(h.file); continue; }
+    const label = `${h.event}${h.matcher ? `[${h.matcher}]` : ""} ${h.file}`;
+    if (hasHookFile(next, h.event, h.file)) {
+      // Rewrite a stale command (e.g. a node path from before an upgrade) in place.
+      const want = hookCommand(s, h.file);
+      let stale = false;
+      for (const g of (next.hooks[h.event] ?? []) as HookGroup[]) {
+        for (const c of g.hooks ?? []) {
+          if (c.command && isHookFile(c.command, h.file) && c.command !== want) { c.command = want; stale = true; }
+        }
+      }
+      if (stale) updated.push(label); else present.push(h.file);
+      continue;
+    }
     const group: HookGroup = { ...(h.matcher ? { matcher: h.matcher } : {}), hooks: [{ type: "command", command: hookCommand(s, h.file) }] };
     next.hooks[h.event] = [...(next.hooks[h.event] ?? []), group];
-    added.push(`${h.event}${h.matcher ? `[${h.matcher}]` : ""} ${h.file}`);
+    added.push(label);
   }
-  return { settings: next, added, present };
+  return { settings: next, added, present, updated };
 }
 
 /** Remove exactly the entries whose command lives under this install's hooks/ dir. */
@@ -149,12 +163,12 @@ export function unmergeHooks(settings: Json, s: Sys): { settings: Json; removed:
 // ── MCP entry ─────────────────────────────────────────────────────────────
 
 /** The `aibroker` entry in ~/.claude.json: whether present and the .js it launches. */
-export function readMcpEntry(s: Sys): { found: boolean; target?: string } {
+export function readMcpEntry(s: Sys): { found: boolean; target?: string; command?: string } {
   const cfg = readJson(claudeJsonPath(s));
   const e = cfg?.mcpServers?.aibroker;
   if (!e) return { found: false };
   const args: string[] = Array.isArray(e.args) ? e.args : [];
-  return { found: true, target: args.find((a) => typeof a === "string" && a.endsWith(".js")) };
+  return { found: true, command: e.command, target: args.find((a) => typeof a === "string" && a.endsWith(".js")) };
 }
 
 function readJson(path: string): Json | null {
@@ -349,9 +363,10 @@ function serviceMac(a: Act, opts: Opts): void {
 function mcpAdd(a: Act): void {
   const s = a.s;
   const entry = readMcpEntry(s);
-  if (entry.found && entry.target && existsSync(entry.target)) {
+  if (entry.found && entry.command === s.execPath && entry.target === mcpJs(s) && existsSync(entry.target)) {
     return a.say(`  aibroker entry already registered -> ${entry.target}; left alone`);
   }
+  if (entry.found && entry.command !== s.execPath) a.say(`  aibroker entry uses node ${entry.command ?? "?"}; updating to ${s.execPath}`);
   if (!existsSync(mcpJs(s)) && !a.dryRun) return a.fail(`${mcpJs(s)} not found; run npm run build`);
   const claude = s.which("claude");
   if (claude) {
@@ -397,11 +412,12 @@ function hooksEdit(a: Act, remove: boolean): void {
     a.write(path, `${JSON.stringify(settings, null, 2)}\n`, true);
     return a.done(`  removed ${removed} hook entr(ies) from ${path}`);
   }
-  const { settings, added, present } = mergeHooks(cur, s);
+  const { settings, added, present, updated } = mergeHooks(cur, s);
   for (const f of present) a.say(`  already wired: ${f}`);
-  if (!added.length) return;
+  if (!added.length && !updated.length) return;
   a.write(path, `${JSON.stringify(settings, null, 2)}\n`, true);
   for (const h of added) a.say(`  ${a.dryRun ? "would add" : "added"}: ${h}`);
+  for (const h of updated) a.say(`  ${a.dryRun ? "would update" : "updated"}: ${h}`);
 }
 
 // ── env file ──────────────────────────────────────────────────────────────
