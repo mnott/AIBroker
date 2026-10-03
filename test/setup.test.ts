@@ -4,7 +4,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, wr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  HOOK_PLAN, cliJs, claudeJsonPath, envFilePath, mcpJs, parseOpts, plistPath, renderPlist, renderUnit, settingsPath, setup, stableNodePath, uninstall, unitPath, runSetup, runUninstall,
+  HOOK_PLAN, cliJs, claudeJsonPath, envFilePath, mcpJs, mergeHooks, parseOpts, plistPath, renderPlist, renderUnit, settingsPath, setup, stableNodePath, uninstall, unitPath, runSetup, runUninstall,
   type Sys,
 } from "../src/daemon/setup.js";
 import { diagnose } from "../src/daemon/doctor.js";
@@ -163,18 +163,69 @@ test("mcp: uses the claude CLI when present, JSON merge otherwise, other servers
   assert.ok(existsSync(`${claudeJsonPath(noCli.sys)}.bak`));
 });
 
-test("mcp: an existing entry pointing at an existing file is left alone; a dangling one is replaced", () => {
+test("mcp: a current entry is left alone; a dangling target or stale node command is re-registered", () => {
   const f = fake("linux", []);
-  const other = join(f.sys.home, "elsewhere.js");
-  writeFileSync(other, "");
-  writeFileSync(claudeJsonPath(f.sys), JSON.stringify({ mcpServers: { aibroker: { command: "node", args: [other] } } }));
+  const entry = (command: string, target: string) => JSON.stringify({ mcpServers: { aibroker: { command, args: [target] } } });
+  const args = () => JSON.parse(readFileSync(claudeJsonPath(f.sys), "utf8")).mcpServers.aibroker;
+  writeFileSync(claudeJsonPath(f.sys), entry(f.sys.execPath, mcpJs(f.sys)));
   setup(f.sys, opts("--no-service", "--no-hooks"), say(f));
-  assert.deepEqual(JSON.parse(readFileSync(claudeJsonPath(f.sys), "utf8")).mcpServers.aibroker.args, [other]);
   assert.match(f.out.join("\n"), /left alone/);
+  assert.deepEqual(f.calls, []);
 
-  writeFileSync(claudeJsonPath(f.sys), JSON.stringify({ mcpServers: { aibroker: { command: "node", args: [join(f.sys.home, "gone.js")] } } }));
+  writeFileSync(claudeJsonPath(f.sys), entry(f.sys.execPath, join(f.sys.home, "gone.js")));
   setup(f.sys, opts("--no-service", "--no-hooks"), say(f));
-  assert.deepEqual(JSON.parse(readFileSync(claudeJsonPath(f.sys), "utf8")).mcpServers.aibroker.args, [mcpJs(f.sys)]);
+  assert.deepEqual(args().args, [mcpJs(f.sys)]);
+
+  const stale = "/opt/homebrew/Cellar/node/26.7.0/bin/node";
+  writeFileSync(claudeJsonPath(f.sys), entry(stale, mcpJs(f.sys)));
+  f.out.length = 0;
+  setup(f.sys, opts("--no-service", "--no-hooks", "--dry-run"), say(f));
+  assert.equal(args().command, stale);
+  assert.match(f.out.join("\n"), /updating to/);
+  setup(f.sys, opts("--no-service", "--no-hooks"), say(f));
+  assert.equal(args().command, f.sys.execPath);
+});
+
+test("mcp: a stale node command goes through claude mcp remove + add", () => {
+  const f = fake("linux", ["claude"]);
+  writeFileSync(claudeJsonPath(f.sys), JSON.stringify({ mcpServers: { aibroker: { command: "/old/node", args: [mcpJs(f.sys)] } } }));
+  setup(f.sys, opts("--no-service", "--no-hooks"), say(f));
+  assert.deepEqual(f.calls, [
+    "claude mcp remove --scope user aibroker",
+    `claude mcp add --scope user aibroker -- ${f.sys.execPath} ${mcpJs(f.sys)}`,
+  ]);
+});
+
+test("hooks: stale node commands are rewritten in place; current ones are untouched", () => {
+  const f = fake("linux", []);
+  const stale = "/opt/homebrew/Cellar/node/26.7.0/bin/node";
+  const foreign = { hooks: [{ type: "command", command: "node /x/foreign.mjs" }] };
+  const hooks: Record<string, any[]> = {};
+  for (const h of HOOK_PLAN) {
+    const cmd = `${stale} ${join(f.sys.pkgRoot, "hooks", h.file)}`;
+    (hooks[h.event] ??= []).push({ ...(h.matcher ? { matcher: h.matcher } : {}), hooks: [{ type: "command", command: cmd }] });
+  }
+  hooks.Stop = [...(hooks.Stop ?? []), foreign];
+  const before = { model: "m", hooks };
+  const r = mergeHooks(structuredClone(before), f.sys);
+  assert.equal(r.updated.length, HOOK_PLAN.length);
+  assert.deepEqual(r.added, []);
+  assert.deepEqual(r.present, []);
+  for (const [ev, groups] of Object.entries(r.settings.hooks as Record<string, any[]>)) {
+    assert.equal(groups.length, hooks[ev].length);
+    groups.forEach((g, i) => {
+      assert.equal(g.matcher, hooks[ev][i].matcher);
+      if (g !== foreign && g.hooks[0].command !== foreign.hooks[0].command) assert.ok(g.hooks[0].command.startsWith(`${f.sys.execPath} `));
+    });
+  }
+  assert.deepEqual(r.settings.hooks.Stop.at(-1), foreign);
+  assert.deepEqual(before.hooks, hooks);
+
+  const again = mergeHooks(r.settings, f.sys);
+  assert.deepEqual(again.updated, []);
+  assert.deepEqual(again.added, []);
+  assert.equal(again.present.length, HOOK_PLAN.length);
+  assert.deepEqual(again.settings, r.settings);
 });
 
 test("invalid JSON in claude.json or settings.json is never overwritten", () => {
@@ -187,7 +238,7 @@ test("invalid JSON in claude.json or settings.json is never overwritten", () => 
   assert.equal(readFileSync(settingsPath(f.sys), "utf8"), "{ not json");
 });
 
-test("hooks: merge keeps foreign hooks, skips ones wired from another install dir, uninstall removes only ours", () => {
+test("hooks: merge keeps foreign hooks, re-points ones wired from another install dir, uninstall removes only ours", () => {
   const f = fake("linux", []);
   mkdirSync(join(f.sys.home, ".claude"), { recursive: true });
   const foreign = { hooks: [{ type: "command", command: "node /x/foreign.mjs" }] };
@@ -203,7 +254,7 @@ test("hooks: merge keeps foreign hooks, skips ones wired from another install di
 
   uninstall(f.sys, opts("--no-service", "--no-mcp"), say(f));
   s = JSON.parse(readFileSync(settingsPath(f.sys), "utf8"));
-  assert.deepEqual(s.hooks, { UserPromptSubmit: [foreign, elsewhere], Stop: [foreign] });
+  assert.deepEqual(s.hooks, { UserPromptSubmit: [foreign], Stop: [foreign] });
 });
 
 test("uninstall removes unit and mcp entry, keeps ~/.aibroker unless --purge", () => {
