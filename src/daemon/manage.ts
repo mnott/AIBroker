@@ -1609,6 +1609,38 @@ export function defaultHandoverTarget(cwd: string | null, notesDirExists: boolea
   return join(cwd, "Notes", "TODO.md");
 }
 
+/**
+ * The live transcript's tail. File mtime is not evidence of life: a stale
+ * transcript keeps getting non-message records appended. Among the five most
+ * recently modified files, the live one is the one whose last user/assistant
+ * record is newest; files with no such record in the tail rank last.
+ * Only the tail is read — these files reach tens of megabytes.
+ */
+export function liveTranscriptTail(dir: string): { file: string; raw: string } | null {
+  let best: { file: string; raw: string; at: number } | null = null;
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .map((f) => ({ f, m: statSync(join(dir, f)).mtimeMs }))
+    .sort((a, b) => b.m - a.m)
+    .slice(0, 5);
+  for (const { f } of files) {
+    const raw = execFileSync("/usr/bin/tail", ["-n", "200", join(dir, f)], {
+      encoding: "utf8",
+      timeout: 4_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    let at = -1;
+    for (const line of raw.split("\n")) {
+      try {
+        const j = JSON.parse(line);
+        if ((j.type === "assistant" || j.type === "user") && j.timestamp) at = Date.parse(j.timestamp);
+      } catch { /* blank or truncated line */ }
+    }
+    if (!best || at > best.at) best = { file: f, raw, at };
+  }
+  return best;
+}
+
 function transcriptReading(claudePid: string): {
   working: boolean | null;
   doing: string | null;
@@ -1620,21 +1652,9 @@ function transcriptReading(claudePid: string): {
     const dir = projectTranscriptDir(claudePid);
     if (!dir) return none;
 
-    // The live transcript is the one being written. Newest wins; a session that
-    // has not written for a long time will show that in its own timestamp
-    // rather than being silently mistaken for a fresh one.
-    const newest = readdirSync(dir)
-      .filter((f) => f.endsWith(".jsonl"))
-      .map((f) => ({ f, m: statSync(join(dir, f)).mtimeMs }))
-      .sort((a, b) => b.m - a.m)[0];
-    if (!newest) return none;
-
-    // Only the tail is needed and these files reach tens of megabytes.
-    const raw = execFileSync("/usr/bin/tail", ["-n", "40", join(dir, newest.f)], {
-      encoding: "utf8",
-      timeout: 4_000,
-      maxBuffer: 8 * 1024 * 1024,
-    });
+    const picked = liveTranscriptTail(dir);
+    if (!picked) return none;
+    const raw = picked.raw;
 
     const msgs: any[] = [];
     for (const line of raw.split("\n")) {

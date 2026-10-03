@@ -67,8 +67,12 @@ export function invalidatePaiProjectCache(): void {
 
 // ── Raw CLI call ──
 
-/** Call `pai project names --json` and parse the JSON output. */
-async function fetchFromCli(all: boolean): Promise<PaiProject[]> {
+/**
+ * Call `pai project names --json` and parse the JSON output.
+ * Returns null on any failure so the caller never mistakes it for an empty list.
+ */
+async function fetchFromCli(all: boolean): Promise<PaiProject[] | null> {
+  const started = Date.now();
   try {
     const args = all ? ["project", "names", "--json", "--all"] : ["project", "names", "--json"];
     const { stdout } = await execFileAsync("pai", args, {
@@ -79,7 +83,7 @@ async function fetchFromCli(all: boolean): Promise<PaiProject[]> {
     const raw = JSON.parse(stdout.trim());
     if (!Array.isArray(raw)) {
       log("pai-projects: unexpected output shape (not array)");
-      return [];
+      return null;
     }
 
     return raw.map((item: Record<string, unknown>) => ({
@@ -112,15 +116,17 @@ async function fetchFromCli(all: boolean): Promise<PaiProject[]> {
     }));
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    // pai not installed, no projects, or timeout — all non-fatal
+    const e = err as { killed?: boolean; signal?: string };
+    const elapsed = Date.now() - started;
+    // pai not installed or failing — non-fatal, the caller falls back to the last good list
     if (msg.includes("ENOENT")) {
-      log("pai-projects: `pai` binary not found — returning empty project list");
-    } else if (msg.includes("ETIMEDOUT") || msg.includes("timed out")) {
-      log("pai-projects: `pai project names --json` timed out");
+      log("pai-projects: `pai` binary not found");
+    } else if (e.killed || e.signal || msg.includes("ETIMEDOUT") || msg.includes("timed out")) {
+      log(`pai-projects: \`pai project names --json\` timed out after ${elapsed}ms`);
     } else {
-      log(`pai-projects: CLI error — ${msg}`);
+      log(`pai-projects: CLI error after ${elapsed}ms — ${msg}`);
     }
-    return [];
+    return null;
   }
 }
 
@@ -136,7 +142,14 @@ export async function listPaiProjects(all = false): Promise<PaiProject[]> {
     return cache.projects;
   }
 
-  const projects = await fetchFromCli(all);
+  const fetched = await fetchFromCli(all);
+  if (!fetched) {
+    // A failed call must never replace or be cached over a good list.
+    const lastGood = cache?.projects ?? [];
+    if (lastGood.length) log(`pai-projects: CLI failed, serving last good list (${lastGood.length})`);
+    return lastGood;
+  }
+  const projects = fetched;
   const entry = { projects, fetchedAt: Date.now() };
   if (all) _cacheAll = entry; else _cache = entry;
   log(`pai-projects: loaded ${projects.length} project(s)${all ? " (all)" : ""}`);
@@ -355,15 +368,14 @@ export async function launchResolvedPaiProject(
   parts.push(`cd ${shellEscape(rootPath)}`);
   // Replicate PAI's launch: `--name` sets the session label, and the single
   // initial-prompt arg `$'/Name <name>\n<next>'` advance-enters the /Name skill
-  // (tab + /resume label) and then does one more thing.
-  //
-  // That second line is normally `go` — resume from TODO.md. A caller with work
-  // to hand over replaces it, and that replacement is the whole point:
+  // (tab + /resume label). Without an `initialPrompt` that is the only line; a
+  // caller with work to hand over adds it as a second line, and that is the
+  // whole point:
   //
   // Claude Code holds initial-prompt lines as QUEUED PROMPTS, and a queued
   // prompt is not on the screen anywhere. Measured 2026-08-04: from t≈6s the
   // input box renders empty and every readiness check passes, while `/Name` and
-  // `go` sit invisibly pending until t≈14s. A dispatcher that waited for
+  // the work order sit invisibly pending until t≈14s. A dispatcher that waited for
   // "ready" and then TYPED its work order landed it inside that window, so the
   // task, the rename and the resume all raced in one input. No amount of screen
   // reading can close that gap — the state is not rendered.
@@ -375,10 +387,10 @@ export async function launchResolvedPaiProject(
   const ansiC = label.replace(/'/g, "");
   // Single line only — see `initialPrompt` above. Newlines are what separate
   // queued prompts, so one embedded here would split the instruction in two.
-  const next = (opts.initialPrompt ?? "go").replace(/[\r\n]+/g, " ").replace(/'/g, "");
+  const next = opts.initialPrompt?.replace(/[\r\n]+/g, " ").replace(/'/g, "");
   // Double backslash — collapsed to `\n` by AppleScript, then to a real newline
   // by zsh's $'...', so the two lines arrive as two queued inputs.
-  const prompt = `$'/Name ${ansiC}\\\\n${next}'`;
+  const prompt = `$'/Name ${ansiC}${next ? `\\\\n${next}` : ""}'`;
   const claudeFlags = flags.includes("--dangerously-skip-permissions")
     ? flags
     : `--dangerously-skip-permissions ${flags}`.trim();

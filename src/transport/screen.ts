@@ -114,13 +114,13 @@ export function inputBoxLines(frame: string): string[] {
  * The distinction that matters for a freshly spawned session. `isClaudeReady`
  * asks whether the box EXISTS, which is the right question for "can this
  * session accept input at all" and the wrong one for "is it safe to type now":
- * a session launched with a queued `/Name … \n go` preamble draws its box with
+ * a session launched with a queued `/Name …` preamble draws its box with
  * that preamble sitting inside it, unsubmitted. Typing a work order at that
  * moment appends to the queued text instead of replacing it — the dispatcher
  * and the preamble interleave, and so does anything the user types.
  *
  * Observed 2026-08-04: a spawned session received its Todoist work order while
- * `/Name Voice Notes` and `go` were both still queued in the box.
+ * `/Name Voice Notes` was still queued in the box.
  *
  * Emptiness — not idleness. A busy session with an empty box queues typed input
  * correctly and must still count as ready, which is what the original comment

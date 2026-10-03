@@ -45,7 +45,7 @@ export interface LaunchOptions {
   dir: string;
   /** Window/tab name and pane title; also what the session is addressed by. */
   name: string;
-  /** PAI-style start: `--name`, skip-permissions and a `/Name <name>` + `go` prompt (session restore). */
+  /** PAI-style start: `--name`, skip-permissions and a `/Name <name>` prompt (session restore). */
   resume?: boolean;
 }
 
@@ -62,7 +62,7 @@ export interface LaunchResult {
 /** Arguments after the `claude` binary. Pure, so every transport starts a session the same way. */
 export function claudeArgs(opts: LaunchOptions): string[] {
   if (!opts.resume) return [];
-  return ["--name", opts.name, "--dangerously-skip-permissions", `/Name ${opts.name}\ngo`];
+  return ["--name", opts.name, "--dangerously-skip-permissions", `/Name ${opts.name}`];
 }
 
 export interface SendOptions {
