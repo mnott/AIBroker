@@ -30,6 +30,7 @@ delete process.env.__CFBundleIdentifier;
 import { execSync } from "node:child_process";
 import { runItermJxa } from "../adapters/iterm/core.js";
 import { missingIssueLink } from "./issue-links.js";
+import { otaCurlArgs } from "./ota-args.js";
 import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { WatcherClient } from "../ipc/client.js";
@@ -1262,18 +1263,10 @@ server.tool(
       if (!existsSync(filePath)) return err(`File not found: ${filePath}`);
 
       // Use curl for multipart upload — avoids pulling in a fetch FormData polyfill
-      const { execSync: exec } = await import("node:child_process");
-      const result = exec(
-        [
-          "curl", "-sf", "-X", "POST",
-          `http://127.0.0.1:${OTA_PORT}/api/apps`,
-          "-F", `slug=${slug}`,
-          "-F", `name=${name}`,
-          "-F", `bundleId=${bundleId}`,
-          "-F", `version=${version}`,
-          "-F", `platform=${platform}`,
-          "-F", `file=@${filePath}`,
-        ].join(" "),
+      const { execFileSync } = await import("node:child_process");
+      const result = execFileSync(
+        "curl",
+        otaCurlArgs(OTA_PORT, { slug, name, bundleId, version, platform, filePath }),
         { encoding: "utf-8" },
       );
       const parsed = JSON.parse(result);
