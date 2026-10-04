@@ -62,7 +62,7 @@ import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
 import { getAllPersistentSessionNames, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
-import { discoverLiveSessions, isClaudeRelated } from "../../core/session-discovery.js";
+import { discoverLiveSessions, isClaudeRelated, listedLiveIds } from "../../core/session-discovery.js";
 
 /**
  * Enrich snapshots with paiName from the persistent JSON store.
@@ -349,7 +349,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
 
   // Auto-discover Claude-related iTerm2 tabs so freshly-started daemons can match
   const liveSnapshots = enrichedSnapshots();
-  const liveIds = new Set(liveSnapshots.map(s => s.id));
+  const liveIds = listedLiveIds(liveSnapshots);
   if (liveSnapshots.length > 0) {
     hybridManager.pruneDeadVisualSessions(liveIds);
   }
@@ -455,7 +455,7 @@ function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): v
   // likely means AppleScript failed, not that all sessions are gone.
   const liveSnapshots = discoverLiveSessions(opts);
   if (liveSnapshots.length > 0) {
-    const liveIds = new Set(liveSnapshots.map(s => s.id));
+    const liveIds = listedLiveIds(liveSnapshots);
     hybridManager.pruneDeadVisualSessions(liveIds);
   }
 
@@ -1559,7 +1559,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
     case "sessions": {
       // Prune dead sessions and publish current list via MQTT
       const liveSnapshots = enrichedSnapshots();
-      const liveIds = new Set(liveSnapshots.map(s => s.id));
+      const liveIds = listedLiveIds(liveSnapshots);
       if (liveSnapshots.length > 0) {
         hybridManager.pruneDeadVisualSessions(liveIds);
       }

@@ -65,6 +65,7 @@ import { statusCache } from "../core/status-cache.js";
 import { router } from "../core/router.js";
 import { deliverViaApi } from "../core/transport.js";
 import { hybridManager } from "../core/hybrid.js";
+import { listedLiveIds } from "../core/session-discovery.js";
 import type { CommandContext } from "./command-context.js";
 import { handleScreenshot } from "./screenshot.js";
 import {
@@ -420,7 +421,7 @@ export function createHubCommandHandler(): (
       if (hybridManager) {
         // Prune dead visual sessions before listing
         const liveSnapshots = snapshotAllSessions();
-        const liveIds = new Set(liveSnapshots.map(s => s.id));
+        const liveIds = listedLiveIds(liveSnapshots);
         hybridManager.pruneDeadVisualSessions(liveIds);
         const list = hybridManager.formatSessionList();
         ctx.reply(list).catch(() => {});

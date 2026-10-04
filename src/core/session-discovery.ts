@@ -77,3 +77,12 @@ export function isClaudeRelated(snap: LiveSession): boolean {
   if (!snap.atPrompt) return true;
   return false;
 }
+
+/**
+ * Ids a visual registry row may keep: every live tab that is not a worker pane.
+ * A pane registered before its marker appeared is dropped by pruning with this
+ * set, the same way a closed tab is.
+ */
+export function listedLiveIds(snaps: Array<{ id: string; workerPane?: boolean }>): Set<string> {
+  return new Set(snaps.filter((s) => !s.workerPane).map((s) => s.id));
+}
