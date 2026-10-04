@@ -70,6 +70,7 @@ export function discoverLiveSessions(opts: { fresh?: boolean } = {}): LiveSessio
  * hides a session that exists, which reads as it not existing at all.
  */
 export function isClaudeRelated(snap: LiveSession): boolean {
+  if (snap.workerPane) return false;
   if (snap.paiName) return true;
   const name = (snap.tabTitle ?? snap.name).toLowerCase();
   if (name.includes("claude")) return true;

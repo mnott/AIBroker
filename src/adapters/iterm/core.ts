@@ -342,6 +342,11 @@ export interface SessionSnapshot {
    * fall back to guessing from the title rather than treat "unknown" as "no".
    */
   isClaude?: boolean;
+  /**
+   * True for a `pai worker follow` pane (iTerm variable `user.paiWorkerPane`
+   * set). Kept in the snapshot for internal lookups; list surfaces drop it.
+   */
+  workerPane?: boolean;
 }
 
 /**
@@ -432,7 +437,9 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
   app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
     var tabTitle = "";
     try { tabTitle = s.variable({ named: "tab.title" }); } catch (e) {}
-    out += [s.id(), s.name(), s.tty(), tabTitle].join("\\t") + "\\n";
+    var workerPane = "";
+    try { workerPane = s.variable({ named: "user.paiWorkerPane" }) || ""; } catch (e) {}
+    out += [s.id(), s.name(), s.tty(), tabTitle, workerPane].join("\\t") + "\\n";
   }); }); });
   return out;`;
 
@@ -472,6 +479,7 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
       isClaude: claudeTtys.size ? claudeTtys.has(parts[2]) : undefined,
       // paiName is null here — callers merge from getAllPersistentSessionNames()
       paiName: null,
+      workerPane: Boolean(parts[4]) && parts[4] !== "missing value",
     });
   }
   return sessions;

@@ -212,8 +212,13 @@ export function findItermSessionForTermId(
 
 // ── Session Listing ──
 
+/** `pai worker follow` panes are not sessions; list surfaces skip them. */
+export function isListed(s: { workerPane?: boolean }): boolean {
+  return !s.workerPane;
+}
+
 export function listClaudeSessions(): Array<{ id: string; name: string }> {
-  const sessions = snapshotAllSessions();
+  const sessions = snapshotAllSessions().filter(isListed);
   const persistentNames = getAllPersistentSessionNames();
   return sessions
     .filter((s) => s.name.toLowerCase().includes("claude") || lookupPersistentName(persistentNames, s.id, s.aibrokerId))
@@ -244,7 +249,7 @@ export function getSessionList(): Array<{
     if (!aliveIds.has(id)) managedSessions.delete(id);
   }
 
-  return snapshots.map((s) => {
+  return snapshots.filter(isListed).map((s) => {
     const paiName = lookupPersistentName(persistentNames, s.id, s.aibrokerId);
     return {
       id: s.id,
