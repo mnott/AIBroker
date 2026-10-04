@@ -107,3 +107,60 @@ test("the source payloads are not modified — the queue keeps its attachments",
   assert.equal(typeof original.imageBase64, "string");
   assert.equal(original.imageBase64.length, 600 * 1024);
 });
+
+// --- spilled attachments: delivered live after the reply, within bounds ---
+
+const { loadQueue, enqueue, getAfter } = await import("../src/adapters/pailot/message-queue.js");
+
+function spill(n: number, caption = "shot"): number {
+  return enqueue("s-1", "image", { type: "image", msgId: `m-${Math.random()}`, imageBase64: blob(n), mimeType: "image/png", caption });
+}
+
+test("a spilled image leaves the reply and comes back as a live replay with its msgId and seq", () => {
+  loadQueue(100);
+  const seq = spill(400 * 1024);
+  const r = buildCatchUp(getAfter(seq - 1));
+  assert.equal(r.messages.length, 0, "no placeholder next to the real image");
+  assert.equal(r.replays.length, 1);
+  const m = r.replays[0] as Record<string, unknown>;
+  assert.equal(m.seq, seq);
+  assert.ok(String(m.msgId).startsWith("m-"));
+  assert.equal(m.type, "image");
+  assert.equal((m.imageBase64 as string).length, 400 * 1024);
+  assert.equal(m.attachment, undefined);
+  assert.ok(r.bytes < 1024, "the reply itself stays small");
+});
+
+test("a silent-screenshot caption is changed so the app puts the replay in the chat", () => {
+  loadQueue(100);
+  const seq = spill(300 * 1024, "Screenshot");
+  const m = buildCatchUp(getAfter(seq - 1)).replays[0] as Record<string, unknown>;
+  assert.notEqual(m.caption, "Screenshot");
+});
+
+test("replays are capped by count: the newest ten are delivered, older stay placeholders", () => {
+  loadQueue(100);
+  const first = spill(300 * 1024);
+  for (let i = 0; i < 11; i++) spill(300 * 1024);
+  const r = buildCatchUp(getAfter(first - 1));
+  assert.equal(r.replays.length, 10);
+  assert.equal(r.messages.length, 2, "the two oldest remain in the reply");
+  for (const m of r.messages as Record<string, unknown>[]) {
+    assert.equal(m.omitted, "imageBase64");
+    assert.match(String(m.caption), /too large/);
+    assert.equal(m.attachment, undefined);
+  }
+  assert.equal((r.replays[0] as Record<string, unknown>).seq, first + 2, "oldest delivered first");
+});
+
+test("replays are capped by total bytes", () => {
+  loadQueue(100);
+  const first = spill(9 * 1024 * 1024);
+  spill(9 * 1024 * 1024);
+  spill(9 * 1024 * 1024);
+  const r = buildCatchUp(getAfter(first - 1));
+  const total = r.replays.reduce((n, m) => n + ((m as Record<string, unknown>).imageBase64 as string).length, 0);
+  assert.ok(total <= 20 * 1024 * 1024, `replayed ${total}`);
+  assert.equal(r.replays.length, 2);
+  assert.equal(r.messages.length, 1, "the oldest is a placeholder");
+});

@@ -235,6 +235,15 @@ export function mqttPublishImage(sessionId: string, imageBase64: string, caption
   mqttPublish("pailot/out", payload);
 }
 
+/**
+ * Re-publish a queued message on the live topic (catch_up attachment replay).
+ * Keeps its original msgId and seq: clients that already have it drop it, the
+ * one that missed it shows it once.
+ */
+export function mqttPublishReplay(payload: Record<string, unknown>): void {
+  mqttPublish("pailot/out", payload);
+}
+
 /** Publish a typing indicator (QoS 0, no msgId — ephemeral). */
 export function mqttPublishTyping(sessionId: string, active: boolean): void {
   mqttPublish("pailot/out", {
