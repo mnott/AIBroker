@@ -48,6 +48,7 @@ import {
   mqttPublishText,
   mqttPublishVoice,
   mqttPublishImage,
+  mqttPublishReplay,
   mqttPublishTyping,
   mqttPublishScreenshot,
   mqttPublishSessions,
@@ -59,7 +60,7 @@ import {
   getMqttAppClientCount,
 } from "./mqtt-broker.js";
 import { sendPush as apnsSendPush } from "../../apns/client.js";
-import { getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
+import { readAttachment, withNote, type AttachmentRef, getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
 import { getAllPersistentSessionNames, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
 import { discoverLiveSessions, isClaudeRelated, listedLiveIds } from "../../core/session-discovery.js";
@@ -190,6 +191,17 @@ const ONE_MESSAGE_MAX_BYTES = 256 * 1024;
 const CATCH_UP_MAX_BYTES = 4 * 1024 * 1024;
 
 /**
+ * Spilled attachments handed back after a catch-up, as separate live messages.
+ * Bounded in count and total bytes so a long absence cannot rebuild the reply
+ * that once reached 194 MB; older images beyond the bound stay placeholders.
+ */
+const REPLAY_MAX_IMAGES = 10;
+const REPLAY_MAX_BYTES = 20 * 1024 * 1024;
+
+/** Captions the app treats as Navigate-screen screenshots and keeps out of the chat. */
+const SILENT_CAPTIONS = new Set(["Screenshot", "Capturing screenshot..."]);
+
+/**
  * Make a catch-up batch a phone can actually receive.
  *
  * THE FAILURE THIS PREVENTS IS SELF-SUSTAINING, which is what makes it worth a
@@ -214,14 +226,42 @@ export function buildCatchUp(missed: Array<{ payload: Record<string, unknown> }>
   bytes: number;
   withheld: number;
   lightened: number;
+  /** Full image messages to publish live after the reply, oldest first. */
+  replays: Record<string, unknown>[];
 } {
   const messages: Record<string, unknown>[] = [];
+  const replays: Record<string, unknown>[] = [];
   let bytes = 0;
   let withheld = 0;
   let lightened = 0;
+  let replayBytes = 0;
 
   for (let i = missed.length - 1; i >= 0; i--) {
     const p: Record<string, unknown> = { ...missed[i].payload };
+
+    // A spilled attachment is delivered as its own live message (same msgId and
+    // seq as the original, so the app's dedup shows it exactly once) and the
+    // message leaves the reply — otherwise the app would show a placeholder AND
+    // the image. Past the bounds, or with the file gone, it stays a placeholder.
+    const ref = p.attachment as AttachmentRef | undefined;
+    delete p.attachment;
+    if (ref) {
+      if (replays.length < REPLAY_MAX_IMAGES && replayBytes + ref.bytes <= REPLAY_MAX_BYTES) {
+        const data = readAttachment(ref);
+        if (data !== undefined) {
+          const caption = p.caption;
+          replays.unshift({
+            ...p,
+            [ref.field]: data,
+            caption: typeof caption === "string" && SILENT_CAPTIONS.has(caption) ? `${caption} (missed)` : caption,
+          });
+          replayBytes += ref.bytes;
+          continue;
+        }
+      }
+      p.omitted = ref.field;
+      p.caption = withNote(p.caption);
+    }
 
     // Audio never survives a replay: it is large, and the transcript carries
     // what the message meant. Downgrading to text says so honestly rather than
@@ -263,7 +303,7 @@ export function buildCatchUp(missed: Array<{ payload: Record<string, unknown> }>
     bytes += size;
   }
 
-  return { messages, bytes, withheld, lightened };
+  return { messages, bytes, withheld, lightened, replays };
 }
 
 /** Handle catch_up command: replay missed messages to the client.
@@ -287,7 +327,7 @@ function handleCatchUp(ws: WebSocket, args?: Record<string, unknown>): void {
   // buffer. That is how a phone was handed 117 MB in one reply, wrote it to its
   // local store, and was killed by the watchdog on the next launch — twice,
   // because reinstalling asks from 0 again.
-  const { messages: payloads, bytes, withheld: skipped, lightened } = buildCatchUp(missed);
+  const { messages: payloads, bytes, withheld: skipped, lightened, replays } = buildCatchUp(missed);
   if (skipped > 0) {
     log(`[PAILot] catch_up: withheld ${skipped} older message(s) — over ${Math.round(CATCH_UP_MAX_BYTES / 1048576)} MB`);
   }
@@ -304,6 +344,7 @@ function handleCatchUp(ws: WebSocket, args?: Record<string, unknown>): void {
     // you are getting" are not the same silence.
     ...(skipped > 0 ? { truncated: true, withheld: skipped } : {}),
   });
+  for (const r of replays) sendTo(ws, r);
 }
 
 function isClientAlive(ws: WebSocket): boolean {
@@ -1831,7 +1872,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       // Same builder as the WebSocket path. The assumption that used to live
       // here — audio stripped, "images kept intact (typically <500KB)" — is
       // what produced a 194 MB reply and the reconnect loop that followed it.
-      const { messages: lightPayloads, bytes, withheld, lightened } = buildCatchUp(missed);
+      const { messages: lightPayloads, bytes, withheld, lightened, replays } = buildCatchUp(missed);
       if (withheld > 0) {
         log(`[MQTT] catch_up: withheld ${withheld} older message(s) — over ${Math.round(CATCH_UP_MAX_BYTES / 1048576)} MB`);
       }
@@ -1848,6 +1889,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         // all you are getting" are the same silence.
         ...(withheld > 0 ? { truncated: true, withheld } : {}),
       });
+      for (const r of replays) mqttPublishReplay(r);
 
       handleMqttCommand("sessions");
       break;

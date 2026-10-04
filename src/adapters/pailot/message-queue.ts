@@ -9,11 +9,12 @@
  * session lists, and other ephemeral messages are not persisted.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { log } from "../../core/log.js";
 import { saveJson } from "../../core/json-store.js";
+import { getAppDir } from "../../core/persistence.js";
 
 const QUEUE_DIR = join(homedir(), ".aibroker");
 const QUEUE_FILE = join(QUEUE_DIR, "pailot-queue.json");
@@ -41,6 +42,15 @@ const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
  * leaves the conversation readable and the attachment retrievable on request.
  */
 const MAX_PAYLOAD_BYTES = 256 * 1024;
+
+/**
+ * Disk ceiling for spilled attachments. The queue's own byte budget counts only
+ * the JSON; the bulk lives in files, so it needs a budget of its own or 500
+ * entries could pin gigabytes. Oldest attachments expire first.
+ */
+const MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024;
+
+const OMITTED_NOTE = "[attachment too large to replay — ask for it again if you need it]";
 
 /** Fields that carry bulk. Dropping them leaves the message and its context. */
 const BULK_FIELDS = ["imageBase64", "audioBase64", "data"] as const;
@@ -92,6 +102,7 @@ export function loadQueue(maxMessages?: number, maxQueueBytes?: number): void {
       // edited by hand, must not survive a restart intact and be replayed.
       messages = messages.map(shrinkIfHuge);
       trimToByteBudget();
+      sweepOrphanAttachments();
     }
 
     log(`[MQ] loaded ${messages.length} messages, nextSeq=${nextSeq}`);
@@ -167,9 +178,12 @@ export function enqueue(sessionId: string, type: string, payload: Record<string,
 
   // Trim circular buffer
   if (messages.length > maxSize) {
-    messages = messages.slice(-maxSize);
+    const cut = messages.length - maxSize;
+    removeAttachments(messages.slice(0, cut));
+    messages = messages.slice(cut);
   }
   trimToByteBudget();
+  trimAttachmentBudget();
 
   scheduleSave();
   return seq;
@@ -184,25 +198,115 @@ function entryBytes(m: QueuedMessage): number {
   }
 }
 
+/** Reference to a spilled attachment, carried in the queued payload. */
+export interface AttachmentRef {
+  field: string;
+  file: string;
+  bytes: number;
+}
+
+function attachmentDir(): string {
+  return join(getAppDir(), "attachments");
+}
+
+function attachmentExt(mimeType: unknown): string {
+  const sub = typeof mimeType === "string" ? mimeType.split("/")[1] ?? "" : "";
+  return sub.replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase() || "bin";
+}
+
 /**
- * Strip the bulk from an oversized entry, keeping the message itself.
+ * Spill the bulk of an oversized entry to disk, keeping a reference.
  *
- * Done at ENQUEUE, not at replay: a payload nobody can be handed is not worth
- * carrying on disk either, and stripping once is cheaper than deciding again
- * for every client that reconnects.
+ * Done at ENQUEUE so the queue file stays small and replay of the JSON is cheap;
+ * the attachment itself is handed out separately on catch_up, within bounds
+ * (see buildCatchUp). Only images are spilled: audio is never replayed and the
+ * transcript carries it. If the write fails the old behaviour applies — the
+ * bulk is dropped and the caption says so.
  */
 function shrinkIfHuge(m: QueuedMessage): QueuedMessage {
   if (entryBytes(m) <= MAX_PAYLOAD_BYTES) return m;
   const payload = { ...m.payload };
   let dropped = false;
+  let ref: AttachmentRef | undefined;
   for (const f of BULK_FIELDS) {
-    if (payload[f]) { delete payload[f]; dropped = true; }
+    const v = payload[f];
+    if (!v) continue;
+    if (m.type === "image" && !ref && typeof v === "string") {
+      const file = `${m.seq}.${attachmentExt(payload.mimeType)}`;
+      try {
+        mkdirSync(attachmentDir(), { recursive: true, mode: 0o700 });
+        writeFileSync(join(attachmentDir(), file), v, { encoding: "utf-8", mode: 0o600 });
+        ref = { field: f, file, bytes: v.length };
+      } catch (err) {
+        log(`[MQ] seq=${m.seq} attachment write failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    delete payload[f];
+    dropped = true;
   }
   if (!dropped) return m;
-  const caption = typeof payload.caption === "string" ? payload.caption : "";
-  payload.caption = `${caption}${caption ? " " : ""}[attachment too large to replay — ask for it again if you need it]`;
-  log(`[MQ] seq=${m.seq} exceeded ${Math.round(MAX_PAYLOAD_BYTES / 1024)} KB — stored without its attachment`);
+  if (ref) {
+    payload.attachment = ref;
+    log(`[MQ] seq=${m.seq} exceeded ${Math.round(MAX_PAYLOAD_BYTES / 1024)} KB — attachment spilled to ${ref.file}`);
+  } else {
+    payload.caption = withNote(payload.caption);
+    log(`[MQ] seq=${m.seq} exceeded ${Math.round(MAX_PAYLOAD_BYTES / 1024)} KB — stored without its attachment`);
+  }
   return { ...m, payload };
+}
+
+/** Append the "cannot replay" note to a caption. */
+export function withNote(caption: unknown): string {
+  const c = typeof caption === "string" ? caption : "";
+  return `${c}${c ? " " : ""}${OMITTED_NOTE}`;
+}
+
+/** Read a spilled attachment back. Undefined when the file is gone. */
+export function readAttachment(ref: AttachmentRef): string | undefined {
+  try {
+    return readFileSync(join(attachmentDir(), ref.file), "utf-8");
+  } catch {
+    return undefined;
+  }
+}
+
+function attachmentOf(m: QueuedMessage): AttachmentRef | undefined {
+  const a = m.payload.attachment as AttachmentRef | undefined;
+  return a && typeof a.file === "string" ? a : undefined;
+}
+
+/** Delete the files of entries leaving the queue, so disk use follows the queue. */
+function removeAttachments(gone: QueuedMessage[]): void {
+  for (const m of gone) {
+    const a = attachmentOf(m);
+    if (!a) continue;
+    try { unlinkSync(join(attachmentDir(), a.file)); } catch { /* already gone */ }
+  }
+}
+
+/** Files left by entries the queue no longer holds (crash, hand-edited queue). */
+function sweepOrphanAttachments(): void {
+  const keep = new Set(messages.map(attachmentOf).filter(Boolean).map((a) => a!.file));
+  try {
+    for (const f of readdirSync(attachmentDir())) {
+      if (!keep.has(f)) { try { unlinkSync(join(attachmentDir(), f)); } catch { /* ignore */ } }
+    }
+  } catch { /* no directory yet */ }
+}
+
+/** Expire the oldest attachments (file only, message stays) past the disk budget. */
+function trimAttachmentBudget(): void {
+  let total = messages.reduce((n, m) => n + (attachmentOf(m)?.bytes ?? 0), 0);
+  for (let i = 0; i < messages.length && total > MAX_ATTACHMENT_TOTAL_BYTES; i++) {
+    const a = attachmentOf(messages[i]);
+    if (!a) continue;
+    removeAttachments([messages[i]]);
+    const payload = { ...messages[i].payload };
+    delete payload.attachment;
+    payload.caption = withNote(payload.caption);
+    messages[i] = { ...messages[i], payload };
+    total -= a.bytes;
+  }
 }
 
 /**
@@ -218,6 +322,7 @@ function trimToByteBudget(): void {
   let dropped = 0;
   while (messages.length > 1 && total > maxBytes) {
     total -= entryBytes(messages[0]);
+    removeAttachments([messages[0]]);
     messages.shift();
     dropped++;
   }

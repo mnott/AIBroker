@@ -32,7 +32,10 @@ const {
   getAfter,
   getLatestSeq,
   isContentType,
+  readAttachment,
 } = await import("../src/adapters/pailot/message-queue.js");
+import type { AttachmentRef } from "../src/adapters/pailot/message-queue.js";
+const { getAppDir } = await import("../src/core/persistence.js");
 
 describe("message-queue", () => {
   // Each test starts with a fresh queue by loading with a clean state
@@ -50,15 +53,49 @@ describe("message-queue", () => {
     // A count is not a size. The queue held 500 messages and 194 MB of them —
     // three videos at 29.7 MB each — and replaying that to a reconnecting phone
     // is what killed the app.
-    it("stores an oversized message without its attachment, keeping the message", () => {
+    it("stores an oversized voice message without its audio, keeping the message", () => {
       loadQueue(100);
       const big = "x".repeat(2 * 1024 * 1024);
-      const seq = enqueue("s-1", "image", { imageBase64: big, caption: "a video", mimeType: "video/mp4" });
+      const seq = enqueue("s-1", "voice", { audioBase64: big, transcript: "hi", caption: "a note" });
       const stored = getAfter(seq - 1).find((m) => m.seq === seq);
       assert.ok(stored, "the message is still queued");
-      assert.equal(stored?.payload.imageBase64, undefined, "the bulk is gone");
-      assert.match(String(stored?.payload.caption), /a video/, "the caption survives");
+      assert.equal(stored?.payload.audioBase64, undefined, "the bulk is gone");
+      assert.match(String(stored?.payload.caption), /a note/, "the caption survives");
       assert.match(String(stored?.payload.caption), /too large/, "and says what happened");
+    });
+
+    it("spills an oversized image to disk and keeps a reference", () => {
+      loadQueue(100);
+      const big = "x".repeat(2 * 1024 * 1024);
+      const seq = enqueue("s-1", "image", { imageBase64: big, caption: "shot", mimeType: "image/png" });
+      const stored = getAfter(seq - 1).find((m) => m.seq === seq);
+      const ref = stored?.payload.attachment as AttachmentRef;
+      assert.equal(stored?.payload.imageBase64, undefined, "the bulk left the queue entry");
+      assert.equal(stored?.payload.caption, "shot", "caption untouched");
+      assert.equal(ref.file, `${seq}.png`);
+      assert.ok(existsSync(join(getAppDir(), "attachments", ref.file)), "file written");
+      assert.equal(readAttachment(ref), big, "and readable back intact");
+    });
+
+    it("deletes the file when the entry is trimmed from the circular buffer", () => {
+      loadQueue(2);
+      const big = "x".repeat(300 * 1024);
+      const seq = enqueue("s-1", "image", { imageBase64: big, mimeType: "image/png" });
+      const file = join(getAppDir(), "attachments", `${seq}.png`);
+      assert.ok(existsSync(file));
+      enqueue("s-1", "text", { content: "a" });
+      enqueue("s-1", "text", { content: "b" });
+      assert.ok(!existsSync(file), "file removed with its entry");
+    });
+
+    it("deletes the file when the byte budget drops the entry", () => {
+      loadQueue(1000, 300 * 1024);
+      const big = "x".repeat(300 * 1024);
+      const seq = enqueue("s-1", "image", { imageBase64: big, mimeType: "image/jpeg" });
+      const file = join(getAppDir(), "attachments", `${seq}.jpeg`);
+      assert.ok(existsSync(file));
+      for (let i = 0; i < 8; i++) enqueue("s-1", "text", { content: "y".repeat(60 * 1024) });
+      assert.ok(!existsSync(file), "file removed with its entry");
     });
 
     it("does not touch a message that fits", () => {
