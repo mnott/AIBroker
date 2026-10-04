@@ -216,7 +216,7 @@ export function registerCoreHandlers(
     // The note that used to sit here — "manager.listSessions() is always empty
     // (nothing populates the internal registry)" — described the defect and
     // routed around it; the registry now populates itself.
-    const snapshots = discoverLiveSessions();
+    const snapshots = discoverLiveSessions().filter((s) => !s.workerPane);
     const sessions = snapshots.map((s, i) => {
       const paiName = s.paiName;
       return {
