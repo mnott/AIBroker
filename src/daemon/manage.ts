@@ -441,6 +441,8 @@ export interface ManagedSession {
    *  clock for that note, since the skip itself happens every tick while the
    *  session stays mid-turn. */
   busyNotedAt?: number;
+  /** When a goal was last queued behind a running turn; at most one pending. */
+  queuedArmAt?: number;
   /**
    * When this session was first seen BLOCKED — waiting on a permission
    * prompt or similar, not merely idle. Kept across ticks so the operator
@@ -3084,6 +3086,28 @@ export function turnStoppedIdle(
 
 export const GOAL_GONE_REASON = "goal gone before until, re-armed";
 
+/** How long one queued arm is awaited before another may be typed. */
+export const QUEUED_ARM_WAIT_MS = 10 * 60_000;
+export const GOAL_GONE_BUSY_REASON = "goal gone before until, re-armed (session busy, queued)";
+
+/**
+ * Goal gone while the session is mid-turn: Claude Code queues a submitted line
+ * and runs it at the next turn boundary, so arming now interrupts nothing.
+ * Same guards as the idle rule (not paused, until ahead, input line empty) plus
+ * at most one pending arm. Clears the pending mark once the marker is back or
+ * the turn is over.
+ */
+export function busyGoalGoneReason(m: ManagedSession, content: string, now: number, busy: boolean): string | null {
+  if (!busy || GOAL_ACTIVE.test(content)) {
+    delete m.queuedArmAt;
+    return null;
+  }
+  if (m.queuedArmAt !== undefined && now - m.queuedArmAt < QUEUED_ARM_WAIT_MS) return null;
+  return reasonToArm({ ...m, lastRearmAt: m.lastRearmAt || 1 }, content, now) === GOAL_GONE_REASON
+    ? GOAL_GONE_BUSY_REASON
+    : null;
+}
+
 export function reasonToArm(m: ManagedSession, content: string, now: number): string | null {
   if (m.paused) return null;
 
@@ -3784,6 +3808,18 @@ async function tick(): Promise<void> {
      * from when it would otherwise fire — it never suppresses one, since a
      * genuinely stuck session goes quiet on the transcript too.
      */
+    // Goal gone mid-turn: queue the arm behind the turn instead of waiting for an idle tick.
+    const queuedReason = busyGoalGoneReason(m, content, now, working && !paneLooksIdle(content, now - m.lastChangeAt));
+    if (queuedReason && now - m.lastRearmAt >= REARM_COOLDOWN_MS) {
+      // Pending whether or not the read-back saw it land: a queued line is invisible until the turn ends.
+      m.queuedArmAt = now;
+      const queued = await tryExclusive(arming, m.sessionId, () => arm(m, queuedReason));
+      if (queued === undefined) delete m.queuedArmAt;
+      else if (!queued) note(m, `${queuedReason} — not confirmed, waiting for the turn to end or the marker`);
+      dirty = true;
+      continue;
+    }
+
     if (!m.paused && lease) {
       if (working) {
         const hadState = m.blockedSince !== undefined || m.blockedAlertedAt !== undefined || m.stuckSince !== undefined;
