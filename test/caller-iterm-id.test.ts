@@ -22,7 +22,7 @@ import "./home-guard.js";
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { callerItermId, sendToSessionDelivery } from "../src/daemon/core-handlers.js";
+import { callerItermId, sendToSessionDelivery, messagePreview } from "../src/daemon/core-handlers.js";
 import type { IpcRequest } from "../src/types/ipc.js";
 
 const UUID = "066504E1-BB16-48D3-9A74-C1F8BA45B7F3";
@@ -80,10 +80,41 @@ test("default (noReply absent/false): a one-line pointer is typed, not the body 
   // Reproduced live 2026-09-23. The pointer must never contain the message
   // body, or a long/multi-line body defeats the fix by leaking back in.
   const r = sendToSessionDelivery("run the sweep", "PAI", false);
-  assert.ok(r.typed.startsWith("[Session:PAI]"));
-  assert.ok(!r.typed.includes("run the sweep"), "typed text must not repeat the body");
-  assert.equal(r.typed.split("\n").length, 1, "typed text must be a single line");
+  assert.equal(r.typed, "[Session:PAI] run the sweep — drain your mailbox (aibroker_receive) for the full text");
   assert.equal(r.deposit, true);
+});
+
+test("long body: the typed line carries a capped preview, never the full body", () => {
+  const body = Array.from({ length: 40 }, (_, i) => `word${i}`).join(" ");
+  const r = sendToSessionDelivery(body, "PAI", false);
+  assert.ok(!r.typed.includes(body));
+  assert.ok(!r.typed.includes("word39"));
+  assert.equal(r.typed.split("\n").length, 1);
+});
+
+test("messagePreview: Agentish T uses i, r, g", () => {
+  assert.equal(messagePreview("T\ni=fix-x\nr=+\ng=do the thing\nz=ignored"), "fix-x r=+ do the thing");
+});
+
+test("messagePreview: Agentish R/S use i, r, z", () => {
+  assert.equal(messagePreview("R\ni=pai-pane-close\nr=+\nz=cpp done"), "pai-pane-close r=+ cpp done");
+  assert.equal(messagePreview("S\ni=job\nz=halfway"), "job halfway");
+});
+
+test("messagePreview: prose is flattened to one line", () => {
+  assert.equal(messagePreview("hello\n\n  there\t world\r\n"), "hello there world");
+});
+
+test("messagePreview: long text is cut at a word boundary with an ellipsis", () => {
+  const p = messagePreview("alpha ".repeat(40));
+  assert.ok(p.endsWith("alpha…"));
+  assert.ok(p.length <= 101);
+});
+
+test("messagePreview: control characters are stripped", () => {
+  const p = messagePreview("a\x1b[31mb\x07c\rd\x00e");
+  assert.equal(p, "a [31mb c d e");
+  assert.ok(!/[\x00-\x1f\x7f]/.test(p));
 });
 
 test("an 8-line AG2 body: typed stays one line, nothing to lose a head from", () => {
@@ -95,6 +126,6 @@ test("an 8-line AG2 body: typed stays one line, nothing to lose a head from", ()
   const body = Array.from({ length: 8 }, (_, i) => `line${i + 1} of 8`).join("\n");
   const r = sendToSessionDelivery(body, "PAI", false);
   assert.equal(r.typed.split("\n").length, 1);
-  assert.ok(!r.typed.includes("line8 of 8"));
+  assert.ok(!r.typed.includes(body));
   assert.equal(r.deposit, true);
 });

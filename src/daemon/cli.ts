@@ -29,6 +29,7 @@ delete process.env.__CFBundleIdentifier;
 import { WatcherClient } from "../ipc/client.js";
 import { validateHubStatus } from "../ipc/validate.js";
 import { formatHubStatus } from "./status-format.js";
+import { runsUnderAgent } from "./agent-env.js";
 import { createAdapter } from "./create-adapter.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -306,6 +307,7 @@ switch (command) {
       const raw = (await client.call_raw("manage", {
         session,
         arg: rest.join(" "),
+        operator: !runsUnderAgent(process.env),
       })) as { message?: string };
       console.log(raw?.message ?? "(no answer)");
     } catch (e) {

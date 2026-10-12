@@ -5,9 +5,10 @@
  * with zero transport-specific imports.
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
+import { parseAttachUuid } from "../../core/claude-attach.js";
 import { timeCall } from "../../core/call-timing.js";
 import { itermInPlay } from "../../transport/policy.js";
 
@@ -47,6 +48,32 @@ export function cleanChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Proc
   return rest;
 }
 
+// spawnSync defaults to a 1 MiB buffer; a full scrollback read can exceed it.
+const OSASCRIPT_MAX_BUFFER = 64 * 1024 * 1024;
+
+/** Log (throttled) why an osascript run produced no answer. NEVER fail silently — see below. */
+function reportOsascriptFailure(
+  script: string,
+  timeoutMs: number,
+  r: { status: number | null; signal: string | null; error?: Error; stderr: string },
+): void {
+  // NEVER fail silently here. Every session feature — send_to_session,
+  // session_content, dispatch — is built on this call, and a null turns into
+  // an empty session list that is indistinguishable from "nothing is open".
+  // A timeout 50ms over budget therefore looked exactly like an empty
+  // machine, and took the whole hub down with nothing in the log to show it.
+  const first = script.trim().split("\n")[0].slice(0, 60);
+  const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" || r.signal === "SIGTERM";
+  const stderr = r.stderr.trim().slice(0, 200);
+  logThrottled(
+    `${first}|${timedOut}`,
+    timedOut
+      ? `osascript TIMED OUT after ${timeoutMs}ms — callers will see an empty result. Script: ${first}…`
+      : `osascript failed (status ${r.status}${r.signal ? `, signal ${r.signal}` : ""})` +
+        `${stderr ? `: ${stderr}` : ""}. Script: ${first}…`,
+  );
+}
+
 /** Run osascript with a script on stdin; null (and a throttled log line) on any failure. */
 function runOsascript(args: string[], script: string, timeoutMs: number): string | null {
   const result = spawnSync("osascript", args, {
@@ -54,29 +81,55 @@ function runOsascript(args: string[], script: string, timeoutMs: number): string
     stdio: ["pipe", "pipe", "pipe"],
     timeout: timeoutMs,
     env: cleanChildEnv(),
+    maxBuffer: OSASCRIPT_MAX_BUFFER,
   });
 
   if (result.status !== 0 || result.error) {
-    // NEVER fail silently here. Every session feature — send_to_session,
-    // session_content, dispatch — is built on this call, and a null turns into
-    // an empty session list that is indistinguishable from "nothing is open".
-    // A timeout 50ms over budget therefore looked exactly like an empty
-    // machine, and took the whole hub down with nothing in the log to show it.
-    const first = script.trim().split("\n")[0].slice(0, 60);
-    const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
-      || result.signal === "SIGTERM";
-    const stderr = result.stderr?.toString().trim().slice(0, 200) ?? "";
-    logThrottled(
-      `${first}|${timedOut}`,
-      timedOut
-        ? `osascript TIMED OUT after ${timeoutMs}ms — callers will see an empty result. Script: ${first}…`
-        : `osascript failed (status ${result.status}${result.signal ? `, signal ${result.signal}` : ""})` +
-          `${stderr ? `: ${stderr}` : ""}. Script: ${first}…`,
-    );
+    reportOsascriptFailure(script, timeoutMs, {
+      status: result.status,
+      signal: result.signal,
+      error: result.error,
+      stderr: result.stderr?.toString() ?? "",
+    });
     return null;
   }
 
   return result.stdout?.toString().trim() ?? null;
+}
+
+/**
+ * runOsascript without blocking the event loop. A pane read pulls iTerm's whole
+ * scrollback through osascript (seconds for a 7000-line pane); done with
+ * spawnSync that stalls IPC, the MQTT loopback and adapter health polls for the
+ * duration. Same null-on-failure contract and failure log as the sync twin.
+ */
+function runOsascriptAsync(args: string[], script: string, timeoutMs: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const child = spawn("osascript", args, { stdio: ["pipe", "pipe", "pipe"], env: cleanChildEnv() });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let timedOut = false;
+    let settled = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMs);
+    const done = (status: number | null, signal: string | null, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (status !== 0 || error) {
+        const e = error ?? (timedOut ? Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }) : undefined);
+        reportOsascriptFailure(script, timeoutMs, { status, signal, error: e, stderr: Buffer.concat(err).toString() });
+        resolve(null);
+      } else {
+        resolve(Buffer.concat(out).toString().trim());
+      }
+    };
+    child.stdout.on("data", (d: Buffer) => out.push(d));
+    child.stderr.on("data", (d: Buffer) => err.push(d));
+    child.on("error", (e) => done(null, null, e));
+    child.on("close", (status, signal) => done(timedOut ? null : status, signal));
+    child.stdin.on("error", () => {});
+    child.stdin.end(script);
+  });
 }
 
 // Default budget. Deliberately generous: exceeding it yields null, which every
@@ -146,13 +199,22 @@ export function runItermJxa(body: string, timeoutMs = 15_000): string | null {
   return out;
 }
 
+/** runItermJxa without blocking the event loop (see runOsascriptAsync). */
+export async function runItermJxaAsync(body: string, timeoutMs = 15_000): Promise<string | null> {
+  const pid = itermPid();
+  if (pid === null) return null;
+  const out = await runOsascriptAsync(["-l", "JavaScript"], buildItermJxa(pid, body), timeoutMs);
+  if (out === null) cachedItermPid = null;
+  return out;
+}
+
 /**
  * Plain-object indirection so tests can replace the osascript call without
  * mocking node:child_process — a builtin's named export is a fixed snapshot
  * taken once at module load, so reassigning it post-load (the usual mock
  * technique) silently does nothing.
  */
-export const _internal = { runAppleScript, runItermJxa };
+export const _internal = { runAppleScript, runItermJxa, runItermJxaAsync };
 
 export function stripItermPrefix(id: string | undefined): string | undefined {
   if (!id) return id;
@@ -347,6 +409,11 @@ export interface SessionSnapshot {
    * set). Kept in the snapshot for internal lookups; list surfaces drop it.
    */
   workerPane?: boolean;
+  /**
+   * Set when the foreground job is `claude attach <uuid>`: this pane only
+   * views a Claude background session, and the uuid (or prefix) names it.
+   */
+  attachUuid?: string;
 }
 
 /**
@@ -385,8 +452,9 @@ export interface SessionSnapshot {
  * open — the same shape of mistake as the AppleScript timeout that scaled with
  * tab count.
  */
-function ttysRunningClaude(): Set<string> {
-  const found = new Set<string>();
+function ttysRunningClaude(): Map<string, string | undefined> {
+  // tty -> the session uuid a `claude attach` viewer shows, undefined for a plain Claude
+  const found = new Map<string, string | undefined>();
   try {
     const out = timeCall("iterm-core:ps-claude-scan", () =>
       execFileSync("ps", ["-ao", "tty=,command="], { encoding: "utf8", timeout: 10_000 }));
@@ -396,7 +464,7 @@ function ttysRunningClaude(): Set<string> {
       const [, tty, command] = m;
       // The binary, not a path that merely mentions it: an MCP server living
       // under a .claude directory is not a session.
-      if (/(^|\/)claude(\s|$)/.test(command)) found.add(tty.startsWith("/dev/") ? tty : `/dev/${tty}`);
+      if (/(^|\/)claude(\s|$)/.test(command)) found.set(tty.startsWith("/dev/") ? tty : `/dev/${tty}`, parseAttachUuid(command));
     }
   } catch {
     /* no answer: callers fall back to the title heuristic rather than see nothing */
@@ -480,6 +548,7 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
       // paiName is null here — callers merge from getAllPersistentSessionNames()
       paiName: null,
       workerPane: Boolean(parts[4]) && parts[4] !== "missing value",
+      attachUuid: claudeTtys.get(parts[2]),
     });
   }
   return sessions;

@@ -27,6 +27,13 @@ export interface IpcRequest {
    * and iTerm reports it per session, so the two can be reconciled.
    */
   callerTty?: string;
+  /**
+   * The Claude Code session uuid the caller runs under, when known. A session
+   * moved into a Claude background session keeps announcing the iTerm pane it
+   * started in (now a shell) while the pane you see runs `claude attach`; the
+   * uuid is what ties the two together for mailbox routing.
+   */
+  claudeSessionId?: string;
   method: string;
   params: Record<string, unknown>;
 }

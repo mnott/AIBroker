@@ -34,7 +34,7 @@ export function sweepStaleMailboxes(now: number = Date.now()): MailboxMessage[] 
   const stale: MailboxMessage[] = [];
   for (const { sessionId, messages } of listSessionMailboxes()) {
     for (const m of messages) {
-      if (m.staleReported) continue;
+      if (m.staleReported || m.shownAt !== undefined) continue;
       const waited = now - m.timestamp;
       if (waited < STALE_AFTER_MS) continue;
       m.staleReported = true;

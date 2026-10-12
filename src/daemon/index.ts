@@ -21,7 +21,7 @@ import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
 import { startTodoistWebhook } from "./todoist-webhook.js";
 import { startMailboxWatch } from "./mailbox-watch.js";
-import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession } from "../adapters/pailot/gateway.js";
+import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession, liveSession } from "../adapters/pailot/gateway.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping, getMqttClientCount, mqttPublishText, mqttPublishControl } from "../adapters/pailot/mqtt-broker.js";
 import { registerToken as apnsRegisterToken, sendPush as apnsSendPush } from "../apns/client.js";
 import { loadQueue, flushQueue } from "../adapters/pailot/message-queue.js";
@@ -477,7 +477,7 @@ export async function startDaemon(options?: {
     }
 
     // Text/voice/image from app — route through AIBP bridge (same as WS path)
-    const routeSession = sessionId || undefined;
+    const routeSession = liveSession(sessionId || undefined);
     if (!routeSession) {
       log(`[MQTT→Hub] no sessionId in inbound ${type} message — dropping`);
       return;

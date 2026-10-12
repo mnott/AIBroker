@@ -76,11 +76,28 @@ function call(method, params) {
 if (process.env.PAI_WORKER === "1") process.exit(0);
 
 const id = sessionId();
-if (!id) process.exit(0);
+
+// The hook payload names the Claude session. Under `claude attach` the iTerm id
+// above is the pane the session was started in, not the one it is viewed in;
+// the uuid lets the daemon find the mailbox deposited for the viewing pane.
+async function claudeSessionId() {
+  if (process.stdin.isTTY) return undefined;
+  try {
+    let raw = "";
+    for await (const chunk of process.stdin) raw += chunk;
+    const v = JSON.parse(raw)?.session_id;
+    return typeof v === "string" ? v : undefined;
+  } catch { return undefined; }
+}
+// Bounded: a stdin that never closes must not hold the prompt.
+const claudeId = await Promise.race([claudeSessionId(), new Promise((r) => setTimeout(r, 300))]);
+// A Claude background session viewed through `claude attach` has neither
+// ITERM_SESSION_ID nor TMUX_PANE; the session uuid alone names its mailbox.
+if (!id && !claudeId) process.exit(0);
 
 // Phase 1: peek, non-destructive. A timeout here emits nothing and the
 // messages stay queued — delivered on the next prompt instead of lost.
-const res = await call("session_mailbox_peek", { sessionId: id });
+const res = await call("session_mailbox_peek", { sessionId: id, claudeSessionId: claudeId });
 const messages = res?.ok ? (res.result?.messages ?? []) : [];
 if (messages.length === 0) process.exit(0);
 
@@ -120,4 +137,4 @@ try {
 // Phase 2, only after a successful emit: ack the daemon to clear what was
 // peeked. Best-effort — a timeout here leaves the messages queued and they are
 // re-delivered on the next prompt. A duplicate is acceptable; a loss is not.
-if (emitted) await call("session_mailbox_ack", { sessionId: id, count: messages.length });
+if (emitted) await call("session_mailbox_ack", { sessionId: id, claudeSessionId: claudeId, count: messages.length });

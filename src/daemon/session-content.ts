@@ -66,6 +66,30 @@ export function readSessionContent(
   return result ? sliceToLines(result, lines) : null;
 }
 
+/**
+ * readSessionContent without blocking the event loop — for the manager tick and
+ * arm path, which read every managed pane every few seconds. The iTerm read
+ * itself is async; tmux capture-pane is a fast local spawnSync and stays sync.
+ */
+export async function readSessionContentAsync(
+  sessionId: string,
+  lines = 100,
+  opts: { fresh?: boolean } = {},
+): Promise<SessionContent | null> {
+  if (!opts.fresh) {
+    const cached = cache.get(sessionId);
+    if (cached && Date.now() - cached.at < CONTENT_TTL_MS && cached.lines >= lines) {
+      return cached.result ? sliceToLines(cached.result, lines) : null;
+    }
+  }
+  const fetchLines = Math.max(lines, MIN_CACHE_LINES);
+  const result = routeToTmux(sessionId)
+    ? readTmuxContent(sessionId, fetchLines)
+    : parseItermContent(sessionId, await _internal.runItermJxaAsync(itermReadScript(sessionId, fetchLines)));
+  cache.set(sessionId, { at: Date.now(), lines: fetchLines, result });
+  return result ? sliceToLines(result, lines) : null;
+}
+
 /** tmux path: `capture-pane -p -J -S -<lines>` through the transport, no AppleScript. */
 function readTmuxContent(sessionId: string, lines: number): SessionContent | null {
   const raw = timeCall("session-content:read", () => captureSession(sessionId, lines));
@@ -85,9 +109,14 @@ function readTmuxContent(sessionId: string, lines: number): SessionContent | nul
 
 function readSessionContentUncached(sessionId: string, lines: number): SessionContent | null {
   if (routeToTmux(sessionId)) return readTmuxContent(sessionId, lines);
+  // _internal indirection, as in core.ts's own enumeration, so tests can
+  // replace the osascript call without mocking node:child_process.
+  return parseItermContent(sessionId, timeCall("session-content:read", () => _internal.runItermJxa(itermReadScript(sessionId, lines))));
+}
 
-  // JXA: get contents, name, atPrompt for a specific session
-  const script = withSessionJxa(
+/** JXA: contents, name, atPrompt for one session; the tail is cut inside osascript so only `lines` cross the pipe. */
+function itermReadScript(sessionId: string, lines: number): string {
+  return withSessionJxa(
     sessionId,
     `          var content = aSession.contents();
           var paiName = "";
@@ -97,12 +126,10 @@ function readSessionContentUncached(sessionId: string, lines: number): SessionCo
           return [aSession.name(), String(aSession.isAtShellPrompt()), paiName, lastLines.join("\\n")].join("\\t");`,
     '"NOT_FOUND"',
   );
+}
 
-  // _internal indirection, as in core.ts's own enumeration, so tests can
-  // replace the osascript call without mocking node:child_process.
-  const result = timeCall("session-content:read", () => _internal.runItermJxa(script));
+function parseItermContent(sessionId: string, result: string | null): SessionContent | null {
   if (!result || result === "NOT_FOUND") return null;
-
   const tabIdx = result.indexOf("\t");
   const tabIdx2 = result.indexOf("\t", tabIdx + 1);
   const tabIdx3 = result.indexOf("\t", tabIdx2 + 1);

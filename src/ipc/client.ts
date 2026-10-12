@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import { readlinkSync } from "node:fs";
 
 import type { IpcRequest, IpcResponse } from "../types/ipc.js";
+import { parseSessionIdArg } from "../core/claude-attach.js";
 
 /**
  * The terminal this process is attached to, or undefined when there is none.
@@ -30,6 +31,34 @@ function callerTty(): string | undefined {
   if (_callerTty !== undefined) return _callerTty ?? undefined;
   _callerTty = resolveTty();
   return _callerTty ?? undefined;
+}
+
+/**
+ * The Claude session uuid this process runs under: the `--session-id` of the
+ * nearest `claude` ancestor. Cached; undefined when no ancestor carries one.
+ */
+let _claudeSessionId: string | null | undefined;
+
+function callerClaudeSessionId(): string | undefined {
+  if (_claudeSessionId !== undefined) return _claudeSessionId ?? undefined;
+  _claudeSessionId = null;
+  // Claude Code exports its own session uuid; the daemon matches the first 8 hex to `claude attach <short>`.
+  const fromEnv = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  if (fromEnv && /^[0-9a-f]{8}/i.test(fromEnv)) return (_claudeSessionId = fromEnv);
+  try {
+    let pid = process.ppid;
+    for (let hop = 0; hop < 8 && pid > 1; hop++) {
+      const line = execFileSync("ps", ["-o", "ppid=,command=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 }).trim();
+      const m = /^(\d+)\s+(.*)$/.exec(line);
+      if (!m) break;
+      const uuid = parseSessionIdArg(m[2]);
+      if (uuid) { _claudeSessionId = uuid; break; }
+      pid = Number(m[1]);
+    }
+  } catch {
+    /* no ps, no answer — the iTerm id alone identifies the caller */
+  }
+  return _claudeSessionId ?? undefined;
 }
 
 function resolveTty(): string | null {
@@ -262,6 +291,8 @@ export class WatcherClient {
         if (!isWorker && process.env.TMUX_PANE) request.tmuxPane = process.env.TMUX_PANE;
         const tty = callerTty();
         if (tty) request.callerTty = tty;
+        const claudeSessionId = isWorker ? undefined : callerClaudeSessionId();
+        if (claudeSessionId) request.claudeSessionId = claudeSessionId;
         socket!.write(JSON.stringify(request) + "\n");
       });
 

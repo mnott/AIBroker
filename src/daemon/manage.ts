@@ -26,10 +26,11 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { log } from "../core/log.js";
 import { timeCall } from "../core/call-timing.js";
-import { readSessionContent } from "./session-content.js";
+import { readSessionContent, readSessionContentAsync } from "./session-content.js";
 import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import { processCwd } from "../core/bins.js";
+import { parseAttachUuid, parseSessionIdArg } from "../core/claude-attach.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
@@ -116,8 +117,8 @@ const GOAL_ACTIVE = /\/goal\s+active/i;
  * because composing one is exactly the sort of work it no longer has room
  * for. The margin has to be big enough to write in.
  */
-const HANDOVER_MARGIN_K_DEFAULT = 100; // warm-up band: ask this far below the trigger, given time or work done
-const REFRESH_MARGIN_K = 40; // refresh band: ask again if it has grown 40k+ since the last one
+const HANDOVER_MARGIN_K_DEFAULT = 50; // warm-up band: ask this far below the trigger, given time or work done
+const REFRESH_MARGIN_K = 30; // refresh band: ask again if it has grown 40k+ since the last one
 const REFRESH_GROWN_K = 40;
 const IMMEDIATE_MARGIN_K = 15; // immediate band: ask NOW, no gating — this close, waiting is the wrong trade
 
@@ -313,6 +314,13 @@ const HANDOVER_REASK_K = 120;
  * growth its own last handover caused.
  */
 const HANDOVER_MIN_GAP_MS = 8 * 60_000;
+
+/**
+ * Least new work (K tokens) since the last confirmed handover before another
+ * is asked for in the warm-up band (refresh needs 40k, immediate is ungated). The log showed re-asks with 3k of new work: a
+ * handover that age-by-clock alone justified, with nothing new to write down.
+ */
+const HANDOVER_MIN_NEW_K = 20;
 
 
 /**
@@ -546,7 +554,13 @@ export interface ManagedSession {
     startedAt: number;
     /** Said once, so the end of a shift is announced and not merely obeyed. */
     endReported?: boolean;
+    /** Set by `supervise`: a bounded stretch with no issue-work rules in the brief. */
+    plain?: boolean;
   };
+  /** Idle-nudge interval in minutes (`supervise every`); unset keeps the ~46-50 min re-arm only. */
+  nudgeEveryMin?: number;
+  /** When a "continue the goal" nudge was last typed. */
+  lastNudgeAt?: number;
   startedAt: number;
 }
 
@@ -648,7 +662,7 @@ function mirrorToRepo(m: ManagedSession): void {
     const tty = m.tty ?? snapshotTty(m.sessionId);
     const proc = tty ? processReading(tty) : { isSession: false, pid: null };
     if (!proc.pid) return;
-    const live = repoRootFor(proc.pid);
+    const live = repoRootFor(proc.pid, proc.uuid);
     if (!live) return;
 
     // Pin on the first successful resolution — including for sessions that
@@ -788,12 +802,12 @@ export function bandOf(usedK: number, effectiveK: number, marginK: number): "bel
  *   nothing is one redundant note, the cost of NOT asking is the session
  *   compacting before it writes anything down.
  *
- *   REFRESH (trigger − 40k) — due once REFRESH_GROWN_K of new work has
+ *   REFRESH (trigger − 30k) — due once REFRESH_GROWN_K of new work has
  *   landed since the last handover, regardless of the clock. A handover
  *   this close to the trigger that predates a lot of new work is stale
  *   exactly where staleness costs the most.
  *
- *   WARM-UP (trigger − marginK, default 100k) — the ordinary case, gated the
+ *   WARM-UP (trigger − marginK, default 50k) — the ordinary case, gated the
  *   same way as before this was split into bands: due by the CLOCK
  *   (`lastAskAt` old enough) or by WORK done since the last one.
  *
@@ -845,6 +859,11 @@ export function handoverDue(input: {
   }
 
   const sinceLast = input.now - (input.lastAskAt ?? 0);
+  // The immediate band stays ungated (this close to the wall, waiting is the
+  // wrong trade); warm-up by clock needs real new work, not 3k.
+  if (used >= warmUpK && grownBy !== undefined && grownBy < HANDOVER_MIN_NEW_K) {
+    return { due: false, reason: `only ${grownBy}k of new work since the last handover (min ${HANDOVER_MIN_NEW_K}k)` };
+  }
   const dueByTime = sinceLast > HANDOVER_REASK_MS;
   const dueByWork = grownBy !== undefined && grownBy >= HANDOVER_REASK_K && sinceLast > HANDOVER_MIN_GAP_MS;
 
@@ -946,6 +965,13 @@ export function typedLineMatches(readBack: string, intended: string): boolean {
     return true;
   }
 
+  // A terminal that wraps mid-word makes the join add a space inside a word;
+  // compare with all whitespace removed as well.
+  const squash = (t: string) => t.replace(/\s+/g, "");
+  if (squash(normalizedReadBack).startsWith(squash(normalizedIntended))) {
+    return true;
+  }
+
   // Strip Claude Code paste placeholder.
   const placeholder = /^\[Pasted text #\d+\]\s*/;
   const collapsed = placeholder.test(normalizedReadBack);
@@ -960,7 +986,8 @@ export function typedLineMatches(readBack: string, intended: string): boolean {
   // Tail match: read-back appears as the end of intended, if long enough.
   if (
     strippedReadBack.length >= 30 &&
-    normalizedIntended.endsWith(strippedReadBack)
+    (normalizedIntended.endsWith(strippedReadBack) ||
+      squash(normalizedIntended).endsWith(squash(strippedReadBack)))
   ) {
     return true;
   }
@@ -1119,7 +1146,10 @@ function clearLanded(m: ManagedSession): void {
  */
 export function promptUnsentText(content: string): string | null {
   const lines = content.split("\n");
-  for (let i = 1; i < lines.length; i++) {
+  // Bottom-up: the live box is the LAST rule-framed ❯ line. An older box
+  // remnant in scrollback (a redraw) must never outvote it, even when the
+  // live one is empty.
+  for (let i = lines.length - 1; i >= 1; i--) {
     // The rule may carry a title — "──── Name ──" — so match its start, not
     // the whole line. Requiring the run of box-drawing characters up front
     // keeps this from matching prose that happens to begin with a dash.
@@ -1127,9 +1157,18 @@ export function promptUnsentText(content: string): string | null {
     if (!isRuleAbove) continue;
     const m = lines[i].match(/^\s*❯\s*(.*)$/);
     if (!m) continue;
-    const typed = m[1].trim();
+    // A line longer than the pane wraps onto continuation lines inside the
+    // box, down to the closing rule; the unsent text is all of them. Without
+    // a closing rule (cut-off capture) only the ❯ line is trusted.
+    const parts = [m[1].trim()];
+    for (let j = i + 1; j < lines.length; j++) {
+      if (/^\s*[─—-]{10,}/.test(lines[j])) break;
+      parts.push(lines[j].trim());
+      if (j === lines.length - 1) parts.length = 1;
+    }
+    const typed = parts.filter(Boolean).join(" ");
     // The terminal's own hint about held input is not the operator's text.
-    if (!typed || /^press up to edit/i.test(typed)) continue;
+    if (!typed || /^press up to edit/i.test(typed)) return null;
     return typed;
   }
   return null;
@@ -1225,12 +1264,12 @@ function repoRootForSession(sessionId: string): string | undefined {
   if (!tty) return undefined;
   const proc = processReading(tty);
   if (!proc.pid) return undefined;
-  return repoRootFor(proc.pid) ?? undefined;
+  return repoRootFor(proc.pid, proc.uuid) ?? undefined;
 }
 
-function repoRootFor(pid: string): string | null {
+function repoRootFor(pid: string, uuid?: string): string | null {
   try {
-    const cwd = processCwd(pid);
+    const cwd = sessionProjectCwd(pid, uuid);
     if (!cwd) return null;
     const root = execFileSync("/usr/bin/env", ["git", "-C", cwd, "rev-parse", "--show-toplevel"], {
       encoding: "utf8",
@@ -1385,6 +1424,33 @@ const lastContextLog = new Map<string, { k: number; reason: string }>();
 const inputLineTracking = new Map<string, { text: string; sameForTicks: number }>();
 
 /**
+ * The report's lines: one per UNPAUSED session, resetting its arming counter.
+ * `kOf` is injectable so the policy can be tested without a live terminal.
+ */
+export function reportLines(
+  managed: ManagedSession[],
+  armingsSince: Map<string, number>,
+  now: number,
+  kOf: (m: ManagedSession) => number | null = contextK,
+): string[] {
+  const mins = Math.round(REPORT_EVERY_MS / 60_000);
+  return managed.filter((m) => !m.paused).map((m) => {
+    const armings = armingsSince.get(m.sessionId) ?? 0;
+    armingsSince.set(m.sessionId, 0);
+    const k = kOf(m);
+    const quietFor = Math.round((now - m.lastChangeAt) / 60_000);
+    const doing = quietFor >= 2 ? `quiet for ${quietFor} min` : "working";
+    const last = m.history.at(-1);
+    return (
+      `• ${m.name} — ${doing}` +
+      (k !== null ? `, ${k}k context` : "") +
+      `, ${armings} arming${armings === 1 ? "" : "s"} in ${mins} min` +
+      (last ? `\n  last: ${last.what.slice(0, 110)}` : "")
+    );
+  });
+}
+
+/**
  * The periodic reading: what every managed session is doing, in one message.
  *
  * One message for all of them rather than one each, because the useful thing on
@@ -1408,21 +1474,11 @@ function reportIfDue(now: number): void {
   if (now - lastReportAt < REPORT_EVERY_MS) return;
   lastReportAt = now;
 
-  const mins = Math.round(REPORT_EVERY_MS / 60_000);
-  const lines = managed.map((m) => {
-    const armings = armingsSinceReport.get(m.sessionId) ?? 0;
-    armingsSinceReport.set(m.sessionId, 0);
-    const k = contextK(m);
-    const quietFor = Math.round((now - m.lastChangeAt) / 60_000);
-    const doing = m.paused ? "paused" : quietFor >= 2 ? `quiet for ${quietFor} min` : "working";
-    const last = m.history.at(-1);
-    return (
-      `• ${m.name} — ${doing}` +
-      (k !== null ? `, ${k}k context` : "") +
-      `, ${armings} arming${armings === 1 ? "" : "s"} in ${mins} min` +
-      (last ? `\n  last: ${last.what.slice(0, 110)}` : "")
-    );
-  });
+  // A paused manager does nothing, so there is nothing to say about it.
+  for (const m of managed) if (m.paused) armingsSinceReport.set(m.sessionId, 0);
+  const lines = reportLines(managed, armingsSinceReport, now);
+  // Only paused sessions: nothing to report, clock already held at now above.
+  if (lines.length === 0) return;
   reportToOperator(`Manager report\n${lines.join("\n")}`);
 }
 
@@ -1491,7 +1547,7 @@ export function resolveSession(idOrName: string): { sessionId: string; name: str
  * them already. That question belongs to the transcript below, which is the
  * session's own record rather than a side effect of it.
  */
-function processReading(tty: string): { isSession: boolean; pid: string | null } {
+function processReading(tty: string): { isSession: boolean; pid: string | null; uuid?: string } {
   const dev = tty.replace(/^\/dev\//, "");
   let out = "";
   try {
@@ -1518,7 +1574,8 @@ function processReading(tty: string): { isSession: boolean; pid: string | null }
   const claude = rows.find((r) => /(^|\/)claude$/.test(r.cmd.split(/\s+/)[0]));
   if (!claude) return { isSession: false, pid: null };
 
-  return { isSession: true, pid: claude.pid };
+  // A `claude attach <id>` viewer's cwd is not the session's; the id is.
+  return { isSession: true, pid: claude.pid, uuid: parseAttachUuid(claude.cmd) ?? parseSessionIdArg(claude.cmd) };
 }
 
 /**
@@ -1583,16 +1640,76 @@ function sessionCwd(claudePid: string): string | null {
 }
 
 /**
+ * The session's project directory. A `claude attach` viewer sits in HOME, so
+ * its process cwd names no project; the transcript named by the session id
+ * records the real one in the `cwd` of its newest record. Process cwd is the
+ * fallback when the id is unknown or the transcript carries no cwd.
+ */
+export function sessionProjectCwd(
+  claudePid: string,
+  uuid?: string,
+  root?: string,
+  procCwd: (pid: string) => string | null = sessionCwd,
+): string | null {
+  const file = uuid ? sessionTranscriptFile(uuid, root) : null;
+  if (file) {
+    try {
+      const tail = execFileSync("/usr/bin/tail", ["-n", "200", file], { encoding: "utf8", timeout: 4_000, maxBuffer: 8 * 1024 * 1024 });
+      const lines = tail.split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const cwd = JSON.parse(lines[i]).cwd;
+          if (typeof cwd === "string" && cwd) return cwd;
+        } catch { /* blank or truncated line */ }
+      }
+    } catch { /* unreadable transcript: fall back */ }
+  }
+  return procCwd(claudePid);
+}
+
+/**
  * The transcript directory for a session's own project, derived from its cwd.
  * Shared by transcriptReading (the live session's own tail) and the
  * measured-compaction reading (every .jsonl in the project, not only the
  * live one).
  */
-function projectTranscriptDir(claudePid: string): string | null {
+function projectTranscriptDir(claudePid: string, uuid?: string): string | null {
+  const byId = uuid ? sessionTranscriptFile(uuid) : null;
+  if (byId) return dirname(byId);
   const cwd = sessionCwd(claudePid);
   if (!cwd) return null;
   const dir = join(homedir(), ".claude", "projects", cwd.replace(/\//g, "-"));
   return existsSync(dir) ? dir : null;
+}
+
+const transcriptFileCache = new Map<string, string>();
+
+/**
+ * The transcript named by a Claude session id (full uuid or the short prefix
+ * `claude attach` takes), found under any project dir. The id is the only
+ * thing that identifies a background session's file: its viewer process sits
+ * in HOME, so the cwd-derived project dir is some other session's. Cached per
+ * id; re-resolved when the cached file is gone.
+ */
+export function sessionTranscriptFile(uuid: string, root = join(homedir(), ".claude", "projects")): string | null {
+  const key = `${root}\0${uuid.toLowerCase()}`;
+  const cached = transcriptFileCache.get(key);
+  if (cached && existsSync(cached)) return cached;
+  transcriptFileCache.delete(key);
+  try {
+    const prefix = uuid.toLowerCase();
+    for (const d of readdirSync(root)) {
+      let names: string[];
+      try { names = readdirSync(join(root, d)); } catch { continue; }
+      const hit = names.find((f) => f.endsWith(".jsonl") && f.toLowerCase().startsWith(prefix));
+      if (hit) {
+        const path = join(root, d, hit);
+        transcriptFileCache.set(key, path);
+        return path;
+      }
+    }
+  } catch { /* no projects dir */ }
+  return null;
 }
 
 /**
@@ -1607,6 +1724,45 @@ function projectTranscriptDir(claudePid: string): string | null {
 export function defaultHandoverTarget(cwd: string | null, notesDirExists: boolean): string | null {
   if (!cwd || !notesDirExists) return null;
   return join(cwd, "Notes", "TODO.md");
+}
+
+/**
+ * The project's configured handover sink, from `.pai/project.yaml`
+ * (`status.sink: forge` + `status.forge.anchor` / `repo`, the schema PAI's
+ * forge-sink owns). Null for the default `todo` sink or no file, so the
+ * caller falls through to Notes/TODO.md. Walks up from the session's cwd.
+ * ponytail: line scan, not a YAML parse — only three scalar keys are read;
+ * switch to the yaml package if the schema grows structure.
+ */
+export function projectSinkDescription(cwd: string | null): string | null {
+  let dir = cwd;
+  for (let i = 0; dir && i < 8; i++, dir = dirname(dir) === dir ? null : dirname(dir)) {
+    const file = join(dir, ".pai", "project.yaml");
+    if (!existsSync(file)) continue;
+    let text: string;
+    try { text = readFileSync(file, "utf8"); } catch { return null; }
+    const key = (k: string) => text.match(new RegExp(`^\\s+${k}:\\s*["']?([^\\s#"']+)`, "m"))?.[1];
+    if (key("sink") !== "forge") return null;
+    const anchor = key("anchor");
+    const repo = key("repo");
+    return (
+      `the forge handover issue named by the anchor${anchor ? ` #${anchor}` : ""}${repo ? ` in ${repo}` : ""} ` +
+      `(this project's status sink in .pai/project.yaml) — replace the section between <!-- pai:continue --> and <!-- /pai:continue --> in it`
+    );
+  }
+  return null;
+}
+
+/** Precedence: explicit handoverFile > project status sink > Notes/TODO.md default. */
+export function pickHandoverTarget(i: {
+  handoverFile?: string;
+  sinkDescription: string | null;
+  defaultPath: string | null;
+}): { path?: string; description?: string; source: "explicit" | "project sink" | "default" | "none" } {
+  if (i.handoverFile) return { path: resolveHandoverPath(i.handoverFile), source: "explicit" };
+  if (i.sinkDescription) return { description: i.sinkDescription, source: "project sink" };
+  if (i.defaultPath) return { path: i.defaultPath, source: "default" };
+  return { source: "none" };
 }
 
 /**
@@ -1641,20 +1797,31 @@ export function liveTranscriptTail(dir: string): { file: string; raw: string } |
   return best;
 }
 
-function transcriptReading(claudePid: string): {
+function transcriptReading(claudePid: string, uuid?: string): {
   working: boolean | null;
   doing: string | null;
   contextK: number | null;
   lastAt: number | null;
+  file?: string;
 } {
   const none = { working: null, doing: null, contextK: null, lastAt: null };
   try {
-    const dir = projectTranscriptDir(claudePid);
-    if (!dir) return none;
-
-    const picked = liveTranscriptTail(dir);
-    if (!picked) return none;
-    const raw = picked.raw;
+    // The file named by the session id wins; the newest-in-project guess is
+    // only for a session whose id is not known.
+    const byId = uuid ? sessionTranscriptFile(uuid) : null;
+    let raw: string;
+    let file: string;
+    if (byId) {
+      raw = execFileSync("/usr/bin/tail", ["-n", "200", byId], { encoding: "utf8", timeout: 4_000, maxBuffer: 8 * 1024 * 1024 });
+      file = byId;
+    } else {
+      const dir = projectTranscriptDir(claudePid);
+      if (!dir) return none;
+      const picked = liveTranscriptTail(dir);
+      if (!picked) return none;
+      raw = picked.raw;
+      file = join(dir, picked.file);
+    }
 
     const msgs: any[] = [];
     for (const line of raw.split("\n")) {
@@ -1688,7 +1855,7 @@ function transcriptReading(claudePid: string): {
     // counts as "no usage" — duplicating the parse is cheap against 40 lines.
     const contextK = usageFromLines(raw.split("\n")) ?? null;
 
-    return { working, doing, contextK, lastAt };
+    return { working, doing, contextK, lastAt, file };
   } catch {
     return none;
   }
@@ -1825,6 +1992,11 @@ function compactionReading(m: ManagedSession, pid: string | null, dir: string | 
  * which number came from the transcript and which was scraped off a status bar
  * cannot tell which one to doubt.
  */
+function fmtAge(ms: number): string {
+  const s = Math.round(ms / 1000);
+  return s < 90 ? `${s}s` : `${Math.round(s / 60)} min`;
+}
+
 function liveReading(sessionId: string, idleSec: number, m?: ManagedSession): string {
   const snap = discoverLiveSessions().find((s) => s.id === sessionId);
   const proc = snap?.tty ? processReading(snap.tty) : { isSession: false, pid: null };
@@ -1833,7 +2005,10 @@ function liveReading(sessionId: string, idleSec: number, m?: ManagedSession): st
     return "  no session process on that pane — it is a bare shell, or the session has exited";
   }
 
-  const t = proc.pid ? transcriptReading(proc.pid) : { working: null, doing: null, contextK: null, lastAt: null };
+  const uuid = proc.uuid ?? snap?.attachUuid;
+  const t: ReturnType<typeof transcriptReading> = proc.pid
+    ? transcriptReading(proc.pid, uuid)
+    : { working: null, doing: null, contextK: null, lastAt: null };
   const out: string[] = [];
 
   if (t.lastAt !== null) {
@@ -1842,13 +2017,18 @@ function liveReading(sessionId: string, idleSec: number, m?: ManagedSession): st
       `  ${t.working ? "working" : "idle"} · last transcript entry ${agoSec < 90 ? `${agoSec}s` : `${Math.round(agoSec / 60)} min`} ago` +
         (t.doing ? ` · ${t.doing}` : ""),
     );
+    if (t.file) {
+      let age = "";
+      try { age = `, written ${fmtAge(Date.now() - statSync(t.file).mtimeMs)} ago`; } catch { /* gone */ }
+      out.push(`  transcript ${t.file}${age}`);
+    }
     if (t.contextK !== null) {
       out.push(`  context ${t.contextK}k tokens (from the transcript's own usage, not the status bar)`);
       // The trigger, fill rate and ETA are only meaningful alongside a
       // session's own margin, so all three are printed together and only
       // when a managed session (`m`) is available to supply it.
       if (m) {
-        const dir = proc.pid ? projectTranscriptDir(proc.pid) : null;
+        const dir = proc.pid ? projectTranscriptDir(proc.pid, uuid) : null;
         const { effectiveK, label } = compactionReading(m, proc.pid, dir);
         const marginK = resolvedMarginK(m);
         const warmUpK = Math.round(effectiveK - marginK);
@@ -2232,6 +2412,167 @@ export function parseShift(
   };
 }
 
+// ── self-supervision: one call from the session itself ───────────────────────
+
+/** "self" or omitted means the caller's own session; anything else is taken as given. */
+export function resolveManageTarget(session: string | undefined, callerId: string | undefined): string | null {
+  const s = (session ?? "").trim();
+  return !s || s.toLowerCase() === "self" ? (callerId ?? null) : s;
+}
+
+/** Put goal / until / every on a managed entry; the screen is never granted by supervise. */
+export function applySupervise(m: ManagedSession, goal: string, until: number | null, every: number | null): void {
+  if (goal) {
+    m.objective = goal;
+    m.pending = [];
+    m.lastRearmAt = 0;
+  }
+  if (every !== null) m.nudgeEveryMin = every;
+  if (until !== null) m.shift = { until, workers: 1, visual: false, startedAt: Date.now(), plain: true };
+  m.paused = false;
+  note(m, `supervise: until ${until !== null ? hhmm(until) : "open-ended"}, nudge every ${m.nudgeEveryMin ?? "-"} min`);
+}
+
+// ── only the operator ends or shortens a goal ────────────────────────────────
+
+export const AGENT_REFUSAL =
+  'refused: only the operator ends or shortens a goal (say "manage <session> off" yourself in a session, or run it from your own terminal)';
+const TOKEN_TTL_MS = 5 * 60_000;
+const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+const tokenDir = () => join(homedir(), ".aibroker", "operator-tokens");
+
+/** Written by hooks/operator-manage-token.mjs from the operator's own typed prompt. */
+export function writeOperatorToken(session: string, action: string, now = Date.now()): void {
+  mkdirSync(tokenDir(), { recursive: true, mode: 0o700 });
+  writeFileSync(join(tokenDir(), `${slug(session)}-${action}.json`), JSON.stringify({ expiresAt: now + TOKEN_TTL_MS }), { mode: 0o600 });
+}
+
+/** One-shot: the file is removed whether or not it was still valid. */
+function consumeToken(sessions: string[], action: string, now: number): boolean {
+  let ok = false;
+  for (const s of new Set(sessions.map(slug).filter(Boolean))) {
+    const file = join(tokenDir(), `${s}-${action}.json`);
+    try {
+      ok = (JSON.parse(readFileSync(file, "utf8")) as { expiresAt?: number }).expiresAt! > now || ok;
+      unlinkSync(file);
+    } catch { /* no token under this name */ }
+  }
+  return ok;
+}
+
+/**
+ * Agents cannot end or shorten a goal. Returns the refusal, or null when the
+ * call may go ahead. `operator` is set only by the CLI (outside any agent
+ * environment) and by the prompt hook; otherwise a one-shot token written from
+ * the operator's typed prompt is required.
+ * ponytail: a process that writes the daemon socket directly can still claim
+ * `operator`; the socket is local-user trust, tighten with a peer credential.
+ */
+export function refuseAgentManage(
+  sessionIdOrName: string,
+  rawArg: string,
+  opts: { until?: string },
+  operator: boolean,
+  now = Date.now(),
+): string | null {
+  if (operator) return null;
+  const arg = rawArg.trim().toLowerCase();
+  const resolved = resolveSession(sessionIdOrName);
+  const cur = resolved ? state[resolved.sessionId]?.shift?.until : undefined;
+  const names = [sessionIdOrName, resolved?.name ?? ""];
+
+  const ending =
+    /^(off|stop)$/.test(arg) ? "off" :
+    arg === "pause" ? "pause" :
+    /^shift\s+(off|stop|end|stand down)\b/.test(arg) ? "shift-off" : null;
+  if (ending) return consumeToken(names, ending, now) ? null : AGENT_REFUSAL;
+
+  const shift = arg.match(/^shift\b\s*([\s\S]*)$/);
+  const next = shift ? now + parseShift(shift[1]).hours * 3_600_000 : opts.until ? parseUntilSpec(opts.until, new Date(now)) : null;
+  return next !== null && cur !== undefined && cur > now && next < cur ? AGENT_REFUSAL : null;
+}
+
+/** "08:00", "until 8pm", "8h", "90m" → epoch ms; null when it reads as none of these. */
+export function parseUntilSpec(spec: string, now: Date = new Date()): number | null {
+  const t = spec.trim().toLowerCase();
+  if (/^\d{1,2}(:\d{2})?\s*(am|pm)?$/.test(t)) return parseUntilClock(`until ${t}`, now);
+  if (/^(until|till|til)\s/.test(t)) return parseUntilClock(t, now);
+  const d = t.match(/^(?:for\s+)?(\d+(?:[.,]\d+)?)\s*(h|hr|hrs|hours?|m|min|mins|minutes?)$/);
+  if (!d) return null;
+  const n = Number(d[1].replace(",", "."));
+  const ms = n * (/^h/.test(d[2]) ? 3_600_000 : 60_000);
+  return now.getTime() + Math.min(ms, SHIFT_MAX_HOURS * 3_600_000);
+}
+
+const NUDGE_EVERY_MIN = 5;
+const NUDGE_EVERY_MAX = 480;
+
+/** Minutes between idle nudges: 30, "30", "30m", "1h". Null outside 5..480. */
+export function parseEveryMin(v: string | number | undefined): number | null {
+  const t = String(v ?? "").trim().toLowerCase();
+  const m = t.match(/^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hours?|m|min|mins|minutes?)?$/);
+  if (!m) return null;
+  const n = Math.round(Number(m[1]) * (m[2] && m[2].startsWith("h") ? 60 : 1));
+  return n >= NUDGE_EVERY_MIN && n <= NUDGE_EVERY_MAX ? n : null;
+}
+
+/** When the next nudge (with `every`) or the ~46-50 min lapse re-arm falls due. */
+export function nextDueAt(m: ManagedSession): number | null {
+  if (m.paused) return null;
+  if (m.nudgeEveryMin) {
+    return Math.max(m.lastChangeAt, m.lastNudgeAt ?? 0, m.lastRearmAt) + m.nudgeEveryMin * 60_000;
+  }
+  return m.lastRearmAt + GOAL_MAX_AGE_MS;
+}
+
+/**
+ * Should a short "continue the goal" line be typed now? Only for a session
+ * with an `every` interval whose goal marker is still shown (a missing marker
+ * is the full re-arm, handled by reasonToArm), idle for that long, with an
+ * EMPTY input line — text there is somebody's, same rule as pointer-guard.
+ * The caller has already ruled out a busy session.
+ */
+export function nudgeDue(m: ManagedSession, content: string, now: number): boolean {
+  if (!m.nudgeEveryMin || m.paused) return false;
+  if (!GOAL_ACTIVE.test(content)) return false;
+  if (promptUnsentText(content) !== null) return false;
+  if (QUEUED_HINT_RE.test(content.split("\n").slice(-8).join("\n"))) return false;
+  const due = nextDueAt(m);
+  return due !== null && now >= due;
+}
+
+export const NUDGE_TEXT = "Continue working toward your standing goal.";
+
+const hhmm = (t: number) => {
+  const d = new Date(t);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+
+/** One block for every managed session: name, goal, until, next due, context, last handover, state. */
+export function statusLines(
+  sessions: ManagedSession[],
+  now: number,
+  kOf: (m: ManagedSession) => number | null = () => null,
+): string[] {
+  if (sessions.length === 0) return ["no sessions are being managed"];
+  return sessions.map((m) => {
+    const goal = oneLine(m.objective);
+    const due = nextDueAt(m);
+    const k = kOf(m);
+    const pct = k !== null ? Math.round((k / (m.contextWindowK ?? 1000)) * 100) : null;
+    const state = m.paused ? "paused" : m.shift ? (m.shift.plain ? "supervised" : "shift") : "on";
+    return [
+      m.name,
+      `goal: ${goal.length > 80 ? `${goal.slice(0, 79)}…` : goal}`,
+      `until: ${m.shift ? hhmm(m.shift.until) : "-"}`,
+      `next ${m.nudgeEveryMin ? "nudge" : "arm"}: ${due === null ? "-" : due <= now ? "due" : `in ${Math.round((due - now) / 60_000)}m`}`,
+      `ctx: ${k !== null ? `${pct}% ${k}k` : "?"}`,
+      `handover: ${m.handoverDoneAt ? hhmm(m.handoverDoneAt) : "-"}`,
+      state,
+    ].join(" | ");
+  });
+}
+
 /**
  * The standing objective for a shift, written once here instead of by hand
  * every night. It says what to work on and what "done" means; how to work is
@@ -2361,11 +2702,23 @@ export function briefSlug(m: Pick<ManagedSession, "name" | "sessionId">): string
  * The line typed at the session: `/goal` plus a pointer to the brief, plus as
  * much of the objective's first words as fits. Never longer than `max`.
  */
-export function buildGoalLine(briefPath: string, objective: string, max = GOAL_LINE_MAX_CHARS): string {
-  const head = `/goal Follow ${briefPath} until done`;
+export function buildGoalLine(briefPath: string, objective: string, until: number | null = null, max = GOAL_LINE_MAX_CHARS): string {
+  const head = `/goal ${noDoneStatePrefix(until)} Follow ${briefPath}`;
   const room = max - head.length - 2;
   const words = oneLine(objective);
   return room >= 20 && words ? `${head}: ${truncateAtWord(words, room)}` : head;
+}
+
+/**
+ * Opens EVERY armed goal, so Claude Code's evaluator has no done-state to judge
+ * met: a goal that names one ("until the fix is in build N") is cleared the
+ * moment the session says it is. Only the operator ends a goal. Never dropped
+ * to fit the line — the objective is shortened first.
+ */
+export function noDoneStatePrefix(until: number | null): string {
+  return until !== null
+    ? `Keep working until ${hhmm(until)}. There is no earlier done-state. Only the operator ends this goal.`
+    : "Keep working. There is no done-state. Only the operator ends this goal.";
 }
 
 /** Everything that does not fit on the typed line, as the file it points to. */
@@ -2418,14 +2771,14 @@ function goalText(m: ManagedSession): { text: string } {
       objective: m.objective,
       agentish: AG2_SPEC,
       rulesSource: rules ? standingRulesSource() : "",
-      shiftRules: m.shift && m.objective !== shift ? shift : "",
+      shiftRules: m.shift && !m.shift.plain && m.objective !== shift ? shift : "",
       hands,
       pending: m.pending,
     }),
     { mode: 0o600 },
   );
   chmodSync(path, 0o600);
-  return { text: buildGoalLine(foldHome(path), m.objective) };
+  return { text: buildGoalLine(foldHome(path), m.objective, m.shift?.until ?? null) };
 }
 
 /**
@@ -2438,19 +2791,28 @@ function goalText(m: ManagedSession): { text: string } {
  */
 export async function confirmArmed(
   typed: string,
-  deps: { readPane: () => string; sleep: (ms: number) => Promise<void>; clearInput: () => void },
+  deps: { readPane: () => string | Promise<string>; sleep: (ms: number) => Promise<void>; clearInput: () => void },
   waits = 5,
   waitMs = 2_000,
 ): Promise<boolean> {
   let unsent: string | null = null;
   for (let i = 0; i < waits; i++) {
     await deps.sleep(waitMs);
-    const pane = deps.readPane();
+    const pane = await deps.readPane();
     unsent = promptUnsentText(pane);
     if (GOAL_ACTIVE.test(pane) && !unsent) return true;
   }
   if (unsent && typedLineMatches(unsent, typed)) deps.clearInput();
   return false;
+}
+
+/** readPane for async callers (tick, arm): the iTerm read does not block the event loop. */
+async function readPaneAsync(sessionId: string, opts: { fresh?: boolean } = {}): Promise<string> {
+  try {
+    return (await readSessionContentAsync(sessionId, 60, opts))?.content ?? "";
+  } catch {
+    return "";
+  }
 }
 
 function readPane(sessionId: string, opts: { fresh?: boolean } = {}): string {
@@ -2463,6 +2825,62 @@ function readPane(sessionId: string, opts: { fresh?: boolean } = {}): string {
 
 async function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Read the input line back after a paste, polling while it is still empty: under
+ * load the terminal has not rendered the paste after a fixed 300 ms. Returns as
+ * soon as the line is non-empty (the caller decides match vs mangled), or the
+ * empty line once the bound is spent. Never decides anything itself.
+ */
+export async function readBackTyped(deps: {
+  read: () => Promise<string>;
+  sleep: (ms: number) => Promise<void>;
+  delaysMs?: number[];
+}): Promise<{ line: string; waitedMs: number }> {
+  const delays = deps.delaysMs ?? [300, 300, 500, 800, 1_000, 1_000, 1_100]; // ~5 s
+  let waitedMs = 0;
+  let line = "";
+  for (const d of delays) {
+    await deps.sleep(d);
+    waitedMs += d;
+    line = await deps.read();
+    if (line) break;
+  }
+  return { line, waitedMs };
+}
+
+/**
+ * Wrap `run` so a call made while the previous one is still pending is skipped
+ * (onSkip) instead of started. The tick yields to the event loop on every pane
+ * read, so under load one outlasts TICK_MS and the next interval would arm the
+ * same session a second time.
+ */
+export function nonOverlapping(run: () => Promise<void>, onSkip: () => void): () => Promise<void> {
+  let running = false;
+  return async () => {
+    if (running) return onSkip();
+    running = true;
+    try {
+      await run();
+    } finally {
+      running = false;
+    }
+  };
+}
+
+/** Sessions with an arm() in flight; a second arm for the same id is refused. */
+const arming = new Set<string>();
+
+/** Run fn unless `id` is already in `busy`; returns undefined when refused. */
+export async function tryExclusive<T>(busy: Set<string>, id: string, fn: () => Promise<T>): Promise<T | undefined> {
+  if (busy.has(id)) return undefined;
+  busy.add(id);
+  try {
+    return await fn();
+  } finally {
+    busy.delete(id);
+  }
 }
 
 async function arm(m: ManagedSession, reason: string): Promise<boolean> {
@@ -2488,7 +2906,7 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
    * the thing we are managing is gone, and the right move is to say so and
    * stop, not to keep typing into whatever is there now.
    */
-  const live = readSessionContent(m.sessionId, 5);
+  const live = await readSessionContentAsync(m.sessionId, 5);
   if (!live) {
     note(m, "the session could not be read — not typing anything");
     return false;
@@ -2518,7 +2936,7 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
    * a line occupied for minutes still reaches blockedReason's operator alert
    * (with a screenshot) — the daemon does not stall silently either way.
    */
-  const onLine = promptUnsentText(readPane(m.sessionId));
+  const onLine = promptUnsentText(await readPaneAsync(m.sessionId));
   const armIdleMs = Math.max(0, Date.now() - m.lastChangeAt);
   const armIdle = armIdleMs >= HANDOVER_IDLE_FLOOR_MS;
 
@@ -2560,25 +2978,32 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   //      (observed 2026-09-13), and arm() is otherwise fine typing into a
   //      busy session (the goal text below queues harmlessly behind it) —
   //      it is specifically the escape sequence that is not safe there.
-  if (armIdle && needsVimEscape(readPane(m.sessionId))) {
+  if (armIdle && needsVimEscape(await readPaneAsync(m.sessionId))) {
     escapeInputMode(m.sessionId);
   }
   if (!pasteTextIntoSession(m.sessionId, text)) {
     note(m, `could not type into the session (${reason}) — will retry`);
     return false;
   }
-  await sleep(300); // let the pane catch up before reading it back
-  const echoedLine = promptUnsentText(readPane(m.sessionId, { fresh: true })) ?? "";
+  const { line: echoedLine, waitedMs } = await readBackTyped({
+    read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
+    sleep,
+  });
   if (!typedLineMatches(echoedLine, text)) {
     sendControlU(m.sessionId);
-    note(m, `arm aborted: line read back as "${echoedLine.slice(0, 60)}" not "${text.slice(0, 60)}"`);
+    await sleep(300);
+    const left = promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "";
+    note(
+      m,
+      `arm aborted: after ${waitedMs}ms line read back as "${echoedLine.slice(0, 60)}" not "${text.slice(0, 60)}"; after Ctrl-U the input ${left ? `still holds ${left.length} chars ("${left.slice(0, 60)}")` : "is empty"}`,
+    );
     return false;
   }
   sendEnterKey(m.sessionId);
 
   // Typed is not sent, and sent is not received.
   const landed = await confirmArmed(text, {
-    readPane: () => readPane(m.sessionId, { fresh: true }),
+    readPane: () => readPaneAsync(m.sessionId, { fresh: true }),
     sleep,
     clearInput: () => sendControlU(m.sessionId),
   });
@@ -2631,7 +3056,35 @@ export function blockedReason(
   return null;
 }
 
-function reasonToArm(m: ManagedSession, content: string, now: number): string | null {
+const STOPPED_REASON = "turn ended with nothing running — re-arming";
+const STOP_SETTLE_MS = 30_000;
+const STOP_NUDGE_COOLDOWN_MS = 3 * 60_000;
+// Status-line "N shells still running" / "N background tasks still running" and
+// the footer's "▶N" worker count — N must be > 0. The footer's "← N agents" and
+// "· N shells" (no "still running") are always-on, not work, and must not match.
+const BACKGROUND_RUNNING_RE =
+  /\b[1-9]\d*\s+(?:background\s+)?(?:shells?|tasks?)\s+still\s+running\b|▶\s*[1-9]\d*/i;
+const LIVE_REGION_LINES = 20;
+
+/**
+ * The session's turn ended (last transcript record is an assistant turn with no
+ * tool call pending), settled for STOP_SETTLE_MS, the prompt is empty and
+ * nothing spins or runs in the background. Pure; never true over typed input.
+ */
+export function turnStoppedIdle(
+  t: { working: boolean | null; lastAt: number | null } | null | undefined,
+  paneText: string,
+  now: number,
+): boolean {
+  if (!t || t.working !== false || t.lastAt === null || now - t.lastAt < STOP_SETTLE_MS) return false;
+  if (promptUnsentText(paneText) !== null) return false;
+  const last = paneText.split("\n").slice(-LIVE_REGION_LINES).join("\n");
+  return !QUEUED_HINT_RE.test(last) && !SPINNER_RE.test(last) && !BACKGROUND_RUNNING_RE.test(last);
+}
+
+export const GOAL_GONE_REASON = "goal gone before until, re-armed";
+
+export function reasonToArm(m: ManagedSession, content: string, now: number): string | null {
   if (m.paused) return null;
 
   if (OUT_OF_GOAL.some((re) => re.test(content))) return "the session reported its goal could not be achieved";
@@ -2645,6 +3098,11 @@ function reasonToArm(m: ManagedSession, content: string, now: number): string | 
   const quietFor = Math.max(0, now - m.lastChangeAt);
   const armedFor = Math.max(0, now - m.lastRearmAt);
   const marker = GOAL_ACTIVE.test(content);
+
+  // The goal was cleared (the session's own doing, or the evaluator's) while the
+  // operator's stretch is still running: no lapse timer, re-arm on this tick.
+  // Paused is the operator's; an occupied input line is never typed over.
+  if (!marker && m.shift && m.shift.until > now && promptUnsentText(content) === null) return GOAL_GONE_REASON;
 
   if (!marker && quietFor > NO_GOAL_GRACE_MS) return `no goal armed (idle ${Math.round(quietFor / 1000)}s)`;
 
@@ -2756,7 +3214,7 @@ async function tick(): Promise<void> {
   }
 
   for (const m of Object.values(state)) {
-    const content = readPane(m.sessionId);
+    const content = await readPaneAsync(m.sessionId);
     if (!content) {
       // A session that cannot be read is not necessarily gone; say so once per
       // tick rather than dropping it, because dropping it silently is how a
@@ -2778,13 +3236,17 @@ async function tick(): Promise<void> {
     // it once per session per tick is the same reading at a fraction of the
     // cost.
     const tickTty = m.tty ?? snapshotTty(m.sessionId);
-    const tickPid = tickTty ? processReading(tickTty).pid : null;
-    const tickTranscript = tickPid ? transcriptReading(tickPid) : null;
-    const working = sessionIsWorking(tickTranscript, now);
+    const tickProc = tickTty ? processReading(tickTty) : null;
+    const tickPid = tickProc?.pid ?? null;
+    const tickUuid = tickProc?.uuid ?? (tickTty ? discoverLiveSessions().find((s) => s.id === m.sessionId)?.attachUuid : undefined);
+    const tickTranscript = tickPid ? transcriptReading(tickPid, tickUuid) : null;
+    // A turn that ended with nothing running is a stop, not work: the 2-minute
+    // "recent transcript" window must not hide it.
+    const stopped = turnStoppedIdle(tickTranscript, content, now);
+    const working = !stopped && sessionIsWorking(tickTranscript, now);
     const tickUsed = tickTranscript?.contextK ?? null;
-    const tickCwd = tickPid ? sessionCwd(tickPid) : null;
-    const tickDirCandidate = tickCwd ? join(homedir(), ".claude", "projects", tickCwd.replace(/\//g, "-")) : null;
-    const tickDir = tickDirCandidate && existsSync(tickDirCandidate) ? tickDirCandidate : null;
+    const tickDir = tickPid ? projectTranscriptDir(tickPid, tickUuid) : null;
+    const tickCwd = tickPid ? sessionProjectCwd(tickPid, tickUuid) : null;
 
     // Sample context for the fill-rate reading in `status`. Pushed only when
     // a real number is available — never a synthetic 0 for a tick where the
@@ -3231,10 +3693,12 @@ async function tick(): Promise<void> {
 
       if (decision.due) {
         const notesDirExists = tickCwd ? existsSync(join(tickCwd, "Notes")) : false;
-        const usedDefault = !m.handoverFile;
-        const askedPath = m.handoverFile
-          ? resolveHandoverPath(m.handoverFile)
-          : (defaultHandoverTarget(tickCwd, notesDirExists) ?? undefined);
+        const target = pickHandoverTarget({
+          handoverFile: m.handoverFile,
+          sinkDescription: projectSinkDescription(tickCwd),
+          defaultPath: defaultHandoverTarget(tickCwd, notesDirExists),
+        });
+        const askedPath = target.path;
 
         m.handoverAskedAt = now;
         m.handoverAskedPath = askedPath;
@@ -3249,7 +3713,9 @@ async function tick(): Promise<void> {
           : "";
         const whereClause = askedPath
           ? `Update ${askedPath}. ${carry}`
-          : `Write it to your project's handover file (its ## Continue section, or wherever this project's convention keeps that) — nothing was set or found automatically, so use your own judgement about where that lives here. `;
+          : target.description
+            ? `Update ${target.description}. `
+            : `Write it to your project's handover file (its ## Continue section, or wherever this project's convention keeps that) — nothing was set or found automatically, so use your own judgement about where that lives here. `;
 
         // Wording follows the band: IMMEDIATE has no time to spare and says
         // so; REFRESH and a work-triggered WARM-UP both mean the session has
@@ -3277,7 +3743,7 @@ async function tick(): Promise<void> {
           `at ${used}k tokens (${decision.reason})` +
             (grownBy !== null ? `, ${grownBy}k of new work since the last one` : "") +
             ` — asked for a handover${m.clearAfterHandover ? " before rolling over" : " before it compacts"}` +
-            (askedPath ? ` — target: ${askedPath}${usedDefault ? " (default — no handoverFile set)" : ""}` : " — no target resolved, asked without naming a path"),
+            (target.source !== "none" ? ` — target (${target.source}): ${askedPath ?? target.description}` : " — no target resolved, asked without naming a path"),
         );
         // The idle age that justified typing into this session now — the
         // un-gated ask reaches every managed session, not just the one
@@ -3390,8 +3856,28 @@ async function tick(): Promise<void> {
 
     if (now - m.lastRearmAt < REARM_COOLDOWN_MS) continue;
 
-    const reason = reasonToArm(m, content, now);
-    if (!reason) continue;
+    let reason = reasonToArm(m, content, now);
+    if (stopped && !m.paused && (!reason || reason.startsWith("no goal armed")) && !GOAL_ACTIVE.test(content)) {
+      reason = STOPPED_REASON;
+    }
+    if (!reason && stopped && now - (m.lastNudgeAt ?? 0) >= STOP_NUDGE_COOLDOWN_MS) {
+      // Marker still up but the turn ended on nothing: nudge now, not at the lapse timer.
+      typeIntoSession(m.sessionId, NUDGE_TEXT);
+      m.lastNudgeAt = now;
+      note(m, `${STOPPED_REASON.replace("re-arming", "nudged to continue")}`);
+      dirty = true;
+      continue;
+    }
+    if (!reason) {
+      // Idle at an empty prompt past the `every` interval: a short nudge, not the full goal.
+      if (nudgeDue(m, content, now)) {
+        typeIntoSession(m.sessionId, NUDGE_TEXT);
+        m.lastNudgeAt = now;
+        note(m, `idle ${m.nudgeEveryMin}+ min at an empty prompt — nudged to continue`);
+        dirty = true;
+      }
+      continue;
+    }
 
     /**
      * A GOAL THAT CANNOT BE CONFIRMED IS NOT RETRIED FOREVER.
@@ -3410,7 +3896,8 @@ async function tick(): Promise<void> {
      * lapse arms it — and the operator is told, because a manager that has
      * given up on delivering a goal is the one thing it must never do quietly.
      */
-    const armed = await arm(m, reason);
+    const armed = await tryExclusive(arming, m.sessionId, () => arm(m, reason));
+    if (armed === undefined) continue; // another arm for this session is in flight
     dirty = true;
     if (armed) {
       m.armFails = 0;
@@ -3451,8 +3938,16 @@ export function startManagerLoop(): void {
   state = loadState();
   const n = Object.keys(state).length;
   if (n) log(`[manage] resuming ${n} managed session${n > 1 ? "s" : ""}`);
+  let skipLogged = false;
+  const guarded = nonOverlapping(tick, () => {
+    if (skipLogged) return;
+    skipLogged = true;
+    log("[manage] tick still running — skipping overlapping tick");
+  });
   timer = setInterval(() => {
-    void tick().catch((e) => log(`[manage] tick failed — ${(e as Error).message}`));
+    void guarded()
+      .then(() => { skipLogged = false; })
+      .catch((e) => log(`[manage] tick failed — ${(e as Error).message}`));
   }, TICK_MS);
   timer.unref?.();
 }
@@ -3490,8 +3985,18 @@ export function stopManaging(s: Record<string, ManagedSession>, sessionId: strin
  * `/manage pause|resume` stop arming without forgetting the objective
  * `/manage now`          arm immediately, whatever the signals say
  */
-export async function handleManage(sessionIdOrName: string, rawArg: string): Promise<ManageResult> {
+export async function handleManage(
+  sessionIdOrName: string,
+  rawArg: string,
+  opts: { goal?: string; until?: string; every?: string | number } = {},
+): Promise<ManageResult> {
   const arg = (rawArg ?? "").trim();
+
+  // Every managed session in one block — before any peer forwarding or
+  // single-session resolution, since "all" names no session.
+  if (sessionIdOrName.trim().toLowerCase() === "all" && (!arg || arg.toLowerCase() === "status")) {
+    return { ok: true, message: statusLines(Object.values(state), Date.now(), contextK).join("\n") };
+  }
 
   /**
    * `machine/session` is managed by that machine's own hub.
@@ -3517,6 +4022,34 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
   if (!resolved) return { ok: false, message: `no live session matches "${sessionIdOrName}"` };
 
   const { sessionId, name } = resolved;
+
+  /**
+   * supervise — a session puts itself under the manager in one call:
+   * {goal, until, every}. goal = standing objective, until = end of the
+   * stretch (clock time or duration), every = idle-nudge interval in minutes.
+   */
+  if (arg.toLowerCase() === "supervise") {
+    const until = opts.until ? parseUntilSpec(opts.until) : null;
+    const every = opts.every !== undefined && opts.every !== "" ? parseEveryMin(opts.every) : null;
+    if (opts.until && until === null) return { ok: false, message: `cannot read until="${opts.until}" — use a clock time (08:00) or a duration (8h, 90m)` };
+    if (opts.every !== undefined && opts.every !== "" && every === null) return { ok: false, message: `every="${opts.every}" must be ${NUDGE_EVERY_MIN}-${NUDGE_EVERY_MAX} minutes` };
+    const goal = (opts.goal ?? "").trim();
+    if (!state[sessionId]) {
+      if (!goal) return { ok: false, message: `${name} is not being managed — supervise needs a goal` };
+      const started = await handleManage(sessionId, `start ${goal}`);
+      if (!started.ok) return started;
+    }
+    const m = state[sessionId];
+    applySupervise(m, goal, until, every);
+    saveState(state);
+    startManagerLoop();
+    return {
+      ok: true,
+      managed: true,
+      message: `${name} is supervised${until !== null ? ` until ${hhmm(until)}` : ""}${m.nudgeEveryMin ? `, nudged after ${m.nudgeEveryMin} min idle` : ""}.\n  ${statusLines([m], Date.now(), contextK)[0]}`,
+    };
+  }
+
   const existing = state[sessionId];
   const word = arg.toLowerCase();
 
@@ -4013,7 +4546,7 @@ export async function handleManage(sessionIdOrName: string, rawArg: string): Pro
 
   /**
    * handover-at <k> — this session's own warm-up margin, overriding the
-   * default 100k.
+   * default 50k.
    *
    * A fixed FRACTION of a fixed window cannot be right for every session —
    * that was tried (0.82 of a 1000k window) and the ground moved under it:

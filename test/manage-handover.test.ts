@@ -106,13 +106,13 @@ test("measuredCompactK: no compact_boundary lines at all — undefined, not a fa
 // ── bandOf ───────────────────────────────────────────────────────────────
 
 test("bandOf: below every band", () => {
-  assert.equal(bandOf(500, 800, 100), "below");
+  assert.equal(bandOf(500, 800, 50), "below");
 });
 
 test("bandOf: warm-up, refresh and immediate bands in order", () => {
-  assert.equal(bandOf(700, 800, 100), "warm-up"); // 800-100
-  assert.equal(bandOf(760, 800, 100), "refresh"); // 800-40
-  assert.equal(bandOf(785, 800, 100), "immediate"); // 800-15
+  assert.equal(bandOf(750, 800, 50), "warm-up"); // 800-50
+  assert.equal(bandOf(770, 800, 50), "refresh"); // 800-30
+  assert.equal(bandOf(785, 800, 50), "immediate"); // 800-15
 });
 
 // ── handoverDue ──────────────────────────────────────────────────────────
@@ -131,10 +131,10 @@ test("undefined context ('unknown') is never due, and says why — never coerced
   assert.equal(result.reason, "context unknown");
 });
 
-test("700k with a measured/override effective trigger of 800k, and dueByTime — due, warm-up", () => {
-  // effective=800 (e.g. windowK=1000, overridePct=80), default margin 100 -> warmUpK=700.
+test("750k with a measured/override effective trigger of 800k, and dueByTime — due, warm-up", () => {
+  // effective=800 (e.g. windowK=1000, overridePct=80), default margin 50 -> warmUpK=750.
   const result = handoverDue({
-    contextK: 700,
+    contextK: 750,
     effectiveK: 800,
     idleMs: IDLE,
     // lastAskAt omitted -> sinceLast is huge -> dueByTime trivially satisfied.
@@ -163,22 +163,22 @@ test("786k against an 800k trigger — IMMEDIATE, even with no time or work sign
   assert.equal(result.reason, "immediate");
 });
 
-test("no override, no measurement: full window assumed at 80% -> effective 800; 700k not due without a time/work signal", () => {
+test("no override, no measurement: full window assumed at 80% -> effective 800; 750k not due without a time/work signal", () => {
   const effectiveK = effectiveCompactK({ windowK: 1000, overridePct: undefined }); // 800
   const result = handoverDue({
-    contextK: 700, // exactly at warmUpK (800-100) but no due-by-time/work signal
+    contextK: 750, // exactly at warmUpK (800-50) but no due-by-time/work signal
     effectiveK,
     idleMs: IDLE,
     lastAskAt: NOW - 1_000,
-    handoverDoneK: 699,
+    handoverDoneK: 749,
     now: NOW,
   });
   assert.equal(result.due, false);
 });
 
-test("no override, no measurement: 720k with dueByTime -> warm-up", () => {
+test("no override, no measurement: 760k with dueByTime -> warm-up", () => {
   const effectiveK = effectiveCompactK({ windowK: 1000, overridePct: undefined }); // 800
-  const result = handoverDue({ contextK: 720, effectiveK, idleMs: IDLE, now: NOW }); // lastAskAt absent -> dueByTime true
+  const result = handoverDue({ contextK: 760, effectiveK, idleMs: IDLE, now: NOW }); // lastAskAt absent -> dueByTime true
   assert.equal(result.due, true);
   assert.equal(result.reason, "warm-up");
 });
@@ -199,11 +199,11 @@ test("no override, no measurement: 790k -> immediate (800-15=785)", () => {
 
 test("refresh band: below immediate, at/above refresh, grown enough since the last handover", () => {
   const result = handoverDue({
-    contextK: 765, // >= 800-40 refreshK, < 800-15 immediateK
+    contextK: 775, // >= 800-30 refreshK, < 800-15 immediateK
     effectiveK: 800,
     idleMs: IDLE,
     lastAskAt: NOW - 1_000, // recent — would fail the warm-up gate
-    handoverDoneK: 700, // grown by 65k, >= REFRESH_GROWN_K (40)
+    handoverDoneK: 720, // grown by 55k, >= REFRESH_GROWN_K (40)
     now: NOW,
   });
   assert.equal(result.due, true);
@@ -212,11 +212,11 @@ test("refresh band: below immediate, at/above refresh, grown enough since the la
 
 test("refresh band: same context, but not grown enough — falls through to warm-up gating", () => {
   const result = handoverDue({
-    contextK: 765,
+    contextK: 775,
     effectiveK: 800,
     idleMs: IDLE,
     lastAskAt: NOW - 1_000, // recent, fails warm-up's time gate too
-    handoverDoneK: 760, // grown by only 5k — below REFRESH_GROWN_K
+    handoverDoneK: 770, // grown by only 5k — below REFRESH_GROWN_K
     now: NOW,
   });
   assert.equal(result.due, false);
@@ -239,17 +239,17 @@ test("a per-session margin override changes only the warm-up band", () => {
 // reads as "was about to ask, held off" rather than "never qualified".
 
 test("warm-up band satisfied, but session busy (idle 12s, floor 60s) — not due", () => {
-  const result = handoverDue({ contextK: 700, effectiveK: 800, idleMs: 12_000, now: NOW });
+  const result = handoverDue({ contextK: 750, effectiveK: 800, idleMs: 12_000, now: NOW });
   assert.equal(result.due, false);
   assert.match(result.reason, /band warm-up but busy \(idle 12s\)/);
 });
 
 test("refresh band satisfied, but session busy — not due", () => {
   const result = handoverDue({
-    contextK: 765,
+    contextK: 775,
     effectiveK: 800,
     idleMs: 5_000,
-    handoverDoneK: 700,
+    handoverDoneK: 720,
     now: NOW,
   });
   assert.equal(result.due, false);

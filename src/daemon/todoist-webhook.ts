@@ -68,7 +68,6 @@ async function deliverA2A(session: string, text: string): Promise<{ delivered: b
     const { snapshotAllSessions, isClaudeSession } = await import("../transport/sync-facade.js");
     const { getAllPersistentSessionNames, lookupPersistentName } = await import("../core/persistence.js");
     const { depositToSessionMailbox } = await import("../core/state.js");
-    const { submitAndConfirm } = await import("./dispatch.js");
 
     const snapshots = snapshotAllSessions();
     const names = getAllPersistentSessionNames();
@@ -80,8 +79,10 @@ async function deliverA2A(session: string, text: string): Promise<{ delivered: b
     if (!isClaudeSession(hit.session.id)) return { delivered: false, detail: `session "${hit.session.name}" is at a shell prompt` };
 
     depositToSessionMailbox(hit.session.id, "a2a", text);
-    const ack = await submitAndConfirm(hit.session.id, text, 15_000, undefined, 1);
-    return { delivered: true, detail: ack ? "delivered" : "queued (session busy)" };
+    // Not into a line the operator is mid-sentence in — pointer-guard.ts.
+    const { typeWhenInputEmpty } = await import("./pointer-guard.js");
+    const guarded = await typeWhenInputEmpty(hit.session.id, text);
+    return { delivered: true, detail: guarded.typed && guarded.ack ? "delivered" : "queued (session busy)" };
   } catch (e) {
     return { delivered: false, detail: e instanceof Error ? e.message : String(e) };
   }
@@ -656,10 +657,14 @@ async function handleInbound(
   // twice, and nothing downstream could tell the copies apart.
   res.writeHead(202, { "content-type": "application/json" }).end('{"accepted":true}');
 
+  // A closed issue gives its claim back. Authenticated and acknowledged above;
+  // releaseOnClose never throws, so delivery below is unaffected.
+  void import("./forge-release.js").then((m) => m.releaseOnClose(route.repo, payload));
+
   const result = await deliverInbound(route, payload);
   audit({
     action: "inbound", actor: `hook:${route.name}`, target: `session:${route.owner}`,
-    outcome: result.ok ? "delivered" : "failed",
+    outcome: result.outcome ?? (result.ok ? "delivered" : "failed"),
     reason: result.detail,
   });
   log(`inbound: /hook/${route.name} → ${route.owner}: ${result.detail}`);

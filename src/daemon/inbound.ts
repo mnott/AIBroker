@@ -34,6 +34,7 @@ import { homedir } from "node:os";
 import { loadJson, saveJson } from "../core/json-store.js";
 import { log } from "../core/log.js";
 import { audit } from "./audit.js";
+import { isClaimReleaseEcho } from "./forge-release.js";
 
 const FILE = join(homedir(), ".aibroker", "inbound.json");
 
@@ -519,6 +520,8 @@ export interface DeliveryResult {
   detail: string;
   /** Set when the failure is an absent owner session — queue it, don't give up. */
   retry?: boolean;
+  /** Audit outcome when it is not simply delivered/failed: "ignored", "dropped". */
+  outcome?: string;
 }
 
 /**
@@ -729,14 +732,23 @@ function coalesceThenDeliver(route: InboundRoute, payload: unknown, deliver: (ba
 }
 
 export async function deliverInbound(route: InboundRoute, payload: unknown): Promise<DeliveryResult> {
+  // Asked first, for its memory: it must see every event, including the ones
+  // the filter below drops, or the next event has nothing to compare against.
+  const echo = isClaimReleaseEcho(payload);
   const skip = shouldIgnore(route, payload);
   if (skip) {
     // Not an error and not a refusal: the event arrived, was authenticated, and
-    // is deliberately not interesting. Recorded so that a hook which has gone
-    // quiet can be told apart from one that is being filtered.
-    audit({ action: "inbound", actor: "external", target: `hook:${route.name}`, outcome: "ignored", reason: skip });
+    // is deliberately not interesting. The caller audits it as "ignored" so that
+    // a hook which has gone quiet can be told apart from one that is being filtered.
     log(`inbound: /hook/${route.name} — dropped an event matching "${skip}"`);
-    return { ok: true, detail: `ignored (${skip})` };
+    return { ok: true, detail: `ignored (${skip})`, outcome: "ignored" };
+  }
+
+  // The echo of a claim release after a close is housekeeping, not the operator.
+  if (echo) {
+    const n = (payload as any).issue.number;
+    log(`inbound: /hook/${route.name} → ${route.owner}: claim release on closed #${n} — not delivered`);
+    return { ok: true, detail: `claim release on closed #${n} — not delivered`, outcome: "dropped" };
   }
 
   if (route.coalesce?.ms) {
@@ -786,8 +798,10 @@ async function attemptMessageDelivery(route: InboundRoute, body: string): Promis
   // Typed as well as deposited, so a session sitting idle sees it now rather
   // than at its next prompt. retries = 1 — a redelivered inbound message is
   // a duplicate nobody can tell apart from two real events.
-  const { submitAndConfirm } = await import("./dispatch.js");
-  const ack = await submitAndConfirm(target.id, body, 15_000, undefined, 1);
+  // Not into a line the operator is mid-sentence in — pointer-guard.ts.
+  const { typeWhenInputEmpty } = await import("./pointer-guard.js");
+  const guarded = await typeWhenInputEmpty(target.id, body);
+  const ack = guarded.typed ? guarded.ack : guarded.reason;
   return {
     ok: true,
     detail: ack === "ok"

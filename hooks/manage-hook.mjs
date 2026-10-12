@@ -173,7 +173,9 @@ const arg2 = KEYWORD.test(arg) ? arg : "status";
 const term = process.env.ITERM_SESSION_ID ?? "";
 const session = term.includes(":") ? term.split(":").pop() : (payload.cwd ?? process.env.PWD ?? "");
 
-const r = await hub("manage", { session, arg: arg2, cwd: payload.cwd });
+// The regexes above anchor at the start of the bare prompt the operator typed
+// (channel and agent messages carry a "[…" prefix), so this IS the operator.
+const r = await hub("manage", { session, arg: arg2, cwd: payload.cwd, operator: true });
 const text = r?.ok ? (r.result?.message ?? "done") : `manage failed: ${r?.error ?? "unknown"}`;
 
 /**

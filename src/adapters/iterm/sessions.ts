@@ -36,8 +36,10 @@ import {
   setActiveItermSessionId,
   clientQueues,
   updateSessionTtyCache,
+  liveSessionFor,
+  claudeSessionOfId,
 } from "../../core/state.js";
-import { saveSessionRegistry, getAllPersistentSessionNames, lookupPersistentName } from "../../core/persistence.js";
+import { saveSessionRegistry, getAllPersistentSessionNames, lookupPersistentName, setPersistentSessionName, removePersistentSessionName } from "../../core/persistence.js";
 
 // ── Session Variable Helpers ──
 
@@ -119,6 +121,26 @@ export function getItermSessionVar(itermSessionId: string): string | null {
 // word. That is reassertPersistentTitles, run from an interval in the daemon.
 
 /**
+ * A name stored under a dead pane id follows its Claude session to the
+ * `claude attach` pane now serving it (killed and reattached keeps its name),
+ * unless that pane already has a name of its own. Returns how many moved.
+ */
+export function moveStaleNamesToAttachPanes(sessions: SessionSnapshot[]): number {
+  const live = new Set(sessions.map((s) => s.id));
+  let moved = 0;
+  for (const [id, name] of Object.entries(getAllPersistentSessionNames())) {
+    if (live.has(id) || !claudeSessionOfId(id)) continue;
+    const target = liveSessionFor(id, sessions);
+    if (target === id || lookupPersistentName(getAllPersistentSessionNames(), target)) continue;
+    removePersistentSessionName(id);
+    if (!setPersistentSessionName(target, name).ok) continue;
+    log(`Name authority: moved "${name}" from dead pane ${id.slice(0, 8)} to attach pane ${target.slice(0, 8)}`);
+    moved += 1;
+  }
+  return moved;
+}
+
+/**
  * Re-write chosen names onto tabs whose title has materially diverged.
  *
  * "Materially" is judged after normaliseLabel() strips the benign decorations
@@ -146,6 +168,7 @@ export function reassertPersistentTitles(
   const setPaneTitle = deps.setPaneTitle ?? setSessionTitle;
   const viewerFor = deps.viewerFor ?? itermViewerSessionId;
   const sessions = deps.sessions ?? snapshotAllTransports();
+  moveStaleNamesToAttachPanes(sessions);
 
   const names = getAllPersistentSessionNames();
   let repinned = 0;

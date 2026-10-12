@@ -310,16 +310,19 @@ server.tool(
   "aibroker_manage",
   "Start, steer, inspect or stop the manager that keeps a session working on a standing objective. Use for 'what is X doing', 'keep X working on Y', 'stop managing X'.",
   {
-    session: z.string().describe("Session name or id — the session being managed, not the caller"),
+    session: z.string().optional().describe("Session name or id — the session being managed. Omit or \"self\" for the CALLER's own session; \"all\" with status lists every managed session"),
     action: z
-      .enum(["status", "start", "instruct", "off", "pause", "resume", "now", "shift", "shift-off"])
-      .describe("shift = a bounded stretch of autonomous work on the tracker's open issues, set up from one sentence in `text` (how long, whether it has the screen, how many workers) — this is what 'work the issues for 8 hours with your controls, 2 workers' means; shift-off = stand it down without killing it; status = report; start = set the standing objective; instruct = one-shot note carried into the next arming; off = stop"),
+      .enum(["status", "start", "instruct", "off", "pause", "resume", "now", "shift", "shift-off", "supervise"])
+      .describe("supervise = put the session under supervision in one call: `goal` (standing objective), `until` (08:00 or 8h), `every` (idle-nudge minutes); shift = a bounded stretch of autonomous work on the tracker's open issues, set up from one sentence in `text` (how long, whether it has the screen, how many workers) — this is what 'work the issues for 8 hours with your controls, 2 workers' means; shift-off = stand it down without killing it; status = report; start = set the standing objective; instruct = one-shot note carried into the next arming; off = stop"),
     text: z
       .string()
       .optional()
       .describe("The objective for start; the instruction for instruct; and for shift the operator's own sentence, verbatim — how long, whether it has the screen, how many workers. Pass it unedited: a shift given no text silently takes defaults rather than what was said. Ignored for the other actions."),
+    goal: z.string().optional().describe("supervise: the standing objective"),
+    until: z.string().optional().describe("supervise: end of the stretch — clock time (08:00) or duration (8h, 90m)"),
+    every: z.union([z.string(), z.number()]).optional().describe("supervise: idle-nudge interval in minutes (5-480); omit to keep the default ~46-50 min re-arm"),
   },
-  async ({ session, action, text }) => {
+  async ({ session, action, text, goal, until, every }) => {
     // The daemon takes one string and decides; keep that as the single place
     // the grammar lives, so this tool and the hook cannot drift apart.
     const arg =
@@ -330,12 +333,16 @@ server.tool(
       action === "now" ? "now" :
       action === "shift" ? `shift ${text ?? ""}`.trim() :
       action === "shift-off" ? "shift off" :
+      action === "supervise" ? "supervise" :
       (text ?? "");
+    if (action === "supervise" && !goal && !until && every === undefined) {
+      return err(new Error("supervise needs a goal, until or every"));
+    }
     if ((action === "start" || action === "instruct") && !text) {
       return err(new Error(`${action} needs the text to use`));
     }
     try {
-      const r = (await hub.call_raw("manage", { session, arg })) as { message?: string };
+      const r = (await hub.call_raw("manage", { session: session ?? (action === "status" ? "all" : "self"), arg, goal, until, every })) as { message?: string };
       return ok(r?.message ?? "(no answer)");
     } catch (e) { return err(e); }
   },
@@ -774,7 +781,7 @@ server.tool(
       const pollInterval = 2000;
       const deadline = Date.now() + maxWait;
 
-      let msgs: Array<{ from: string; content: string; timestamp: number }> = [];
+      let msgs: Array<{ from: string; content: string; timestamp: number; shownAt?: number }> = [];
 
       // First immediate check
       const r = await hub.call_raw("session_mailbox_receive", { sessionId }) as any;
@@ -788,7 +795,7 @@ server.tool(
       }
 
       if (msgs.length === 0) return ok("No messages received.");
-      const lines = msgs.map((m) => `[${new Date(m.timestamp).toISOString()}] From ${m.from}: ${m.content}`);
+      const lines = msgs.map((m) => `[${new Date(m.timestamp).toISOString()}] From ${m.from}${m.shownAt ? ` (already shown at ${new Date(m.shownAt).toLocaleTimeString("en-GB", { hour12: false, hour: "2-digit", minute: "2-digit" })})` : ""}: ${m.content}`);
       return ok(lines.join("\n"));
     } catch (e) { return err(e); }
   },

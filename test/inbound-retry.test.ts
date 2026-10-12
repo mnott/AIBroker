@@ -45,8 +45,8 @@ test("an owner with no live pane is retried, not dropped", async (t) => {
       depositToSessionMailbox: (id: string, from: string, body: string) => { deposited = { id, from, body }; },
     },
   });
-  t.mock.module("../src/daemon/dispatch.js", {
-    namedExports: { submitAndConfirm: async () => "ok" },
+  t.mock.module("../src/daemon/pointer-guard.js", {
+    namedExports: { typeWhenInputEmpty: async () => ({ typed: true, ack: "ok" }) },
   });
 
   const { deliverInbound, __retryPendingNow } = await import("../src/daemon/inbound.js");
@@ -104,8 +104,8 @@ test("a non-ok ack is not reported as delivered", async (t) => {
   t.mock.module("../src/core/state.js", {
     namedExports: { depositToSessionMailbox: () => {} },
   });
-  t.mock.module("../src/daemon/dispatch.js", {
-    namedExports: { submitAndConfirm: async () => "no-ack" },
+  t.mock.module("../src/daemon/pointer-guard.js", {
+    namedExports: { typeWhenInputEmpty: async () => ({ typed: true, ack: "no-ack" }) },
   });
 
   const { deliverInbound } = await import("../src/daemon/inbound.js");
@@ -146,8 +146,8 @@ test("a retry that throws is not lost — the queue keeps going", async (t) => {
       depositToSessionMailbox: (id: string, _from: string, body: string) => { deposited = { id, body }; },
     },
   });
-  t.mock.module("../src/daemon/dispatch.js", {
-    namedExports: { submitAndConfirm: async () => "ok" },
+  t.mock.module("../src/daemon/pointer-guard.js", {
+    namedExports: { typeWhenInputEmpty: async () => ({ typed: true, ack: "ok" }) },
   });
 
   const { deliverInbound, __retryPendingNow } = await import("../src/daemon/inbound.js");

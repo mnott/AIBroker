@@ -29,16 +29,17 @@ import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText, handleM
 import { mqttRequestDebugState } from "../adapters/pailot/mqtt-broker.js";
 import { WatcherClient } from "../ipc/client.js";
 import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName, lookupPersistentName } from "../core/persistence.js";
-import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox, peekSessionMailbox } from "../core/state.js";
+import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox, markMailboxShown, peekSessionMailbox, setAttachAlias, hasAttachAlias, mailboxKeys, rememberIdSession, claudeSessionOfId } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
-import { promptUnsentText, inputLineDecision } from "./manage.js";
+import { typeWhenInputEmpty } from "./pointer-guard.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
+import { sameClaudeSession } from "../core/claude-attach.js";
 import { matchSession, resolveCallerSession } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
@@ -74,15 +75,6 @@ function getPackageVersion(): string {
 }
 
 const HUB_VERSION = getPackageVersion();
-
-/**
- * How long send_to_session waits for the target to take the message.
- *
- * Much shorter than a dispatch budget: a caller is waiting on this reply, and
- * an unconfirmed message is not lost — it is in the mailbox. Better to say
- * "queued" quickly than to block for a minute to say "delivered".
- */
-const SEND_ACK_TIMEOUT_MS = 15_000;
 
 /**
  * Best human-readable identity for whoever made this call, for the audit trail.
@@ -126,15 +118,18 @@ export function callerItermId(req: IpcRequest): string | undefined {
  * prefix is typed (the prefix tells the receiving Claude to route a reply
  * back to a sender, but a beat's label is not a registered session).
  *
- * When a message IS deposited, only a one-line pointer is typed — never the
- * full body. Typing the full body and pressing Enter submits it as an
+ * When a message IS deposited, only a one-line pointer is typed
+ * (`[Session:<sender>] <preview> — drain your mailbox (aibroker_receive) for
+ * the full text`) — a capped
+ * preview (messagePreview), never the full body. Typing the full body and pressing Enter submits it as an
  * ordinary prompt, which fires the target's own `hooks/drain-mailbox.mjs`
  * UserPromptSubmit hook on that same submission. That hook drains the very
  * message this call just deposited and re-injects it as a system-reminder —
  * so the full content showed up twice in one turn: once as the typed prompt,
  * once again from the mailbox. Reproduced live 2026-09-23 on both an idle and
  * a busy target — not a busy-only race. A short pointer and the deposited
- * body are different strings, so the hook's drain is the only place the full
+ * body are different strings (the preview is capped at ~100 chars, so a long
+ * body is never typed whole), so the hook's drain is the only place the full
  * content appears, and a multi-line body is never typed into a live pane at
  * all — the failure mode where only the last line survived typing cannot
  * recur here because there is nothing but one line to type.
@@ -146,13 +141,69 @@ export function sendToSessionDelivery(
 ): { typed: string; deposit: boolean } {
   return noReply
     ? { typed: message, deposit: false }
-    : { typed: `[Session:${senderLabel}] message in your mailbox — shown above if your drain hook ran, otherwise read with aibroker_receive`, deposit: true };
+    : { typed: mailboxPointer(senderLabel, messagePreview(message)), deposit: true };
+}
+
+/** The one line typed for a deposited message: it says the receiver must drain it. */
+export function mailboxPointer(senderLabel: string, preview: string): string {
+  return `[Session:${senderLabel}] ${preview} — drain your mailbox (aibroker_receive) for the full text`;
+}
+
+const PREVIEW_MAX = 100;
+
+/**
+ * The short, single-line summary typed in the pointer — never the full body
+ * (see sendToSessionDelivery). Agentish v2 messages (a kind letter on the
+ * first line, then k=v lines) are summarised as `i=` `r=` and `g=` (T) or
+ * `z=`; anything else is flattened prose. Control characters (CR/LF, ESC, …)
+ * are dropped so nothing in it can act as a keystroke; the cut falls on a
+ * word boundary and ends with "…".
+ */
+export function messagePreview(message: string): string {
+  const lines = message.split(/\r?\n/);
+  let text = message;
+  if (/^[TRSQAX]$/.test(lines[0].trim())) {
+    const kv = new Map<string, string>();
+    for (const l of lines.slice(1)) {
+      const m = /^([A-Za-z#]+)=(.*)$/.exec(l.trim());
+      if (m && !kv.has(m[1])) kv.set(m[1], m[2]);
+    }
+    const parts = ["i", "r", lines[0].trim() === "T" ? "g" : "z"].map((k) => { const v = kv.get(k); return v && (k === "r" ? `r=${v}` : v); }).filter(Boolean);
+    if (parts.length) text = parts.join(" ");
+  }
+  // eslint-disable-next-line no-control-regex
+  const flat = text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+  if (flat.length <= PREVIEW_MAX) return flat;
+  const cut = flat.slice(0, PREVIEW_MAX + 1);
+  const sp = cut.lastIndexOf(" ");
+  return `${(sp > 0 ? cut.slice(0, sp) : cut.slice(0, PREVIEW_MAX)).trimEnd()}…`;
+}
+
+/**
+ * The pane a caller lives in. A caller whose own id has no live pane (its
+ * session was moved into a Claude background session, the original pane is a
+ * shell) is the pane that attaches to its session uuid.
+ */
+export function snapForCaller(id: string | undefined, claudeSessionId: string | undefined, snapshots: SessionSnapshot[]): SessionSnapshot | undefined {
+  const own = id ? snapshots.find((s) => s.id === id) : undefined;
+  if (own && !(own.isClaude === false && claudeSessionId)) return own;
+  const viewer = claudeSessionId ? snapshots.find((s) => s.attachUuid && sameClaudeSession(s.attachUuid, claudeSessionId)) : undefined;
+  return viewer ?? own;
+}
+
+/**
+ * The one answer to "which live pane is the caller": manage self, caller
+ * labels and sender labels all go through here. A caller whose own id is not a
+ * live Claude pane is found by its session uuid (`claude attach <short>`).
+ */
+export function resolveCallerPane(req: IpcRequest, snapshots: SessionSnapshot[] = snapshotAllSessions()): SessionSnapshot | undefined {
+  return snapForCaller(callerItermId(req), req.claudeSessionId, snapshots);
 }
 
 function callerLabel(req: IpcRequest): string {
   const id = callerItermId(req);
   if (id) {
-    const snap = snapshotAllSessions().find((s) => s.id === id);
+    const snap = resolveCallerPane(req);
     if (snap) {
       const paiName = lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId);
       // Namespaced per the audit multi-writer contract: bare names collide
@@ -179,9 +230,21 @@ function callerLabel(req: IpcRequest): string {
  * naturally fails to match any session and a reply to it is refused rather
  * than silently reaching the wrong pane.
  */
+/**
+ * Mailbox keys for an id and/or Claude session uuid. When no attach pane is
+ * known for the uuid (daemon restarted, nothing sent since), scan live panes
+ * for its `claude attach` viewer once, which records the alias.
+ */
+export function resolveMailboxKeys(id: string | undefined, uuid: string | undefined, scan: () => SessionSnapshot[]): string[] {
+  if (uuid && !hasAttachAlias(uuid)) {
+    try { for (const snap of scan()) setAttachAlias(snap.id, snap.attachUuid); } catch { /* keep the own-id key */ }
+  }
+  return mailboxKeys(id, uuid);
+}
+
 export function resolveSenderLabel(req: IpcRequest, snapshots: SessionSnapshot[]): string {
   const senderItermId = callerItermId(req);
-  const senderSnap = senderItermId ? snapshots.find((s) => s.id === senderItermId) : undefined;
+  const senderSnap = resolveCallerPane(req, snapshots);
   if (senderSnap) return senderSnap.paiName ?? senderSnap.id;
   return senderItermId ?? "unknown";
 }
@@ -1093,6 +1156,7 @@ export function registerCoreHandlers(
       const persistentNames = getAllPersistentSessionNames();
       for (const snap of snaps) {
         snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
+        setAttachAlias(snap.id, snap.attachUuid);
       }
       return snaps;
     }
@@ -1105,8 +1169,13 @@ export function registerCoreHandlers(
         return snap ? { id: snap.id, name: snap.paiName ?? snap.name } : { id: null, name: null };
       }
       if (/^[0-9A-Fa-f-]{20,}$/.test(target)) {
-        // Looks like an iTerm UUID — use directly if it exists
+        // Looks like an iTerm UUID — use directly if it exists. A pane that is
+        // no longer Claude (or gone) whose session now runs behind an attach
+        // pane is redirected to that pane.
         const snap = snaps.find((s) => s.id === target);
+        const uuid = claudeSessionOfId(target);
+        const viewer = uuid && snap?.isClaude !== true ? snaps.find((s) => s.attachUuid && sameClaudeSession(s.attachUuid, uuid)) : undefined;
+        if (viewer) return { id: viewer.id, name: viewer.paiName ?? viewer.name };
         if (snap) return { id: snap.id, name: snap.paiName ?? snap.name };
         // Trust the caller — they may have a valid ID not yet in the snapshot
         return { id: target, name: target };
@@ -1134,6 +1203,7 @@ export function registerCoreHandlers(
     }
 
     let snapshots = withPersistentNames(snapshotAllSessions());
+    rememberIdSession(callerItermId(req) ?? "", req.claudeSessionId);
     let { id: itermSessionId, name: resolvedName } = resolveTarget(snapshots);
 
     /*
@@ -1214,43 +1284,6 @@ export function registerCoreHandlers(
       };
     }
 
-    // Refuse to type on top of unsent text already sitting in the target's
-    // input line — see manage.ts's inputLineDecision for the full policy
-    // (shared with arm()'s tick loop). This call site has no continuity
-    // across calls to tell a ghost from someone typing, so `sameForTicks: 1`
-    // pins it to "type" only when the line is empty and "skip" (never clear)
-    // otherwise — a single-shot send has no business ever hitting Ctrl-U on
-    // a session it does not own the arming loop for. The message is still
-    // deposited to the mailbox below, so nothing is lost — only the
-    // immediate typed delivery is withheld.
-    {
-      const targetContent = readSessionContent(itermSessionId, 5);
-      const onLine = promptUnsentText(targetContent?.content ?? "") ?? "";
-      const lineDecision = inputLineDecision({ text: onLine, sameForTicks: 1, idle: false });
-      if (lineDecision.action !== "type") {
-        const evicted = noReply ? undefined : depositToSessionMailbox(itermSessionId, senderLabel, message);
-        const reason = `input line holds '${onLine}'`;
-        audit({
-          action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
-          outcome: "refused", body: message,
-          reason: `not typed — ${reason}`, meta: { noReply },
-        });
-        if (evicted) {
-          audit({
-            action: "send", actor: `session:${evicted.from}`, target: resolvedName ?? target,
-            outcome: "evicted", body: evicted.content,
-            reason: "mailbox full — oldest undrained message discarded to make room",
-          });
-        }
-        return {
-          ok: false,
-          error: noReply
-            ? `not typed — ${reason}. Dropped — noReply carries no mailbox fallback.`
-            : `not typed — ${reason}. Queued in ${resolvedName ?? target}'s mailbox instead; it can drain it with aibroker_receive.`,
-        };
-      }
-    }
-
     // What gets typed and whether it goes to the mailbox — see
     // sendToSessionDelivery() for why noReply skips both.
     const { typed: prefixedMessage, deposit: shouldDeposit } = sendToSessionDelivery(message, senderLabel, noReply);
@@ -1287,8 +1320,16 @@ export function registerCoreHandlers(
     // of the bug it was fixing, one delivery reported as three instead of three
     // reported as one. An unconfirmed message is queued in the mailbox, which
     // is what makes a single attempt safe.
-    const { submitAndConfirm } = await import("./dispatch.js");
-    const ack = await submitAndConfirm(itermSessionId, prefixedMessage, SEND_ACK_TIMEOUT_MS, undefined, 1);
+    //
+    // The input line is checked first (pointer-guard.ts): typing + Enter into a
+    // line the operator is half-way through submits their sentence mid-word. A
+    // held line (or an unreadable pane) types nothing; the deposit above
+    // already made the message recoverable and a retry types the pointer once
+    // the line clears.
+    const guarded = await typeWhenInputEmpty(itermSessionId, prefixedMessage, {
+      multi: shouldDeposit ? (n) => mailboxPointer(senderLabel, `${n} messages`) : undefined,
+    });
+    const ack = guarded.typed ? guarded.ack : "held";
 
     if (ack === "ok") {
       const eventId = audit({
@@ -1307,7 +1348,9 @@ export function registerCoreHandlers(
     // Not delivered — but not lost either. Say which, in both the audit and the
     // result, because "queued" and "delivered" are different promises and the
     // caller is entitled to know which one it got.
-    const reason = ack === "unreadable"
+    const reason = !guarded.typed
+      ? guarded.reason
+      : ack === "unreadable"
       ? "could not read the target terminal, so submission could not be confirmed"
       : "typed but never observed leaving the input box — the target may be mid-task";
     const eventId = audit({
@@ -1354,22 +1397,36 @@ export function registerCoreHandlers(
     return rawId.includes(":") ? rawId.split(":").pop()! : rawId;
   };
 
+  /** Own id (if any) plus any attach pane viewing the caller's Claude session; also remembers id → session. */
+  const mailboxKeysFor = (req: IpcRequest, id: string | undefined): string[] => {
+    const { claudeSessionId: explicit } = req.params as { claudeSessionId?: string };
+    const uuid = req.claudeSessionId ?? explicit;
+    if (id) rememberIdSession(id, uuid);
+    return resolveMailboxKeys(id, uuid, snapshotAllSessions);
+  };
+
+  /** A request names a mailbox by iTerm id, Claude session uuid, or both. */
+  const hasMailboxIdentity = (req: IpcRequest): boolean => {
+    const { claudeSessionId: explicit } = req.params as { claudeSessionId?: string };
+    return !!(mailboxSessionId(req) ?? req.claudeSessionId ?? explicit);
+  };
+
   server.on("session_mailbox_receive", async (req) => {
     const itermSessionId = mailboxSessionId(req);
-    if (!itermSessionId) {
+    if (!hasMailboxIdentity(req)) {
       return { ok: false, error: "Cannot determine session ID — pass sessionId param or run inside an iTerm session" };
     }
-    const messages = drainSessionMailbox(itermSessionId);
+    const messages = drainSessionMailbox(mailboxKeysFor(req, itermSessionId));
     return { ok: true, result: { messages, sessionId: itermSessionId } };
   });
 
   /** Phase 1 of the hook's drain: return the pending messages WITHOUT clearing. */
   server.on("session_mailbox_peek", async (req) => {
     const itermSessionId = mailboxSessionId(req);
-    if (!itermSessionId) {
+    if (!hasMailboxIdentity(req)) {
       return { ok: false, error: "Cannot determine session ID — pass sessionId param or run inside an iTerm session" };
     }
-    return { ok: true, result: { messages: peekSessionMailbox(itermSessionId), sessionId: itermSessionId } };
+    return { ok: true, result: { messages: peekSessionMailbox(mailboxKeysFor(req, itermSessionId)), sessionId: itermSessionId } };
   });
 
   /**
@@ -1379,11 +1436,11 @@ export function registerCoreHandlers(
    */
   server.on("session_mailbox_ack", async (req) => {
     const itermSessionId = mailboxSessionId(req);
-    if (!itermSessionId) {
+    if (!hasMailboxIdentity(req)) {
       return { ok: false, error: "Cannot determine session ID — pass sessionId param or run inside an iTerm session" };
     }
     const { count } = req.params as { count?: number };
-    const cleared = drainSessionMailbox(itermSessionId, count).length;
+    const cleared = markMailboxShown(mailboxKeysFor(req, itermSessionId), count ?? Infinity);
     return { ok: true, result: { cleared, sessionId: itermSessionId } };
   });
 
@@ -1826,12 +1883,18 @@ export function registerCoreHandlers(
      * a stale claim can be traded for the pane the caller is really in.
      */
     const live = snapshotAllSessions();
-    const itermSessionId = resolveCallerSession(claimedId, req.callerTty, live);
+    rememberIdSession(claimedId ?? "", req.claudeSessionId);
+    // A background session's pty is not an iTerm tty, so the uuid → attach pane
+    // lookup comes first; the tty is the fallback for everything else.
+    const viaAttach = claimedId && !live.some((s) => s.id === claimedId) ? resolveCallerPane(req, live)?.id : undefined;
+    const itermSessionId = viaAttach ?? resolveCallerSession(claimedId, req.callerTty, live);
 
     if (claimedId && itermSessionId && itermSessionId !== claimedId) {
       log(
         `rename: caller claimed session ${claimedId.slice(0, 8)}, which is not open; ` +
-          `using ${itermSessionId.slice(0, 8)} found via tty ${req.callerTty}`,
+          (viaAttach
+            ? `using ${itermSessionId.slice(0, 8)} found via claude attach ${req.claudeSessionId?.slice(0, 8)}`
+            : `using ${itermSessionId.slice(0, 8)} found via tty ${req.callerTty}`),
       );
     }
 
@@ -2028,10 +2091,16 @@ export function registerCoreHandlers(
    * anything to be idle, so this must not depend on a session's turn.
    */
   server.on("manage", async (req) => {
-    const { session, arg } = req.params as { session?: string; arg?: string };
-    if (!session) return { ok: false, error: "session is required" };
-    const { handleManage } = await import("./manage.js");
-    const r = await handleManage(session, arg ?? "");
+    const { session, arg, goal, until, every, operator } = req.params as {
+      session?: string; arg?: string; goal?: string; until?: string; every?: string | number; operator?: boolean;
+    };
+    const { handleManage, resolveManageTarget, refuseAgentManage } = await import("./manage.js");
+    // "self" or omitted = the caller's own session, by its iTerm id.
+    const target = resolveManageTarget(session, resolveCallerPane(req)?.id ?? callerItermId(req));
+    if (!target) return { ok: false, error: "cannot tell which session is asking — name it" };
+    const refusal = refuseAgentManage(target, arg ?? "", { until }, operator === true);
+    if (refusal) return { ok: false, error: refusal };
+    const r = await handleManage(target, arg ?? "", { goal, until, every });
     return r.ok
       ? { ok: true, result: { message: r.message, managed: r.managed ?? false } }
       : { ok: false, error: r.message };

@@ -38,6 +38,8 @@ import {
   lastRoutedSessionId,
   setLastRoutedSessionId,
   getAibpBridge,
+  claudeSessionOfId,
+  liveSessionFor,
 } from "../../core/state.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, autoTabName, createClaudeSession, killSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
@@ -483,6 +485,20 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
 
   // Return sessions with updated active state
   handleSessionsCommand(ws);
+}
+
+/**
+ * The pane to use for an id PAILot (or a caller) names. A dead pane whose
+ * Claude session now runs behind a `claude attach` pane maps to that pane; the
+ * snapshot is only read when the session of the id is known.
+ */
+export function liveSession(id: string): string;
+export function liveSession(id: string | undefined): string | undefined;
+export function liveSession(id: string | undefined): string | undefined {
+  if (!id || !claudeSessionOfId(id)) return id;
+  const live = liveSessionFor(id, snapshotAllSessions());
+  if (live !== id) log(`[PAILot] session ${id.slice(0, 8)} is dead — redirected to attach pane ${live.slice(0, 8)}`);
+  return live;
 }
 
 function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): void {
@@ -1217,7 +1233,7 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
         // Extract the session ID that PAILot says this message belongs to.
         // This is the iTerm session ID the user was viewing when they typed/spoke.
         // We use it for routing instead of guessing from activeItermSessionId.
-        const pailotSessionId = typeof msg.sessionId === "string" ? msg.sessionId : undefined;
+        const pailotSessionId = typeof msg.sessionId === "string" ? liveSession(msg.sessionId) : undefined;
 
         // Validate against the live session list. A stale id (e.g. a Claude Code
         // session was restarted and got a new id) would otherwise silently fall
@@ -1383,7 +1399,7 @@ function resolveSessionId(sessionId?: string): string | undefined {
 }
 
 export function broadcastText(text: string, sessionId?: string, direct?: boolean): void {
-  const resolvedSession = sessionId || resolveSessionId(sessionId);
+  const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
   const traceId = randomUUID().slice(0, 8);
   const contentPreview = text.replace(/\s+/g, " ").trim().slice(0, 80);
 
@@ -1445,7 +1461,7 @@ export async function broadcastVoice(
   direct?: boolean,
   chunkMeta?: { groupId: string; chunkIndex: number; totalChunks: number },
 ): Promise<void> {
-  const resolvedSession = sessionId || resolveSessionId(sessionId);
+  const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
   const traceId = randomUUID().slice(0, 8);
   const contentPreview = transcript.replace(/\s+/g, " ").trim().slice(0, 80);
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
@@ -1523,7 +1539,7 @@ export async function broadcastVoice(
  * @param sessionId — iTerm session ID of the originating Claude session
  */
 export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean, mimeType?: string): void {
-  const resolvedSession = sessionId || resolveSessionId(sessionId);
+  const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
   const imgBase64 = imageBuffer.toString("base64");
   broadcast({
     type: "image",
@@ -1646,7 +1662,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "switch": {
-      const sessionId = args.sessionId as string | undefined;
+      const sessionId = liveSession(args.sessionId as string | undefined);
       const sessionIndex = args.index as number | undefined;
       let targetIndex: number | undefined;
       if (sessionIndex) {
@@ -1668,7 +1684,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "screenshot": {
-      const ssSessionId = args.sessionId as string | undefined;
+      const ssSessionId = liveSession(args.sessionId as string | undefined);
       log(`[MQTT] screenshot command: requested session=${ssSessionId?.slice(0, 8) ?? "none"}`);
       if (ssSessionId) {
         setActiveItermSessionId(ssSessionId);
@@ -1686,7 +1702,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "rename": {
-      const sessionId = args.sessionId as string | undefined;
+      const sessionId = liveSession(args.sessionId as string | undefined);
       const name = args.name as string | undefined;
       if (sessionId && name) {
         // Persist so the rename survives re-enumeration: enrichedSnapshots reads
@@ -1713,7 +1729,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "remove": {
-      const sessionId = args.sessionId as string | undefined;
+      const sessionId = liveSession(args.sessionId as string | undefined);
       if (sessionId) {
         const sessions = hybridManager.listSessions();
         const idx = sessions.findIndex(s => s.backendSessionId === sessionId);

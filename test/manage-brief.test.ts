@@ -35,7 +35,7 @@ test("line never exceeds 250 chars, whatever the objective; brief holds all of i
   const notes = ["do the tests before the docs", "skip the flaky one"];
   const line = buildGoalLine(BRIEF_PATH, objective);
   assert.ok(line.length <= 250, `${line.length}`);
-  assert.ok(line.startsWith(`/goal Follow ${BRIEF_PATH} until done`));
+  assert.ok(line.startsWith("/goal Keep working. There is no done-state. Only the operator ends this goal. Follow "));
   assert.ok(!line.includes("\n"));
   const brief = buildBrief({ objective, agentish: LEGEND, rulesSource: rules, shiftRules, hands: "THE OPERATOR HAS THE SCREEN", pending: notes });
   for (const piece of [objective, LEGEND, rules, shiftRules, "THE OPERATOR HAS THE SCREEN", ...notes]) {
@@ -44,7 +44,7 @@ test("line never exceeds 250 chars, whatever the objective; brief holds all of i
 });
 
 test("a short objective rides on the line after the pointer", () => {
-  assert.equal(buildGoalLine(BRIEF_PATH, "fix the toolbar"), `/goal Follow ${BRIEF_PATH} until done: fix the toolbar`);
+  assert.equal(buildGoalLine(BRIEF_PATH, "fix the toolbar"), `/goal Keep working. There is no done-state. Only the operator ends this goal. Follow ${BRIEF_PATH}: fix the toolbar`);
 });
 
 test("slug is file-name safe", () => {
