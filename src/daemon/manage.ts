@@ -556,6 +556,8 @@ export interface ManagedSession {
     startedAt: number;
     /** Said once, so the end of a shift is announced and not merely obeyed. */
     endReported?: boolean;
+    /** The "until passed" line has been logged; proactive typing stays off. */
+    lapseNoted?: boolean;
     /** Set by `supervise`: a bounded stretch with no issue-work rules in the brief. */
     plain?: boolean;
   };
@@ -2535,7 +2537,7 @@ export function nextDueAt(m: ManagedSession): number | null {
  * The caller has already ruled out a busy session.
  */
 export function nudgeDue(m: ManagedSession, content: string, now: number): boolean {
-  if (!m.nudgeEveryMin || m.paused) return false;
+  if (!m.nudgeEveryMin || m.paused || shiftOver(m, now)) return false;
   if (!GOAL_ACTIVE.test(content)) return false;
   if (promptUnsentText(content) !== null) return false;
   if (QUEUED_HINT_RE.test(content.split("\n").slice(-8).join("\n"))) return false;
@@ -3108,8 +3110,11 @@ export function busyGoalGoneReason(m: ManagedSession, content: string, now: numb
     : null;
 }
 
+/** A shift/supervision whose `until` has passed: nothing proactive is typed into the session any more. */
+export const shiftOver = (m: ManagedSession, now: number): boolean => !!m.shift && now >= m.shift.until;
+
 export function reasonToArm(m: ManagedSession, content: string, now: number): string | null {
-  if (m.paused) return null;
+  if (m.paused || shiftOver(m, now)) return null;
 
   if (OUT_OF_GOAL.some((re) => re.test(content))) return "the session reported its goal could not be achieved";
 
@@ -3893,10 +3898,16 @@ async function tick(): Promise<void> {
     if (now - m.lastRearmAt < REARM_COOLDOWN_MS) continue;
 
     let reason = reasonToArm(m, content, now);
-    if (stopped && !m.paused && (!reason || reason.startsWith("no goal armed")) && !GOAL_ACTIVE.test(content)) {
+    const over = shiftOver(m, now);
+    if (over && m.shift && !m.shift.lapseNoted) {
+      m.shift.lapseNoted = true;
+      note(m, "until passed — no more nudges/arms");
+      dirty = true;
+    }
+    if (stopped && !m.paused && !over && (!reason || reason.startsWith("no goal armed")) && !GOAL_ACTIVE.test(content)) {
       reason = STOPPED_REASON;
     }
-    if (!reason && stopped && now - (m.lastNudgeAt ?? 0) >= STOP_NUDGE_COOLDOWN_MS) {
+    if (!reason && stopped && !m.paused && !over && now - (m.lastNudgeAt ?? 0) >= STOP_NUDGE_COOLDOWN_MS) {
       // Marker still up but the turn ended on nothing: nudge now, not at the lapse timer.
       typeIntoSession(m.sessionId, NUDGE_TEXT);
       m.lastNudgeAt = now;
