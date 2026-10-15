@@ -94,6 +94,16 @@ test("supervise: earlier until refused, later accepted; status and now untouched
   assert.equal(M.refuseAgentManage("CaseLeaf", "set new wording", {}, false, NOW), null);
 });
 
+test("shift with a clock until: same minute allowed, earlier refused, later allowed", () => {
+  // stored until is 00:30 the next day; the sentence is the live repro's shape
+  const text = "shift until 00:30 with your controls, same workers as tonight";
+  assert.equal(M.refuseAgentManage("CaseLeaf", text, {}, false, NOW), null);
+  assert.equal(M.refuseAgentManage("CaseLeaf", text, {}, false, NOW + 7), null);
+  assert.equal(M.refuseAgentManage("CaseLeaf", "shift until 00:00", {}, false, NOW), M.AGENT_REFUSAL);
+  assert.equal(M.refuseAgentManage("CaseLeaf", "shift until 02:00 with your controls", {}, false, NOW), null);
+  assert.equal(M.refuseAgentManage("CaseLeaf", "supervise", { until: "00:30" }, false, NOW + 7), null);
+});
+
 test("the CLI under an agent environment is not the operator", () => {
   assert.equal(runsUnderAgent({ CLAUDECODE: "1" }), true);
   assert.equal(runsUnderAgent({ CLAUDE_CODE_SESSION_ID: "abc" }), true);

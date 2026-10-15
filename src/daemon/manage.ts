@@ -2492,8 +2492,10 @@ export function refuseAgentManage(
   if (ending) return consumeToken(names, ending, now) ? null : AGENT_REFUSAL;
 
   const shift = arg.match(/^shift\b\s*([\s\S]*)$/);
-  const next = shift ? now + parseShift(shift[1]).hours * 3_600_000 : opts.until ? parseUntilSpec(opts.until, new Date(now)) : null;
-  return next !== null && cur !== undefined && cur > now && next < cur ? AGENT_REFUSAL : null;
+  const next = shift ? now + parseShift(shift[1], new Date(now)).hours * 3_600_000 : opts.until ? parseUntilSpec(opts.until, new Date(now)) : null;
+  // Minute precision: the same clock time is not a shortening because of float/ms drift.
+  const minute = (t: number) => Math.floor(t / 60_000);
+  return next !== null && cur !== undefined && cur > now && minute(next) < minute(cur) ? AGENT_REFUSAL : null;
 }
 
 /** "08:00", "until 8pm", "8h", "90m" → epoch ms; null when it reads as none of these. */
