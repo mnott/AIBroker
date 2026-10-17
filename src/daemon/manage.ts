@@ -582,6 +582,10 @@ export interface ManagedSession {
   nudgeEveryMin?: number;
   /** When a "continue the goal" nudge was last typed. */
   lastNudgeAt?: number;
+  /** When an API-retry continue was last typed — the one-per-minute clock for that nudge. */
+  lastApiRetryAt?: number;
+  /** When the API-retry banner was last NOTED. The note dedups; the nudge itself does not. */
+  apiRetryNotedAt?: number;
   startedAt: number;
 }
 
@@ -2167,8 +2171,8 @@ export function oneLine(text: string): string {
 function landsWhen(m: ManagedSession): string {
   if (m.paused) return "  The manager is paused — nothing is armed until you resume it.";
   return (
-    "  This changes what the next arming says; it types nothing now.\n" +
-    "  The next arming comes when the session stops — or immediately, with `now`."
+    "  This arms on the next tick — every ask is now, and a line typed at a\n" +
+    "  session mid-turn queues at the turn boundary and interrupts nothing."
   );
 }
 
@@ -2454,6 +2458,34 @@ export function applySupervise(m: ManagedSession, goal: string, until: number | 
   note(m, `supervise: until ${until !== null ? hhmm(until) : "open-ended"}, nudge every ${m.nudgeEveryMin ?? "-"} min`);
 }
 
+/**
+ * Change the standing objective on a managed entry.
+ *
+ * EVERY ask for arming is now (2026-10-17 14:48), and a changed objective is
+ * an ask: the new text must reach the session, not whenever the lapse timer
+ * next gets around to it, but on the very next tick. `0` is the sentinel the
+ * arm gates read as "arm now" — idle or queued behind a running turn, which
+ * is safe because a queued line lands at the turn boundary and interrupts
+ * nothing.
+ */
+export function setObjective(m: ManagedSession, objective: string): void {
+  m.objective = objective;
+  m.lastRearmAt = 0;
+}
+
+/**
+ * Queue an operator instruction, and demand the arming that delivers it.
+ *
+ * The queue only goes out with an arming, so an instruction that did not
+ * demand one waited for the lapse timer — an arming that had nothing to do
+ * with what the operator just said, and one they may wait the better part of
+ * an hour for. Every ask is now: the instruction rides out on the next tick.
+ */
+export function queueInstruction(m: ManagedSession, instruction: string): void {
+  m.pending.push(instruction);
+  m.lastRearmAt = 0;
+}
+
 // ── only the operator ends or shortens a goal ────────────────────────────────
 
 export const AGENT_REFUSAL =
@@ -2565,6 +2597,61 @@ export function nudgeDue(m: ManagedSession, content: string, now: number): boole
 }
 
 export const NUDGE_TEXT = "Continue working toward your standing goal.";
+
+/**
+ * The API-retry banner, seen live 2026-10-17 14:50:
+ *
+ *   Goal still active · the API was unavailable or the connection dropped ·
+ *   retrying in 1 min (1/3) · send a message to retry now
+ *
+ * Claude Code retries three times, then gives up — and the goal sits frozen
+ * over a session that is not working but sleeping between retries. The banner
+ * itself offers the way out — any message retries now — so the manager takes
+ * it: one minimal continue per minute, for as long as the banner lasts,
+ * deterministically and with no cap, because a stretch of API trouble can
+ * outlast any count.
+ */
+export const API_RETRY =
+  /the API was unavailable or the connection dropped|retrying in \d+ min \(\d+\/3\)/;
+
+/** At most one retry-breaking message per minute while the banner persists. */
+export const API_RETRY_EVERY_MS = 60_000;
+
+/** The history note about the banner dedups; the nudge itself is 1/60s, not the note. */
+const API_RETRY_NOTE_EVERY_MS = 5 * 60_000;
+
+export const API_RETRY_TEXT = "Continue now — the API is back. Pick the turn up where it dropped.";
+
+/**
+ * Type the retry-breaking continue when this pane shows the banner and a
+ * minute has passed since the last one. Never over text sitting unsent on the
+ * input line (skip silently; the next tick tries again), never while paused,
+ * never past a shift's end — the banner is not a reason to restart a
+ * stood-down session. Returns true when a line went out.
+ *
+ * The tick calls it before the busy gate: the retry wait IS the busy state
+ * here, and typing mid-turn is safe because the line queues at the turn
+ * boundary. `type` is injectable so the caller's exact behavior is testable
+ * without a terminal; the tick passes nothing and gets the real one.
+ */
+export function apiRetryNudge(
+  m: ManagedSession,
+  content: string,
+  now: number,
+  type: (sessionId: string, text: string) => unknown = typeIntoSession,
+): boolean {
+  if (m.paused || shiftOver(m, now)) return false;
+  if (!API_RETRY.test(content)) return false;
+  if (promptUnsentText(content) !== null) return false;
+  if (now - (m.lastApiRetryAt ?? 0) < API_RETRY_EVERY_MS) return false;
+  type(m.sessionId, API_RETRY_TEXT);
+  m.lastApiRetryAt = now;
+  if (!m.apiRetryNotedAt || now - m.apiRetryNotedAt >= API_RETRY_NOTE_EVERY_MS) {
+    note(m, "API-retry banner on the pane — typed a continue to break the retry wait (1/min while it lasts)");
+    m.apiRetryNotedAt = now;
+  }
+  return true;
+}
 
 const hhmm = (t: number) => {
   const d = new Date(t);
@@ -3214,13 +3301,13 @@ export const GOAL_FORCED_BUSY_REASON = "asked to arm now (session busy, queued)"
  * empty) plus at most one pending arm. Clears the pending mark once the marker
  * is back or the turn is over.
  *
- * Forced arms too (`lastRearmAt === 0`, set by `now` or by supervise with a
- * new goal), because a session arming ITSELF through the MCP tool is by
- * definition mid-turn when it asks — waiting for an idle pane defers its
- * request until a hard-working session happens to go quiet, which may be
- * never. Unlike the goal-gone case the forced arm fires with the old marker
- * still on screen: the point of the call is to replace that goal with the new
- * text.
+ * Forced arms too (`lastRearmAt === 0`, set by `now`, a new objective, a
+ * queued instruction, or supervise with a new goal), because a session arming
+ * ITSELF through the MCP tool is by definition mid-turn when it asks —
+ * waiting for an idle pane defers its request until a hard-working session
+ * happens to go quiet, which may be never. Unlike the goal-gone case the
+ * forced arm fires with the old marker still on screen: the point of the call
+ * is to replace that goal with the new text.
  */
 export function busyGoalGoneReason(m: ManagedSession, content: string, now: number, busy: boolean): string | null {
   if (!busy) {
@@ -3942,6 +4029,19 @@ async function tick(): Promise<void> {
      * from when it would otherwise fire — it never suppresses one, since a
      * genuinely stuck session goes quiet on the transcript too.
      */
+    /**
+     * API-RETRY KEEP-ALIVE — ahead of every gate below that continues on a
+     * busy or blocked pane, because the retry wait IS the busy state here and
+     * waiting it out loses the stretch: Claude Code retries three times and
+     * gives up, leaving the goal frozen over a session that is only sleeping
+     * between its own retries. The banner coexists with "Goal still active",
+     * so this never re-arms — it only breaks the retry wait.
+     */
+    if (apiRetryNudge(m, content, now)) {
+      dirty = true;
+      continue;
+    }
+
     // Goal gone — or a forced arm (now / supervise with a new goal, asked by a
     // session that is itself mid-turn) — mid-turn: queue the arm behind the
     // turn instead of waiting for an idle tick.
@@ -4484,7 +4584,7 @@ export async function handleManage(
   const setMatch = arg.match(/^(?:set|objective|replace|start)\s+([\s\S]+)$/i);
   if (setMatch && existing) {
     const before = existing.objective;
-    existing.objective = setMatch[1].trim();
+    setObjective(existing, setMatch[1].trim());
     // Notes written against the old objective may not make sense against the
     // new one; say so rather than silently carrying them over.
     const dropped = existing.pending.length;
@@ -4518,7 +4618,7 @@ export async function handleManage(
   const addMatch = arg.match(/^(?:add|also|append|extend)\s+([\s\S]+)$/i);
   if (addMatch && existing) {
     const extra = addMatch[1].trim();
-    existing.objective = `${existing.objective} Also: ${extra}`;
+    setObjective(existing, `${existing.objective} Also: ${extra}`);
     note(existing, `objective extended: ${extra.slice(0, 80)}`);
     saveState(state);
     return {
@@ -4786,9 +4886,12 @@ export async function handleManage(
       objective,
       pending: [],
       history: [],
-      // Give the session the benefit of the grace period rather than arming
-      // on top of whatever it is doing at the moment the operator types this.
-      lastRearmAt: Date.now(),
+      // EVERY ask for arming is now (2026-10-17 14:48). The grace period this
+      // line once gave — don't arm on top of whatever the session is doing as
+      // the operator types — predates safe mid-turn queuing: a queued arm
+      // lands at the turn boundary and interrupts nothing, so its reason is
+      // gone, and 0 arms on the very next tick.
+      lastRearmAt: 0,
       lastChangeAt: Date.now(),
       lastHash: hash(readPane(sessionId)),
       tty: snapshotTty(sessionId),
@@ -4816,7 +4919,7 @@ export async function handleManage(
   }
 
   const instruction = arg.match(/^instruct\s+([\s\S]+)$/i)?.[1].trim() ?? arg;
-  existing.pending.push(instruction);
+  queueInstruction(existing, instruction);
   note(existing, `operator: ${instruction.slice(0, 80)}`);
   saveState(state);
   return {
