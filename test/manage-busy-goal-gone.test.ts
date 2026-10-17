@@ -48,3 +48,29 @@ test("paused or after until: no", () => {
   assert.equal(M.busyGoalGoneReason(entry({ paused: true }), pane("", false), NOW, true), null);
   assert.equal(M.busyGoalGoneReason(entry(), pane("", false), NOW + 5 * 3_600_000, true), null);
 });
+
+// A session arming ITSELF (action=now, or supervise with a new goal) is always
+// mid-turn when it asks, so the forced arm must queue behind the turn too —
+// even with the old goal marker still on screen, which the new text replaces.
+test("forced (lastRearmAt=0), busy, marker present: queue it anyway", () => {
+  assert.equal(M.busyGoalGoneReason(entry({ lastRearmAt: 0 }), pane("", true), NOW, true), M.GOAL_FORCED_BUSY_REASON);
+});
+
+test("forced, busy, marker absent: queue it", () => {
+  assert.equal(M.busyGoalGoneReason(entry({ lastRearmAt: 0 }), pane("", false), NOW, true), M.GOAL_FORCED_BUSY_REASON);
+});
+
+test("forced, busy, one already pending: no second arm until the wait lapses", () => {
+  const m = entry({ lastRearmAt: 0, queuedArmAt: NOW - 60_000 });
+  assert.equal(M.busyGoalGoneReason(m, pane("", true), NOW, true), null);
+  assert.ok(M.busyGoalGoneReason(m, pane("", true), NOW + M.QUEUED_ARM_WAIT_MS, true));
+});
+
+test("forced but not busy is the idle rule's business, not this one", () => {
+  assert.equal(M.busyGoalGoneReason(entry({ lastRearmAt: 0 }), pane("", false), NOW, false), null);
+});
+
+test("forced while paused or after until: no", () => {
+  assert.equal(M.busyGoalGoneReason(entry({ lastRearmAt: 0, paused: true }), pane("", true), NOW, true), null);
+  assert.equal(M.busyGoalGoneReason(entry({ lastRearmAt: 0 }), pane("", true), NOW + 5 * 3_600_000, true), null);
+});

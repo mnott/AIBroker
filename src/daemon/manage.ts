@@ -3089,24 +3089,40 @@ export function turnStoppedIdle(
 }
 
 export const GOAL_GONE_REASON = "goal gone before until, re-armed";
+export const FORCED_ARM_REASON = "asked to arm now";
 
 /** How long one queued arm is awaited before another may be typed. */
 export const QUEUED_ARM_WAIT_MS = 10 * 60_000;
 export const GOAL_GONE_BUSY_REASON = "goal gone before until, re-armed (session busy, queued)";
+export const GOAL_FORCED_BUSY_REASON = "asked to arm now (session busy, queued)";
 
 /**
- * Goal gone while the session is mid-turn: Claude Code queues a submitted line
- * and runs it at the next turn boundary, so arming now interrupts nothing.
- * Same guards as the idle rule (not paused, until ahead, input line empty) plus
- * at most one pending arm. Clears the pending mark once the marker is back or
- * the turn is over.
+ * An arm due while the session is mid-turn: Claude Code queues a submitted
+ * line and runs it at the next turn boundary, so arming now interrupts
+ * nothing. Same guards as the idle rule (not paused, until ahead, input line
+ * empty) plus at most one pending arm. Clears the pending mark once the marker
+ * is back or the turn is over.
+ *
+ * Forced arms too (`lastRearmAt === 0`, set by `now` or by supervise with a
+ * new goal), because a session arming ITSELF through the MCP tool is by
+ * definition mid-turn when it asks — waiting for an idle pane defers its
+ * request until a hard-working session happens to go quiet, which may be
+ * never. Unlike the goal-gone case the forced arm fires with the old marker
+ * still on screen: the point of the call is to replace that goal with the new
+ * text.
  */
 export function busyGoalGoneReason(m: ManagedSession, content: string, now: number, busy: boolean): string | null {
-  if (!busy || GOAL_ACTIVE.test(content)) {
+  if (!busy) {
+    delete m.queuedArmAt;
+    return null;
+  }
+  const forced = reasonToArm(m, content, now) === FORCED_ARM_REASON;
+  if (!forced && GOAL_ACTIVE.test(content)) {
     delete m.queuedArmAt;
     return null;
   }
   if (m.queuedArmAt !== undefined && now - m.queuedArmAt < QUEUED_ARM_WAIT_MS) return null;
+  if (forced) return GOAL_FORCED_BUSY_REASON;
   return reasonToArm({ ...m, lastRearmAt: m.lastRearmAt || 1 }, content, now) === GOAL_GONE_REASON
     ? GOAL_GONE_BUSY_REASON
     : null;
@@ -3124,7 +3140,7 @@ export function reasonToArm(m: ManagedSession, content: string, now: number): st
   // computed from the epoch and the log says "armed 29779818 min ago", which is
   // true of a number and nonsense about the world — the kind of line that costs
   // somebody ten minutes at three in the morning.
-  if (m.lastRearmAt === 0) return "asked to arm now";
+  if (m.lastRearmAt === 0) return FORCED_ARM_REASON;
 
   const quietFor = Math.max(0, now - m.lastChangeAt);
   const armedFor = Math.max(0, now - m.lastRearmAt);
@@ -3815,7 +3831,9 @@ async function tick(): Promise<void> {
      * from when it would otherwise fire — it never suppresses one, since a
      * genuinely stuck session goes quiet on the transcript too.
      */
-    // Goal gone mid-turn: queue the arm behind the turn instead of waiting for an idle tick.
+    // Goal gone — or a forced arm (now / supervise with a new goal, asked by a
+    // session that is itself mid-turn) — mid-turn: queue the arm behind the
+    // turn instead of waiting for an idle tick.
     const queuedReason = busyGoalGoneReason(m, content, now, working && !paneLooksIdle(content, now - m.lastChangeAt));
     if (queuedReason && now - m.lastRearmAt >= REARM_COOLDOWN_MS) {
       // Pending whether or not the read-back saw it land: a queued line is invisible until the turn ends.
@@ -4150,7 +4168,8 @@ export async function handleManage(
         `                a bounded stretch of autonomous work on the tracker's open\n` +
         `                issues: objective, screen decision, expiry and arming in one\n` +
         `                sentence. \`shift off\` stands it down without killing it\n` +
-        `  now           arm immediately, whatever the signals say\n` +
+        `  now           arm immediately, whatever the signals say — safe mid-turn,\n` +
+        `                the /goal line queues behind a running turn\n` +
         `  pause         stop arming, keep the objective\n` +
         `  resume        start arming again\n` +
         `  off           stop managing entirely\n` +

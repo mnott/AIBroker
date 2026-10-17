@@ -308,12 +308,12 @@ server.tool("aibroker_sessions", "List Claude sessions managed by the hub", {}, 
  */
 server.tool(
   "aibroker_manage",
-  "Start, steer, inspect or stop the manager that keeps a session working on a standing objective. Use for 'what is X doing', 'keep X working on Y', 'stop managing X'.",
+  "Start, steer, inspect or stop the manager that keeps a session working on a standing objective. Use for 'what is X doing', 'keep X working on Y', 'stop managing X'. SELF-ARMING: any session can put itself under supervision — action=supervise, session='self', goal=<objective>, until=<08:00|8h>; the watcher then keeps you armed, re-arms a lapsed goal, and nudges on idle. action=now forces an immediate arm and is SAFE MID-TURN: the /goal line queues behind your running turn and lands at the next turn boundary — never tell the operator to type /goal by hand.",
   {
     session: z.string().optional().describe("Session name or id — the session being managed. Omit or \"self\" for the CALLER's own session; \"all\" with status lists every managed session"),
     action: z
       .enum(["status", "start", "instruct", "off", "pause", "resume", "now", "shift", "shift-off", "supervise"])
-      .describe("supervise = put the session under supervision in one call: `goal` (standing objective), `until` (08:00 or 8h), `every` (idle-nudge minutes); shift = a bounded stretch of autonomous work on the tracker's open issues, set up from one sentence in `text` (how long, whether it has the screen, how many workers) — this is what 'work the issues for 8 hours with your controls, 2 workers' means; shift-off = stand it down without killing it; status = report; start = set the standing objective; instruct = one-shot note carried into the next arming; off = stop"),
+      .describe("supervise = put the session under supervision in one call: `goal` (standing objective), `until` (08:00 or 8h), `every` (idle-nudge minutes) — self-arming: session='self' works; shift = a bounded stretch of autonomous work on the tracker's open issues, set up from one sentence in `text` (how long, whether it has the screen, how many workers) — this is what 'work the issues for 8 hours with your controls, 2 workers' means; shift-off = stand it down without killing it; status = report; start = set the standing objective; instruct = one-shot note carried into the next arming; now = force an immediate arm, safe mid-turn (the /goal line queues behind the running turn); off = stop"),
     text: z
       .string()
       .optional()
