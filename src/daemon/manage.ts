@@ -441,6 +441,23 @@ export interface ManagedSession {
    *  clock for that note, since the skip itself happens every tick while the
    *  session stays mid-turn. */
   busyNotedAt?: number;
+  /** When arming last logged "arm deferred: input line holds …" — the dedup
+   *  clock for that note, since the skip itself repeats on every attempt
+   *  while the line stays occupied. A skip is not a failure and never reaches
+   *  armFails (see arm()/applyArmResult), so without a clock of its own its
+   *  note would either spam the history or be lost entirely. */
+  armSkipNotedAt?: number;
+  /**
+   * Said ONCE per demanded arm: the operator's own unsent text is holding it.
+   *
+   * A demanded arm (`lastRearmAt === 0`) meeting an occupied input line is
+   * nobody's fault but it must not be silent — the operator asked for action
+   * and the thing standing in the way is their own half-typed line. Said once
+   * because repeating it every tick is how a channel teaches its reader to
+   * ignore it. Cleared when the arm finally lands or a non-forced skip shows
+   * the demand episode is over.
+   */
+  forcedArmHoldNotedAt?: number;
   /** When a goal was last queued behind a running turn; at most one pending. */
   queuedArmAt?: number;
   /**
@@ -2889,7 +2906,22 @@ export async function tryExclusive<T>(busy: Set<string>, id: string, fn: () => P
   }
 }
 
-async function arm(m: ManagedSession, reason: string): Promise<boolean> {
+/**
+ * The outcome of one arm attempt.
+ *
+ * Three values, because two of them were once one boolean and the confusion
+ * was not harmless. "armed" — typed, read back, and seen to land. "failed" —
+ * the attempt genuinely went wrong: the pane could not be read, the paste was
+ * refused, the line read back mangled, or the landing was never confirmed.
+ * "skipped" — a guard declined to type: the input line holds the operator's
+ * own unsent text. A skip is the guard working as designed, not the arming
+ * failing, so it counts toward nothing and simply retries next tick; counting
+ * it as a failure is what killed a demanded arm on 2026-10-17 14:42 (see
+ * applyArmResult).
+ */
+export type ArmResult = "armed" | "failed" | "skipped";
+
+export async function arm(m: ManagedSession, reason: string): Promise<ArmResult> {
   const { text } = goalText(m);
 
   /**
@@ -2915,12 +2947,12 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   const live = await readSessionContentAsync(m.sessionId, 5);
   if (!live) {
     note(m, "the session could not be read — not typing anything");
-    return false;
+    return "failed";
   }
   if (live.atPrompt && !isClaudePane(live.name)) {
     m.paused = true;
     notify(m, "PAUSED — that pane is at a shell prompt, so the session has exited. Not typing a goal into a shell. `resume` once it is back.");
-    return false;
+    return "failed";
   }
 
   /**
@@ -2938,9 +2970,12 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
    * SKIPPED and retried next tick — never cleared, never typed over —
    * unless the IDENTICAL text has sat there for GHOST_TICKS consecutive
    * ticks (2 minutes) while the session is idle, which is inputLineDecision's
-   * job to decide. Skips still count toward armFails/armFailStreak below, so
-   * a line occupied for minutes still reaches blockedReason's operator alert
-   * (with a screenshot) — the daemon does not stall silently either way.
+   * job to decide. A skip is NOT a failure: it counts toward nothing (on
+   * 2026-10-17 14:42 the operator typing while a demanded arm waited was
+   * counted as arm failures, crossed the cap, and the arm was never even
+   * typed — see test/manage-arm-skip.test.ts). The skip says so in the log at
+   * most once per 5 minutes; a DEMANDED arm held this way says so loudly, and
+   * once.
    */
   const onLine = promptUnsentText(await readPaneAsync(m.sessionId));
   const armIdleMs = Math.max(0, Date.now() - m.lastChangeAt);
@@ -2954,11 +2989,28 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   const lineDecision = inputLineDecision({ text: onLine ?? "", sameForTicks, idle: armIdle, idleMs: armIdleMs });
 
   if (lineDecision.action === "skip") {
-    note(
-      m,
-      `arm deferred: input line holds '${onLine}' (unsent for ${sameForTicks} tick${sameForTicks === 1 ? "" : "s"}, idle ${Math.round(armIdleMs / 1000)}s)`,
-    );
-    return false;
+    if (m.lastRearmAt !== 0) {
+      delete m.forcedArmHoldNotedAt;
+      if (!m.armSkipNotedAt || Date.now() - m.armSkipNotedAt >= 5 * 60_000) {
+        note(
+          m,
+          `arm deferred: input line holds '${onLine}' (unsent for ${sameForTicks} tick${sameForTicks === 1 ? "" : "s"}, idle ${Math.round(armIdleMs / 1000)}s)`,
+        );
+        m.armSkipNotedAt = Date.now();
+      }
+    } else {
+      // The operator demanded this arm; what is holding it is their own
+      // unsent line. Say so, once, where it will be seen.
+      if (!m.forcedArmHoldNotedAt) {
+        notify(
+          m,
+          `a demanded arm (${reason}) is NOT being typed: the input line holds the operator's own unsent text ` +
+            `("${(onLine ?? "").slice(0, 60)}") — clear or send that line to let the arm through; it is not typed over`,
+        );
+        m.forcedArmHoldNotedAt = Date.now();
+      }
+    }
+    return "skipped";
   }
 
   if (lineDecision.action === "clear-then-type") {
@@ -2989,7 +3041,7 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   }
   if (!pasteTextIntoSession(m.sessionId, text)) {
     note(m, `could not type into the session (${reason}) — will retry`);
-    return false;
+    return "failed";
   }
   const { line: echoedLine, waitedMs } = await readBackTyped({
     read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
@@ -3003,7 +3055,7 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
       m,
       `arm aborted: after ${waitedMs}ms line read back as "${echoedLine.slice(0, 60)}" not "${text.slice(0, 60)}"; after Ctrl-U the input ${left ? `still holds ${left.length} chars ("${left.slice(0, 60)}")` : "is empty"}`,
     );
-    return false;
+    return "failed";
   }
   sendEnterKey(m.sessionId);
 
@@ -3015,15 +3067,74 @@ async function arm(m: ManagedSession, reason: string): Promise<boolean> {
   });
   if (landed) {
     m.lastRearmAt = Date.now();
+    delete m.forcedArmHoldNotedAt;
     const carried = m.pending.length;
     m.pending = [];
     armingsSinceReport.set(m.sessionId, (armingsSinceReport.get(m.sessionId) ?? 0) + 1);
     note(m, `armed: ${reason}${carried ? ` (carrying ${carried} operator instruction${carried > 1 ? "s" : ""})` : ""}`);
-    return true;
+    return "armed";
   }
 
   notify(m, `typed but the goal never took (no active marker, or the line stayed in the input) — input cleared, treating as NOT armed (${reason})`);
-  return false;
+  return "failed";
+}
+
+/**
+ * The book-keeping one arm attempt's outcome earns, shared by every caller
+ * that retries on the tick.
+ *
+ * ONLY a "failed" counts. A skip is not here because it is not a fault: the
+ * guard that declined (the operator's own text on the input line) is doing
+ * its job, and the demand — or the lapse — is still pending on the next tick.
+ * Counting skips is the 2026-10-17 14:42 fault: three ticks of the operator
+ * typing crossed this cap, the cap consumed the forced-arm sentinel, and the
+ * manager went silent exactly when it had been told to act.
+ */
+export function applyArmResult(m: ManagedSession, result: ArmResult, now: number): void {
+  if (result === "armed") {
+    m.armFails = 0;
+    m.armFailStreak = 0;
+    delete m.stuckSince;
+    delete m.blockedSince;
+    delete m.blockedAlertedAt;
+    return;
+  }
+  if (result === "skipped") return;
+  m.armFails = (m.armFails ?? 0) + 1;
+  m.armFailStreak = (m.armFailStreak ?? 0) + 1;
+  if (m.armFails >= ARM_ATTEMPTS) {
+    m.armFails = 0;
+    // The cap must not eat the sentinel: `lastRearmAt === 0` is a pending
+    // DEMANDED arm, and stamping it with `now` is what turned "arm NOW" into
+    // a 90-second cooldown and then a permanent mute on 2026-10-17 14:42.
+    // A pending forced arm survives the cap.
+    if (m.lastRearmAt !== 0) m.lastRearmAt = now;
+    m.stuckSince ??= now;
+    // No operator push here. Pushing on every cap is the 144-alerts-overnight
+    // bug: this fires again every ~2-4 minutes for as long as arming keeps
+    // failing, and it is content-agnostic — it cannot tell "mid-turn, will
+    // clear itself" from "stuck on a modal for hours". The blocked check
+    // above owns the operator alert now: it has `armFailStreak`/`stuckSince`
+    // (which survive this reset) plus a static-pane confirmation, and its
+    // own BLOCKED_REALERT_MS dedup. This stays log-only.
+    note(
+      m,
+      `arming keeps failing (streak ${m.armFailStreak}) — holding off; the blocked check owns the operator alert now`,
+    );
+  }
+}
+
+/**
+ * Whether the stuck backoff — arming having crossed ARM_ATTEMPTS — may hold
+ * this session's arm back.
+ *
+ * A DEMANDED arm (`lastRearmAt === 0`) is never held by it. This is the other
+ * half of the 2026-10-17 14:42 fix: once the cap had marked the session stuck
+ * mid-demand, this gate muted every later tick, so the demanded arm was never
+ * even typed. A demand outranks a backoff it had no part in earning.
+ */
+export function stuckBackoffHolds(m: Pick<ManagedSession, "stuckSince" | "lastRearmAt">): boolean {
+  return m.stuckSince !== undefined && m.lastRearmAt !== 0;
 }
 
 /**
@@ -3840,7 +3951,7 @@ async function tick(): Promise<void> {
       m.queuedArmAt = now;
       const queued = await tryExclusive(arming, m.sessionId, () => arm(m, queuedReason));
       if (queued === undefined) delete m.queuedArmAt;
-      else if (!queued) note(m, `${queuedReason} — not confirmed, waiting for the turn to end or the marker`);
+      else if (queued === "failed") note(m, `${queuedReason} — not confirmed, waiting for the turn to end or the marker`);
       dirty = true;
       continue;
     }
@@ -3913,7 +4024,12 @@ async function tick(): Promise<void> {
     // REARM_COOLDOWN_MS. This is what actually fixes the overnight bug: the
     // old code kept re-arming (and re-spamming) forever because each retype
     // reset lastChangeAt and the freeze detector never got a quiet window.
-    if (m.stuckSince !== undefined) continue;
+    //
+    // But a DEMANDED arm is never held here (2026-10-17 14:42): the cap had
+    // marked the session stuck while the operator was mid-demand, and this
+    // gate then muted every tick after it — the demanded arm was never even
+    // typed. A demand outranks a backoff it had no part in earning.
+    if (stuckBackoffHolds(m)) continue;
 
     if (now - m.lastRearmAt < REARM_COOLDOWN_MS) continue;
 
@@ -3962,36 +4078,18 @@ async function tick(): Promise<void> {
      * ordinary rules — the session is still managed, and the next genuine
      * lapse arms it — and the operator is told, because a manager that has
      * given up on delivering a goal is the one thing it must never do quietly.
+     *
+     * Counting is for GENUINE FAILURES only. On 2026-10-17 14:42 the count
+     * also took guard skips: the operator, mid-demand ("arm NOW"), was typing
+     * into the pane, three occupied-line ticks crossed the cap, the cap
+     * consumed the forced-arm sentinel, and the manager — told to act — never
+     * typed at all. A guard declining is the system working, not the attempt
+     * failing.
      */
     const armed = await tryExclusive(arming, m.sessionId, () => arm(m, reason));
     if (armed === undefined) continue; // another arm for this session is in flight
     dirty = true;
-    if (armed) {
-      m.armFails = 0;
-      m.armFailStreak = 0;
-      delete m.stuckSince;
-      delete m.blockedSince;
-      delete m.blockedAlertedAt;
-      continue;
-    }
-    m.armFails = (m.armFails ?? 0) + 1;
-    m.armFailStreak = (m.armFailStreak ?? 0) + 1;
-    if (m.armFails >= ARM_ATTEMPTS) {
-      m.armFails = 0;
-      m.lastRearmAt = now;
-      m.stuckSince ??= now;
-      // No operator push here. Pushing on every cap is the 144-alerts-overnight
-      // bug: this fires again every ~2-4 minutes for as long as arming keeps
-      // failing, and it is content-agnostic — it cannot tell "mid-turn, will
-      // clear itself" from "stuck on a modal for hours". The blocked check
-      // above owns the operator alert now: it has `armFailStreak`/`stuckSince`
-      // (which survive this reset) plus a static-pane confirmation, and its
-      // own BLOCKED_REALERT_MS dedup. This stays log-only.
-      note(
-        m,
-        `arming keeps failing (streak ${m.armFailStreak}) — holding off; the blocked check owns the operator alert now`,
-      );
-    }
+    applyArmResult(m, armed, now);
   }
 
   if (dirty) saveState(state);
