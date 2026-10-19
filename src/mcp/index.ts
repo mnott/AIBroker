@@ -28,6 +28,7 @@ import { z } from "zod";
 delete process.env.__CFBundleIdentifier;
 
 import { execSync } from "node:child_process";
+import { resolve } from "node:path";
 import { runItermJxa } from "../adapters/iterm/core.js";
 import { missingIssueLink } from "./issue-links.js";
 import { otaCurlArgs } from "./ota-args.js";
@@ -37,6 +38,15 @@ import { WatcherClient } from "../ipc/client.js";
 import { OTA_PORT } from "../daemon/ota.js";
 
 const DAEMON_SOCKET = "/tmp/aibroker.sock";
+
+// Is this file the program, or is it imported (as the tests do, to reach the
+// tool handlers directly)? A stdio transport and an AIBP registration belong
+// to the running shim only; an import must stay side-effect free.
+const IS_ENTRY =
+  process.argv[1] !== undefined &&
+  (() => {
+    try { return fileURLToPath(import.meta.url) === resolve(process.argv[1]); } catch { return false; }
+  })();
 
 // ── Self vintage ──
 //
@@ -164,7 +174,7 @@ async function registerWithAibp(): Promise<void> {
 }
 
 // Fire and forget — don't block MCP startup
-void registerWithAibp();
+if (IS_ENTRY) void registerWithAibp();
 
 function getSessionId(): string | undefined {
   // A worker child process (PAI_WORKER=1) inherits the pane's env vars, so
@@ -346,6 +356,47 @@ server.tool(
       return ok(r?.message ?? "(no answer)");
     } catch (e) { return err(e); }
   },
+);
+
+/**
+ * aibroker_set_goal — the conversational half of the same surface.
+ *
+ * The operator says "set your goal", "arm", "keep working until 8pm" in plain
+ * words, and a tool NAMED for the phrase removes the judgment of fishing the
+ * action out of aibroker_manage's enum. It delegates to the very supervise
+ * path the manage tool takes — one hub call, session=self — so the daemon
+ * stays the single place the behaviour lives: objective set, arm forced (an
+ * ask is now, typed even mid-turn, landing at the turn boundary), pause
+ * lifted, until replaced, cadence reset.
+ *
+ * Exported with the hub call injected so the tests can pin what is sent
+ * without a daemon.
+ */
+export async function setGoal(
+  a: { goal?: string; until?: string; every?: number },
+  call: (method: string, params: Record<string, unknown>) => Promise<unknown> = (m, p) => hub.call_raw(m, p),
+) {
+  const goal = (a.goal ?? "").trim();
+  if (!goal) return err(new Error("set_goal needs a goal — the standing objective, in plain words"));
+  // until defaults to 8h; an omitted every is left out entirely so supervise
+  // keeps the watcher's own cadence.
+  const params: Record<string, unknown> = { session: "self", arg: "supervise", goal, until: a.until ?? "8h" };
+  if (a.every !== undefined) params.every = a.every;
+  try {
+    const r = (await call("manage", params)) as { message?: string };
+    return ok(`${r?.message ?? "(no answer)"}\ngoal set and armed — marker lands within one tick`);
+  } catch (e) { return err(e); }
+}
+
+server.tool(
+  "aibroker_set_goal",
+  "Set this session's standing goal and put it under supervision — this is what the operator means by 'set your goal', 'arm', 'keep working until X'. Installs/refreshes the watcher on YOUR OWN session, arms it immediately (typed even mid-turn, lands at the turn boundary; a busy pane delays nothing). Never ask the operator to type /goal or arm anything. Verify afterwards with aibroker_manage action=status.",
+  {
+    goal: z.string().min(1).describe("The standing objective, in plain words — what 'keep working' means"),
+    until: z.string().optional().describe("End of the stretch — clock time (08:00) or duration (8h, 90m). Default 8h"),
+    every: z.number().optional().describe("Idle-nudge interval in minutes (5-480). Omit to keep the watcher's default"),
+  },
+  (a) => setGoal(a),
 );
 
 server.tool(
@@ -1297,7 +1348,9 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((e) => {
-  process.stderr.write(`[aibroker-mcp] Fatal: ${e}\n`);
-  process.exit(1);
-});
+if (IS_ENTRY) {
+  main().catch((e) => {
+    process.stderr.write(`[aibroker-mcp] Fatal: ${e}\n`);
+    process.exit(1);
+  });
+}
