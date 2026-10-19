@@ -180,9 +180,50 @@ export function itermPid(): number | null {
   return cachedItermPid;
 }
 
+/**
+ * JXA helpers every body can use. A window, tab or session that is being closed
+ * can return null (or throw) from windows()/tabs()/sessions()/any property, so
+ * each level is read inside try/catch and null entries are skipped: one closing
+ * window must never abort the walk.
+ */
+export const JXA_WALK_PRELUDE = `  function safeList(f) {
+    try { var l = f(); return l ? l : []; } catch (e) { return []; }
+  }
+  function eachSession(fn) {
+    safeList(function () { return app.windows(); }).forEach(function (w) {
+      if (!w) return;
+      safeList(function () { return w.tabs(); }).forEach(function (t) {
+        if (!t) return;
+        safeList(function () { return t.sessions(); }).forEach(function (s) {
+          if (!s) return;
+          try { fn(s); } catch (e) {}
+        });
+      });
+    });
+  }`;
+
 /** The JXA program run for a body: `app` is bound to the real iTerm process, the body returns a string. */
 export function buildItermJxa(pid: number, body: string): string {
-  return `(function () {\n  var app = Application(${pid});\n${body}\n})()`;
+  return `(function () {\n  var app = Application(${pid});\n${JXA_WALK_PRELUDE}\n${body}\n})()`;
+}
+
+/**
+ * Run an enumeration, and if it fails (null) retry once after a short pause —
+ * a window closing mid-walk is usually gone by then.
+ */
+export function withEnumRetry(
+  run: () => string | null,
+  sleep: (ms: number) => void = sleepSync,
+  delayMs = 300,
+): string | null {
+  const first = run();
+  if (first !== null) return first;
+  sleep(delayMs);
+  return run();
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
@@ -229,16 +270,21 @@ export function stripItermPrefix(id: string | undefined): string | undefined {
  */
 export function withSessionJxa(sessionId: string, body: string, fallback = '""'): string {
   return `  var wanted = ${JSON.stringify(sessionId)};
-  var windows = app.windows();
+  var windows = safeList(function () { return app.windows(); });
   for (var wi = 0; wi < windows.length; wi++) {
     var aWindow = windows[wi];
-    var tabs = aWindow.tabs();
+    if (!aWindow) continue;
+    var tabs = safeList(function () { return aWindow.tabs(); });
     for (var ti = 0; ti < tabs.length; ti++) {
       var aTab = tabs[ti];
-      var sessions = aTab.sessions();
+      if (!aTab) continue;
+      var sessions = safeList(function () { return aTab.sessions(); });
       for (var si = 0; si < sessions.length; si++) {
         var aSession = sessions[si];
-        if (aSession.id() === wanted) {
+        if (!aSession) continue;
+        var matched = false;
+        try { matched = aSession.id() === wanted; } catch (e) {}
+        if (matched) {
 ${body}
         }
       }
@@ -281,9 +327,9 @@ export function pasteTextIntoSession(sessionId: string, text: string): boolean {
 
 export function findClaudeSession(): string | null {
   const script = `  var out = "";
-  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+  eachSession(function (s) {
     out += s.id() + "\\t" + s.name() + "\\n";
-  }); }); });
+  });
   return out;`;
 
   const result = runItermJxa(script);
@@ -502,13 +548,13 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
   // Fetch id, name, tty, tab.title. Skip `profile name` (~0.6s) and
   // `is at shell prompt` (~3.3s) — both derived or irrelevant.
   const script = `  var out = "";
-  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+  eachSession(function (s) {
     var tabTitle = "";
     try { tabTitle = s.variable({ named: "tab.title" }); } catch (e) {}
     var workerPane = "";
     try { workerPane = s.variable({ named: "user.paiWorkerPane" }) || ""; } catch (e) {}
     out += [s.id(), s.name(), s.tty(), tabTitle, workerPane].join("\\t") + "\\n";
-  }); }); });
+  });
   return out;`;
 
   // Timeout scales with the work: iTerm's AppleScript cost grows with the
@@ -518,7 +564,7 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
   // 4.05s and every enumeration returned empty, killing all session features
   // at once. Budget generously — this is a correctness floor, not a latency
   // target, and a slow answer beats a confidently wrong empty one.
-  const result = timeCall("iterm-core:snapshot-enum", () => _internal.runItermJxa(script, 30_000));
+  const result = timeCall("iterm-core:snapshot-enum", () => withEnumRetry(() => _internal.runItermJxa(script, 30_000)));
   if (!result) {
     lastSnapshotOk = false;
     return [];
@@ -656,9 +702,9 @@ export function invalidateSnapshotCache(): void {
  */
 export function clearAllPaiNames(): number {
   const script = `  var cleared = 0;
-  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+  eachSession(function (s) {
     try { s.setVariable({ named: "user.paiName", to: "" }); cleared++; } catch (e) {}
-  }); }); });
+  });
   return String(cleared);`;
   // Allow 10s since this iterates all sessions with variable writes
   const result = runItermJxa(script, 10_000);

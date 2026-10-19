@@ -221,12 +221,12 @@ export function findItermSessionForTermId(
 
   const script = `  var wanted = ${JSON.stringify(termSessionId)};
   var found = "";
-  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+  eachSession(function (s) {
     if (found) return;
     var v = "";
     try { v = s.variable({ named: "TERM_SESSION_ID" }); } catch (e) {}
     if (v === wanted) found = s.id();
-  }); }); });
+  });
   return found;`;
 
   const result = runItermJxa(script);
