@@ -589,7 +589,7 @@ export interface ManagedSession {
   startedAt: number;
 }
 
-type State = Record<string, ManagedSession>;
+export type State = Record<string, ManagedSession>;
 
 /**
  * A duration nobody can print nonsense from.
@@ -633,7 +633,13 @@ function repairHistory(s: State): boolean {
   return changed;
 }
 
-function loadState(): State {
+/**
+ * Exported, with saveState below, for `aibroker arm-self` (cli.ts): a session
+ * forcing its own arm reads and writes this file through the same pair the
+ * daemon uses, because a second reader of managers.json is a second format
+ * waiting to disagree.
+ */
+export function loadState(): State {
   try {
     if (existsSync(STATE_FILE)) {
       const s = JSON.parse(readFileSync(STATE_FILE, "utf8")) as State;
@@ -649,7 +655,8 @@ function loadState(): State {
   return {};
 }
 
-function saveState(s: State): void {
+/** The saving half of the pair arm-self reuses; see loadState. */
+export function saveState(s: State): void {
   try {
     writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
   } catch (e) {

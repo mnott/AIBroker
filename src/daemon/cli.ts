@@ -317,6 +317,61 @@ switch (command) {
     break;
   }
 
+  /**
+   * arm-self — a session arms its own goal, in one command with no arguments.
+   *
+   * Watched sessions coming out of a compact kept having to re-derive how to
+   * demand their own arming: objective written to /tmp, TODO.md updated, the
+   * operator asked to type the /goal line by hand — while the watcher holding
+   * that objective sat in managers.json the whole time. A tool description
+   * still leaves the model composing a call. This is the deterministic
+   * shortcut: one verb, zero arguments, zero judgment — the session that types
+   * it is the session it arms.
+   *
+   * It forces nothing but the arm. Pause, until, objective and nudges are the
+   * operator's, and stay untouched; only the every-ask-is-now sentinel
+   * (lastRearmAt = 0, the same thing `manage <session> now` sets) is written,
+   * through the daemon's own loadState/saveState pair so this file keeps
+   * exactly one format and one writer's habits.
+   */
+  case "arm-self": {
+    if (rest.length) {
+      console.error("arm-self takes no arguments — it arms the session that types it.");
+      process.exit(1);
+    }
+    // The pane suffix is the form managers.json is keyed by; the manage command
+    // resolves its own-session case the same way.
+    const selfId = (process.env.ITERM_SESSION_ID ?? "").split(":").pop() ?? "";
+    if (!selfId) {
+      console.error("run this from inside your own session — it arms the session that types it.");
+      process.exit(1);
+    }
+    const { loadState, saveState } = await import("./manage.js");
+    const managers = loadState();
+    const m = managers[selfId];
+    if (!m) {
+      console.error(
+        "no watcher for this session yet. Install one: aibroker manage supervise <objective> until <time> (or aibroker_manage action=supervise session=self).",
+      );
+      process.exit(1);
+    }
+    if (m.paused) {
+      console.error("watcher is PAUSED — only the operator resumes it.");
+      process.exit(1);
+    }
+    if (m.shift && Date.now() >= m.shift.until) {
+      console.error("watcher's until has passed — re-supervise with a new until.");
+      process.exit(1);
+    }
+    m.lastRearmAt = 0;
+    saveState(managers);
+    console.log(
+      "arming on the next tick — the /goal line is typed even mid-turn (it queues at the turn boundary). " +
+        "If the input line holds unsent text, clear or send it; the manager never types over live input.",
+    );
+    break;
+  }
+
   case "help":
   case "--help":
   case "-h":
