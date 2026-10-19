@@ -121,9 +121,9 @@ function detectSessionId(): string | undefined {
     // Use multiple -e flags since osascript doesn't handle \n in single -e strings
     const result = runItermJxa(`  var tty = ${JSON.stringify(tty)};
   var found = "";
-  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+  eachSession(function (s) {
     if (!found && s.tty() === tty) found = s.id();
-  }); }); });
+  });
   return found;`, 3_000)?.trim();
     return result || undefined;
   } catch {

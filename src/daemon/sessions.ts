@@ -42,7 +42,7 @@ import { fileURLToPath } from "node:url";
 import { DAEMON_SOCKET_PATH } from "./index.js";
 import { tightenLog } from "../core/private-file.js";
 import { serviceEnv, plistEnvEntries } from "../core/service-env.js";
-import { runItermJxa } from "../adapters/iterm/core.js";
+import { runItermJxa, withEnumRetry } from "../adapters/iterm/core.js";
 import { pruneSessionNames } from "../core/persistence.js";
 
 const HOME = homedir();
@@ -122,11 +122,11 @@ async function liveSessions(): Promise<DaemonSession[] | null> {
 
 /** id -> tty for every open iTerm2 session (";"-delimited to dodge newline issues). */
 function ttyMap(): Record<string, string> {
-  const raw = runItermJxa(`  var out = "";
-  app.windows().forEach(function (w) { w.tabs().forEach(function (t) { t.sessions().forEach(function (s) {
+  const raw = withEnumRetry(() => runItermJxa(`  var out = "";
+  eachSession(function (s) {
     out += s.id() + "|" + s.tty() + ";";
-  }); }); });
-  return out;`) ?? "";
+  });
+  return out;`)) ?? "";
   const m: Record<string, string> = {};
   for (const pair of raw.split(";")) {
     const [id, tty] = pair.split("|");
