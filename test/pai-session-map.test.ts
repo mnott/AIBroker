@@ -19,7 +19,7 @@ import "./home-guard.js";
  *     the cost of arming the wrong session dwarfs the cost of asking again;
  *   - a missing, malformed or unreadable map is the old refusal, verbatim.
  */
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
@@ -62,6 +62,16 @@ const snap = (id: string): SessionSnapshot =>
     id, name: id, profileName: "Default", tabTitle: null, tty: `/dev/ttys-${id}`,
     atPrompt: true, paiName: null,
   }) as SessionSnapshot;
+
+/** callerSelfId has no clock seam; pin Date.now to NOW so map ages are deterministic. */
+async function callerSelfIdAtNow(...args: Parameters<typeof callerSelfId>) {
+  const clock = mock.method(Date, "now", () => NOW);
+  try {
+    return await callerSelfId(...args);
+  } finally {
+    clock.mock.restore();
+  }
+}
 
 // ── the pieces ───────────────────────────────────────────────────────────────
 
@@ -197,19 +207,19 @@ test("map not an object → nothing", async () => {
 // ── the hub side: callerSelfId ───────────────────────────────────────────────
 
 test("a request carrying an iTerm id resolves exactly as before", async () => {
-  assert.equal(await callerSelfId(req({ itermSessionId: `w0t0p0:${UID}` }), []), UID);
-  assert.equal(await callerSelfId(req({ sessionId: `w11t0p0:${UID}` }), []), UID, "the TERM-derived claim still passes through");
+  assert.equal(await callerSelfIdAtNow(req({ itermSessionId: `w0t0p0:${UID}` }), []), UID);
+  assert.equal(await callerSelfIdAtNow(req({ sessionId: `w11t0p0:${UID}` }), []), UID, "the TERM-derived claim still passes through");
 });
 
 test("unknown-session + claude uuid in the request + map hit → the map's uid", async () => {
   writeMap(freshMap());
-  const r = await callerSelfId(req({ claudeSessionId: CLAUDE_ID }), []);
+  const r = await callerSelfIdAtNow(req({ claudeSessionId: CLAUDE_ID }), []);
   assert.equal(r, UID);
 });
 
 test("unknown-session + no uuid + one fresh entry naming a live pane → that pane", async () => {
   writeMap(freshMap(NOW - 60_000));
-  const r = await callerSelfId(req({}), [snap(OTHER_UID), snap(UID)]);
+  const r = await callerSelfIdAtNow(req({}), [snap(OTHER_UID), snap(UID)]);
   assert.equal(r, UID);
 });
 
@@ -218,11 +228,11 @@ test("unknown-session + two fresh live candidates → undefined, the caller is t
     [CLAUDE_ID]: { uid: UID, ts: NOW - 60_000 },
     [OTHER_CLAUDE_ID]: { uid: OTHER_UID, ts: NOW - 120_000 },
   });
-  assert.equal(await callerSelfId(req({}), [snap(UID), snap(OTHER_UID)]), undefined);
+  assert.equal(await callerSelfIdAtNow(req({}), [snap(UID), snap(OTHER_UID)]), undefined);
 });
 
 test("unknown-session + no map at all → undefined, exactly the old refusal", async () => {
   rmSync(paiSessionMapPath(), { force: true });
-  assert.equal(await callerSelfId(req({ claudeSessionId: CLAUDE_ID }), []), undefined);
-  assert.equal(await callerSelfId(req({}), [snap(UID)]), undefined);
+  assert.equal(await callerSelfIdAtNow(req({ claudeSessionId: CLAUDE_ID }), []), undefined);
+  assert.equal(await callerSelfIdAtNow(req({}), [snap(UID)]), undefined);
 });
