@@ -29,6 +29,7 @@ delete process.env.__CFBundleIdentifier;
 import { WatcherClient } from "../ipc/client.js";
 import { validateHubStatus } from "../ipc/validate.js";
 import { formatHubStatus } from "./status-format.js";
+import { resolveSelfSessionId } from "./pai-session-map.js";
 import { runsUnderAgent } from "./agent-env.js";
 import { createAdapter } from "./create-adapter.js";
 import { readFileSync } from "node:fs";
@@ -47,6 +48,23 @@ function getVersion(): string {
 
 const args = process.argv.slice(2);
 const [command, ...rest] = args;
+
+/**
+ * The hub's live session ids — the list the self-resolution's newest-entry
+ * fallback must name. Empty when the daemon is unreachable: an id nobody can
+ * confirm live is not resolved from, it is refused. The watcher ticks in the
+ * daemon anyway, so a session whose daemon is down has nothing to arm into.
+ */
+async function hubSessionIds(): Promise<string[]> {
+  try {
+    const r = (await new WatcherClient(DAEMON_SOCKET_PATH).call_raw("sessions", {})) as {
+      sessions?: Array<{ id?: string }>;
+    };
+    return (r.sessions ?? []).map((s) => s.id ?? "").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
 
 if (args.includes("--version") || args.includes("-v")) {
   console.log(`aibroker ${getVersion()}`);
@@ -340,8 +358,18 @@ switch (command) {
       process.exit(1);
     }
     // The pane suffix is the form managers.json is keyed by; the manage command
-    // resolves its own-session case the same way.
-    const selfId = (process.env.ITERM_SESSION_ID ?? "").split(":").pop() ?? "";
+    // resolves its own-session case the same way. When the environment is
+    // silent — a session run under the Claude background daemon carries no
+    // ITERM_SESSION_ID, and those are exactly the overnight supervised ones —
+    // PAI's own session map answers for it (pai-session-map.ts), refusing as
+    // before when it cannot name the caller beyond doubt.
+    const selfId = (
+      await resolveSelfSessionId({
+        itermSessionId: process.env.ITERM_SESSION_ID,
+        env: process.env,
+        knownUids: hubSessionIds,
+      })
+    )?.id ?? "";
     if (!selfId) {
       console.error("run this from inside your own session — it arms the session that types it.");
       process.exit(1);

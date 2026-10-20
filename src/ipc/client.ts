@@ -102,6 +102,14 @@ function resolveTty(): string | null {
   return null;
 }
 
+/**
+ * What a caller with no terminal identity at all announces itself as — the
+ * sessionId of last resort below. The hub treats this literal as "the caller
+ * could not be named from the environment", which is the trigger for PAI's
+ * session-map resolution (daemon/pai-session-map.ts).
+ */
+export const UNKNOWN_SESSION_ID = "unknown-session";
+
 export class WatcherClient {
   private readonly sessionId: string;
   private readonly socketPath: string;
@@ -125,7 +133,7 @@ export class WatcherClient {
      */
     this.sessionId = process.env.PAI_WORKER === "1"
       ? `worker-${process.pid}`
-      : (process.env.TERM_SESSION_ID ?? "unknown-session");
+      : (process.env.TERM_SESSION_ID ?? UNKNOWN_SESSION_ID);
     this.socketPath = socketPath;
   }
 

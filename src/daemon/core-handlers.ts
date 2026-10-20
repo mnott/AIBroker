@@ -27,7 +27,7 @@ import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText, handleMqttCommand } from "../adapters/pailot/gateway.js";
 import { mqttRequestDebugState } from "../adapters/pailot/mqtt-broker.js";
-import { WatcherClient } from "../ipc/client.js";
+import { WatcherClient, UNKNOWN_SESSION_ID } from "../ipc/client.js";
 import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName, lookupPersistentName } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox, markMailboxShown, peekSessionMailbox, setAttachAlias, hasAttachAlias, mailboxKeys, rememberIdSession, claudeSessionOfId } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
@@ -40,6 +40,7 @@ import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { sameClaudeSession } from "../core/claude-attach.js";
+import { resolveSelfSessionId } from "./pai-session-map.js";
 import { matchSession, resolveCallerSession } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
@@ -198,6 +199,33 @@ export function snapForCaller(id: string | undefined, claudeSessionId: string | 
  */
 export function resolveCallerPane(req: IpcRequest, snapshots: SessionSnapshot[] = snapshotAllSessions()): SessionSnapshot | undefined {
   return snapForCaller(callerItermId(req), req.claudeSessionId, snapshots);
+}
+
+/**
+ * The caller's own session id, for everything the tools mean by "self".
+ *
+ * The usual answers first, exactly as resolveCallerPane and callerItermId gave
+ * them: the live pane the caller sits in, else the iTerm id it announced. A
+ * caller that announced NOTHING — sessionId "unknown-session", the shape of a
+ * session run under the Claude background daemon, whose environment carries no
+ * ITERM_SESSION_ID and no TERM_SESSION_ID — used to be unanswerable, and those
+ * are the overnight supervised sessions that most need to arm themselves. For
+ * them PAI's own session map is asked (pai-session-map.ts): the request's
+ * claude session uuid — the client read it from the caller's environment —
+ * matched against the registry the statusline keeps, else the one fresh entry
+ * that names a session this hub can see. The map resolves only when it can do
+ * so beyond doubt; otherwise undefined, and the caller is told to name itself.
+ */
+export async function callerSelfId(req: IpcRequest, snapshots: SessionSnapshot[] = snapshotAllSessions()): Promise<string | undefined> {
+  const pane = resolveCallerPane(req, snapshots)?.id;
+  if (pane) return pane;
+  const claimed = callerItermId(req);
+  if (claimed && claimed !== UNKNOWN_SESSION_ID) return claimed;
+  const resolved = await resolveSelfSessionId({
+    claudeSessionId: req.claudeSessionId,
+    knownUids: snapshots.map((s) => s.id),
+  });
+  return resolved?.id;
 }
 
 function callerLabel(req: IpcRequest): string {
@@ -2095,8 +2123,9 @@ export function registerCoreHandlers(
       session?: string; arg?: string; goal?: string; until?: string; every?: string | number; operator?: boolean;
     };
     const { handleManage, resolveManageTarget, refuseAgentManage } = await import("./manage.js");
-    // "self" or omitted = the caller's own session, by its iTerm id.
-    const target = resolveManageTarget(session, resolveCallerPane(req)?.id ?? callerItermId(req));
+    // "self" or omitted = the caller's own session, by its iTerm id — or, when
+    // the caller could name itself no other way, PAI's session map (callerSelfId).
+    const target = resolveManageTarget(session, await callerSelfId(req));
     if (!target) return { ok: false, error: "cannot tell which session is asking — name it" };
     const refusal = refuseAgentManage(target, arg ?? "", { until }, operator === true);
     if (refusal) return { ok: false, error: refusal };
