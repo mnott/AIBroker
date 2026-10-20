@@ -28,11 +28,10 @@ import { z } from "zod";
 delete process.env.__CFBundleIdentifier;
 
 import { execSync } from "node:child_process";
-import { resolve } from "node:path";
 import { runItermJxa } from "../adapters/iterm/core.js";
 import { missingIssueLink } from "./issue-links.js";
 import { otaCurlArgs } from "./ota-args.js";
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { WatcherClient } from "../ipc/client.js";
 import { OTA_PORT } from "../daemon/ota.js";
@@ -42,11 +41,19 @@ const DAEMON_SOCKET = "/tmp/aibroker.sock";
 // Is this file the program, or is it imported (as the tests do, to reach the
 // tool handlers directly)? A stdio transport and an AIBP registration belong
 // to the running shim only; an import must stay side-effect free.
+// Node resolves import.meta.url through symlinks to the real path, while
+// process.argv[1] stays exactly as the launcher spelled it (the MCP config
+// launches `node ~/dev/ai/AIBroker/dist/mcp/index.js`, and ~/dev is a symlink).
+// Both sides must be realpath'd or the comparison is never equal and the
+// server exits 0 with empty stdout — CONNECTION_CLOSED for every new session.
+export function isEntryPath(modulePath: string, argvPath: string): boolean {
+  const real = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+  try { return real(modulePath) === real(argvPath); } catch { return false; }
+}
+
 const IS_ENTRY =
   process.argv[1] !== undefined &&
-  (() => {
-    try { return fileURLToPath(import.meta.url) === resolve(process.argv[1]); } catch { return false; }
-  })();
+  isEntryPath(fileURLToPath(import.meta.url), process.argv[1]);
 
 // ── Self vintage ──
 //
