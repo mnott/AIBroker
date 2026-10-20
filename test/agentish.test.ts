@@ -109,6 +109,28 @@ test("check-c-item-without-ref- a chg entry with neither an @ref nor a path is r
   assert.ok(errors.includes("c: bad shape"));
 });
 
+test("check-c-none+ c=none is a valid no-changes value", () => {
+  const msg = ["R", "i=x", "res=?", "chg=none", "test=One+", "z=read only"].join("\n");
+  assert.deepEqual(check(msg).errors, []);
+});
+
+test("check-c-placeholders-still-bad- c=- and c=? are still a bad shape", () => {
+  for (const c of ["-", "?", "0", "None"]) {
+    const msg = ["R", "i=x", "res=?", `chg=${c}`, "test=One+", "z=n"].join("\n");
+    assert.ok(check(msg).errors.includes("c: bad shape"), `c=${c}`);
+  }
+});
+
+test("check-c-missing-still-required- an R without c is still rejected", () => {
+  const msg = ["R", "i=x", "res=?", "test=One+", "z=n"].join("\n");
+  assert.ok(check(msg).errors.includes("R requires c"));
+});
+
+test("check-c-path-unchanged+ a normal c=path summary is still valid", () => {
+  const msg = ["R", "i=x", "res=?", "chg=src/a.ts fixed", "test=One+", "z=n"].join("\n");
+  assert.deepEqual(check(msg).errors, []);
+});
+
 // ── @n symbols ───────────────────────────────────────────────────────────────
 
 test("check-undeclared-at-ref- a chg entry naming an undeclared symbol is rejected", () => {
