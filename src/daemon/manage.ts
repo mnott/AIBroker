@@ -448,6 +448,20 @@ export interface ManagedSession {
    *  note would either spam the history or be lost entirely. */
   armSkipNotedAt?: number;
   /**
+   * When arming last said a clear did not take — the dedup clock (10 min) for
+   * both the loud "clear did not take" note and the hands-off note that
+   * follows it on later ticks.
+   *
+   * 2026-10-20 04:25, CaseLeaf: the session's CLI deferred keystrokes
+   * mid-turn, so Ctrl-U silently cleared nothing — but arm() pasted anyway
+   * after the unverified clear, inputLineDecision re-ordered clear-then-type
+   * every ghost window, and ~7 concatenated /goal pastes piled up on the input
+   * buffer over two minutes. A clear that is not verified is not a clear, so
+   * the failure is now said once per window instead of being passed over in
+   * silence on the way to the paste.
+   */
+  clearFailedNotedAt?: number;
+  /**
    * Said ONCE per demanded arm: the operator's own unsent text is holding it.
    *
    * A demanded arm (`lastRearmAt === 0`) meeting an occupied input line is
@@ -1079,6 +1093,12 @@ export function isClaudePane(name: string | undefined): boolean {
  * typing, full stop — the caller resets `sameForTicks` to 1 on any change,
  * which alone keeps this skipping for as long as that keeps happening.
  *
+ * The one exception to "skip and retry" is a clear that already failed for
+ * this line (`clearFailed`): then the answer is "stop" — no clear, no type —
+ * until the caller sees the line empty. A clear whose Ctrl-U the session
+ * never executed must not be re-ordered into another clear-then-type, because
+ * each round of it appended another paste to the pile (2026-10-20 CaseLeaf).
+ *
  * `idleMs` and `band` are threaded through into the return value rather than
  * only consumed here so the caller can log the evidence for a clear-then-type
  * decision without recomputing it — a decision this rare is worth a complete
@@ -1092,8 +1112,11 @@ export function inputLineDecision(input: {
   idle: boolean;
   idleMs?: number;
   band?: string;
+  /** A clear-then-type was already ordered for this line and the line did not
+   *  empty — one failed clear per line, then hands off (see the "stop" below). */
+  clearFailed?: boolean;
 }): {
-  action: "type" | "skip" | "clear-then-type";
+  action: "type" | "skip" | "clear-then-type" | "stop";
   logCleared?: string;
   sameForTicks: number;
   idleMs?: number;
@@ -1101,6 +1124,22 @@ export function inputLineDecision(input: {
 } {
   const { text, sameForTicks, idle, idleMs, band } = input;
   if (!text) return { action: "type", sameForTicks, idleMs, band };
+
+  /**
+   * A FAILED CLEAR ESCALATES TO HANDS-OFF, NOT TO A RETRY.
+   *
+   * 2026-10-20 04:25, CaseLeaf: the session's CLI deferred keystrokes
+   * mid-turn, Ctrl-U cleared nothing, and arm() — having no verification —
+   * pasted anyway. The line still held its text, so the next ghost window
+   * ordered clear-then-type AGAIN, and again, each cycle appending another
+   * /goal paste: ~7 concatenated lines piled onto the input buffer over two
+   * minutes, to submit as one giant broken line at the turn boundary. So the
+   * decision after a failed clear is "stop" — no clear, no type — until the
+   * line observably empties on its own (the turn boundary submits or clears
+   * it). One failed clear per line, then hands off; the caller lifts the
+   * escalation only when a read comes back empty.
+   */
+  if (input.clearFailed) return { action: "stop", sameForTicks, idleMs, band };
 
   if (sameForTicks >= GHOST_TICKS && idle) {
     const totalSec = sameForTicks * (TICK_MS / 1000);
@@ -1453,7 +1492,7 @@ const lastContextLog = new Map<string, { k: number; reason: string }>();
  * persisted: a daemon restart losing this only delays a ghost-clear by up to
  * GHOST_TICKS more ticks, never causes one to fire early.
  */
-const inputLineTracking = new Map<string, { text: string; sameForTicks: number }>();
+const inputLineTracking = new Map<string, { text: string; sameForTicks: number; clearFailed?: boolean }>();
 
 /**
  * The report's lines: one per UNPAUSED session, resetting its arming counter.
@@ -2967,6 +3006,52 @@ export async function readBackTyped(deps: {
   return { line, waitedMs };
 }
 
+/** How many Ctrl-U attempts a verified clear gets before it is declared failed. */
+export const CLEAR_VERIFY_ATTEMPTS = 3;
+/** How long to wait after each Ctrl-U before reading the line back. */
+export const CLEAR_VERIFY_READ_MS = 300;
+/** How long the "clear did not take" note dedups — a pile-up alarm loses its
+ *  edge if it rings every 20-second tick, and the blocked check owns escalation. */
+export const CLEAR_RETRY_NOTE_MS = 10 * 60_000;
+
+/**
+ * Send Ctrl-U until the input line READS BACK empty — never assume the clear.
+ *
+ * 2026-10-20 04:25, CaseLeaf: the session's CLI defers keystrokes while a
+ * turn is in flight, so a Ctrl-U sent mid-turn clears nothing — and arm(),
+ * which pasted straight after an unverified clear, stacked ~7 concatenated
+ * /goal pastes onto the input buffer over two minutes. sendControlU's return
+ * value says the keystroke was SENT, never that it landed, so the only
+ * witness that counts is the pane itself.
+ *
+ * Up to `CLEAR_VERIFY_ATTEMPTS` Ctrl-U's are sent, each followed by a read
+ * (an extra keystroke between attempts, exactly for the flaky-first-send
+ * case); the result says whether the line ended empty and, when it did not,
+ * what is still on it. Never decides anything else — the caller owns the
+ * consequences (skip the paste, escalate the decision, tell the operator).
+ * Shared by arm()'s clear-then-type branch and the `manage … clear-line`
+ * emergency lever, so both verify the same way.
+ */
+export async function clearLineUntilEmpty(deps: {
+  send: () => void;
+  read: () => Promise<string>;
+  sleep: (ms: number) => Promise<void>;
+  attempts?: number;
+  delayMs?: number;
+}): Promise<{ cleared: boolean; remaining: string; attempts: number }> {
+  const max = deps.attempts ?? CLEAR_VERIFY_ATTEMPTS;
+  const delayMs = deps.delayMs ?? CLEAR_VERIFY_READ_MS;
+  let remaining = await deps.read();
+  let attempts = 0;
+  while (remaining && attempts < max) {
+    deps.send();
+    attempts++;
+    await deps.sleep(delayMs);
+    remaining = await deps.read();
+  }
+  return { cleared: !remaining, remaining, attempts };
+}
+
 /**
  * Wrap `run` so a call made while the previous one is still pending is skipped
  * (onSkip) instead of started. The tick yields to the event loop on every pane
@@ -3077,10 +3162,18 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
 
   const prevLine = inputLineTracking.get(m.sessionId);
   const sameForTicks = onLine && prevLine && prevLine.text === onLine ? prevLine.sameForTicks + 1 : 1;
-  if (onLine) inputLineTracking.set(m.sessionId, { text: onLine, sameForTicks });
+  // A failed clear stays failed until the line is seen EMPTY — text changing
+  // on the line is not the line emptying (inputLineDecision holds the policy).
+  if (onLine) inputLineTracking.set(m.sessionId, { text: onLine, sameForTicks, clearFailed: prevLine?.clearFailed });
   else inputLineTracking.delete(m.sessionId);
 
-  const lineDecision = inputLineDecision({ text: onLine ?? "", sameForTicks, idle: armIdle, idleMs: armIdleMs });
+  const lineDecision = inputLineDecision({
+    text: onLine ?? "",
+    sameForTicks,
+    idle: armIdle,
+    idleMs: armIdleMs,
+    clearFailed: prevLine?.clearFailed === true,
+  });
 
   if (lineDecision.action === "skip") {
     if (m.lastRearmAt !== 0) {
@@ -3107,10 +3200,87 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
     return "skipped";
   }
 
+  if (lineDecision.action === "stop") {
+    /**
+     * HANDS OFF AFTER A FAILED CLEAR — the anti-pile-up half of the fix.
+     *
+     * The previous cycle ordered clear-then-type and the line did not empty;
+     * re-ordering it here is how the CaseLeaf pile was built (seven /goal
+     * pastes appended by six consecutive ghost windows). So: nothing is sent,
+     * nothing is typed, and the arm simply waits — the turn boundary will
+     * submit or clear the line on its own, and the FIRST empty read lifts the
+     * escalation (the tracking entry above is deleted the moment onLine is
+     * empty). The blocked-check alert path owns telling the operator; this is
+     * the log that explains it afterwards.
+     */
+    if (!m.clearFailedNotedAt || Date.now() - m.clearFailedNotedAt >= CLEAR_RETRY_NOTE_MS) {
+      note(
+        m,
+        `clear did not take earlier — hands off the input line (${(onLine ?? "").length} chars on it) until it empties on its own; not clearing again, not typing`,
+      );
+      m.clearFailedNotedAt = Date.now();
+    }
+    return "skipped";
+  }
+
   if (lineDecision.action === "clear-then-type") {
     note(m, lineDecision.logCleared ?? "clearing persistent input-line text before typing");
-    sendControlU(m.sessionId);
+    /**
+     * A CLEAR THAT IS NOT VERIFIED IS NOT A CLEAR.
+     *
+     * sendControlU returning true says the keystroke was SENT; a session whose
+     * CLI defers keystrokes mid-turn executes none of them, and pasting after
+     * such a clear is pasting onto 1171 live characters (2026-10-20 04:25,
+     * CaseLeaf). So the clear is verified by reading the line back — up to
+     * three Ctrl-U's, one between reads — and ONLY an empty read-back may be
+     * followed by the paste. Anything still on the line: no paste, the
+     * decision escalates to hands-off (the tracking entry below), and the
+     * failure is noted loudly but deduped — the blocked check owns the
+     * operator alert.
+     */
+    const clear = await clearLineUntilEmpty({
+      send: () => sendControlU(m.sessionId),
+      read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
+      sleep,
+    });
+    if (!clear.cleared) {
+      inputLineTracking.set(m.sessionId, { text: onLine ?? "", sameForTicks, clearFailed: true });
+      if (!m.clearFailedNotedAt || Date.now() - m.clearFailedNotedAt >= CLEAR_RETRY_NOTE_MS) {
+        note(
+          m,
+          `clear did not take — ${clear.remaining.length} chars survive Ctrl-U; not pasting, not feeding the pile`,
+        );
+        m.clearFailedNotedAt = Date.now();
+      }
+      return "skipped";
+    }
     inputLineTracking.delete(m.sessionId);
+  }
+
+  /**
+   * VERIFY-EMPTY BEFORE EVERY TYPE — the last look, covering every arm path
+   * that reaches the paste, including the busy-queued one. The decision above
+   * read the line a moment ago; between that read and this one the terminal
+   * can have rendered deferred keystrokes, a stalled paste, or the tail of a
+   * pile. Pasting is only ever allowed into a line that JUST read back empty,
+   * so the check sits immediately before the vim escape and the paste and
+   * reads the pane fresh. Anything on the line: no paste, and the skip costs
+   * nothing (no streak, no sentinel) — retried next tick.
+   */
+  const preTypePane = await readPaneAsync(m.sessionId, { fresh: true });
+  const onLineNow = promptUnsentText(preTypePane);
+  if (onLineNow) {
+    if (!inputLineTracking.has(m.sessionId)) {
+      inputLineTracking.set(m.sessionId, { text: onLineNow, sameForTicks: 1 });
+    }
+    if (!m.armSkipNotedAt || Date.now() - m.armSkipNotedAt >= 5 * 60_000) {
+      note(
+        m,
+        `arm deferred: input line holds ${onLineNow.length} chars just before typing ("${onLineNow.slice(0, 60)}") — not pasting onto it`,
+      );
+      m.armSkipNotedAt = Date.now();
+    }
+    return "skipped";
   }
 
   // TYPE, READ BACK, VERIFY, THEN CR. Never combined in one shot: a `/goal …`
@@ -3130,7 +3300,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   //      (observed 2026-09-13), and arm() is otherwise fine typing into a
   //      busy session (the goal text below queues harmlessly behind it) —
   //      it is specifically the escape sequence that is not safe there.
-  if (armIdle && needsVimEscape(await readPaneAsync(m.sessionId))) {
+  if (armIdle && needsVimEscape(preTypePane)) {
     escapeInputMode(m.sessionId);
   }
   if (!pasteTextIntoSession(m.sessionId, text)) {
@@ -4375,6 +4545,8 @@ export async function handleManage(
         `                sentence. \`shift off\` stands it down without killing it\n` +
         `  now           arm immediately, whatever the signals say — safe mid-turn,\n` +
         `                the /goal line queues behind a running turn\n` +
+        `  clear-line    emergency: Ctrl-U the session's input line, up to 3 tries,\n` +
+        `                each verified by reading the line back; reports what remains\n` +
         `  pause         stop arming, keep the objective\n` +
         `  resume        start arming again\n` +
         `  off           stop managing entirely\n` +
@@ -4854,6 +5026,40 @@ export async function handleManage(
     existing.paused = word === "pause";
     saveState(state);
     return { ok: true, managed: true, message: `${word === "pause" ? "paused" : "resumed"} managing ${name}` };
+  }
+
+  /**
+   * clear-line — the manual emergency lever behind the 2026-10-20 pile-up.
+   *
+   * When a session's input line is holding a pile the manager correctly
+   * refuses to touch, a person still needs a way to empty it by hand. This
+   * sends Ctrl-U up to three times, reading the line back between attempts
+   * (the same verified clear arm() uses), and reports what the line reads
+   * afterwards — empty, or how many characters survived. It changes nothing
+   * else: no manager is created, no state is touched, and it answers for any
+   * live session whether managed or not. A session whose CLI is deferring
+   * keystrokes will fail all three attempts and say so, which is the honest
+   * answer.
+   */
+  if (word === "clear-line") {
+    const clear = await clearLineUntilEmpty({
+      send: () => sendControlU(sessionId),
+      read: async () => promptUnsentText(await readPaneAsync(sessionId, { fresh: true })) ?? "",
+      sleep,
+    });
+    return clear.cleared
+      ? {
+          ok: true,
+          managed: !!existing,
+          message: `${name}: input line is empty${clear.attempts ? ` after Ctrl-U ×${clear.attempts}` : " (already clear)"}`,
+        }
+      : {
+          ok: false,
+          managed: !!existing,
+          message:
+            `${name}: clear did not take — ${clear.remaining.length} chars still on the input line after Ctrl-U ×${clear.attempts}: ` +
+            `"${clear.remaining.slice(0, 80)}"`,
+        };
   }
 
   if (!existing) {

@@ -257,6 +257,7 @@ switch (command) {
    *   aibroker manage <session>                 what is going on
    *   aibroker manage <session> <objective>     start, or send an instruction
    *   aibroker manage <session> off             stop
+   *   aibroker manage <session> clear-line      Ctrl-U the input line, verified
    */
   case "peer":
   case "fleet": {
@@ -274,7 +275,7 @@ switch (command) {
     // case that matters, since a busy session cannot answer for itself.
     const here = (process.env.ITERM_SESSION_ID ?? "").split(":").pop() ?? "";
     const first = args[1];
-    const KEYWORDS = new Set(["", "status", "state", "what", "info", "show", "off", "stop", "pause", "resume", "now", "rules", "shift", "help", "?"]);
+    const KEYWORDS = new Set(["", "status", "state", "what", "info", "show", "off", "stop", "pause", "resume", "now", "rules", "shift", "clear-line", "help", "?"]);
     // A leading dash is never a session name. Without this, `manage --help`
     // was read as "the session called --help" and answered "no live session
     // matches" — a true statement about a question nobody asked.
