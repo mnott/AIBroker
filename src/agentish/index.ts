@@ -34,7 +34,7 @@
  * must speak it. This is the sibling project's spec — extensions live in
  * AG2_EXTENSIONS instead of being folded in here. */
 export const AG2_SPEC =
-  "AG2. msg=kind line+k=v lines. kinds T R S Q A X. keys i id g goal o own n forbid d steps p proof u out l limits r res c changes t tests G gate I inst m images # nums w worst x next z note(<200ch). sep |. outcomes + - ~ ? !. @n=path declared once then reused; @n:12=file:line. tests as Name+ Name-. no prose, no articles, never restate, unknown=?. r=+ only if all t +.";
+  "AG2. msg=kind line+k=v lines. kinds T R S Q A X. keys i id g goal o own n forbid d steps p proof u out l limits r res c changes(c=none when nothing changed) t tests G gate I inst m images # nums w worst x next z note(<200ch). sep |. outcomes + - ~ ? !. @n=path declared once then reused; @n:12=file:line. tests as Name+ Name-. no prose, no articles, never restate, unknown=?. r=+ only if all t +.";
 
 /** What this validator accepts beyond AG2_SPEC. Not yet proposed back to the
  * sibling project — see the module comment. */
@@ -82,7 +82,9 @@ const SHAPE_SYMBOL: Record<string, string> = {
   id: "i", res: "r", gate: "G", num: "#", img: "m", chg: "c",
 };
 
-const OUTCOMES = new Set(["+", "-", "~", "?", "!"]);
+/** The one non-path value `c` accepts: a read-only report changed no files. */
+const NO_CHANGES = "none";
+const OUTCOMES =new Set(["+", "-", "~", "?", "!"]);
 const MAX_LINES = 25;
 const NOTE_MAX_CHARS = 200;
 const WHY_MAX_CHARS = 600;
@@ -261,7 +263,7 @@ export function check(msg: string, earlier: string[] = []): AgentishCheckResult 
       fail("E_SHAPE", "test: every entry ends with + - ~ ?", fieldLine.test);
     }
 
-    if ("chg" in fields) {
+    if ("chg" in fields && fields.chg !== NO_CHANGES) {
       const entries = fields.chg.split("|").map((p) => p.trim()).filter(Boolean);
       if (entries.some((e) => !AT_REF.test(e) && !e.includes("/"))) {
         fail("E_SHAPE", `${SHAPE_SYMBOL.chg}: bad shape`, fieldLine.chg);
