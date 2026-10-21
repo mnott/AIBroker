@@ -3,7 +3,8 @@
  * daemon/cli.ts — CLI for the aibroker daemon.
  *
  * Usage:
- *   aibroker start              Start the daemon
+ *   aibroker                    Show the command list (never starts a daemon)
+ *   aibroker start              Start the daemon (refuses when one is already running)
  *   aibroker start --socket /tmp/aibroker.sock
  *   aibroker status             Query daemon status
  *   aibroker stop|restart       Stop/restart via the service, IPC shutdown or daemon.pid
@@ -36,6 +37,32 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 
+function printCommandList(): void {
+  console.log(`aibroker ${getVersion()} — AI message broker daemon\n`);
+  console.log("Commands:");
+  console.log("  start              Start the daemon (refuses when one is already running)");
+  console.log("  status             Show daemon status and adapter health");
+  console.log("  stop | restart     Stop or restart the daemon (service, IPC shutdown, or daemon.pid)");
+  console.log("  launch <dir|proj>  Open a Claude session there [--name N]: tmux window or iTerm tab");
+  console.log("  send <name> <text> Type a message into a session, by name");
+  console.log("  ping               Quick heartbeat check");
+  console.log("  setup              Install service, MCP entry, hooks, env (--no-service --no-mcp --no-hooks --dry-run --force)");
+  console.log("  doctor             Check the install; non-zero exit on a required failure");
+  console.log("  uninstall          Remove what setup added (--purge also deletes ~/.aibroker)");
+  console.log("  create-adapter     Scaffold a new adapter project");
+  console.log("  ota <sub>          OTA hub: up|down|status|logs|setup-serve");
+  console.log("  sessions <sub>     Session backup: snapshot|restore|checkpoint|list|install");
+  console.log("  dispatch <project> Deliver a work order to a project's session (--stdin --json)");
+  console.log("  ask <project>      Ask a session a question and wait for its reply (--stdin --json)");
+  console.log("  audit              What one session did to another (--session|--trace|--bodies)");
+  console.log("  todoist <sub>      Todoist inbound channel: auth|status");
+  console.log("  agentish <verb>    AG2 wire format: spec|check|measure");
+  console.log("  help               Show this help");
+  console.log("\nFlags:");
+  console.log("  --version, -v      Show version");
+  console.log("  --help, -h         Help for any subcommand (never starts anything)");
+}
+
 function getVersion(): string {
   try {
     const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json");
@@ -48,6 +75,66 @@ function getVersion(): string {
 
 const args = process.argv.slice(2);
 const [command, ...rest] = args;
+
+/**
+ * Help is an answer, never an action. On 2026-10-21 `aibroker start --help`
+ * started a SECOND daemon in the foreground and a bare `aibroker` started one
+ * too — a help flag cannot be a start, and no verb may treat it as one.
+ * Checked before anything else runs, so help starts nothing and imports no
+ * daemon code.
+ */
+const HELP_FLAGS = ["--help", "-h"];
+const helpRequested = args.some((a) => HELP_FLAGS.includes(a));
+if (helpRequested && command !== undefined && command !== "help" && command !== "--version" && command !== "-v") {
+  const subHelp: Record<string, string[]> = {
+    start: [
+      "Usage: aibroker start [--socket <path>]",
+      "",
+      "Start the daemon. Refuses to start a second one while another daemon is",
+      "alive (live pid file or a socket that answers); a stale lock from a dead",
+      "pid is taken over.",
+    ],
+    status: ["Usage: aibroker status", "", "Show daemon status and adapter health."],
+    stop: ["Usage: aibroker stop", "", "Stop the daemon: active service, then IPC shutdown, then daemon.pid."],
+    restart: ["Usage: aibroker restart", "", "Restart the daemon: the service restarts its own unit; otherwise stop, then start detached."],
+    ping: ["Usage: aibroker ping", "", "Quick heartbeat check."],
+    launch: [
+      "Usage: aibroker launch <dir|pai-project> [--name N]",
+      "",
+      "Open a Claude session (tmux window / iTerm tab). Attaches when it is already running.",
+    ],
+    send: ["Usage: aibroker send <name> <text>", "", "Type a message into a session, by name."],
+    setup: ["Usage: aibroker setup [--no-service --no-mcp --no-hooks --dry-run --force]", "", "Install service, MCP entry, hooks, env."],
+    doctor: ["Usage: aibroker doctor", "", "Check the install; non-zero exit on a required failure."],
+    uninstall: ["Usage: aibroker uninstall [--purge]", "", "Remove what setup added; --purge also deletes ~/.aibroker."],
+    "create-adapter": [
+      "Usage: aibroker create-adapter <adapter-name> [--display-name <Name>] [--output <dir>]",
+      "",
+      "Scaffold a new adapter project from the built-in template.",
+    ],
+    ota: ["Usage: aibroker ota <up|down|status|logs|setup-serve>", "", "OTA install hub (Docker + Tailscale Serve)."],
+    sessions: ["Usage: aibroker sessions <snapshot|restore|checkpoint|list|install>", "", "Session backup."],
+    dispatch: ["Usage: aibroker dispatch <project> [--stdin --json]", "", "Deliver a work order to a project's session."],
+    ask: ["Usage: aibroker ask <project> [--stdin --json]", "", "Ask a session a question and wait for its reply."],
+    audit: ["Usage: aibroker audit [--session|--trace|--bodies]", "", "What one session did to another."],
+    todoist: ["Usage: aibroker todoist <auth|status>", "", "Todoist inbound channel."],
+    agentish: ["Usage: aibroker agentish <spec|check|measure>", "", "AG2 wire format."],
+  };
+  const lines = subHelp[command];
+  if (lines) {
+    console.log(lines.join("\n"));
+  } else {
+    console.log(`aibroker ${command}: no dedicated help; see \`aibroker help\` for the command list.`);
+  }
+  process.exit(0);
+}
+
+// A bare `aibroker` is a person looking for the command list, not a request to
+// start a daemon — that is what `start` is for.
+if (command === undefined && !helpRequested) {
+  printCommandList();
+  process.exit(0);
+}
 
 /**
  * The hub's live session ids — the list the self-resolution's newest-entry
@@ -77,7 +164,6 @@ if (command !== "start" && command !== undefined) silenceLog();
 
 switch (command) {
   case "start":
-  case undefined:
     await startDaemon();
     break;
 
@@ -404,28 +490,7 @@ switch (command) {
   case "help":
   case "--help":
   case "-h":
-    console.log(`aibroker ${getVersion()} — AI message broker daemon\n`);
-    console.log("Commands:");
-    console.log("  start              Start the daemon (default)");
-    console.log("  status             Show daemon status and adapter health");
-    console.log("  stop | restart     Stop or restart the daemon (service, IPC shutdown, or daemon.pid)");
-    console.log("  launch <dir|proj>  Open a Claude session there [--name N]: tmux window or iTerm tab");
-    console.log("  send <name> <text> Type a message into a session, by name");
-    console.log("  ping               Quick heartbeat check");
-    console.log("  setup              Install service, MCP entry, hooks, env (--no-service --no-mcp --no-hooks --dry-run --force)");
-    console.log("  doctor             Check the install; non-zero exit on a required failure");
-    console.log("  uninstall          Remove what setup added (--purge also deletes ~/.aibroker)");
-    console.log("  create-adapter     Scaffold a new adapter project");
-    console.log("  ota <sub>          OTA hub: up|down|status|logs|setup-serve");
-    console.log("  sessions <sub>     Session backup: snapshot|restore|checkpoint|list|install");
-    console.log("  dispatch <project> Deliver a work order to a project's session (--stdin --json)");
-    console.log("  ask <project>      Ask a session a question and wait for its reply (--stdin --json)");
-    console.log("  audit              What one session did to another (--session|--trace|--bodies)");
-    console.log("  todoist <sub>      Todoist inbound channel: auth|status");
-    console.log("  agentish <verb>    AG2 wire format: spec|check|measure");
-    console.log("  help               Show this help");
-    console.log("\nFlags:");
-    console.log("  --version, -v      Show version");
+    printCommandList();
     break;
 
   default:

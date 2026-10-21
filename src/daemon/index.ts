@@ -42,6 +42,7 @@ import { ITERM_UUID_KEY, pruneSessionNames, setHolderLivenessProbe } from "../co
 import { typeIntoSession, isClaudeRunningInSession, snapshotAllSessions, logTransportPolicy } from "../transport/sync-facade.js";
 import { activeItermSessionId, setActiveItermSessionId, setLastRoutedSessionId } from "../core/state.js";
 import { pruneStaleContexts } from "./image-context.js";
+import { instanceDeps, liveDaemonPid, alreadyRunningMessage, startSocketGuard } from "./daemon-instance.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -56,6 +57,16 @@ function getVersion(): string {
 }
 
 export const DAEMON_SOCKET_PATH = "/tmp/aibroker.sock";
+
+/** How often the daemon checks that its socket file still exists (AIBROKER_SOCKET_CHECK_SECONDS). */
+export function socketCheckMs(): number {
+  const raw = process.env.AIBROKER_SOCKET_CHECK_SECONDS;
+  if (raw) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return n * 1000;
+  }
+  return 30_000;
+}
 
 const KNOWN_ADAPTERS: { name: string; socketPath: string }[] = [
   { name: "whazaa", socketPath: "/tmp/whazaa-watcher.sock" },
@@ -87,6 +98,17 @@ export async function startDaemon(options?: {
   setLogPrefix("aibroker");
   const appDir = options?.appDir ?? join(homedir(), ".aibroker");
   const socketPath = options?.socketPath ?? DAEMON_SOCKET_PATH;
+
+  // One daemon at a time. On 2026-10-21 a second daemon started alongside a
+  // live one and both connected to PAILot; the pid file is the lock — a live
+  // pid (or a socket that answers) refuses, a dead pid's stale lock is taken
+  // over. Checked before anything is initialized so a refusal starts nothing.
+  const livePid = await liveDaemonPid(instanceDeps(appDir, socketPath));
+  if (livePid !== null) {
+    console.error(alreadyRunningMessage(livePid, socketPath));
+    process.exit(1);
+  }
+
   setAppDir(appDir);
 
   // Load environment from ~/.aibroker/env (KEY=VALUE, one per line)
@@ -299,6 +321,21 @@ export async function startDaemon(options?: {
   }
   ipcServer.start();
   adapterRegistry.startHealthPolling();
+
+  // Socket self-heal: the socket FILE can be deleted from under a healthy
+  // listener (2026-10-21: /tmp cleanup removed it while the daemon kept
+  // listening; every client then failed with "socket not found" for hours).
+  // Check every AIBROKER_SOCKET_CHECK_SECONDS (default 30) that the path still
+  // exists and is a socket; if not, close and re-listen on it. The close and
+  // the re-listen are one step in IpcServer — the close callback removes the
+  // file, so re-listening must wait for it.
+  const stopSocketGuard = startSocketGuard({
+    socketPath,
+    intervalMs: socketCheckMs(),
+    close: () => ipcServer.reListen(),
+    reListen: () => {},
+    log,
+  });
 
   // Todoist inbound channel. Enabled only when TODOIST_CLIENT_SECRET is set;
   // a task filed from a phone or fired by a reminder reaches the owning
@@ -633,6 +670,7 @@ export async function startDaemon(options?: {
   // Graceful shutdown — ensure socket cleanup even on abrupt exit
   const shutdown = (signal: string) => {
     console.log(`\n[aibroker] ${signal} received. Stopping.`);
+    stopSocketGuard();
     try { unlinkSync(pidFile); } catch { /* already gone */ }
     adapterRegistry.stopHealthPolling();
     flushQueue();
