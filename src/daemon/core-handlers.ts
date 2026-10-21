@@ -28,7 +28,7 @@ import type { BrokerMessage } from "../types/broker.js";
 import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText, handleMqttCommand } from "../adapters/pailot/gateway.js";
 import { mqttRequestDebugState } from "../adapters/pailot/mqtt-broker.js";
 import { WatcherClient, UNKNOWN_SESSION_ID } from "../ipc/client.js";
-import { saveVoiceConfig, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName, lookupPersistentName } from "../core/persistence.js";
+import { saveVoiceConfig, setSessionProject, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName, lookupPersistentName } from "../core/persistence.js";
 import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox, markMailboxShown, peekSessionMailbox, setAttachAlias, hasAttachAlias, mailboxKeys, rememberIdSession, claudeSessionOfId } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
@@ -1951,6 +1951,7 @@ export function registerCoreHandlers(
         };
       }
       const renamedCwd = live.find((x) => x.id === itermSessionId)?.cwd;
+      setSessionProject(itermSessionId, renamedCwd);
       log(`Persisted name "${name}" for iTerm session ${itermSessionId.slice(0, 8)}${renamedCwd ? ` (cwd project ${displayName(name, renamedCwd)})` : ""}`);
     }
 

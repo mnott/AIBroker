@@ -440,7 +440,7 @@ export interface SessionSnapshot {
    * on this when present so a tmux session keeps its name across %N churn.
    */
   aibrokerId?: string | null;
-  /** Working directory, when the host reports it (tmux). Absent on iTerm. */
+  /** Working directory, when the host reports it (tmux; iTerm via its "path" variable, null without shell integration). */
   cwd?: string | null;
   /** Host this row came from; absent means iTerm. */
   transport?: "iterm" | "tmux";
@@ -460,6 +460,16 @@ export interface SessionSnapshot {
    * views a Claude background session, and the uuid (or prefix) names it.
    */
   attachUuid?: string;
+}
+
+/**
+ * The session variable "path" is the shell-integration working directory, read
+ * in the same JXA pass as the rest (no process spawn). Empty, "missing value"
+ * or a non-absolute string means iTerm does not know it: null, never a guess.
+ */
+export function parseItermPath(raw: string | undefined): string | null {
+  const v = (raw ?? "").trim();
+  return v.startsWith("/") ? v : null;
 }
 
 /**
@@ -498,24 +508,53 @@ export interface SessionSnapshot {
  * open — the same shape of mistake as the AppleScript timeout that scaled with
  * tab count.
  */
-function ttysRunningClaude(): Map<string, string | undefined> {
+function ttysRunningClaude(pids?: Map<string, string>): Map<string, string | undefined> {
   // tty -> the session uuid a `claude attach` viewer shows, undefined for a plain Claude
   const found = new Map<string, string | undefined>();
   try {
     const out = timeCall("iterm-core:ps-claude-scan", () =>
-      execFileSync("ps", ["-ao", "tty=,command="], { encoding: "utf8", timeout: 10_000 }));
+      execFileSync("ps", ["-ao", "tty=,pid=,command="], { encoding: "utf8", timeout: 10_000 }));
     for (const line of out.split("\n")) {
-      const m = line.match(/^\s*(\S+)\s+(.*)$/);
+      const m = line.match(/^\s*(\S+)\s+(\d+)\s+(.*)$/);
       if (!m) continue;
-      const [, tty, command] = m;
+      const [, tty, pid, command] = m;
       // The binary, not a path that merely mentions it: an MCP server living
       // under a .claude directory is not a session.
-      if (/(^|\/)claude(\s|$)/.test(command)) found.set(tty.startsWith("/dev/") ? tty : `/dev/${tty}`, parseAttachUuid(command));
+      if (/(^|\/)claude(\s|$)/.test(command)) {
+        const key = tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
+        found.set(key, parseAttachUuid(command));
+        pids?.set(key, pid);
+      }
     }
   } catch {
     /* no answer: callers fall back to the title heuristic rather than see nothing */
   }
   return found;
+}
+
+/** Parse `lsof -Fpn` output (p<pid> then n<path> lines) into pid -> cwd. */
+export function parseLsofCwds(out: string): Map<string, string> {
+  const res = new Map<string, string>();
+  let pid: string | null = null;
+  for (const line of out.split("\n")) {
+    if (line.startsWith("p")) pid = line.slice(1);
+    else if (line.startsWith("n") && pid && line.startsWith("n/")) res.set(pid, line.slice(1));
+  }
+  return res;
+}
+
+/** cwd of each given pid in ONE lsof call (macOS has no /proc); empty on failure. */
+function cwdsOfPids(pids: string[]): Map<string, string> {
+  if (!pids.length) return new Map();
+  try {
+    const out = timeCall("iterm-core:lsof-cwd", () =>
+      execFileSync("/usr/sbin/lsof", ["-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }));
+    return parseLsofCwds(out);
+  } catch (e) {
+    // lsof exits 1 when some pid vanished but still prints the rest
+    const out = (e as { stdout?: string }).stdout;
+    return typeof out === "string" ? parseLsofCwds(out) : new Map();
+  }
 }
 
 /**
@@ -553,7 +592,9 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
     try { tabTitle = s.variable({ named: "tab.title" }); } catch (e) {}
     var workerPane = "";
     try { workerPane = s.variable({ named: "user.paiWorkerPane" }) || ""; } catch (e) {}
-    out += [s.id(), s.name(), s.tty(), tabTitle, workerPane].join("\\t") + "\\n";
+    var path = "";
+    try { path = s.variable({ named: "path" }) || ""; } catch (e) {}
+    out += [s.id(), s.name(), s.tty(), tabTitle, workerPane, path].join("\\t") + "\\n";
   });
   return out;`;
 
@@ -571,7 +612,9 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
   }
   lastSnapshotOk = true;
 
-  const claudeTtys = ttysRunningClaude();
+  const claudePids = new Map<string, string>();
+  const claudeTtys = ttysRunningClaude(claudePids);
+  const pidCwds = cwdsOfPids([...claudePids.values()]);
   const sessions: SessionSnapshot[] = [];
   for (const line of result.split("\n").filter(Boolean)) {
     const parts = line.split("\t");
@@ -594,6 +637,9 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
       // paiName is null here — callers merge from getAllPersistentSessionNames()
       paiName: null,
       workerPane: Boolean(parts[4]) && parts[4] !== "missing value",
+      // The Claude process's own directory when there is one: the "path"
+      // variable is the shell's, which stays at $HOME for a launcher-started Claude.
+      cwd: (claudePids.has(parts[2]) ? pidCwds.get(claudePids.get(parts[2])!) : undefined) ?? parseItermPath(parts[5]),
       attachUuid: claudeTtys.get(parts[2]),
     });
   }

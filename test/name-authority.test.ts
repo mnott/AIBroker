@@ -55,9 +55,9 @@ test("sessions surface renders paiName over the decorated tab title, tabTitle ke
   invalidateSnapshotCache();
   const stub = stubAppleScript([
     // id, process name, tty, tab title — auto-titled over the chosen name
-    ["na-named", "claude (node)", "/dev/ttys001", "✳ VoiceNotes-smooth-fiddle"].join("\t"),
+    ["na-named", "claude (node)", "/dev/ttyz901", "✳ VoiceNotes-smooth-fiddle"].join("\t"),
     // no chosen name: falls to the tab title, not the raw process string
-    ["na-plain", "-zsh", "/dev/ttys002", "Plain Tab"].join("\t"),
+    ["na-plain", "-zsh", "/dev/ttyz902", "Plain Tab"].join("\t"),
   ], "");
   try {
     const r = await registerAndCapture().get("sessions")!({
@@ -80,7 +80,7 @@ test("session_content surface renders paiName over the tab title, tabTitle kept 
   invalidateSnapshotCache();
   // content read answers: name, atPrompt, paiName(session var), content
   const stub = stubAppleScript(
-    [["na-content", "claude (node)", "/dev/ttys001", "VoiceNotes-smooth-fiddle"].join("\t")],
+    [["na-content", "claude (node)", "/dev/ttyz901", "VoiceNotes-smooth-fiddle"].join("\t")],
     ["claude (node)", "false", "", "some terminal output"].join("\t"),
   );
   try {

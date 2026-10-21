@@ -275,6 +275,33 @@ export function setPersistentSessionName(itermSessionId: string, name: string): 
 }
 
 /**
+ * Project directory each named session was renamed in, beside the store rather
+ * than inside it: the store maps id to a plain name string and other readers
+ * iterate it, so object values would break them.
+ */
+function projectsPath(): string {
+  return join(_appDir, SESSION_NAMES_FILE.replace(/\.json$/, "-projects.json"));
+}
+
+export function getSessionProjects(): Record<string, string> {
+  const r = loadJson<Record<string, string>>(projectsPath());
+  return r.status === "ok" ? r.data : {};
+}
+
+/** Record the cwd a session was named in; a null cwd leaves the record alone. */
+export function setSessionProject(id: string, cwd: string | null | undefined): void {
+  if (!cwd) return;
+  try {
+    const all = getSessionProjects();
+    if (all[id] === cwd) return;
+    all[id] = cwd;
+    saveJson(projectsPath(), all, { backup: false });
+  } catch {
+    /* annotation only: failing to record it must not fail a rename */
+  }
+}
+
+/**
  * Drop names whose session no longer exists.
  *
  * This map is keyed by session id and has never been garbage-collected: on
