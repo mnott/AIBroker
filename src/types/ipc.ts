@@ -34,6 +34,15 @@ export interface IpcRequest {
    * uuid is what ties the two together for mailbox routing.
    */
   claudeSessionId?: string;
+  /**
+   * True when the caller's Claude process has no terminal: a background
+   * session. Its inherited pane ids are not its own and are not sent.
+   */
+  background?: boolean;
+  /** The terminal of the caller's Claude process; a pane is the caller's only if its tty equals this. */
+  claudeTty?: string;
+  /** The background session's own name, when its command line carries one. */
+  claudeName?: string;
   method: string;
   params: Record<string, unknown>;
 }

@@ -198,7 +198,15 @@ export function snapForCaller(id: string | undefined, claudeSessionId: string | 
  * live Claude pane is found by its session uuid (`claude attach <short>`).
  */
 export function resolveCallerPane(req: IpcRequest, snapshots: SessionSnapshot[] = snapshotAllSessions()): SessionSnapshot | undefined {
-  return snapForCaller(callerItermId(req), req.claudeSessionId, snapshots);
+  let id = callerItermId(req);
+  if (req.background) id = undefined;
+  // A claimed pane whose tty is not the one the caller's Claude process runs on
+  // is the pane that spawned it, not the caller's own.
+  else if (req.claudeTty && id) {
+    const own = snapshots.find((s) => s.id === id);
+    if (own?.tty && own.tty !== req.claudeTty) id = undefined;
+  }
+  return snapForCaller(id, req.claudeSessionId, snapshots);
 }
 
 /**
@@ -274,6 +282,7 @@ export function resolveSenderLabel(req: IpcRequest, snapshots: SessionSnapshot[]
   const senderItermId = callerItermId(req);
   const senderSnap = resolveCallerPane(req, snapshots);
   if (senderSnap) return senderSnap.paiName ?? senderSnap.id;
+  if (req.background) return req.claudeName ?? (req.claudeSessionId ? `claude-${req.claudeSessionId.slice(0, 8)}` : "unknown");
   return senderItermId ?? "unknown";
 }
 
@@ -1906,6 +1915,10 @@ export function registerCoreHandlers(
     // Resolve caller's iTerm2 session UUID from "w0t0p0:UUID" format, taking it
     // from whichever field carried it — the same reason as callerItermId.
     const claimedId = callerItermId(req);
+
+    if (req.background && !resolveCallerPane(req)) {
+      return { ok: false, error: "This is a background session: rename it in Claude Code (/rename), not the iTerm pane. It does not run on a pane of its own." };
+    }
 
     /*
      * Believe the claim only if the session it names exists.

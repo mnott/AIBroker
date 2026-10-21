@@ -61,6 +61,49 @@ function callerClaudeSessionId(): string | undefined {
   return _claudeSessionId ?? undefined;
 }
 
+/**
+ * What the nearest `claude` ancestor says about where the caller lives.
+ *
+ * A Claude background session has no terminal ("??"), yet inherits
+ * TERM_SESSION_ID / ITERM_SESSION_ID from the pane that spawned it. That id
+ * names the spawning pane, not the caller, so a background caller must not
+ * present it. `tty` is the claude process's own terminal (null when it has
+ * none); undefined overall means no claude ancestor was found.
+ */
+export interface ClaudeProc { tty: string | null; name?: string }
+
+const CLAUDE_CMD = /(?:^|\/)claude(?:\.exe)?(?:\s|$)/;
+
+/** Parse a `ps -o ppid=,tty=,command=` line; undefined when it is not a claude process. */
+export function parseClaudeProc(tty: string, command: string): ClaudeProc | undefined {
+  if (!CLAUDE_CMD.test(command.trim())) return undefined;
+  const name = /\s(?:--name|-n)[ =]([^\s-][^\s]*)/.exec(command)?.[1]
+    ?? /^\S*claude(?:\.exe)?\s+(bg-[^\s]+)/.exec(command.trim())?.[1];
+  const hasTty = !!tty && tty !== "??" && tty !== "?";
+  return { tty: hasTty ? (tty.startsWith("/dev/") ? tty : `/dev/${tty}`) : null, name };
+}
+
+let _claudeProc: ClaudeProc | null | undefined;
+
+function callerClaudeProc(): ClaudeProc | undefined {
+  if (_claudeProc !== undefined) return _claudeProc ?? undefined;
+  _claudeProc = null;
+  try {
+    let pid = process.ppid;
+    for (let hop = 0; hop < 8 && pid > 1; hop++) {
+      const line = execFileSync("ps", ["-o", "ppid=,tty=,command=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 }).trim();
+      const m = /^(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+      if (!m) break;
+      const proc = parseClaudeProc(m[2], m[3]);
+      if (proc) { _claudeProc = proc; break; }
+      pid = Number(m[1]);
+    }
+  } catch {
+    /* no ps, no answer — the claim stands */
+  }
+  return _claudeProc ?? undefined;
+}
+
 function resolveTty(): string | null {
   // The direct case: a CLI run straight in the pane owns the terminal.
   for (const fd of [0, 1, 2]) {
@@ -294,12 +337,23 @@ export class WatcherClient {
         // Same reasoning as the constructor: a worker must never claim the
         // pane's inherited env-var identity.
         const isWorker = process.env.PAI_WORKER === "1";
-        const itermId = isWorker ? undefined : process.env.ITERM_SESSION_ID;
-        if (itermId) request.itermSessionId = itermId;
-        if (!isWorker && process.env.TMUX_PANE) request.tmuxPane = process.env.TMUX_PANE;
+        const claudeSessionId = isWorker ? undefined : callerClaudeSessionId();
+        // A Claude process without a terminal is a background session: its
+        // inherited pane ids belong to whoever spawned it, so it is its own sender.
+        const proc = isWorker ? undefined : callerClaudeProc();
+        const background = !!proc && proc.tty === null;
+        if (background) {
+          request.background = true;
+          if (proc!.name) request.claudeName = proc!.name;
+          if (claudeSessionId) request.sessionId = claudeSessionId;
+        } else {
+          const itermId = isWorker ? undefined : process.env.ITERM_SESSION_ID;
+          if (itermId) request.itermSessionId = itermId;
+          if (!isWorker && process.env.TMUX_PANE) request.tmuxPane = process.env.TMUX_PANE;
+          if (proc?.tty) request.claudeTty = proc.tty;
+        }
         const tty = callerTty();
         if (tty) request.callerTty = tty;
-        const claudeSessionId = isWorker ? undefined : callerClaudeSessionId();
         if (claudeSessionId) request.claudeSessionId = claudeSessionId;
         socket!.write(JSON.stringify(request) + "\n");
       });
