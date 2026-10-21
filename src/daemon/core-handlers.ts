@@ -41,7 +41,7 @@ import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { sameClaudeSession } from "../core/claude-attach.js";
 import { resolveSelfSessionId } from "./pai-session-map.js";
-import { matchSession, resolveCallerSession } from "../core/session-match.js";
+import { matchSession, resolveCallerSession, cwdMatches, displayName, selfSendError } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, revealItermSession } from "../adapters/iterm/sessions.js";
@@ -316,7 +316,7 @@ export function registerCoreHandlers(
         // A chosen name IS the session's name; the tab title (auto-titler,
         // process string) is only what it falls back to. Raw title stays
         // beside it so a lying display can be told from a lying name.
-        name: paiName ?? s.tabTitle ?? s.name,
+        name: paiName ? displayName(paiName, s.cwd) : (s.tabTitle ?? s.name),
         tabTitle: s.tabTitle,
         paiName,
         atPrompt: s.atPrompt,
@@ -1225,7 +1225,9 @@ export function registerCoreHandlers(
       // target expects "clickr" to find "Clickr (node)".
       const best = matchSession([target], snaps, {
         kinds: ["exact", "normalised", "substring"],
-        prefer: (s) => (isClaudeSession(s.id) ? 1 : 0),
+        // A session running in the project the target names outranks one that
+        // merely carries the name (a "PAI" tab sitting in a CaseLeaf checkout).
+        prefer: (s) => (isClaudeSession(s.id) ? 1 : 0) + (cwdMatches(target, (s as { cwd?: string | null }).cwd) ? 0.5 : 0),
       });
       return best ? { id: best.session.id, name: best.label } : { id: null, name: null };
     }
@@ -1290,6 +1292,12 @@ export function registerCoreHandlers(
 
     // Resolve the sender's name for the mailbox "from" label and the prefix.
     const senderLabel = resolveSenderLabel(req, snapshots);
+
+    const selfErr = selfSendError(resolveCallerPane(req, snapshots)?.id, itermSessionId, senderLabel, resolvedName ?? target);
+    if (selfErr) {
+      audit({ action: "refuse", actor: `session:${senderLabel}`, target: resolvedName ?? target, outcome: "refused", body: message, reason: "sender and target are the same session" });
+      return { ok: false, error: selfErr };
+    }
 
     // Refuse before depositing OR typing: if the target is a shell, the message
     // is not merely undeliverable, it is executable. Say so plainly rather than
@@ -1942,7 +1950,8 @@ export function registerCoreHandlers(
           error: `Name "${name}" is held by live session ${nameClaim.heldBy?.slice(0, 8) ?? "unknown"} — release it there first (close that tab, or rename it).`,
         };
       }
-      log(`Persisted name "${name}" for iTerm session ${itermSessionId.slice(0, 8)}`);
+      const renamedCwd = live.find((x) => x.id === itermSessionId)?.cwd;
+      log(`Persisted name "${name}" for iTerm session ${itermSessionId.slice(0, 8)}${renamedCwd ? ` (cwd project ${displayName(name, renamedCwd)})` : ""}`);
     }
 
     // Update in hub's session manager

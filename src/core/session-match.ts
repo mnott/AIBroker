@@ -176,3 +176,37 @@ export function matchSession(
   const best = matchAllSessions(references, sessions, opts)[0];
   return best ? { session: best.session, label: best.label, kind: best.kind } : null;
 }
+
+/** Last path segment of a working directory — the project a session is in. */
+export function cwdProject(cwd: string | null | undefined): string | null {
+  if (!cwd) return null;
+  const seg = cwd.replace(/\/+$/, "").split("/").pop();
+  return seg || null;
+}
+
+/**
+ * The name to show for a session: its chosen name, plus the project of its
+ * working directory when that is a different thing. A session named "PAI" that
+ * runs in a CaseLeaf checkout reads "PAI (CaseLeaf)", so the disagreement is
+ * visible instead of being resolved silently in someone's favour.
+ */
+export function displayName(name: string, cwd: string | null | undefined): string {
+  const project = cwdProject(cwd);
+  if (!project || normaliseLabel(project) === normaliseLabel(name)) return name;
+  return `${name} (${project})`;
+}
+
+/** True when a reference names the project the session's cwd is in. */
+export function cwdMatches(reference: string, cwd: string | null | undefined): boolean {
+  const project = cwdProject(cwd);
+  return !!project && normaliseLabel(project) === normaliseLabel(reference);
+}
+
+/**
+ * A session must never be its own recipient: the message would come back into
+ * the sender's own mailbox and read as a reply from someone else.
+ */
+export function selfSendError(senderId: string | undefined, targetId: string, senderName: string, targetName: string): string | null {
+  if (!senderId || senderId !== targetId) return null;
+  return `Refused: sender "${senderName}" and target "${targetName}" are the same session (${targetId.slice(0, 8)}). A session cannot send to itself.`;
+}
