@@ -29,6 +29,11 @@ export class IpcServer {
   private peerServer: Server | null = null;
   private readonly handlers = new Map<string, IpcHandler>();
   private readonly socketPath: string;
+  /**
+   * True while the socket guard is re-listening: the close callback removes the
+   * socket file, and that removal is ours, not a loss to log and heal.
+   */
+  private reListening = false;
 
   constructor(socketPath: string) {
     this.socketPath = socketPath;
@@ -92,11 +97,41 @@ export class IpcServer {
       log(`IPC server listening on ${this.socketPath}`);
     });
 
+    // The listener's close removes the socket file (node does it unless
+    // preserveOpen is set). When that close was the guard's own re-listen, the
+    // removal is expected; otherwise the file vanished from under a healthy
+    // listener — the 2026-10-21 incident, where clients failed for hours while
+    // the daemon looked fine.
+    this.server.on("close", () => {
+      // The guard's close callback runs before this one (registered first), so
+      // by now it has already re-listened; the flag is only still set when the
+      // close came from somewhere else (stop, shutdown).
+      if (this.reListening) this.reListening = false;
+      else if (!existsSync(this.socketPath)) {
+        log(`socket file ${this.socketPath} was removed while the daemon was running`);
+      }
+    });
+
     this.server.on("error", (err) => {
       log(`IPC server error: ${err}`);
     });
 
     this.startPeerListener();
+  }
+
+  /**
+   * Close the UDS listener (the peer listener keeps its port) and re-listen on
+   * the same path once the close has completed, so the stale file is gone
+   * before listen() re-creates it. Used by the socket guard.
+   */
+  reListen(): void {
+    if (!this.server) return;
+    this.reListening = true;
+    this.server.close(() => {
+      this.server = null;
+      this.start();
+      this.reListening = false;
+    });
   }
 
   /**
