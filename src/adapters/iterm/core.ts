@@ -9,6 +9,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
 import { parseAttachUuid } from "../../core/claude-attach.js";
+import { transcriptCwd } from "../../core/claude-transcript-cwd.js";
 import { timeCall } from "../../core/call-timing.js";
 import { itermInPlay } from "../../transport/policy.js";
 
@@ -639,7 +640,10 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
       workerPane: Boolean(parts[4]) && parts[4] !== "missing value",
       // The Claude process's own directory when there is one: the "path"
       // variable is the shell's, which stays at $HOME for a launcher-started Claude.
-      cwd: (claudePids.has(parts[2]) ? pidCwds.get(claudePids.get(parts[2])!) : undefined) ?? parseItermPath(parts[5]),
+      // A viewer (`claude attach`) shows another process's session: that
+      // session's transcript knows where it works, the viewer's cwd does not.
+      cwd: (claudeTtys.get(parts[2]) ? transcriptCwd(claudeTtys.get(parts[2])!) : null)
+        ?? (claudePids.has(parts[2]) ? pidCwds.get(claudePids.get(parts[2])!) : undefined) ?? parseItermPath(parts[5]),
       attachUuid: claudeTtys.get(parts[2]),
     });
   }
