@@ -13,12 +13,12 @@ Install AIBroker and your Claude Code sessions become reachable from anywhere. A
 ## Install
 
 ```bash
-npm install -g aibroker
+npm i -g https://github.com/mnott/AIBroker/releases/latest/download/aibroker.tgz
 aibroker setup      # service + MCP registration + Claude Code hooks + ~/.aibroker/env
 aibroker doctor     # every check green, or it says exactly what to fix
 ```
 
-Then connect an adapter: `npm install -g whazaa && whazaa setup` (WhatsApp) or `npm install -g @tekmidian/telex && telex setup` (Telegram). Platform guides: [macOS](docs/macos.md), [Linux](docs/linux.md). Flags, source checkout and the adapter service commands: [docs/install.md](docs/install.md).
+Then connect an adapter: `npm i -g https://github.com/mnott/Whazaa/releases/latest/download/whazaa.tgz && whazaa setup` (WhatsApp) or `npm i -g https://github.com/mnott/Telex/releases/latest/download/telex.tgz && telex setup` (Telegram). Update: `pai update --package aibroker`. The npm registry is no longer updated; releases come from GitHub. Platform guides: [macOS](docs/macos.md), [Linux](docs/linux.md). Flags, source checkout and the adapter service commands: [docs/install.md](docs/install.md).
 
 ---
 
