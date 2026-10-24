@@ -1440,19 +1440,32 @@ async function alertBlocked(m: ManagedSession, caption: string): Promise<void> {
 }
 
 /**
- * A note that is ALSO worth a buzz on the phone.
+ * The two registers an event can earn, and why they are not one.
  *
- * The line between this and `note` is who caused the event. Anything the
- * operator just did — set an objective, take the screen back, start managing —
- * is recorded and not sent, because telling someone what they themselves just
- * typed is how a notification channel teaches its reader to ignore it. What
- * gets sent is what the MANAGER decided on its own while nobody was watching:
- * a rollover, a session that died, a goal that would not land.
+ * `logOnly` is the record: what the manager did, written into the session's
+ * history and the daemon log, where a person looks for it when they go looking.
+ * `alert` is the record PLUS a message to the operator, wherever they are.
  *
- * Routine armings are not here. They are real, and frequent, and belong in the
- * periodic report where they arrive as a count instead of sixteen buzzes.
+ * The line between them is not who caused the event — it is whether the
+ * operator has anything to DO about it. A handover written, a clear landed,
+ * a shift over by schedule: routine steps of the job the manager was told to
+ * run, and sixteen buzzes a night is how a channel teaches its reader to
+ * ignore it; the periodic report carries their count. What gets buzzed is
+ * what needs attention: a session that exited to a shell, a goal that would
+ * not land, a demanded arm the operator's own text is holding, a handover
+ * that was asked for and never came, a screen that has not moved for an
+ * hour, a grant the operator is being asked to renew.
+ *
+ * Routine armings are not here either way. They are real, and frequent, and
+ * belong in the periodic report where they arrive as a count instead of
+ * sixteen buzzes.
  */
-function notify(m: ManagedSession, what: string): void {
+function logOnly(m: ManagedSession, what: string): void {
+  note(m, what);
+}
+
+/** A note that is ALSO worth the operator's attention. See `logOnly`. */
+function alert(m: ManagedSession, what: string): void {
   note(m, what);
   alertOperator(`${m.name} — ${what}`);
 }
@@ -3130,7 +3143,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   }
   if (live.atPrompt && !isClaudePane(live.name)) {
     m.paused = true;
-    notify(m, "PAUSED — that pane is at a shell prompt, so the session has exited. Not typing a goal into a shell. `resume` once it is back.");
+    alert(m, "PAUSED — that pane is at a shell prompt, so the session has exited. Not typing a goal into a shell. `resume` once it is back.");
     return "failed";
   }
 
@@ -3189,7 +3202,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
       // The operator demanded this arm; what is holding it is their own
       // unsent line. Say so, once, where it will be seen.
       if (!m.forcedArmHoldNotedAt) {
-        notify(
+        alert(
           m,
           `a demanded arm (${reason}) is NOT being typed: the input line holds the operator's own unsent text ` +
             `("${(onLine ?? "").slice(0, 60)}") — clear or send that line to let the arm through; it is not typed over`,
@@ -3339,7 +3352,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
     return "armed";
   }
 
-  notify(m, `typed but the goal never took (no active marker, or the line stayed in the input) — input cleared, treating as NOT armed (${reason})`);
+  alert(m, `typed but the goal never took (no active marker, or the line stayed in the input) — input cleared, treating as NOT armed (${reason})`);
   return "failed";
 }
 
@@ -3608,8 +3621,7 @@ function answerBlockingDialogs(): void {
   }
 }
 
-async function tick(): Promise<void> {
-  const now = Date.now();
+async function tick(now = Date.now()): Promise<void> {
   let dirty = false;
   beat();
 
@@ -3754,7 +3766,7 @@ async function tick(): Promise<void> {
      * session having moved at all.
      */
     if (!m.paused && !m.handoverAskedAt && !m.stuckSince && now - m.lastChangeAt > STUCK_AFTER_MS) {
-      notify(
+      alert(
         m,
         `nothing has moved on that screen for ${minutesSince(m.lastChangeAt, now)} — arming, because a managed session is never meant to be still this long`,
       );
@@ -3794,7 +3806,7 @@ async function tick(): Promise<void> {
           log(`[manage:${m.name}] could not return the screen — ${(e as Error).message}`);
         }
       }
-      notify(m, `shift over after ${Math.round((now - m.shift.startedAt) / 3_600_000)}h — no longer arming; the objective is kept, \`resume\` continues it`);
+      logOnly(m, `shift over after ${Math.round((now - m.shift.startedAt) / 3_600_000)}h — no longer arming; the objective is kept, \`resume\` continues it`);
       dirty = true;
     }
 
@@ -3834,7 +3846,7 @@ async function tick(): Promise<void> {
            * message says how much was left and lets a person judge.
            */
           const left = Math.max(0, Math.round((lease.until - now) / 60_000));
-          notify(
+          alert(
             m,
             `the screen went back to the operator with ${left} min still on the grant — leaving it with them; visual work stops, everything else carries on. If that was not you, the session stood itself down: \`hands on until HH:MM\` puts it back`,
           );
@@ -3858,7 +3870,7 @@ async function tick(): Promise<void> {
         if (tool.effective === "agent" && !m.screenDisagreementReported) {
           m.screenDisagreementReported = true;
           const ends = new Date(tool.until!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-          notify(
+          alert(
             m,
             `the screen was handed over outside the manager (grant runs to ${ends}) — I am still telling it to do no pointer work, so the two disagree. \`hands on until ${ends}\` makes it stick`,
           );
@@ -3903,7 +3915,7 @@ async function tick(): Promise<void> {
           ? "The time you had the screen for is up — my controls. The operator may be back at the machine, so stop screen and pointer work now, write down how far you got and what still needs checking on screen, and carry on with everything that does not need it."
           : "your controls. The screen is yours again — the operator's hold has expired. You may resume visual work where your notes left it.",
       );
-      notify(m, m.noScreen ? "timed grant expired — screen work stopped" : "timed hold expired — screen work permitted again");
+      logOnly(m, m.noScreen ? "timed grant expired — screen work stopped" : "timed hold expired — screen work permitted again");
       dirty = true;
     }
 
@@ -3919,7 +3931,7 @@ async function tick(): Promise<void> {
      */
     if (m.clearPendingSince && !m.clearTypedAt) {
       if (CLEARED_BANNER.test(content) && !QUEUED_INPUT.test(content)) {
-        notify(m, `the clear typed ${minutesSince(m.clearPendingSince, now)} ago has landed — arming the fresh session`);
+        logOnly(m, `the clear typed ${minutesSince(m.clearPendingSince, now)} ago has landed — arming the fresh session`);
         clearLanded(m);
         dirty = true;
       }
@@ -3962,7 +3974,7 @@ async function tick(): Promise<void> {
          * to disk. So the valuable half runs and the dangerous half does not,
          * unless somebody asks for it by name.
          */
-        notify(m, "handover written — leaving the session to compact on its own rather than clearing it");
+        logOnly(m, "handover written — leaving the session to compact on its own rather than clearing it");
         m.handoverDoneAt = now;
         m.handoverDoneK = contextK(m) ?? undefined;
         delete m.handoverAskedAt;
@@ -3990,7 +4002,7 @@ async function tick(): Promise<void> {
           if (m.clearPendingSince && now - m.clearPendingSince < CLEAR_PENDING_MAX_MS) {
             // An earlier clear is still unaccounted for. Typing another would
             // put two in a queue that fires against two different sessions.
-            notify(
+            logOnly(
               m,
               `a clear typed ${minutesSince(m.clearPendingSince, now)} ago has still not landed — not typing another, and not rolling over again until it does`,
             );
@@ -3998,7 +4010,7 @@ async function tick(): Promise<void> {
             dirty = true;
             continue;
           }
-          notify(m, "handover written — asking it to clear");
+          logOnly(m, "handover written — asking it to clear");
           typeIntoSession(m.sessionId, "/clear");
           m.clearTypedAt = now;
           m.clearPendingSince = now;
@@ -4042,7 +4054,7 @@ async function tick(): Promise<void> {
         const nowK = contextK(m);
         const fell = m.contextAtClear !== undefined && nowK !== null && nowK < m.contextAtClear / 2;
         if (CLEARED_BANNER.test(content) && !QUEUED_INPUT.test(content)) {
-          notify(
+          logOnly(
             m,
             fell
               ? `cleared — fresh session on the pane, context fell from ${m.contextAtClear}k to ${nowK}k; re-arming`
@@ -4072,7 +4084,7 @@ async function tick(): Promise<void> {
            * which doing nothing is the better move, so this no longer does
            * nothing.
            */
-          notify(
+          alert(
             m,
             "the clear was typed and could not be confirmed — NOT typing a second one, " +
               "but arming anyway: an armed session is safe whether or not the clear landed",
@@ -4083,7 +4095,7 @@ async function tick(): Promise<void> {
         continue;
       }
       if (now - m.handoverAskedAt > HANDOVER_GRACE_MS) {
-        notify(m, "asked for a handover and did not get one — NOT clearing, the session keeps its context");
+        alert(m, "asked for a handover and did not get one — NOT clearing, the session keeps its context");
         delete m.handoverAskedAt;
         delete m.handoverWas;
         dirty = true;
@@ -4160,7 +4172,7 @@ async function tick(): Promise<void> {
               ? `You will be cleared once that file has changed on disk, and not before.`
               : `Then carry straight on with the work; you are not being cleared. And keep that file current as you go — anything you work out after writing it is at risk until it is on disk.`),
         );
-        notify(
+        logOnly(
           m,
           `at ${used}k tokens (${decision.reason})` +
             (grownBy !== null ? `, ${grownBy}k of new work since the last one` : "") +
@@ -4373,6 +4385,28 @@ async function tick(): Promise<void> {
   // Last, so the report describes the state this tick left behind rather than
   // the one it found.
   reportIfDue(now);
+}
+
+/**
+ * One tick over one entry of the caller's, for tests.
+ *
+ * The live loop reads the module's state; a test that wants to watch ONE
+ * decision — a handover landing, a clear coming in, a session that stopped
+ * answering — would otherwise have to write managers.json and share the
+ * module's state with every other entry in it. So the entry is installed
+ * under its own id for the duration of the tick and taken back afterwards,
+ * and the live loop is untouched. Nothing else about a tick changes: same
+ * reads, same writes to the entry it is handed.
+ */
+export async function runTickForTest(now: number, entry: ManagedSession): Promise<void> {
+  const saved = state[entry.sessionId];
+  state[entry.sessionId] = entry;
+  try {
+    await tick(now);
+  } finally {
+    if (saved === undefined) delete state[entry.sessionId];
+    else state[entry.sessionId] = saved;
+  }
 }
 
 export function startManagerLoop(): void {
