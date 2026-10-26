@@ -51,6 +51,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { addRoute, findRoute, noteOwnWrite } from "./inbound.js";
+import { issueWriteCredential, botIgnoreRule, routeIgnoresAccount } from "./forge-credential.js";
 import { issueOp, whoAmI, READ_VERBS, WRITE_VERBS, type IssueVerb } from "./forge-issues.js";
 import { funnelHostname } from "./funnel-watchdog.js";
 import { transportLabel } from "../transport/policy.js";
@@ -2196,10 +2197,11 @@ export function registerCoreHandlers(
       };
     }
 
+    const cred = issueWriteCredential();
     const r = await issueOp(verb as IssueVerb, { issue, comment, body, title, label, state, count }, {
       ref,
-      token: process.env.AIBROKER_FORGE_TOKEN,
-      botLogin: process.env.AIBROKER_FORGE_BOT_LOGIN,
+      token: cred.credential,
+      botLogin: cred.login,
       authorLabel: owner,
     });
     // Reads are traffic; writes are acts. Only the acts go in the trail, so it
@@ -2219,7 +2221,13 @@ export function registerCoreHandlers(
         // amend is given a comment id, and an edit echoes back just as a new
         // comment does.
         const touched = issue ?? r.issue ?? (r.data as { number?: number } | undefined)?.number;
-        if (touched) noteOwnWrite(`${ref.owner}/${ref.repo}`, touched);
+        // A bot account is dropped by name at the route, so the window is kept
+        // for the shared-credential case only and the operator's comment made
+        // just after a write is not swallowed with it.
+        const botLogin = cred.bot && cred.credential
+          ? await whoAmI({ ref, token: cred.credential, fetchImpl: fetch, botLogin: cred.login })
+          : undefined;
+        if (touched && !routeIgnoresAccount(route, botLogin)) noteOwnWrite(`${ref.owner}/${ref.repo}`, touched);
       }
     }
     return r.ok
@@ -2279,11 +2287,12 @@ export function registerCoreHandlers(
     // Which account this machine posts as, asked of the forge itself. Falls
     // back to the configured name only when the forge will not answer. Reported
     // back rather than turned into a filter — see below.
+    const cred = issueWriteCredential();
     const postsAs = await whoAmI({
       ref,
-      token: process.env.AIBROKER_FORGE_TOKEN ?? "",
+      token: cred.credential ?? "",
       fetchImpl: fetch,
-      botLogin: process.env.AIBROKER_FORGE_BOT_LOGIN,
+      botLogin: cred.login,
     });
 
     const name = routeNameFor(ref);
@@ -2299,6 +2308,10 @@ export function registerCoreHandlers(
       // deliberately rather than re-derived, because the number came from
       // watching real traffic and I have none yet.
       coalesce: { ms: 25_000, key: "issue.number" },
+      // The one exception to the above: a dedicated bot account is nobody the
+      // route exists to hear, so its events are dropped by name. The operator's
+      // comments still arrive.
+      ...(cred.bot && postsAs ? { ignore: [botIgnoreRule(postsAs)] } : {}),
       // No account is filtered here, and that is the correction rather than an
       // omission. This used to add `sender.login=<the token's account>` so a
       // session would not be woken by its own footprints. Where the credential
@@ -2319,7 +2332,7 @@ export function registerCoreHandlers(
     });
     const hookUrl = `https://${host}/hook/${route.name}`;
 
-    const token = process.env.AIBROKER_FORGE_TOKEN;
+    const token = cred.credential;
     const outcome = await registerHook(ref, hookUrl, route.secret, token);
 
     // Asked after registering, so the answer is what the forge holds now. A

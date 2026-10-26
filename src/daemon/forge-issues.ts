@@ -278,7 +278,7 @@ export async function issueOp(
   args: { issue?: number; comment?: number; body?: string; title?: string; label?: string; state?: string; count?: number },
   ctx: { ref: RepoRef; token?: string; botLogin?: string; authorLabel?: string; fetchImpl?: typeof fetch },
 ): Promise<IssueResult> {
-  if (!ctx.token) return { ok: false, error: "no forge token configured — set AIBROKER_FORGE_TOKEN" };
+  if (!ctx.token) return { ok: false, error: "no forge token configured — set AIBROKER_FORGE_BOT_TOKEN or AIBROKER_FORGE_TOKEN" };
   const c: Ctx = { ref: ctx.ref, token: ctx.token, botLogin: ctx.botLogin, authorLabel: ctx.authorLabel, fetchImpl: ctx.fetchImpl ?? fetch };
   const n = args.issue;
 

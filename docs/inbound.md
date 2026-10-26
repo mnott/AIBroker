@@ -117,7 +117,9 @@ Two defaults come from watching real traffic rather than from taste:
 |---|---|
 | `AIBROKER_FORGE_TOKEN` | The route is still created and the URL and secret are handed back for you to paste into the forge once. Needs repository write scope. |
 | `AIBROKER_PUBLIC_HOST` | Falls back to the Tailscale funnel hostname, which is usually right. Only set it if that is wrong. |
-| `AIBROKER_FORGE_BOT_LOGIN` | Nothing, in the normal case. The account is asked of the forge itself; this is only the fallback for a forge that will not answer `/user`. |
+| `AIBROKER_FORGE_BOT_TOKEN` | Issue and comment writes and webhook registration fall back to `AIBROKER_FORGE_TOKEN`, so they are signed as the operator. |
+| `AIBROKER_FORGE_BOT_USER` + `AIBROKER_FORGE_BOT_PASSWORD` | The Basic-auth form of the same bot credential, for an account that has a password and no token. `BOT_TOKEN` wins when both forms are set. |
+| `AIBROKER_FORGE_BOT_LOGIN` | Nothing, in the normal case. The account is asked of the forge itself; this is only the fallback for a forge that will not answer `/user`. Defaults to `AIBROKER_FORGE_BOT_USER`. |
 
 **Why the account is asked rather than configured.** It was configured once, and
 on the first live write the configured name and the token's real account turned
@@ -259,6 +261,16 @@ and 50th *oldest*.
 full user record — including an email address — that nothing here needs.
 
 ### Credentials
+
+Issue-tracker writes (new, comment, amend, rewrite, retitle, label, unlabel,
+claim, release, close) and webhook registration use the **bot** credential when
+one is set — `AIBROKER_FORGE_BOT_TOKEN`, or `AIBROKER_FORGE_BOT_USER` +
+`AIBROKER_FORGE_BOT_PASSWORD` — and otherwise `AIBROKER_FORGE_TOKEN`. Release
+and push-mirror work always keeps `AIBROKER_FORGE_TOKEN`, which is the
+operator's and needs repository admin. Put the values in `~/.aibroker/env`.
+When the bot is in use, subscribing adds `sender.login=<bot>` to the route's
+`ignore`, so the bot's own comments are dropped by account while the
+operator's are still delivered.
 
 `AIBROKER_FORGE_TOKEN` takes either an API token or `user:password`; the second
 is sent as Basic auth. Attachments need the same credential — a plain fetch of a

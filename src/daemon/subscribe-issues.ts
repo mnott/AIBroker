@@ -27,6 +27,8 @@
  * subscribing twice re-points the route instead of accumulating duplicates.
  */
 
+import { authHeader } from "./forge-issues.js";
+
 /** What a Gitea issue or comment event carries that is worth reading. */
 export const ISSUE_FIELDS = [
   "action",
@@ -193,7 +195,7 @@ export async function postComment(
   token: string | undefined,
   fetchImpl: typeof fetch = fetch,
 ): Promise<CommentOutcome> {
-  if (!token) return { ok: false, error: "no forge token configured — set AIBROKER_FORGE_TOKEN" };
+  if (!token) return { ok: false, error: "no forge token configured — set AIBROKER_FORGE_BOT_TOKEN or AIBROKER_FORGE_TOKEN" };
   if (!body.trim()) return { ok: false, error: "refusing to post an empty comment" };
 
   const url = commentsEndpoint(ref, issue);
@@ -201,7 +203,7 @@ export async function postComment(
   try {
     const res = await fetchImpl(url, {
       method: "POST",
-      headers: { authorization: `token ${token}`, "content-type": "application/json" },
+      headers: { authorization: authHeader(token), "content-type": "application/json" },
       body: JSON.stringify({ body }),
     });
     if (res.status !== 201 && res.status !== 200) {
@@ -226,7 +228,7 @@ export async function postComment(
   // rather than reporting success — an unverified write is exactly what this
   // function exists to stop being reported as done.
   try {
-    const res = await fetchImpl(`${url}?limit=50`, { headers: { authorization: `token ${token}` } });
+    const res = await fetchImpl(`${url}?limit=50`, { headers: { authorization: authHeader(token) } });
     if (res.status === 200) {
       const all = (await res.json()) as Array<{ id?: number; body?: string; html_url?: string }>;
       const mine = all.find((c) => c.id === created.id);
@@ -280,7 +282,7 @@ export async function registerHook(
     const res = await fetchImpl(hooksEndpoint(ref), {
       method: "POST",
       headers: {
-        authorization: `token ${token}`,
+        authorization: authHeader(token),
         "content-type": "application/json",
       },
       body: JSON.stringify(hookPayload(ref, hookUrl, secret)),
@@ -327,7 +329,7 @@ export async function duplicateHooks(
     return [];
   }
   try {
-    const res = await fetchImpl(hooksEndpoint(ref), { headers: { authorization: `token ${token}` } });
+    const res = await fetchImpl(hooksEndpoint(ref), { headers: { authorization: authHeader(token) } });
     if (res.status !== 200) return [];
     const hooks = (await res.json()) as Array<{ config?: { url?: string } }>;
     if (!Array.isArray(hooks)) return [];
