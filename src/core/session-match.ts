@@ -135,6 +135,21 @@ export interface MatchHit {
  * list and take the first one that answers; matchSession() below remains the
  * "just give me one" read.
  */
+/** How `label` matches any of `refs`, best kind found; null when none does. */
+function matchKind(label: string, refs: { raw: string; norm: string }[], kinds: MatchKind[]): MatchKind | null {
+  const lower = label.toLowerCase();
+  const norm = normaliseLabel(label);
+  let kind: MatchKind | null = null;
+  for (const ref of refs) {
+    if (kinds.includes("exact") && lower === ref.raw) return "exact";
+    if (kinds.includes("normalised") && norm === ref.norm) kind = kind ?? "normalised";
+    if (kinds.includes("substring") && (lower.includes(ref.raw) || norm.includes(ref.norm))) {
+      kind = kind ?? "substring";
+    }
+  }
+  return kind;
+}
+
 export function matchAllSessions(
   references: string[],
   sessions: SessionCandidate[],
@@ -155,21 +170,9 @@ export function matchAllSessions(
     // "Archiware (Chenarlier)" must still resolve by its plain name first, and
     // a reference matching only the display form is a hit worth reporting as
     // such (viaDisplay) so a caller can see it was the list's form that matched.
-    const labels = [label, s.displayLabel].filter((l): l is string => Boolean(l) && l !== label);
-    let kind: MatchKind | null = null;
-    let viaDisplay = false;
-    for (const cand of labels) {
-      const lower = cand.toLowerCase();
-      const norm = normaliseLabel(cand);
-      for (const ref of refs) {
-        if (kinds.includes("exact") && lower === ref.raw) { kind = "exact"; break; }
-        if (kinds.includes("normalised") && norm === ref.norm) { kind = kind ?? "normalised"; continue; }
-        if (kinds.includes("substring") && (lower.includes(ref.raw) || norm.includes(ref.norm))) {
-          kind = kind ?? "substring";
-        }
-      }
-      if (kind === "exact") { viaDisplay = cand !== label; break; }
-    }
+    const plain = matchKind(label, refs, kinds);
+    const viaDisplay = plain === null && Boolean(s.displayLabel) && s.displayLabel !== label;
+    const kind = plain ?? (viaDisplay ? matchKind(s.displayLabel!, refs, kinds) : null);
     if (!kind) continue;
 
     // Preference dominates: 100 leaves room for every match kind beneath it.
