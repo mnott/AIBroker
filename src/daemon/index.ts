@@ -22,6 +22,7 @@ import { registerCoreHandlers } from "./core-handlers.js";
 import { startTodoistWebhook } from "./todoist-webhook.js";
 import { startMailboxWatch } from "./mailbox-watch.js";
 import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession, liveSession } from "../adapters/pailot/gateway.js";
+import { recordSessions, successorOf } from "../core/session-history.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping, getMqttClientCount, mqttPublishText, mqttPublishControl } from "../adapters/pailot/mqtt-broker.js";
 import { registerToken as apnsRegisterToken, sendPush as apnsSendPush } from "../apns/client.js";
 import { loadQueue, flushQueue } from "../adapters/pailot/message-queue.js";
@@ -38,7 +39,7 @@ import { fileURLToPath } from "node:url";
 import { AibpBridge } from "../aibp/bridge.js";
 import { findClaudeSession } from "../adapters/iterm/core.js";
 import { reassertPersistentTitles } from "../adapters/iterm/sessions.js";
-import { ITERM_UUID_KEY, pruneSessionNames, setHolderLivenessProbe } from "../core/persistence.js";
+import { getPersistentSessionName, ITERM_UUID_KEY, pruneSessionNames, setHolderLivenessProbe } from "../core/persistence.js";
 import { typeIntoSession, isClaudeRunningInSession, snapshotAllSessions, logTransportPolicy } from "../transport/sync-facade.js";
 import { activeItermSessionId, setActiveItermSessionId, setLastRoutedSessionId } from "../core/state.js";
 import { pruneStaleContexts } from "./image-context.js";
@@ -465,6 +466,7 @@ export async function startDaemon(options?: {
   // eligible — durable-id keys outlive pane churn by design.
   setInterval(() => {
     reassertPersistentTitles();
+    recordSessions(manager.knownSessions());
     const snaps = snapshotAllSessions();
     const dropped = pruneSessionNames(
       snaps.flatMap((s) => [s.id, ...(s.aibrokerId ? [s.aibrokerId] : [])]),
@@ -522,7 +524,7 @@ export async function startDaemon(options?: {
     }
 
     // Text/voice/image from app — route through AIBP bridge (same as WS path)
-    const routeSession = liveSession(sessionId || undefined);
+    let routeSession = liveSession(sessionId || undefined);
     if (!routeSession) {
       log(`[MQTT→Hub] no sessionId in inbound ${type} message — dropping`);
       return;
@@ -538,7 +540,21 @@ export async function startDaemon(options?: {
     // session that does exist is the expensive mistake here, not the lookup.
     const known = (list: { backendSessionId: string }[]) =>
       list.some(s => s.backendSessionId === routeSession);
-    const knownSession = known(manager.knownSessions()) || known(manager.listSessions());
+    let knownSession = known(manager.knownSessions()) || known(manager.listSessions());
+    if (knownSession) {
+      recordSessions(manager.knownSessions());
+    } else {
+      // The app holds an id from before a restart. Hand the message to the
+      // session that took over the name and tell the app to re-bind.
+      const successor = successorOf(routeSession, manager.knownSessions(), undefined, getPersistentSessionName(routeSession));
+      if (successor) {
+        log(`[MQTT→Hub] ${type} for stale session ${routeSession.slice(0, 8)} re-routed to "${successor.name}" (${successor.backendSessionId.slice(0, 8)})`);
+        mqttPublishControl({ type: "session_moved", old: routeSession, new: successor.backendSessionId, oldSessionId: routeSession, sessionId: successor.backendSessionId, name: successor.name });
+        handleMqttCommand("sessions");
+        routeSession = successor.backendSessionId;
+        knownSession = true;
+      }
+    }
     if (!knownSession) {
       log(`[MQTT→Hub] Rejecting ${type} — sessionId=${routeSession.slice(0, 8)} is stale (no matching session). Refreshing client list.`);
       mqttPublishControl({ type: "session_not_found", sessionId: routeSession });
