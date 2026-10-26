@@ -340,14 +340,56 @@ export class ProjectRootMissingError extends Error {
   }
 }
 
+/**
+ * The name a launched session carries: `--name` and `PAI_SESSION_NAME` must be
+ * the same value. The configured env wins (it is what PAI itself exports); else
+ * the curated name — `display_name` is often just the slug (`i052341`), so a
+ * different-cased alias ("Home") beats it.
+ */
+export function sessionLabel(
+  project: PaiProject,
+  env: Record<string, string> = {},
+): string {
+  if (env.PAI_SESSION_NAME) return env.PAI_SESSION_NAME;
+  if (project.displayName && project.displayName !== project.slug) return project.displayName;
+  const alias = project.names.find((n) => n !== project.name && n.toLowerCase() === project.name.toLowerCase());
+  return alias || project.name || project.displayName;
+}
+
+/**
+ * The `claude …` part of a launch command; the one place a launch builds its
+ * first input.
+ *
+ * With a work order the initial prompt is EXACTLY that single line. No `/Name`
+ * line: `--name` already names the session, and Claude Code parses a prompt
+ * starting with `/Name` as one slash command whose argument swallows the order,
+ * so the order never ran. Without an order (plain open) `/Name` alone keeps the
+ * tab + /resume label. Single line only: newlines split queued prompts.
+ */
+export function buildClaudeInvocation(
+  project: PaiProject,
+  effective: { flags?: string; env?: Record<string, string> },
+  initialPrompt?: string,
+): string {
+  const label = sessionLabel(project, effective.env);
+  const flags = effective.flags ?? "";
+  const claudeFlags = flags.includes("--dangerously-skip-permissions")
+    ? flags
+    : `--dangerously-skip-permissions ${flags}`.trim();
+  const order = initialPrompt?.replace(/[\r\n]+/g, " ").replace(/'/g, "").trim();
+  const prompt = order
+    ? shellEscape(order)
+    : `$'/Name ${label.replace(/'/g, "")}'`;
+  return `claude ${claudeFlags} --name ${shellEscape(label)} ${prompt}`;
+}
+
 export async function launchResolvedPaiProject(
   project: PaiProject,
   opts: {
     /**
      * What the session should do instead of resuming.
      *
-     * Queued as the second initial-prompt line, so it runs immediately after
-     * `/Name` and before anything else can reach the session. MUST be a single
+     * Passed as the whole initial prompt (no `/Name` line), so it runs first. MUST be a single
      * line: Claude Code splits the initial-prompt argument on newlines and
      * treats each as a separate queued prompt, so an embedded newline silently
      * fragments the instruction into several.
@@ -391,8 +433,8 @@ export async function launchResolvedPaiProject(
   // Get effective config (project overrides global defaults)
   const effective = await getEffectiveConfig(name) ?? project.sessionConfig ?? {};
 
-  const flags = effective.flags ?? "";
-  const env = effective.env ?? {};
+  const env = { ...(effective.env ?? {}) };
+  env.PAI_SESSION_NAME ||= sessionLabel(project);
 
   // Build the shell command: export envs, cd, run claude
   const parts: string[] = [];
@@ -400,39 +442,7 @@ export async function launchResolvedPaiProject(
     parts.push(`export ${key}=${shellEscape(value)}`);
   }
   parts.push(`cd ${shellEscape(rootPath)}`);
-  // Replicate PAI's launch: `--name` sets the session label, and the single
-  // initial-prompt arg `$'/Name <name>\n<next>'` advance-enters the /Name skill
-  // (tab + /resume label). Without an `initialPrompt` that is the only line; a
-  // caller with work to hand over adds it as a second line, and that is the
-  // whole point:
-  //
-  // Claude Code holds initial-prompt lines as QUEUED PROMPTS, and a queued
-  // prompt is not on the screen anywhere. Measured 2026-08-04: from t≈6s the
-  // input box renders empty and every readiness check passes, while `/Name` and
-  // the work order sit invisibly pending until t≈14s. A dispatcher that waited for
-  // "ready" and then TYPED its work order landed it inside that window, so the
-  // task, the rename and the resume all raced in one input. No amount of screen
-  // reading can close that gap — the state is not rendered.
-  //
-  // Putting the work order in the launch removes the race by construction
-  // rather than by timing: the queue is ordered, nothing else types, and there
-  // is no window to lose.
-  const label = project.displayName || project.name;
-  const ansiC = label.replace(/'/g, "");
-  // Single line only — see `initialPrompt` above. Newlines are what separate
-  // queued prompts, so one embedded here would split the instruction in two.
-  const next = opts.initialPrompt?.replace(/[\r\n]+/g, " ").replace(/'/g, "");
-  // One backslash-n: the command reaches the terminal through JXA's
-  // JSON-encoded `session.write`, which does NOT collapse escapes (the old
-  // AppleScript path did, and needed two). Doubled, the shell received a
-  // literal `\\n` and `/Name` swallowed the work-order line as its argument.
-  // zsh's $'...' turns this single `\n` into the real newline that separates the
-  // two queued inputs.
-  const prompt = `$'/Name ${ansiC}${next ? `\\n${next}` : ""}'`;
-  const claudeFlags = flags.includes("--dangerously-skip-permissions")
-    ? flags
-    : `--dangerously-skip-permissions ${flags}`.trim();
-  parts.push(`claude ${claudeFlags} --name ${shellEscape(label)} ${prompt}`);
+  parts.push(buildClaudeInvocation(project, { ...effective, env }, opts.initialPrompt));
 
   const command = parts.join(" && ");
   const sessionId = `pai-${project.slug}-${Date.now()}`;
