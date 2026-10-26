@@ -12,9 +12,10 @@
  * One table, one function. A source that is not listed is machine ingress.
  */
 
-export type Delivery = "type" | "mailboxOnly";
+/** `pointer`: mailbox plus the idle-only one-line pointer (no waiter to wake the session). */
+export type Delivery = "type" | "mailboxOnly" | "pointer";
 
-const INGRESS_DELIVERY = {
+const INGRESS_DELIVERY: Record<string, "type" | "machine"> = {
   // The operator's own channels.
   telex: "type",
   telegram: "type",
@@ -22,17 +23,23 @@ const INGRESS_DELIVERY = {
   whatsapp: "type",
   pailot: "type",
   // Machine ingress.
-  todoist: "mailboxOnly",
-  forge: "mailboxOnly",
-  github: "mailboxOnly",
-  inbound: "mailboxOnly",
-  a2a: "mailboxOnly",
-  worker: "mailboxOnly",
-  session: "mailboxOnly",
-} as const satisfies Record<string, Delivery>;
+  todoist: "machine",
+  forge: "machine",
+  github: "machine",
+  inbound: "machine",
+  a2a: "machine",
+  worker: "machine",
+  session: "machine",
+};
 
-/** How a message from `source` reaches a session; an unknown source is machine ingress. */
-export function deliveryFor(source: string | undefined): Delivery {
-  const hit = (INGRESS_DELIVERY as Record<string, Delivery>)[(source ?? "").toLowerCase()];
-  return hit ?? "mailboxOnly";
+/**
+ * How a message from `source` reaches a session. The operator's channels type.
+ * Machine ingress (and any unknown source) is mailbox-only when the session has
+ * an active `aibroker mailbox wait` to wake it, else mailbox plus the idle-only
+ * pointer so an idle session without a waiter still notices it.
+ */
+export function deliveryFor(source: string | undefined, hasWaiter = false): Delivery {
+  const hit = INGRESS_DELIVERY[(source ?? "").toLowerCase()];
+  if (hit === "type") return "type";
+  return hasWaiter ? "mailboxOnly" : "pointer";
 }

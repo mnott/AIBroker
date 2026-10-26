@@ -29,7 +29,7 @@ import { broadcastStatus, broadcastVoice, broadcastImage, broadcastText, handleM
 import { mqttRequestDebugState } from "../adapters/pailot/mqtt-broker.js";
 import { WatcherClient, UNKNOWN_SESSION_ID } from "../ipc/client.js";
 import { saveVoiceConfig, setSessionProject, setPersistentSessionName, getPersistentSessionName, getAllPersistentSessionNames, removePersistentSessionName, lookupPersistentName } from "../core/persistence.js";
-import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox, markMailboxShown, peekSessionMailbox, setAttachAlias, hasAttachAlias, mailboxKeys, rememberIdSession, claudeSessionOfId } from "../core/state.js";
+import { voiceConfig, setVoiceConfig, activeItermSessionId, lastRoutedSessionId, getAibpBridge, depositToSessionMailbox, drainSessionMailbox, markMailboxShown, peekSessionMailbox, setAttachAlias, hasAttachAlias, mailboxKeys, rememberIdSession, claudeSessionOfId, registerMailboxWaiter, hasActiveWaiter, activeWaiters } from "../core/state.js";
 import { splitIntoChunks } from "../adapters/kokoro/media.js";
 import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
@@ -1180,8 +1180,6 @@ export function registerCoreHandlers(
    */
   server.on("send_to_session", async (req) => {
     const { target: targetParam, message, noReply = false, mailboxOnly: mailboxOnlyParam = false, source = "session" } = req.params as { target?: string; message?: string; noReply?: boolean; mailboxOnly?: boolean; source?: string };
-    // Only the operator's own channels type into the input line (ingress.ts).
-    const mailboxOnly = mailboxOnlyParam || deliveryFor(source) === "mailboxOnly";
     if (!targetParam) return { ok: false, error: "target is required" };
     if (!message) return { ok: false, error: "message is required" };
     const target = targetParam;
@@ -1197,7 +1195,7 @@ export function registerCoreHandlers(
      */
     {
       const { forwardToPeer } = await import("./peer-handlers.js");
-      const forwarded = await forwardToPeer(target, "send_to_session", { message, noReply, mailboxOnly, source });
+      const forwarded = await forwardToPeer(target, "send_to_session", { message, noReply, mailboxOnly: mailboxOnlyParam, source });
       if (forwarded) {
         return forwarded.ok
           ? { ok: true, result: forwarded.result ?? { sent: true } }
@@ -1445,6 +1443,10 @@ export function registerCoreHandlers(
       };
     }
 
+    // Only the operator's own channels type into the input line; machine
+    // ingress is mailbox-only once a waiter can wake the session (ingress.ts).
+    const mailboxOnly = mailboxOnlyParam || deliveryFor(source, hasActiveWaiter(mailboxKeys(itermSessionId, claudeSessionOfId(itermSessionId)))) === "mailboxOnly";
+
     // What gets typed and whether it goes to the mailbox — see
     // sendToSessionDelivery() for why noReply skips both.
     const { typed: prefixedMessage, deposit: shouldDeposit } = sendToSessionDelivery(message, senderLabel, noReply);
@@ -1607,8 +1609,13 @@ export function registerCoreHandlers(
     if (!hasMailboxIdentity(req)) {
       return { ok: false, error: "Cannot determine session ID — pass sessionId param or run inside an iTerm session" };
     }
-    return { ok: true, result: { messages: peekSessionMailbox(mailboxKeysFor(req, itermSessionId)), sessionId: itermSessionId } };
+    const keys = mailboxKeysFor(req, itermSessionId);
+    if ((req.params as { waiter?: boolean }).waiter) registerMailboxWaiter(keys);
+    return { ok: true, result: { messages: peekSessionMailbox(keys), sessionId: itermSessionId } };
   });
+
+  /** Sessions with an active `aibroker mailbox wait`. */
+  server.on("mailbox_waiters", async () => ({ ok: true, result: { waiters: activeWaiters() } }));
 
   /**
    * Phase 2 of the hook's drain: clear what was peeked, return how many went.

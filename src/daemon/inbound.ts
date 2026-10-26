@@ -807,7 +807,8 @@ async function attemptMessageDelivery(route: InboundRoute, body: string): Promis
   // arrived as a second prompt (and the drain hook re-injected the whole).
   // Not into a line the operator is mid-sentence in — pointer-guard.ts.
   const { deliveryFor } = await import("./ingress.js");
-  if (deliveryFor("inbound") === "mailboxOnly") {
+  const { hasActiveWaiter, mailboxKeys, claudeSessionOfId } = await import("../core/state.js");
+  if (deliveryFor("inbound", hasActiveWaiter(mailboxKeys(target.id, claudeSessionOfId(target.id)))) === "mailboxOnly") {
     return { ok: true, detail: `queued in ${target.name}'s mailbox (nothing typed)` };
   }
   const { typeWhenInputEmpty } = await import("./pointer-guard.js");

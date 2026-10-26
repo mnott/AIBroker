@@ -58,7 +58,7 @@ import {
 } from "./terminal-screen.js";
 import { log } from "../core/log.js";
 import { deliveryFor } from "./ingress.js";
-import { depositToSessionMailbox } from "../core/state.js";
+import { depositToSessionMailbox, hasActiveWaiter, mailboxKeys, claudeSessionOfId } from "../core/state.js";
 import { matchAllSessions } from "../core/session-match.js";
 
 export type DispatchOutcome =
@@ -309,11 +309,11 @@ export async function submitAndConfirm(
 /**
  * Production delivery of a work order to a live session. Dispatch carries
  * Todoist tasks and routine work orders — machine ingress — so the order goes
- * to the session's mailbox and nothing is typed (ingress.ts); the typed path
- * stays for a source the table lets type.
+ * to the session's mailbox and nothing is typed when a mailbox waiter will wake
+ * it (ingress.ts); a session without a waiter is typed as before.
  */
 const deliverWorkOrder: DispatchDeps["deliver"] = async (sessionId, body, timeoutMs, io, retries) => {
-  if (deliveryFor("todoist") === "mailboxOnly") {
+  if (deliveryFor("todoist", hasActiveWaiter(mailboxKeys(sessionId, claudeSessionOfId(sessionId)))) === "mailboxOnly") {
     depositToSessionMailbox(sessionId, "task", body);
     return "ok";
   }

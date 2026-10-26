@@ -82,7 +82,8 @@ async function deliverA2A(session: string, text: string): Promise<{ delivered: b
     depositToSessionMailbox(hit.session.id, "a2a", text);
     // Not into a line the operator is mid-sentence in — pointer-guard.ts.
     const { deliveryFor } = await import("./ingress.js");
-    if (deliveryFor("a2a") === "mailboxOnly") return { delivered: true, detail: "queued (mailbox, nothing typed)" };
+    const { hasActiveWaiter, mailboxKeys, claudeSessionOfId } = await import("../core/state.js");
+    if (deliveryFor("a2a", hasActiveWaiter(mailboxKeys(hit.session.id, claudeSessionOfId(hit.session.id)))) === "mailboxOnly") return { delivered: true, detail: "queued (mailbox, nothing typed)" };
     const { typeWhenInputEmpty } = await import("./pointer-guard.js");
     const guarded = await typeWhenInputEmpty(hit.session.id, "[a2a] new message — drain your mailbox (aibroker_receive) for the full text");
     return { delivered: true, detail: guarded.typed && guarded.ack ? "delivered" : "queued (session busy)" };

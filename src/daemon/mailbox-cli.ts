@@ -73,14 +73,19 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
 
 export async function runMailbox(args: string[]): Promise<void> {
   const [verb, ...rest] = args;
+  if (verb === "waiters") {
+    const r = (await new WatcherClient(DAEMON_SOCKET_PATH).call_raw("mailbox_waiters", {})) as { waiters?: string[] };
+    for (const id of r.waiters ?? []) console.log(id);
+    process.exit(0);
+  }
   if (verb !== "wait") {
-    console.error("Usage: aibroker mailbox wait [--session <id>] [--timeout <s>]");
+    console.error("Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] | waiters>");
     process.exit(1);
   }
   const client = new WatcherClient(DAEMON_SOCKET_PATH);
   const code = await mailboxWait(rest, {
     peek: async (session) => {
-      const r = (await client.call_raw("session_mailbox_peek", session ? { sessionId: session } : {})) as { messages?: Pending[] };
+      const r = (await client.call_raw("session_mailbox_peek", { waiter: true, ...(session ? { sessionId: session } : {}) })) as { messages?: Pending[] };
       return r.messages ?? [];
     },
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),

@@ -309,6 +309,25 @@ export function drainSessionMailbox(ids: string | string[], now: number = Date.n
   return out.sort((x, y) => x.timestamp - y.timestamp);
 }
 
+// ── Mailbox waiters ──
+// `aibroker mailbox wait` heartbeats through session_mailbox_peek; a waiter is
+// active while its last heartbeat is recent, so a dead process drops out alone.
+const WAITER_TTL_MS = 5000;
+const waiterSeen = new Map<string, number>();
+
+export function registerMailboxWaiter(ids: string | string[], now: number = Date.now()): void {
+  for (const id of asKeys(ids)) waiterSeen.set(id, now);
+}
+
+export function hasActiveWaiter(ids: string | string[] | undefined, now: number = Date.now()): boolean {
+  if (!ids) return false;
+  return asKeys(ids).some((id) => now - (waiterSeen.get(id) ?? -Infinity) <= WAITER_TTL_MS);
+}
+
+export function activeWaiters(now: number = Date.now()): string[] {
+  return [...waiterSeen].filter(([, at]) => now - at <= WAITER_TTL_MS).map(([id]) => id);
+}
+
 // ── Message Dispatch ──
 
 export function dispatchIncomingMessage(body: string, timestamp: number): void {
