@@ -346,7 +346,17 @@ export async function dispatch(
   const deliverTimeoutMs = () => Math.min(opts.deliverTimeoutMs ?? DEFAULT_DELIVER_TIMEOUT_MS, left());
 
   const project = await deps.resolve(projectName);
-  if (!project) {
+  // The owner NAME is evidence on its own. A router derives "pai" from a
+  // project called PAI, or "home" from a default, and the curated registry may
+  // know that project only as pai-1 or i052341 — while a session literally
+  // called "PAI" / "Home" is idle and waiting. Match the name against the
+  // running sessions (case- and separator-insensitively) before any verdict
+  // that would launch or give up.
+  const ownerHits = matchAllSessions([projectName], deps.sessions(), {
+    kinds: ["exact", "normalised"],
+    prefer: (s) => (s.isClaude === true ? 2 : s.isClaude === false ? 0 : 1),
+  }).map((h) => ({ id: h.session.id, label: h.label }));
+  if (!project && ownerHits.length === 0) {
     if (curatedRegistryEmpty()) {
       return {
         outcome: "unlaunchable",
@@ -367,11 +377,12 @@ export async function dispatch(
     };
   }
 
-  const label = project.displayName || project.name;
+  const label = project?.displayName || project?.name || projectName;
   const body = `${opts.prefix ?? TASK_PREFIX} ${message}`;
 
   // ── already running? ──
-  const candidates = findSessionsForProject(project, deps.sessions());
+  const candidates = [...(project ? findSessionsForProject(project, deps.sessions()) : [])];
+  for (const h of ownerHits) if (!candidates.some((c) => c.id === h.id)) candidates.push(h);
   const existing = candidates[0] ?? null;
   if (existing) {
     if (left() <= 0) {
@@ -463,6 +474,12 @@ export async function dispatch(
         `within the window. This is delivery, not failure — do NOT retry. Recorded at ${queuedRecordPath} ` +
         `in case it turns out to have been lost; redriven once on the next daemon start.`,
     };
+  }
+
+  if (!project) {
+    // Unreachable in practice: no project means the only candidates were owner
+    // hits, and any candidate returns above. Kept so the types say so.
+    return { outcome: "unlaunchable", project: projectName, session: "", reason: `No curated alias for "${projectName}".` };
   }
 
   // Enumeration itself may have failed rather than truthfully found nothing —
