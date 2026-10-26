@@ -20,7 +20,7 @@
  * says what it did. Everything requiring judgement stays with the person.
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, chmodSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -47,6 +47,28 @@ import {
 import { AG2_SPEC } from "./agentish.js";
 
 const STATE_FILE = join(homedir(), ".aibroker", "managers.json");
+
+/**
+ * A managed session quiet (no pane change) and not running for longer than
+ * this is dropped from management rather than reported forever.
+ *
+ * Default 24 hours, overridable via `AIBROKER_MANAGE_MAX_QUIET_HOURS` — a
+ * machine left alone for a weekend should not come back to a manager still
+ * buzzing about sessions that lapsed days ago.
+ */
+const MAX_QUIET_MS_DEFAULT = 24 * 3_600_000;
+function maxQuietMs(): number {
+  const h = Number(process.env.AIBROKER_MANAGE_MAX_QUIET_HOURS);
+  return Number.isFinite(h) && h > 0 ? h * 3_600_000 : MAX_QUIET_MS_DEFAULT;
+}
+
+/**
+ * How long a managed session may go UNREADABLE before it is dropped rather
+ * than skipped. A pane that cannot be read is not necessarily gone (a transient
+ * osascript fault reads the same), so it gets a grace period; past it, the
+ * terminal is gone and keeping the record only feeds a stale report.
+ */
+const DROP_UNREADABLE_MS = 30 * 60_000;
 
 /** How often every manager is looked at. Cheap: one content read per managed session. */
 const TICK_MS = 20_000;
@@ -493,6 +515,12 @@ export interface ManagedSession {
   handoverDoneK?: number;
   /** When a handover was asked for, so a silent session can be given up on. */
   handoverAskedAt?: number;
+  /**
+   * When this session's pane last could not be read at all. Set by the tick's
+   * drop rule; cleared the moment a read succeeds. A pane unreadable past
+   * DROP_UNREADABLE_MS is a gone terminal, and management ends with it.
+   */
+  unreadableSince?: number;
   /** What that file looked like when asked, so "changed" is measured not claimed. */
   handoverWas?: string;
   /** When a clear was typed, so it is never typed twice WITHIN one rollover. */
@@ -604,6 +632,105 @@ export interface ManagedSession {
 }
 
 export type State = Record<string, ManagedSession>;
+
+/**
+ * Is this terminal still there, and still carrying the session?
+ *
+ * A managed session whose pane (iTerm/tmux id) no longer exists, or whose
+ * Claude process is gone, is not a session to keep working on — it is a record
+ * of one. Such entries used to survive forever and appear in every report
+ * ("quiet for 15314 min"), which is the manager describing its own stale state
+ * as if it were the machine's. This answers the question the operating system
+ * answers exactly: is the pane enumerated, and is there a `claude` on its tty.
+ *
+ * `paneExists` is passed in rather than looked up here so the rule is testable
+ * without iTerm; it must come from a RELIABLE enumeration — the caller guards
+ * that, because a failed osascript enumeration returns an empty list that is
+ * indistinguishable from a genuinely empty machine, and dropping live sessions
+ * on that would be worse than reporting a stale one.
+ */
+export function sessionIsGone(
+  m: ManagedSession,
+  paneExists: boolean,
+  proc: { isSession: boolean; pid: string | null } | null,
+): boolean {
+  if (!paneExists) return true;
+  if (proc && !proc.isSession) return true;
+  return false;
+}
+
+/**
+ * Should this record stop being managed? Pure, so the drop rule is checkable
+ * without a pane, a process table or a clock race.
+ *
+ * Three ways a record is gone:
+ *   gone-pane    — the terminal or its Claude process no longer exists.
+ *   unreadable   — the pane could not be read at all for DROP_UNREADABLE_MS.
+ *   quiet-limit  — no pane change and not running for longer than maxQuietMs
+ *                  (default 24h). A session quiet that long with nothing
+ *                  running has lapsed; keeping it managed only produces
+ *                  reports about a session nobody is working in.
+ *
+ * `working` is the tick's transcript reading; undefined (unknown) does NOT
+ * suppress the quiet-limit drop — quiet is measured by the pane, and a session
+ * that cannot even be read for a day is exactly the lapse this catches.
+ */
+export function shouldDrop(
+  m: ManagedSession,
+  input: {
+    paneExists: boolean;
+    proc: { isSession: boolean; pid: string | null } | null;
+    now: number;
+    maxQuietMs?: number;
+    working?: boolean;
+  },
+): { drop: boolean; reason: string } {
+  if (sessionIsGone(m, input.paneExists, input.proc)) return { drop: true, reason: "gone" };
+  if (m.unreadableSince !== undefined && input.now - m.unreadableSince >= DROP_UNREADABLE_MS) {
+    return { drop: true, reason: "unreadable" };
+  }
+  const limit = input.maxQuietMs ?? maxQuietMs();
+  if (!m.paused && input.working !== true && input.now - m.lastChangeAt > limit) {
+    return { drop: true, reason: "quiet-limit" };
+  }
+  return { drop: false, reason: "" };
+}
+
+/**
+ * The identity a report row is keyed by — the STABLE session identity, not the
+ * transcript file or the pane it happens to be read through.
+ *
+ * The defect this closes: one live session (a `claude attach` background
+ * session) appeared as three rows in one report, because rows were effectively
+ * per-transcript/per-pane and several panes view the same session. The id is
+ * the attach uuid when the pane views a background session (that is the session
+ * itself), else the pane's own id, else the durable tmux id.
+ */
+export function stableSessionKey(input: {
+  attachUuid?: string | null;
+  paneId?: string | null;
+  aibrokerId?: string | null;
+}): string {
+  return input.attachUuid ?? input.paneId ?? input.aibrokerId ?? "";
+}
+
+/**
+ * Collapse duplicate rows for the same live session to ONE row.
+ *
+ * Rows arrive in report order (first wins); duplicates keyed to the same stable
+ * identity are dropped. Rows whose identity could not be determined are kept
+ * as-is — a row we cannot key is not evidence of a duplicate.
+ */
+export function dedupeReportRows<T>(rows: { key: string; row: T }[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const r of rows) {
+    if (seen.has(r.key)) continue;
+    if (r.key) seen.add(r.key);
+    out.push(r.row);
+  }
+  return out;
+}
 
 /**
  * A duration nobody can print nonsense from.
@@ -1470,17 +1597,9 @@ function alert(m: ManagedSession, what: string): void {
   alertOperator(`${m.name} — ${what}`);
 }
 
-/**
- * How often the operator hears from the manager when nothing is wrong.
- *
- * Long, because the report competes with the alerts for the same attention: a
- * channel that speaks every few minutes about nothing is one whose alerts get
- * swiped away unread. Half an hour is roughly "next time you glance at it".
- */
+/** The window the "N armings in N min" figure covers. The report is asked-for
+ *  only (see managerReportText); this is the count's span, not a send timer. */
 const REPORT_EVERY_MS = 30 * 60_000;
-
-/** When the operator was last told the state of things. */
-let lastReportAt = 0;
 
 /**
  * Armings since the last report, per session. NOT persisted, on purpose — the
@@ -1511,59 +1630,65 @@ const inputLineTracking = new Map<string, { text: string; sameForTicks: number; 
  * The report's lines: one per UNPAUSED session, resetting its arming counter.
  * `kOf` is injectable so the policy can be tested without a live terminal.
  */
+/**
+ * The stable identity a report row belongs to, resolved against the live
+ * enumeration. A `claude attach` pane views a background session, and several
+ * panes may view the SAME one — keying by pane would then print one session as
+ * several rows (seen live: three "◑ PAI (claude)" rows, 730k context, one
+ * session). Keying by the attach uuid collapses them.
+ */
+function reportKey(m: ManagedSession, live: { id: string; aibrokerId?: string | null; attachUuid?: string }[]): string {
+  const snap = live.find((s) => s.id === m.sessionId || s.aibrokerId === m.sessionId);
+  return stableSessionKey({ attachUuid: snap?.attachUuid, paneId: snap?.id ?? m.sessionId, aibrokerId: snap?.aibrokerId ?? undefined });
+}
+
+/**
+ * One report row per managed session, de-duplicated by stable session identity:
+ * three records viewing one live session produce ONE row.
+ */
 export function reportLines(
   managed: ManagedSession[],
   armingsSince: Map<string, number>,
   now: number,
   kOf: (m: ManagedSession) => number | null = contextK,
+  live: { id: string; aibrokerId?: string | null; attachUuid?: string }[] = discoverLiveSessions(),
 ): string[] {
   const mins = Math.round(REPORT_EVERY_MS / 60_000);
-  return managed.filter((m) => !m.paused).map((m) => {
-    const armings = armingsSince.get(m.sessionId) ?? 0;
-    armingsSince.set(m.sessionId, 0);
-    const k = kOf(m);
-    const quietFor = Math.round((now - m.lastChangeAt) / 60_000);
-    const doing = quietFor >= 2 ? `quiet for ${quietFor} min` : "working";
-    const last = m.history.at(-1);
-    return (
-      `• ${m.name} — ${doing}` +
-      (k !== null ? `, ${k}k context` : "") +
-      `, ${armings} arming${armings === 1 ? "" : "s"} in ${mins} min` +
-      (last ? `\n  last: ${last.what.slice(0, 110)}` : "")
-    );
-  });
+  const rows = managed
+    .filter((m) => !m.paused)
+    .map((m) => {
+      const armings = armingsSince.get(m.sessionId) ?? 0;
+      armingsSince.set(m.sessionId, 0);
+      const k = kOf(m);
+      const quietFor = Math.round((now - m.lastChangeAt) / 60_000);
+      const doing = quietFor >= 2 ? `quiet for ${quietFor} min` : "working";
+      const last = m.history.at(-1);
+      const row =
+        `• ${m.name} — ${doing}` +
+        (k !== null ? `, ${k}k context` : "") +
+        `, ${armings} arming${armings === 1 ? "" : "s"} in ${mins} min` +
+        (last ? `\n  last: ${last.what.slice(0, 110)}` : "");
+      return { key: reportKey(m, live), row };
+    });
+  return dedupeReportRows(rows);
 }
 
 /**
- * The periodic reading: what every managed session is doing, in one message.
+ * The reading the operator asked for: what every managed session is doing, in
+ * one message.
  *
- * One message for all of them rather than one each, because the useful thing on
- * a phone is a page you take in at a glance, and armings across several
- * sessions are the same event happening in several places.
+ * NEVER automatic. It used to ride the tick on a 30-minute timer and the
+ * standing rule is that PAILot gets only replies to the operator's own asks —
+ * a periodic "Manager report" was unsolicited notice, and a daemon restart made
+ * the first tick fire it immediately, replaying state as a report the operator
+ * never asked for (observed 2026-10-26 13:56, right after a kickstart). It is
+ * produced only on an explicit ask: `manage status` / the MCP status call.
+ * The tick no longer sends anything.
  */
-function reportIfDue(now: number): void {
-  const managed = Object.values(state);
-  // Nothing is being managed, so there is nothing to report and the clock is
-  // held at now — otherwise a report would be overdue the moment one starts.
-  if (managed.length === 0) {
-    lastReportAt = now;
-    return;
-  }
-  // First tick after a restart. Start the clock rather than reporting, so
-  // restarting the daemon is not itself a reason for the phone to buzz.
-  if (lastReportAt === 0) {
-    lastReportAt = now;
-    return;
-  }
-  if (now - lastReportAt < REPORT_EVERY_MS) return;
-  lastReportAt = now;
-
-  // A paused manager does nothing, so there is nothing to say about it.
-  for (const m of managed) if (m.paused) armingsSinceReport.set(m.sessionId, 0);
+export function managerReportText(managed: ManagedSession[] = Object.values(state), now = Date.now()): string {
   const lines = reportLines(managed, armingsSinceReport, now);
-  // Only paused sessions: nothing to report, clock already held at now above.
-  if (lines.length === 0) return;
-  reportToOperator(`Manager report\n${lines.join("\n")}`);
+  if (lines.length === 0) return "no sessions are being managed";
+  return `Manager report\n${lines.join("\n")}`;
 }
 
 /**
@@ -3647,13 +3772,61 @@ async function tick(now = Date.now()): Promise<void> {
     }
   }
 
+  // The live enumeration, once per tick: the drop rule needs it, and the
+  // per-session readings below reuse it rather than re-enumerating.
+  const liveSnaps = reliable ? discoverLiveSessions() : [];
+
+  /**
+   * A record whose terminal is gone, or whose Claude process is gone, stops
+   * being managed — with ONE log line, not a report row.
+   *
+   * This is what ended the 15314-minute "quiet" rows and the "could not type —
+   * will retry" loop for a session that no longer exists: the record survived
+   * the session, so every tick kept describing it and every failed type kept
+   * promising a retry against nothing. Dropping it is the end of that loop.
+   * Guarded on a RELIABLE enumeration: a failed osascript returns [] exactly
+   * like an empty machine, and dropping live sessions on that is worse than
+   * reporting a stale one.
+   */
+  const dropIfGone = (m: ManagedSession, proc: { isSession: boolean; pid: string | null } | null, working?: boolean): boolean => {
+    const paneExists = liveSnaps.some((s) => s.id === m.sessionId || (s.aibrokerId && s.aibrokerId === m.sessionId));
+    const verdict = reliable
+      ? shouldDrop(m, { paneExists, proc, now, working })
+      : { drop: false, reason: "" };
+    if (!verdict.drop) return false;
+    const why =
+      verdict.reason === "gone"
+        ? "the terminal or its Claude process is gone"
+        : verdict.reason === "unreadable"
+          ? `its pane has been unreadable for ${Math.round((now - (m.unreadableSince ?? now)) / 60_000)} min`
+          : `quiet and not running for ${minutesSince(m.lastChangeAt, now)}`;
+    log(`[manage] dropped ${m.name} from management — ${why}; not reporting a session that is not there`);
+    delete state[m.sessionId];
+    // The retry memories die with the record: nothing may keep typing, or
+    // promising to retry, at a session that has been dropped.
+    inputLineTracking.delete(m.sessionId);
+    arming.delete(m.sessionId);
+    armingsSinceReport.delete(m.sessionId);
+    lastContextLog.delete(m.sessionId);
+    return true;
+  };
+
   for (const m of Object.values(state)) {
     const content = await readPaneAsync(m.sessionId);
     if (!content) {
-      // A session that cannot be read is not necessarily gone; say so once per
-      // tick rather than dropping it, because dropping it silently is how a
-      // manager stops managing without anybody noticing.
+      // A session that cannot be read is not necessarily gone; the tick skips
+      // it, but the clock starts. Past DROP_UNREADABLE_MS the terminal is gone
+      // and the record goes with it — one log line, not a report row forever.
+      m.unreadableSince ??= now;
+      if (dropIfGone(m, null)) {
+        dirty = true;
+        continue;
+      }
       continue;
+    }
+    if (m.unreadableSince !== undefined) {
+      delete m.unreadableSince;
+      dirty = true;
     }
 
     const h = hash(content);
@@ -3671,6 +3844,13 @@ async function tick(now = Date.now()): Promise<void> {
     // cost.
     const tickTty = m.tty ?? snapshotTty(m.sessionId);
     const tickProc = tickTty ? processReading(tickTty) : null;
+    // A pane with no Claude on it is a gone session: drop it here, BEFORE any
+    // typing happens below, so the "could not type — will retry" loop cannot
+    // run against a terminal that no longer holds a session.
+    if (dropIfGone(m, tickProc)) {
+      dirty = true;
+      continue;
+    }
     const tickPid = tickProc?.pid ?? null;
     const tickUuid = tickProc?.uuid ?? (tickTty ? discoverLiveSessions().find((s) => s.id === m.sessionId)?.attachUuid : undefined);
     const tickTranscript = tickPid ? transcriptReading(tickPid, tickUuid) : null;
@@ -3739,6 +3919,13 @@ async function tick(now = Date.now()): Promise<void> {
         );
         lastContextLog.set(m.sessionId, { k: tickUsed ?? (prevLog?.k ?? -1), reason: tickHandoverDecision.reason });
       }
+    }
+
+    // The quiet-limit drop, after the transcript reading exists so "not
+    // running" is the transcript's own answer rather than the pane's silence.
+    if (dropIfGone(m, tickProc, working)) {
+      dirty = true;
+      continue;
     }
 
     /**
@@ -4382,9 +4569,10 @@ async function tick(now = Date.now()): Promise<void> {
   }
 
   if (dirty) saveState(state);
-  // Last, so the report describes the state this tick left behind rather than
-  // the one it found.
-  reportIfDue(now);
+  // No report here, ever. The manager report is asked-for only
+  // (managerReportText, via `manage status` / the MCP call); a tick that pushed
+  // one on a timer — and fired it immediately after a daemon restart — was the
+  // unsolicited notice the operator's standing rule forbids.
 }
 
 /**
@@ -4409,9 +4597,34 @@ export async function runTickForTest(now: number, entry: ManagedSession): Promis
   }
 }
 
+/**
+ * Records that describe no live terminal stop being managed, at load.
+ *
+ * Daemon start used to replay every stale record as a report; now stale
+ * records are simply dropped here, with one log line each, and the loop starts
+ * clean. Only pane-existence drops run at load — a quiet-limit drop needs the
+ * transcript's "not running" reading, which the tick has. Guarded on a
+ * reliable enumeration: a failed osascript must not empty the machine.
+ */
+function dropGoneOnLoad(): void {
+  const live = discoverLiveSessions();
+  if (!wasLastEnumerationReliable()) return;
+  let dropped = 0;
+  for (const m of Object.values(state)) {
+    const paneExists = live.some((s) => s.id === m.sessionId || (s.aibrokerId && s.aibrokerId === m.sessionId));
+    if (!paneExists) {
+      log(`[manage] dropped ${m.name} from management — its terminal no longer exists; not reporting a session that is not there`);
+      delete state[m.sessionId];
+      dropped++;
+    }
+  }
+  if (dropped) saveState(state);
+}
+
 export function startManagerLoop(): void {
   if (timer) return;
   state = loadState();
+  dropGoneOnLoad();
   const n = Object.keys(state).length;
   if (n) log(`[manage] resuming ${n} managed session${n > 1 ? "s" : ""}`);
   let skipLogged = false;
@@ -4469,9 +4682,10 @@ export async function handleManage(
   const arg = (rawArg ?? "").trim();
 
   // Every managed session in one block — before any peer forwarding or
-  // single-session resolution, since "all" names no session.
+  // single-session resolution, since "all" names no session. This is the
+  // operator's ASK for the manager report: the only place it is ever produced.
   if (sessionIdOrName.trim().toLowerCase() === "all" && (!arg || arg.toLowerCase() === "status")) {
-    return { ok: true, message: statusLines(Object.values(state), Date.now(), contextK).join("\n") };
+    return { ok: true, message: managerReportText(Object.values(state), Date.now()) };
   }
 
   /**
