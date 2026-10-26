@@ -37,7 +37,6 @@ import { audit } from "./audit.js";
 import { snapshotAllSessions, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import {
   findCuratedPaiProject,
-  curatedRegistryEmpty,
   launchResolvedPaiProject,
   invalidatePaiProjectCache,
   type PaiProject,
@@ -347,16 +346,6 @@ export async function dispatch(
 
   const project = await deps.resolve(projectName);
   if (!project) {
-    if (curatedRegistryEmpty()) {
-      return {
-        outcome: "unlaunchable",
-        project: projectName,
-        session: "",
-        reason:
-          `PAI returned no curated projects at all, so "${projectName}" cannot be resolved — ` +
-          `the registry is unavailable or its aliases are gone (not a missing alias for this project). Retryable.`,
-      };
-    }
     return {
       outcome: "unlaunchable",
       project: projectName,

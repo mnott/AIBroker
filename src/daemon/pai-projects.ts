@@ -16,7 +16,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "../core/log.js";
-import { loadJson, saveJson } from "../core/json-store.js";
 import { createClaudeSession } from "../adapters/iterm/sessions.js";
 
 const execFileAsync = promisify(execFile);
@@ -59,26 +58,6 @@ interface Cache {
 const CACHE_TTL_MS = 30_000;
 let _cache: Cache | null = null;       // curated shortlist
 let _cacheAll: Cache | null = null;    // all active projects (--all)
-
-let _curatedEmpty = false;
-
-/**
- * Did the last curated lookup come back empty (registry unavailable or aliases
- * lost)? Lets a caller report that as the cause instead of a missing alias.
- */
-export function curatedRegistryEmpty(): boolean { return _curatedEmpty; }
-
-const LAST_GOOD_FILE = join(homedir(), ".aibroker", "pai-projects-last-good.json");
-
-/** Survives a daemon restart that happens while the registry is down. */
-function saveLastGoodCurated(projects: PaiProject[]): void {
-  try { saveJson(LAST_GOOD_FILE, { projects }); } catch { /* best effort */ }
-}
-
-function loadLastGoodCurated(): PaiProject[] {
-  const r = loadJson<{ projects: PaiProject[] }>(LAST_GOOD_FILE);
-  return r.status === "ok" && Array.isArray(r.data?.projects) ? r.data.projects : [];
-}
 
 /** Invalidate the project list cache (e.g. after launching a project). */
 export function invalidatePaiProjectCache(): void {
@@ -163,29 +142,16 @@ export async function listPaiProjects(all = false): Promise<PaiProject[]> {
     return cache.projects;
   }
 
-  let fetched = await fetchFromCli(all);
-  // The curated list is never legitimately empty once it has had entries: `pai`
-  // exits 0 with `[]` while its registry (Postgres) is down or restarting, and
-  // taking that at face value made every alias unresolvable — a dispatch then
-  // failed as "unlaunchable" although nothing about the alias had changed.
-  if (fetched && fetched.length === 0 && !all) {
-    log("pai-projects: `pai project names --json` returned 0 curated projects — treating the registry as unavailable");
-    fetched = null;
-    // Only "no aliases at all" is a registry fault; with a last good list to
-    // serve, a failed lookup of one name is an ordinary missing alias.
-    _curatedEmpty = !(cache?.projects.length || loadLastGoodCurated().length);
-  } else if (fetched && !all) {
-    _curatedEmpty = false;
-  }
+  const fetched = await fetchFromCli(all);
   if (!fetched) {
     // A failed call must never replace or be cached over a good list.
-    const lastGood = cache?.projects ?? (all ? [] : loadLastGoodCurated());
+    const lastGood = cache?.projects ?? [];
     if (lastGood.length) log(`pai-projects: CLI failed, serving last good list (${lastGood.length})`);
     return lastGood;
   }
   const projects = fetched;
   const entry = { projects, fetchedAt: Date.now() };
-  if (all) _cacheAll = entry; else { _cache = entry; saveLastGoodCurated(projects); }
+  if (all) _cacheAll = entry; else _cache = entry;
   log(`pai-projects: loaded ${projects.length} project(s)${all ? " (all)" : ""}`);
   return projects;
 }

@@ -952,9 +952,7 @@ export function createWebhookServer(cfg: WebhookConfig | null, deps: WebhookDeps
  * The one function both the live request path and the disk-queue retry call,
  * so a fix here covers every event kind that reaches it, not just reminders.
  */
-export async function processResolvedEvent(
-  event: TodoistEvent, cfg: WebhookConfig, deps: WebhookDeps,
-): Promise<string | undefined> {
+async function processResolvedEvent(event: TodoistEvent, cfg: WebhookConfig, deps: WebhookDeps): Promise<void> {
   // A comment written on a MIRROR entry is meant for the real task.
   //
   // The mirror is where the reader's attention is, so replying there rather
@@ -977,7 +975,7 @@ export async function processResolvedEvent(
         outcome: r.carried ? "carried-back" : "ignored",
         reason: r.reason ?? "comment on a mirror entry carried to its source task",
       });
-      return r.carried ? "carried-back" : "ignored";
+      return;
     }
   }
 
@@ -1046,7 +1044,7 @@ export async function processResolvedEvent(
         nearMiss: decision.nearMiss,
       },
     });
-    return "ignored";
+    return;
   }
 
   // Claim a trigger before dispatching, and release it if the dispatch
@@ -1144,7 +1142,7 @@ export async function processResolvedEvent(
         await setTaskLabel(decision.taskId, RUNNING_LABEL, false);
         const { forgetClaim } = await import("./todoist-claims.js");
         forgetClaim(decision.taskId);
-        log(`todoist-webhook: released ${RUNNING_LABEL} on ${decision.taskId} — dispatch was ${r.outcome}${r.reason ? ` (${r.reason})` : ""}`);
+        log(`todoist-webhook: released ${RUNNING_LABEL} on ${decision.taskId} — dispatch was ${r.outcome}`);
       } catch { /* the claim is a hint, not a lock; a stuck one is visible */ }
     }
     audit({
@@ -1156,14 +1154,6 @@ export async function processResolvedEvent(
         duplicateTitles: twins > 1 ? twins : undefined,
       },
     });
-    // A due occurrence that landed must not be dispatched again by the due
-    // poll; one that did not land stays unrecorded and is retried there.
-    if (!isComment && event.event_name === "reminder:fired") {
-      const { dueKey, recordDueHandled, outcomeIsFinal } = await import("./todoist-due-poll.js");
-      const due = event.event_data?.due as { date?: string; datetime?: string | null } | undefined;
-      if (due && outcomeIsFinal(r.outcome)) recordDueHandled(dueKey(decision.taskId, due));
-    }
-    return r.outcome;
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     audit({
@@ -1172,52 +1162,7 @@ export async function processResolvedEvent(
       meta: { event: event.event_name, taskId: decision.taskId },
     });
     log(`todoist-webhook: delivery failed — ${reason}`);
-    return "failed";
   }
-}
-
-/** Ingress projects the due poll scans: configured, granted, and subtree children. */
-export async function duePollProjectIds(cfg: WebhookConfig): Promise<string[]> {
-  const { applyGrants, listGrants } = await import("./todoist-ingress.js");
-  const ids = new Set(applyGrants(cfg).ingressProjectIds);
-  const subtreeRoots = new Set(listGrants().filter((g) => g.subtree).map((g) => g.projectId));
-  if (subtreeRoots.size) {
-    const { projectTree, ancestorsOf } = await import("./todoist-projects.js");
-    const tree = await projectTree();
-    for (const id of tree.keys()) {
-      if (ancestorsOf(id, tree).some((a) => subtreeRoots.has(a))) ids.add(id);
-    }
-  }
-  return [...ids];
-}
-
-/** Start the due-task poll. TODOIST_DUE_POLL_MINUTES=0 disables it. */
-function startDuePoll(cfg: WebhookConfig, deps: WebhookDeps): void {
-  const raw = process.env.TODOIST_DUE_POLL_MINUTES;
-  const minutes = raw === undefined || raw === "" ? 5 : Number(raw);
-  if (!Number.isFinite(minutes) || minutes <= 0) {
-    log("todoist-due-poll: disabled (TODOIST_DUE_POLL_MINUTES=0)");
-    return;
-  }
-  const maxOverdueDays = Number(process.env.TODOIST_DUE_POLL_MAX_OVERDUE_DAYS) || 7;
-  const tick = () => {
-    void import("./todoist-due-poll.js").then(async (m) => {
-      const decisions = await m.runDuePoll({
-        projectIds: () => duePollProjectIds(cfg),
-        listTasks: (id) => m.listProjectTasks(id),
-        handle: (task) => processResolvedEvent(
-          { event_name: "reminder:fired", event_data: task as unknown as Record<string, unknown> } as TodoistEvent,
-          cfg, deps),
-        maxOverdueDays,
-        runningLabel: RUNNING_LABEL,
-      });
-      const n = decisions.filter((d) => d.action === "dispatch").length;
-      if (n) log(`todoist-due-poll: handled ${n} due task(s)`);
-    }).catch((e) => log(`todoist-due-poll: tick failed — ${e instanceof Error ? e.message : String(e)}`));
-  };
-  setTimeout(tick, 45_000).unref();
-  setInterval(tick, minutes * 60_000).unref();
-  log(`todoist-due-poll: every ${minutes} min, overdue limit ${maxOverdueDays}d`);
 }
 
 /** Read config from the environment. Returns null when not configured. */
@@ -1311,7 +1256,6 @@ export function startTodoistWebhook(deps: WebhookDeps): Server | null {
     };
     setTimeout(sweep, 20_000).unref();
     setInterval(sweep, 60_000).unref();
-    startDuePoll(liveCfg, deps);
   }
 
   if (cfg && bind !== "127.0.0.1" && bind !== "localhost") {
