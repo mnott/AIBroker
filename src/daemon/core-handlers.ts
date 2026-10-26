@@ -2159,9 +2159,9 @@ export function registerCoreHandlers(
    * verb that was actually asked for and leaves custody alone.
    */
   server.on("issue", async (req) => {
-    const { repo, verb, issue, comment, body, title, label, state, count } = req.params as {
+    const { repo, verb, issue, comment, body, title, label, state, count, keepClosed } = req.params as {
       repo?: string; verb?: string; issue?: number; comment?: number;
-      body?: string; title?: string; label?: string; state?: string; count?: number;
+      body?: string; title?: string; label?: string; state?: string; count?: number; keepClosed?: boolean;
     };
     const ref = parseRepoUrl(repo ?? "");
     if (!ref) return { ok: false, error: "repo must be a repository URL" };
@@ -2195,8 +2195,8 @@ export function registerCoreHandlers(
       };
     }
 
-    const cred = issueWriteCredential();
-    const r = await issueOp(verb as IssueVerb, { issue, comment, body, title, label, state, count }, {
+    const cred = issueWriteCredential(process.env, ref);
+    const r = await issueOp(verb as IssueVerb, { issue, comment, body, title, label, state, count, keepClosed }, {
       ref,
       token: cred.credential,
       botLogin: cred.login,
@@ -2285,7 +2285,7 @@ export function registerCoreHandlers(
     // Which account this machine posts as, asked of the forge itself. Falls
     // back to the configured name only when the forge will not answer. Reported
     // back rather than turned into a filter — see below.
-    const cred = issueWriteCredential();
+    const cred = issueWriteCredential(process.env, ref);
     const postsAs = await whoAmI({
       ref,
       token: cred.credential ?? "",

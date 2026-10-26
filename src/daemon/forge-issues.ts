@@ -35,12 +35,12 @@ export type ReadVerb = "get" | "comments" | "list" | "labels" | "assets";
 /** Verbs that change the tracker. */
 export type WriteVerb =
   | "new" | "comment" | "amend" | "rewrite" | "retitle"
-  | "label" | "unlabel" | "claim" | "release" | "close";
+  | "label" | "unlabel" | "claim" | "release" | "close" | "reopen";
 export type IssueVerb = ReadVerb | WriteVerb;
 
 export const READ_VERBS: ReadVerb[] = ["get", "comments", "list", "labels", "assets"];
 export const WRITE_VERBS: WriteVerb[] = [
-  "new", "comment", "amend", "rewrite", "retitle", "label", "unlabel", "claim", "release", "close",
+  "new", "comment", "amend", "rewrite", "retitle", "label", "unlabel", "claim", "release", "close", "reopen",
 ];
 
 /** The API root for a repository, on either forge shape. */
@@ -265,6 +265,25 @@ async function readIssue(c: Ctx, n: number): Promise<{ status: number; issue?: a
   return { status: r.status, issue: r.json as any };
 }
 
+/** Set an issue's state and read it back. `state` is undefined when the read-back failed. */
+async function setState(
+  c: Ctx, n: number, state: "open" | "closed",
+): Promise<{ ok: boolean; error?: string; state?: string; url?: string }> {
+  const r = await call(c, "PATCH", `/issues/${n}`, { state });
+  if (r.status >= 300) return { ok: false, error: explain(r.status) };
+  const back = await readIssue(c, n);
+  return back.status === 200 ? { ok: true, state: back.issue.state, url: back.issue.html_url } : { ok: true };
+}
+
+/** Reopen the issue when it is closed. The reply fields say what happened. */
+async function reopenIfClosed(c: Ctx, n: number): Promise<Record<string, unknown> | undefined> {
+  const cur = await readIssue(c, n);
+  if (cur.status !== 200 || cur.issue?.state !== "closed") return undefined;
+  const r = await setState(c, n, "open");
+  if (!r.ok) return { reopened: false, reopenError: r.error };
+  return r.state === "open" ? { reopened: true } : { reopened: false, reopenError: "could not be confirmed" };
+}
+
 /**
  * Run one verb.
  *
@@ -275,7 +294,7 @@ async function readIssue(c: Ctx, n: number): Promise<{ status: number; issue?: a
  */
 export async function issueOp(
   verb: IssueVerb,
-  args: { issue?: number; comment?: number; body?: string; title?: string; label?: string; state?: string; count?: number },
+  args: { issue?: number; comment?: number; body?: string; title?: string; label?: string; state?: string; count?: number; keepClosed?: boolean },
   ctx: { ref: RepoRef; token?: string; botLogin?: string; authorLabel?: string; fetchImpl?: typeof fetch },
 ): Promise<IssueResult> {
   if (!ctx.token) return { ok: false, error: "no forge token configured — set AIBROKER_FORGE_BOT_TOKEN or AIBROKER_FORGE_TOKEN" };
@@ -364,12 +383,16 @@ export async function issueOp(
       const r = await call(c, "POST", `/issues/${n}/comments`, { body: sign(args.body, c.authorLabel) });
       if (r.status !== 201 && r.status !== 200) return { ok: false, error: explain(r.status) };
       const made = r.json as any;
+      // A comment on a closed issue is something the operator must see, and
+      // closed issues are not in the open list. Reopen after posting, so a
+      // failed post never leaves a reopened issue with nothing new on it.
+      const reopened = args.keepClosed ? undefined : await reopenIfClosed(c, n!);
       const back = await call(c, "GET", `/issues/${n}/comments`);
       if (back.status === 200) {
         const mine = (back.json as any[]).find((x) => x.id === made.id);
-        if (mine) return { ok: true, url: mine.html_url, data: { body: mine.body } };
+        if (mine) return { ok: true, url: mine.html_url, data: { body: mine.body, ...reopened } };
       }
-      return { ok: true, url: made.html_url, warning: "posted, but could not be read back — treat the link as unconfirmed" };
+      return { ok: true, url: made.html_url, data: reopened, warning: "posted, but could not be read back — treat the link as unconfirmed" };
     }
     case "amend": {
       /*
@@ -482,6 +505,14 @@ export async function issueOp(
       return back.status === 200
         ? { ok: true, url: back.issue.html_url, data: { assignees: (back.issue.assignees ?? []).map((a: any) => a.login) } }
         : { ok: true, warning: `${verb} applied, but could not be read back — treat as unconfirmed` };
+    }
+    case "reopen": {
+      const bad = needsNumber(); if (bad) return { ok: false, error: bad };
+      const r = await setState(c, n!, "open");
+      if (!r.ok) return { ok: false, error: r.error };
+      return r.state === "open"
+        ? { ok: true, url: r.url, data: { state: r.state } }
+        : { ok: true, warning: "reopened, but could not be confirmed — treat as unconfirmed" };
     }
     case "close": {
       const bad = needsNumber(); if (bad) return { ok: false, error: bad };

@@ -432,12 +432,12 @@ server.tool(
 
 server.tool(
   "aibroker_issue",
-  "Work a repository's issue tracker: read (get, comments, list, labels, assets) and write (new, comment, amend, rewrite, retitle, label, unlabel, claim, release, close). Allowed only for repositories THIS session is subscribed to. Every write is read back and returns the resulting URL.",
+  "Work a repository's issue tracker: read (get, comments, list, labels, assets) and write (new, comment, amend, rewrite, retitle, label, unlabel, claim, release, close, reopen). A comment on a closed issue reopens it so it shows in the open list (pass keepClosed:true to leave it closed). Allowed only for repositories THIS session is subscribed to. Every write is read back and returns the resulting URL.",
   {
     repo: z.string().min(1).describe("Repository URL, e.g. https://forge.example/owner/name"),
     verb: z.enum([
       "get", "comments", "list", "labels", "assets",
-      "new", "comment", "amend", "rewrite", "retitle", "label", "unlabel", "claim", "release", "close",
+      "new", "comment", "amend", "rewrite", "retitle", "label", "unlabel", "claim", "release", "close", "reopen",
     ]),
     issue: z.number().int().positive().optional().describe("Issue number, for verbs that act on one"),
     comment: z.number().int().positive().optional().describe("Comment id, for amend"),
@@ -446,6 +446,7 @@ server.tool(
     label: z.string().optional().describe("Label name for label/unlabel; must already exist"),
     state: z.string().optional().describe("For list: open (default), closed, all"),
     count: z.number().int().positive().optional().describe("For comments: only the newest N"),
+    keepClosed: z.boolean().optional().describe("For comment: do not reopen a closed issue"),
   },
   async (a) => {
     try {
