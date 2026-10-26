@@ -32,6 +32,16 @@ export interface SessionCandidate {
    * holder of a name ahead of a same-name shell tab.
    */
   isClaude?: boolean;
+  /**
+   * The name `sessions`/`aibroker_sessions` displays for this row: the chosen
+   * name decorated with its cwd project ("Archiware (Chenarlier)"), else the
+   * tab title. Matching it lets a target typed exactly as the list shows it
+   * resolve; without it the parenthetical is no part of any name the matcher
+   * knows, and a copy-paste from the list reports "not found" (live 2026-10-26).
+   */
+  displayLabel?: string | null;
+  /** Working directory, for cwdMatches-style preference. */
+  cwd?: string | null;
 }
 
 /** How a name was matched, weakest last. Reported so a fuzzy hit is visible. */
@@ -111,6 +121,8 @@ export interface MatchHit {
   label: string;
   kind: MatchKind;
   score: number;
+  /** True when the reference matched this row's display label rather than its plain name. */
+  viaDisplay?: boolean;
 }
 
 /**
@@ -138,22 +150,30 @@ export function matchAllSessions(
 
   for (const s of sessions) {
     const label = labelOf(s);
-    if (!label) continue;
-    const lower = label.toLowerCase();
-    const norm = normaliseLabel(label);
-
+    // The display label is a second label for the same row, tried only when the
+    // plain name did not match: a session named "Archiware" shown as
+    // "Archiware (Chenarlier)" must still resolve by its plain name first, and
+    // a reference matching only the display form is a hit worth reporting as
+    // such (viaDisplay) so a caller can see it was the list's form that matched.
+    const labels = [label, s.displayLabel].filter((l): l is string => Boolean(l) && l !== label);
     let kind: MatchKind | null = null;
-    for (const ref of refs) {
-      if (kinds.includes("exact") && lower === ref.raw) { kind = "exact"; break; }
-      if (kinds.includes("normalised") && norm === ref.norm) { kind = kind ?? "normalised"; continue; }
-      if (kinds.includes("substring") && (lower.includes(ref.raw) || norm.includes(ref.norm))) {
-        kind = kind ?? "substring";
+    let viaDisplay = false;
+    for (const cand of labels) {
+      const lower = cand.toLowerCase();
+      const norm = normaliseLabel(cand);
+      for (const ref of refs) {
+        if (kinds.includes("exact") && lower === ref.raw) { kind = "exact"; break; }
+        if (kinds.includes("normalised") && norm === ref.norm) { kind = kind ?? "normalised"; continue; }
+        if (kinds.includes("substring") && (lower.includes(ref.raw) || norm.includes(ref.norm))) {
+          kind = kind ?? "substring";
+        }
       }
+      if (kind === "exact") { viaDisplay = cand !== label; break; }
     }
     if (!kind) continue;
 
     // Preference dominates: 100 leaves room for every match kind beneath it.
-    hits.push({ session: s, label, kind, score: prefer(s) * 100 + KIND_RANK[kind] });
+    hits.push({ session: s, label, kind, score: prefer(s) * 100 + KIND_RANK[kind], viaDisplay });
   }
 
   // Stable descending: equal scores keep enumeration order, which is what the
@@ -172,9 +192,9 @@ export function matchSession(
   references: string[],
   sessions: SessionCandidate[],
   opts: MatchOptions = {},
-): { session: SessionCandidate; label: string; kind: MatchKind } | null {
+): MatchHit | null {
   const best = matchAllSessions(references, sessions, opts)[0];
-  return best ? { session: best.session, label: best.label, kind: best.kind } : null;
+  return best ?? null;
 }
 
 /** Last path segment of a working directory — the project a session is in. */
@@ -190,10 +210,27 @@ export function cwdProject(cwd: string | null | undefined): string | null {
  * runs in a CaseLeaf checkout reads "PAI (CaseLeaf)", so the disagreement is
  * visible instead of being resolved silently in someone's favour.
  */
+/**
+ * A directory's project name as a human titles it: `chenarlier` → `Chenarlier`.
+ *
+ * The parenthetical is a title, not a path: lowercase, hyphen- and
+ * underscore-separated directory names read as shouty inside the name
+ * ("Archiware (chenarlier)"), and a caller copying the list verbatim then
+ * targets a name no matcher recognises case-insensitively against the session
+ * it came from.
+ */
+export function projectTitle(project: string): string {
+  return project
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
 export function displayName(name: string, cwd: string | null | undefined): string {
   const project = cwdProject(cwd);
   if (!project || normaliseLabel(project) === normaliseLabel(name)) return name;
-  return `${name} (${project})`;
+  return `${name} (${projectTitle(project)})`;
 }
 
 /** True when a reference names the project the session's cwd is in. */
