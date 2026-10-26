@@ -20,7 +20,7 @@
  * says what it did. Everything requiring judgement stays with the person.
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, chmodSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, chmodSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -1626,10 +1626,6 @@ const lastContextLog = new Map<string, { k: number; reason: string }>();
  */
 const inputLineTracking = new Map<string, { text: string; sameForTicks: number; clearFailed?: boolean }>();
 
-/**
- * The report's lines: one per UNPAUSED session, resetting its arming counter.
- * `kOf` is injectable so the policy can be tested without a live terminal.
- */
 /**
  * The stable identity a report row belongs to, resolved against the live
  * enumeration. A `claude attach` pane views a background session, and several
