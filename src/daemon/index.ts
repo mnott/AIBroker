@@ -401,7 +401,7 @@ export async function startDaemon(options?: {
       const names: string[] = [];
       try {
         const { listPaiProjects } = await import("./pai-projects.js");
-        for (const p of await listPaiProjects()) names.push(...(p.names ?? [p.name]));
+        for (const p of await listPaiProjects()) names.push(p.name, ...(p.names ?? []));
       } catch (e) {
         log(`todoist: could not list PAI projects for addressing — ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -410,6 +410,14 @@ export async function startDaemon(options?: {
         if (n) names.push(n);
       }
       return names;
+    },
+    projectNames: async () => {
+      try {
+        const { listPaiProjects } = await import("./pai-projects.js");
+        return (await listPaiProjects(true)).flatMap((p) => [p.name, ...p.names]);
+      } catch {
+        return [];
+      }
     },
   });
 

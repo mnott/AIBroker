@@ -561,6 +561,16 @@ export interface WebhookDeps {
    * daemon runs, and a name that was valid at boot need not be valid now.
    */
   knownOwners?: () => string[] | Promise<string[]>;
+  /**
+   * Names a sub-project may be matched against, beyond `knownOwners`: every
+   * registered PAI project, aliased or not.
+   *
+   * A folder named "PAI" belongs to the pai project whether or not a tab of
+   * that name happens to be open. Matching only live sessions made the owner
+   * depend on the moment: a task filed while the tab was busy or renamed fell
+   * through to the default owner.
+   */
+  projectNames?: () => string[] | Promise<string[]>;
 }
 
 function readBody(req: IncomingMessage, limit = 1_000_000): Promise<Buffer> {
@@ -1033,7 +1043,7 @@ export async function processResolvedEvent(
       const tree = await projectTree();
       live = expandThroughSubtree(live, eventProject, ancestorsOf(eventProject, tree), {
         name: tree.get(eventProject)?.name,
-        known: await (deps.knownOwners?.() ?? []),
+        known: [...(await (deps.knownOwners?.() ?? [])), ...(await (deps.projectNames?.() ?? []))],
       });
     } catch (err) {
       log(`todoist-webhook: subtree lookup failed — ${err instanceof Error ? err.message : String(err)}`);
