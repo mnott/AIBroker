@@ -29,6 +29,7 @@ import { appendPrivate } from "../../core/private-file.js";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { log } from "../../core/log.js";
+import { successorOf } from "../../core/session-history.js";
 import { WHISPER_MODEL } from "../kokoro/media.js";
 import { resolveWhisperBin, resolveFfmpegBin } from "../../core/bins.js";
 import {
@@ -1419,6 +1420,17 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
  * @param sessionId — iTerm session ID of the originating Claude session
  */
 function resolveSessionId(sessionId?: string): string | undefined {
+  const id = resolveSessionIdRaw(sessionId);
+  if (!id || !hybridManager) return id;
+  const known = hybridManager.knownSessions();
+  if (known.length === 0 || known.some(s => s.backendSessionId === id)) return id;
+  // The id is from before a restart: attribute the message to the session that took over its name.
+  const next = successorOf(id, known, undefined, getPersistentSessionName(id));
+  if (next) log(`[PAILot] outbound session ${id.slice(0, 8)} is stale — attributed to "${next.name}" (${next.backendSessionId.slice(0, 8)})`);
+  return next?.backendSessionId ?? id;
+}
+
+function resolveSessionIdRaw(sessionId?: string): string | undefined {
   // If an explicit sessionId was passed (from MCP detectSessionId), check the reply map
   // first — the reply map records which session the user was actually talking to,
   // which may differ from whatever iTerm tab is currently focused on the Mac.
