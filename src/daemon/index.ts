@@ -21,7 +21,7 @@ import { AdapterRegistry } from "./adapter-registry.js";
 import { registerCoreHandlers } from "./core-handlers.js";
 import { startTodoistWebhook } from "./todoist-webhook.js";
 import { startMailboxWatch } from "./mailbox-watch.js";
-import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession, liveSession } from "../adapters/pailot/gateway.js";
+import { startWsGateway, stopWsGateway, setScreenshotHandler, broadcastText, broadcastVoice, broadcastImage, handleMqttCommand, transcribeAndRoute, setVoiceBatchSession, liveSession, fallbackLiveSession } from "../adapters/pailot/gateway.js";
 import { recordSessions, successorOf } from "../core/session-history.js";
 import { startMqttBroker, stopMqttBroker, setMqttInboundHandler, mqttPublishTyping, getMqttClientCount, mqttPublishText, mqttPublishControl } from "../adapters/pailot/mqtt-broker.js";
 import { registerToken as apnsRegisterToken, sendPush as apnsSendPush } from "../apns/client.js";
@@ -546,9 +546,17 @@ export async function startDaemon(options?: {
     } else {
       // The app holds an id from before a restart. Hand the message to the
       // session that took over the name and tell the app to re-bind.
-      const successor = successorOf(routeSession, manager.knownSessions(), undefined, getPersistentSessionName(routeSession));
+      const live = manager.knownSessions();
+      let successor = successorOf(routeSession, live, undefined, getPersistentSessionName(routeSession));
+      let rule = "name";
+      if (!successor) {
+        // Never recorded, so no name to follow: deliver to the session the user is talking to.
+        const fb = fallbackLiveSession(live, manager.activeSession?.backendSessionId);
+        successor = fb?.session;
+        rule = fb?.rule ?? rule;
+      }
       if (successor) {
-        log(`[MQTT→Hub] ${type} for stale session ${routeSession.slice(0, 8)} re-routed to "${successor.name}" (${successor.backendSessionId.slice(0, 8)})`);
+        log(`[MQTT→Hub] ${type} for stale session ${routeSession.slice(0, 8)} re-routed to "${successor.name}" (${successor.backendSessionId.slice(0, 8)}) by ${rule}`);
         mqttPublishControl({ type: "session_moved", old: routeSession, new: successor.backendSessionId, oldSessionId: routeSession, sessionId: successor.backendSessionId, name: successor.name });
         handleMqttCommand("sessions");
         routeSession = successor.backendSessionId;
