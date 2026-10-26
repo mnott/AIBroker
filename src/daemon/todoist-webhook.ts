@@ -1162,7 +1162,12 @@ export async function processResolvedEvent(
     // Remember who took it, so a later comment reaches the same session.
     // Recorded on the way out and only on a real delivery: a task nobody
     // accepted has no owner to inherit.
-    if (!isComment && (r.outcome === "delivered" || r.outcome === "queued" || r.outcome === "spawned")) rememberOwner(decision.taskId, decision.project);
+    // Remembered whatever the outcome: the owner is the ROUTING answer, and a
+    // task whose first dispatch failed ("unlaunchable", "unreachable") still
+    // belongs to that owner. Skipping it let the follow-up comment re-derive
+    // the owner from live session names, which had changed by then, and fall
+    // through to the default owner.
+    if (!isComment) rememberOwner(decision.taskId, decision.project);
 
     // Release a claim the dispatch did not earn. "queued" keeps it — the
     // work IS in flight, the session is simply mid-turn — but a trigger
