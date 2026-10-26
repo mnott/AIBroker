@@ -114,11 +114,9 @@ export function callerItermId(req: IpcRequest): string | undefined {
  * What send_to_session types and whether it deposits to the mailbox, for a
  * given noReply mode.
  *
- * noReply is for automated beats that expect no answer: nothing is queued
- * (a beat has no value later, and the drain-mailbox reminder would repeat a
- * demand to reply that the sender can never see), and no `[Session:...]`
- * prefix is typed (the prefix tells the receiving Claude to route a reply
- * back to a sender, but a beat's label is not a registered session).
+ * Every message is deposited in the mailbox and at most a one-line pointer is
+ * typed (idle-only, see pointer-guard.ts) — noReply included. The full text is
+ * never typed: it would land in whatever the operator is writing.
  *
  * When a message IS deposited, only a one-line pointer is typed
  * (`[Session:<sender>] <preview> — drain your mailbox (aibroker_receive) for
@@ -141,9 +139,10 @@ export function sendToSessionDelivery(
   senderLabel: string,
   noReply: boolean,
 ): { typed: string; deposit: boolean } {
-  return noReply
-    ? { typed: message, deposit: false }
-    : { typed: mailboxPointer(senderLabel, messagePreview(message)), deposit: true };
+  // Never the body: noReply only drops the reply demand, not the mailbox. A
+  // typed full message lands in whatever the operator is writing.
+  void noReply;
+  return { typed: mailboxPointer(senderLabel, messagePreview(message)), deposit: true };
 }
 
 /** The one line typed for a deposited message: it says the receiver must drain it. */
@@ -1150,9 +1149,8 @@ export function registerCoreHandlers(
    *
    * Calls typeIntoSession which writes text + Enter into the session's stdin.
    *
-   * noReply: for automated beats that expect no answer. Nothing is queued
-   * to the mailbox, and no `[Session:...]` routing prefix is typed — see
-   * sendToSessionDelivery() for why both matter for a beat.
+   * noReply: for automated beats that expect no answer. Delivered like any
+   * other message (mailbox + idle-only pointer); see sendToSessionDelivery().
    */
   server.on("send_to_session", async (req) => {
     const { target: targetParam, message, noReply = false } = req.params as { target?: string; message?: string; noReply?: boolean };
@@ -1402,7 +1400,7 @@ export function registerCoreHandlers(
         sessionId: itermSessionId, name: resolvedName,
         note: shouldDeposit
           ? `${reason}. It is in the session's mailbox and readable with aibroker_receive.`
-          : `${reason}. Not queued — noReply carries no mailbox fallback.`,
+          : `${reason}. `,
       },
     };
   });
