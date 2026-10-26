@@ -9,6 +9,7 @@
 
 import { apiRoot, authHeader } from "./forge-issues.js";
 import { parseRepoUrl, type RepoRef } from "./subscribe-issues.js";
+import { releaseCredential } from "./forge-credential.js";
 import { log } from "../core/log.js";
 
 export const CLAIM_ASSIGNEE = "claude";
@@ -80,7 +81,7 @@ function fetchClient(ref: RepoRef, token: string, fetchImpl: typeof fetch): Rele
 export async function releaseOnClose(
   routeRepo: string | undefined,
   payload: any,
-  token = process.env.AIBROKER_FORGE_TOKEN,
+  token = releaseCredential(),
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
   try {
