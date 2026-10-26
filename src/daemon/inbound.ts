@@ -514,6 +514,12 @@ export function composeDelivery(route: InboundRoute, payloads: unknown | unknown
 
 // --- delivery ------------------------------------------------------------
 
+/** The single line typed for a deposited inbound body: never the body itself. */
+export function inboundPointer(routeName: string): string {
+  const safe = routeName.replace(/[^\w.:-]+/g, "_");
+  return `[Inbound:${safe}] new event — drain your mailbox (aibroker_receive) for the full text`;
+}
+
 export interface DeliveryResult {
   ok: boolean;
   /** What happened, for the audit trail and the caller's 200 body. */
@@ -795,12 +801,13 @@ async function attemptMessageDelivery(route: InboundRoute, body: string): Promis
 
   depositToSessionMailbox(target.id, `inbound:${route.name}`, body);
 
-  // Typed as well as deposited, so a session sitting idle sees it now rather
-  // than at its next prompt. retries = 1 — a redelivered inbound message is
-  // a duplicate nobody can tell apart from two real events.
+  // A one-line pointer is typed so an idle session wakes now rather than at
+  // its next prompt; the full body reaches it once, from the mailbox. Typing
+  // the multi-line body made each newline a separate submit, so the tail
+  // arrived as a second prompt (and the drain hook re-injected the whole).
   // Not into a line the operator is mid-sentence in — pointer-guard.ts.
   const { typeWhenInputEmpty } = await import("./pointer-guard.js");
-  const guarded = await typeWhenInputEmpty(target.id, body);
+  const guarded = await typeWhenInputEmpty(target.id, inboundPointer(route.name));
   const ack = guarded.typed ? guarded.ack : guarded.reason;
   return {
     ok: true,

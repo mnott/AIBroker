@@ -81,7 +81,7 @@ async function deliverA2A(session: string, text: string): Promise<{ delivered: b
     depositToSessionMailbox(hit.session.id, "a2a", text);
     // Not into a line the operator is mid-sentence in — pointer-guard.ts.
     const { typeWhenInputEmpty } = await import("./pointer-guard.js");
-    const guarded = await typeWhenInputEmpty(hit.session.id, text);
+    const guarded = await typeWhenInputEmpty(hit.session.id, "[a2a] new message — drain your mailbox (aibroker_receive) for the full text");
     return { delivered: true, detail: guarded.typed && guarded.ack ? "delivered" : "queued (session busy)" };
   } catch (e) {
     return { delivered: false, detail: e instanceof Error ? e.message : String(e) };
