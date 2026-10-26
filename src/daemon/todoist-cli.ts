@@ -8,7 +8,7 @@
  */
 
 import { loadEnvFile } from "../core/env.js";
-import { authorizeUrl, beginAuth, loadToken } from "./todoist-oauth.js";
+import { authorizeUrl, beginAuth, isExpired, loadToken } from "./todoist-oauth.js";
 
 const DEFAULT_SCOPE = "data:read_write";
 
@@ -81,8 +81,14 @@ export async function runTodoist(args: string[]): Promise<void> {
         const left = Math.round((Date.parse(token.expires_at) - Date.now()) / 60000);
         console.log(`Expires: ${token.expires_at} (${left} min)`);
         console.log(token.refresh_token
-          ? "Refresh: automatic — refreshed on demand before it expires"
+          ? "Refresh: automatic — the daemon's keeper refreshes it before it expires"
           : "Refresh: NONE ON FILE — this token will stop working and cannot renew itself");
+        if (isExpired(token)) {
+          console.log("Status: EXPIRED or expiring now. If the daemon is running the keeper " +
+            "refreshes within moments; if this line persists, the refresh itself is failing — " +
+            "check the daemon log, then run `aibroker todoist auth`.");
+          process.exitCode = 1;
+        }
       } else {
         console.log("Expires: no expiry reported — this app has refresh tokens DISABLED.");
         console.log("Todoist issues such tokens without a refresh path, so when one stops working");
@@ -91,31 +97,13 @@ export async function runTodoist(args: string[]): Promise<void> {
       }
       console.log(deliveryLine);
 
-      // The whole point of a status command is to answer "does it work", and
-      // reading a file cannot answer that. This one reported "Authorised" for
-      // twenty hours while every call 401'd — the one command you would run to
-      // diagnose a lapsed grant said everything was fine.
-      process.stdout.write("Live check: ");
-      try {
-        const auth = { authorization: `${token.token_type} ${token.access_token}` };
-        const res = await fetch("https://api.todoist.com/api/v1/projects", { headers: auth });
-        if (res.ok) {
-          console.log("OK — the token works right now.");
-        } else {
-          const body = await res.text();
-          console.log(`FAILING — ${res.status}.`);
-          if (res.status === 401) {
-            console.log("  401 with error_code 477 means the token is invalid or expired.");
-            console.log("  Do not retry it; run `aibroker todoist auth`.");
-          } else {
-            console.log(`  ${body.slice(0, 160)}`);
-          }
-          process.exitCode = 1;
-        }
-      } catch (e) {
-        console.log(`could not reach Todoist — ${e instanceof Error ? e.message : String(e)}`);
-        process.exitCode = 1;
-      }
+      // No live API check, and no refresh of our own. A CLI process holds no
+      // lock, so refreshing here — or probing with the stored token — races the
+      // daemon's keeper: two processes presenting the same rotating refresh
+      // token is reuse, and Todoist answers reuse by revoking the whole grant.
+      // That is how the 2026-10-26 15:51 outage started. Reading the file cannot
+      // prove the token works, but nothing a CLI may do can prove it safely;
+      // the daemon log is the live source.
       break;
     }
 

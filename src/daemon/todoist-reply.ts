@@ -263,17 +263,17 @@ export async function setTaskLabel(
       // token can be invalid well before its stated expiry — trusting the
       // stored expiry here would decline to refresh precisely when the server
       // has just told us it must.
-      const { loadToken, refreshAccessToken } = await import("./todoist-oauth.js");
+      //
+      // This MUST go through forceRefreshAccessToken(), not refreshAccessToken()
+      // directly: a direct call skips the single-flight guard, and a forced
+      // refresh racing the keeper presents the same rotating refresh token
+      // twice. Todoist reads that as reuse and revokes the whole grant — which
+      // is exactly how the 2026-10-26 15:51 outage started.
+      const { forceRefreshAccessToken, loadToken } = await import("./todoist-oauth.js");
       const current = loadToken();
-      const clientId = process.env.TODOIST_CLIENT_ID;
-      const clientSecret = process.env.TODOIST_CLIENT_SECRET;
-      if (current?.refresh_token && clientId && clientSecret) {
-        try {
-          const refreshed = await refreshAccessToken(clientId, clientSecret, current, fetchImpl);
-          if (refreshed.access_token !== token.access_token) {
-            return setTaskLabel(taskId, label, present, fetchImpl, 2);
-          }
-        } catch { /* fall through to the message below */ }
+      const refreshed = await forceRefreshAccessToken(fetchImpl);
+      if (refreshed) {
+        return setTaskLabel(taskId, label, present, fetchImpl, 2);
       }
       throw new Error(
         `task lookup failed with 401 — the Todoist token is invalid or expired and ` +
