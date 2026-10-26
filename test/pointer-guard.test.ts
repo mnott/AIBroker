@@ -19,6 +19,7 @@ function fake(pane: () => string | null, mailbox: () => number) {
     type: async (_id, text) => { typed.push(text); return "ok"; },
     mailboxSize: mailbox,
     now: () => t,
+    sleep: async () => {},
     setTimer: (fn, ms) => { const e = { fn, at: t + ms, live: true }; timers.push(e); return e; },
     clearTimer: (h) => { (h as { live: boolean }).live = false; },
   };

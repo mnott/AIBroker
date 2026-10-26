@@ -19,6 +19,8 @@ import type { AckResult } from "./sessions.js";
 
 export const RETRY_MS = 20_000;
 export const GIVEUP_MS = 10 * 60_000;
+/** The input line must stay empty and unchanged this long before anything is typed. */
+export const QUIET_MS = 2_000;
 export const HELD_REASON = "input line holds unsent text — not typed";
 export const UNREADABLE_REASON = "could not read the target terminal — not typed";
 
@@ -28,6 +30,7 @@ export interface GuardDeps {
   type(sessionId: string, text: string): Promise<AckResult>;
   mailboxSize(sessionId: string): number;
   now(): number;
+  sleep(ms: number): Promise<void>;
   setTimer(fn: () => void, ms: number): { unref?: () => void } | unknown;
   clearTimer(t: unknown): void;
 }
@@ -42,6 +45,7 @@ export const realGuardDeps: GuardDeps = {
   },
   mailboxSize: (id) => peekSessionMailbox(id).length,
   now: () => Date.now(),
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   setTimer: (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t; },
   clearTimer: (t) => clearTimeout(t as NodeJS.Timeout),
 };
@@ -62,7 +66,14 @@ export function resetPointerGuard(deps: GuardDeps = realGuardDeps): void {
 async function inputState(sessionId: string, deps: GuardDeps): Promise<"empty" | "held" | "unreadable"> {
   const pane = await deps.read(sessionId);
   if (pane === null) return "unreadable";
-  return promptUnsentText(pane) ? "held" : "empty";
+  if (promptUnsentText(pane)) return "held";
+  // Empty now is not idle: the operator may be about to start a sentence. Require
+  // the line to still be empty after a quiet window, so typing that began since
+  // the first read is seen rather than landed in the middle of.
+  await deps.sleep(QUIET_MS);
+  const again = await deps.read(sessionId);
+  if (again === null) return "unreadable";
+  return promptUnsentText(again) ? "held" : "empty";
 }
 
 function schedule(sessionId: string, p: Pending, deps: GuardDeps): void {
