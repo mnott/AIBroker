@@ -36,6 +36,7 @@ import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-project
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { typeWhenInputEmpty } from "./pointer-guard.js";
 import { deliveryFor } from "./ingress.js";
+import { isGroupJid, subscribeGroup, unsubscribeGroup, listSubscriptions, routeInbound, deliverExternalToOwner, type InboundWhatsApp } from "./whatsapp-external.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
@@ -2519,6 +2520,58 @@ export function registerCoreHandlers(
         secret: outcome.registered ? undefined : route.secret,
       },
     };
+  });
+
+  /**
+   * whatsapp_subscribe / whatsapp_unsubscribe / whatsapp_subscriptions — which
+   * WhatsApp groups reach which session. Same shape as subscribe_issues: the
+   * owner is the caller's own persistent name, there is no target parameter.
+   * Messages from a subscribed group arrive as external, mailbox-only mail
+   * (whatsapp-external.ts); an unsubscribed group is ignored.
+   */
+  const callerOwner = (req: IpcRequest): string | undefined => {
+    const id = callerItermId(req);
+    const snap = id ? snapshotAllSessions().find((s) => s.id === id) : undefined;
+    return snap ? (lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId) ?? undefined) : undefined;
+  };
+  const NO_OWNER = "cannot tell which session is asking by a stable name — name this session first (aibroker_rename), then subscribe";
+
+  server.on("whatsapp_subscribe", async (req) => {
+    const { groupId, groupName } = req.params as { groupId?: string; groupName?: string };
+    if (!groupId || !isGroupJid(groupId)) return { ok: false, error: "groupId must be a WhatsApp group JID ending in @g.us" };
+    const owner = callerOwner(req);
+    if (!owner) return { ok: false, error: NO_OWNER };
+    const sub = subscribeGroup(groupId, owner, groupName);
+    log(`whatsapp: ${owner} subscribed to group ${groupName ?? groupId}`);
+    return { ok: true, result: { ...sub, owner } };
+  });
+
+  server.on("whatsapp_unsubscribe", async (req) => {
+    const { group } = req.params as { group?: string };
+    const owner = callerOwner(req);
+    if (!owner) return { ok: false, error: NO_OWNER };
+    const changed = unsubscribeGroup(group ?? "", owner);
+    if (changed) log(`whatsapp: ${owner} unsubscribed from group ${group}`);
+    return { ok: true, result: { changed } };
+  });
+
+  server.on("whatsapp_subscriptions", async () => ({ ok: true, result: { groups: listSubscriptions() } }));
+
+  /**
+   * whatsapp_inbound — the WhatsApp adapter asks, for EVERY inbound message,
+   * what it is before routing it. `operator` means type it as `[Whazaa]` as
+   * before; anything else is never typed, and external group mail has already
+   * been deposited when this returns.
+   */
+  server.on("whatsapp_inbound", async (req) => {
+    const p = req.params as Partial<InboundWhatsApp> & { designatedChats?: string[] };
+    if (typeof p.chatJid !== "string" || typeof p.text !== "string") return { ok: false, error: "chatJid and text are required" };
+    const msg: InboundWhatsApp = {
+      chatJid: p.chatJid, fromMe: p.fromMe === true, senderJid: p.senderJid,
+      senderName: p.senderName, groupName: p.groupName, text: p.text,
+    };
+    const r = await routeInbound(msg, p.designatedChats ?? [], { deliver: deliverExternalToOwner });
+    return { ok: true, result: r };
   });
 
   /**
