@@ -21,15 +21,18 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { log } from "../core/log.js";
 import { audit } from "./audit.js";
 
 const STATE_DIR = join(homedir(), ".aibroker");
-const TOKEN_FILE = join(STATE_DIR, "todoist-oauth.json");
-const PENDING_FILE = join(STATE_DIR, "todoist-oauth-pending.json");
+// AIBROKER_HOME redirects the whole state directory. Without it a scratch run
+// that forgot to redirect HOME would read — and on a refresh, overwrite — the
+// real account's token file.
+const TOKEN_FILE = join(process.env.AIBROKER_HOME ?? STATE_DIR, "todoist-oauth.json");
+const PENDING_FILE = join(process.env.AIBROKER_HOME ?? STATE_DIR, "todoist-oauth-pending.json");
 
 /** Anything Todoist hands back on a successful exchange, plus when we got it. */
 export interface StoredToken {
@@ -56,11 +59,19 @@ interface Pending {
 const PENDING_TTL_MS = 15 * 60 * 1000;
 
 function writePrivate(file: string, data: unknown): void {
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(file, JSON.stringify(data, null, 2), "utf-8");
+  mkdirSync(dirname(file), { recursive: true });
+  // Write the whole pair to a sibling and rename it over the target. A
+  // half-written token file — access token landed, refresh token not — reads
+  // as a valid token and then cannot be refreshed when it lapses, which is
+  // indistinguishable from a revoked grant. Rename is atomic on every platform
+  // we run on, so a reader sees either the old pair or the new one, never a
+  // mixture.
+  const tmp = `${file}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
   // The token is a bearer credential for the whole account. Group and world
   // have no business reading it, and the default umask is not a guarantee.
-  chmodSync(file, 0o600);
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, file);
 }
 
 function readJson<T>(file: string): T | null {
@@ -310,12 +321,6 @@ export async function refreshAccessToken(
 }
 
 /**
- * The token to use right now, refreshed if it is about to expire.
- *
- * Every caller should go through this rather than `loadToken()`: an hour is
- * short enough that "it worked when I tested it" proves nothing.
- */
-/**
  * The refresh in flight, if any.
  *
  * Todoist ROTATES refresh tokens and treats a second use of one as an attack:
@@ -332,17 +337,31 @@ export async function refreshAccessToken(
  * That is not hypothetical: it happened on 2026-08-03 at 13:50, minutes after
  * the five-minute mirror timer was added and while the daemon was being
  * restarted repeatedly. Everything Todoist stopped working and the only symptom
- * was 401s.
+ * was 401s. It happened again on 2026-10-26 at 15:51 — the keeper refreshed at
+ * 15:42:35 and every call 401'd from 15:51:53 with error_code 477, because a
+ * second caller (the 401 retry path in todoist-reply, and out-of-process runs
+ * importing the built module) presented the same rotating refresh token outside
+ * this guard. A guard that lives in one function while another function calls
+ * `refreshAccessToken()` directly is not one owner.
  *
- * So: one refresh at a time, and everyone else waits for its result.
+ * So: one refresh at a time, and everyone else waits for its result — every
+ * caller, including the forced refresh on a 401.
  */
 let refreshing: Promise<StoredToken> | undefined;
 
-export async function getAccessToken(fetchImpl: typeof fetch = fetch): Promise<StoredToken | null> {
-  const t = loadToken();
-  if (!t) return null;
-  if (!isExpired(t)) return t;
-
+/**
+ * One refresh at a time for the whole process.
+ *
+ * `force` refreshes even a token whose stated expiry is still in the future —
+ * a 401 says the token is invalid NOW and the stored expiry cannot be trusted.
+ * Without the guard a forced refresh races the keeper and spends the same
+ * rotating refresh token twice, which revokes the grant.
+ */
+async function refreshOnce(
+  t: StoredToken,
+  force: boolean,
+  fetchImpl: typeof fetch,
+): Promise<StoredToken | null> {
   const clientId = process.env.TODOIST_CLIENT_ID;
   const clientSecret = process.env.TODOIST_CLIENT_SECRET;
   if (!clientId || !clientSecret) {
@@ -356,7 +375,7 @@ export async function getAccessToken(fetchImpl: typeof fetch = fetch): Promise<S
       // one we loaded a moment ago would spend a token that is already spent.
       refreshing = (async () => {
         const current = loadToken() ?? t;
-        if (!isExpired(current)) return current;
+        if (!force && !isExpired(current)) return current;
         return refreshAccessToken(clientId, clientSecret, current, fetchImpl);
       })().finally(() => { refreshing = undefined; });
     }
@@ -370,6 +389,34 @@ export async function getAccessToken(fetchImpl: typeof fetch = fetch): Promise<S
     });
     return t; // let the caller's 401 speak for itself rather than inventing one
   }
+}
+
+/**
+ * The token to use right now, refreshed if it is about to expire.
+ *
+ * Every caller should go through this rather than `loadToken()`: an hour is
+ * short enough that "it worked when I tested it" proves nothing.
+ */
+export async function getAccessToken(fetchImpl: typeof fetch = fetch): Promise<StoredToken | null> {
+  const t = loadToken();
+  if (!t) return null;
+  if (!isExpired(t)) return t;
+  return await refreshOnce(t, false, fetchImpl);
+}
+
+/**
+ * Refresh now, regardless of the stated expiry — for a caller holding a 401.
+ *
+ * Goes through the same single-flight guard as `getAccessToken()`, so a forced
+ * refresh and a keeper tick can never present the same refresh token twice.
+ * Returns null when there is nothing to refresh (no token, no credentials, or
+ * the refresh itself failed).
+ */
+export async function forceRefreshAccessToken(fetchImpl: typeof fetch = fetch): Promise<StoredToken | null> {
+  const t = loadToken();
+  if (!t?.refresh_token) return null;
+  const next = await refreshOnce(t, true, fetchImpl);
+  return next && next.access_token !== t.access_token ? next : null;
 }
 
 function page(title: string, detail: string, ok: boolean): string {
