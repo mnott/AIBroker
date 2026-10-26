@@ -258,6 +258,7 @@ const server = new McpServer(
       "- If a prefixed task takes more than a few seconds, send a brief ack first via the matching `_tts`/`_send` tool. Never leave the client silent.",
       "- `[Session:NAME]`: reply via `aibroker_send_to_session(target=NAME, message=YOUR_RESPONSE)`, not the terminal — the sender waits on `aibroker_receive`. Don't add a `[Session:...]` prefix yourself; the hub does.",
       "- Routing switches per message automatically, no manual toggle.",
+      "- Only the operator's own channels (Telex, Whazaa, PAILot) are typed into your input line. Machine ingress (Todoist, forge/GitHub events, worker alerts, other sessions) is stored in your mailbox and nothing is typed. Keep exactly ONE `aibroker mailbox wait` running in the background (`run_in_background`) and re-start it after every exit; when it exits, read the mailbox (`aibroker_receive`) and act.",
       "",
       "### Companion app tagging",
       "Outgoing text is prefixed with U+FEFF (invisible in WhatsApp) so companion apps can tell PAI from the user; Baileys message IDs start with `3EB0`, user phone IDs never do.",

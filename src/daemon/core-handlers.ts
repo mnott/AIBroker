@@ -35,6 +35,7 @@ import { stripMarkdown } from "../core/markdown.js";
 import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-projects.js";
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { typeWhenInputEmpty } from "./pointer-guard.js";
+import { deliveryFor } from "./ingress.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
@@ -1178,7 +1179,9 @@ export function registerCoreHandlers(
    * other message (mailbox + idle-only pointer); see sendToSessionDelivery().
    */
   server.on("send_to_session", async (req) => {
-    const { target: targetParam, message, noReply = false, mailboxOnly = false } = req.params as { target?: string; message?: string; noReply?: boolean; mailboxOnly?: boolean };
+    const { target: targetParam, message, noReply = false, mailboxOnly: mailboxOnlyParam = false, source = "session" } = req.params as { target?: string; message?: string; noReply?: boolean; mailboxOnly?: boolean; source?: string };
+    // Only the operator's own channels type into the input line (ingress.ts).
+    const mailboxOnly = mailboxOnlyParam || deliveryFor(source) === "mailboxOnly";
     if (!targetParam) return { ok: false, error: "target is required" };
     if (!message) return { ok: false, error: "message is required" };
     const target = targetParam;
@@ -1194,7 +1197,7 @@ export function registerCoreHandlers(
      */
     {
       const { forwardToPeer } = await import("./peer-handlers.js");
-      const forwarded = await forwardToPeer(target, "send_to_session", { message, noReply, mailboxOnly });
+      const forwarded = await forwardToPeer(target, "send_to_session", { message, noReply, mailboxOnly, source });
       if (forwarded) {
         return forwarded.ok
           ? { ok: true, result: forwarded.result ?? { sent: true } }
