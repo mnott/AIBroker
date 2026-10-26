@@ -40,6 +40,22 @@ export interface GroupSubscription {
   groupName?: string;
   /** Persistent names of the sessions that receive this group's messages. */
   owners: string[];
+  /** Standing rule: voice notes in this chat are transcribed and mirrored back by the adapter. */
+  transcribe?: boolean;
+}
+
+export type SubscriptionMode = "deliver" | "transcribe";
+
+const CONFIG = join(homedir(), ".aibroker", "config.json");
+const TRANSCRIBE_MARKER = "📝 ";
+const DEFAULT_MAX_AGE_MIN = 15;
+
+interface WaConfig { operatorName?: string; transcribe?: { maxAgeMinutes?: number } }
+
+/** The `whatsapp` block of ~/.aibroker/config.json. Empty when absent or unreadable. */
+function waConfig(): WaConfig {
+  const r = loadJson<{ whatsapp?: WaConfig }>(CONFIG);
+  return r.status === "ok" && r.data?.whatsapp ? r.data.whatsapp : {};
 }
 
 interface Store { groups: Record<string, GroupSubscription> }
@@ -54,10 +70,11 @@ export function listSubscriptions(): GroupSubscription[] {
   return Object.values(read().groups);
 }
 
-export function subscribeGroup(groupId: string, owner: string, groupName?: string): GroupSubscription {
+export function subscribeGroup(groupId: string, owner: string | undefined, groupName?: string, mode: SubscriptionMode = "deliver"): GroupSubscription {
   const s = read();
   const cur = s.groups[groupId] ?? { groupId, owners: [] };
-  if (!cur.owners.includes(owner)) cur.owners.push(owner);
+  if (mode === "transcribe") cur.transcribe = true;
+  else if (owner && !cur.owners.includes(owner)) cur.owners.push(owner);
   if (groupName) cur.groupName = groupName;
   s.groups[groupId] = cur;
   saveJson(FILE, s);
@@ -65,12 +82,18 @@ export function subscribeGroup(groupId: string, owner: string, groupName?: strin
 }
 
 /** Remove `owner` from the group (matched by id or by name). Returns whether anything changed. */
-export function unsubscribeGroup(groupRef: string, owner: string): boolean {
+export function unsubscribeGroup(groupRef: string, owner: string | undefined, mode: SubscriptionMode = "deliver"): boolean {
   const s = read();
   const hit = Object.values(s.groups).find((g) => g.groupId === groupRef || g.groupName === groupRef);
-  if (!hit || !hit.owners.includes(owner)) return false;
-  hit.owners = hit.owners.filter((o) => o !== owner);
-  if (hit.owners.length === 0) delete s.groups[hit.groupId];
+  if (!hit) return false;
+  if (mode === "transcribe") {
+    if (!hit.transcribe) return false;
+    delete hit.transcribe;
+  } else {
+    if (!owner || !hit.owners.includes(owner)) return false;
+    hit.owners = hit.owners.filter((o) => o !== owner);
+  }
+  if (hit.owners.length === 0 && !hit.transcribe) delete s.groups[hit.groupId];
   saveJson(FILE, s);
   return true;
 }
@@ -86,6 +109,12 @@ export interface InboundWhatsApp {
   senderName?: string;
   groupName?: string;
   text: string;
+  /** Baileys upsert type "notify" — a message arriving now, not history sync. */
+  live?: boolean;
+  /** Message time, epoch seconds or milliseconds. */
+  timestamp?: number;
+  /** Message carries a voice note / audio. */
+  audio?: boolean;
 }
 
 export type Classification =
@@ -120,6 +149,31 @@ export function classifyInbound(
   }
   if (m.fromMe && designatedChats.includes(m.chatJid)) return { kind: "operator" };
   return { kind: "ignore", reason: m.fromMe ? "operator message in a non-designated chat" : "message from another contact" };
+}
+
+/**
+ * Does the adapter owe this message a transcript? Only for a live, fresh voice
+ * note in a chat with a transcribe subscription, and never for a transcript
+ * itself (marker) — that would loop.
+ */
+export function decideTranscribe(
+  m: InboundWhatsApp,
+  subscriptions: GroupSubscription[] = listSubscriptions(),
+  now: number = Date.now(),
+): { transcribe: boolean; speaker: string; reason: string } {
+  const cfg = waConfig();
+  const speaker = m.fromMe ? (cfg.operatorName ?? m.senderName ?? "operator") : (m.senderName ?? m.senderJid ?? "unknown");
+  const no = (reason: string) => ({ transcribe: false, speaker, reason });
+  if (!subscriptions.find((g) => g.groupId === m.chatJid)?.transcribe) return no("chat has no transcribe subscription");
+  if (m.text.startsWith(TRANSCRIBE_MARKER)) return no("already a transcript (marker)");
+  if (m.audio !== true) return no("not a voice note");
+  if (m.live !== true) return no("not live (history sync)");
+  if (typeof m.timestamp === "number") {
+    const ms = m.timestamp < 1e12 ? m.timestamp * 1000 : m.timestamp;
+    const maxMin = cfg.transcribe?.maxAgeMinutes ?? DEFAULT_MAX_AGE_MIN;
+    if (now - ms > maxMin * 60_000) return no(`older than ${maxMin} min`);
+  }
+  return { transcribe: true, speaker, reason: "live fresh voice note" };
 }
 
 /**
