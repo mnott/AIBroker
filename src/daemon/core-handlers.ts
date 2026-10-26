@@ -41,7 +41,7 @@ import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { sameClaudeSession } from "../core/claude-attach.js";
 import { resolveSelfSessionId } from "./pai-session-map.js";
-import { matchSession, resolveCallerSession, cwdMatches, displayName, selfSendError } from "../core/session-match.js";
+import { matchSession, matchAllSessions, resolveCallerSession, cwdMatches, displayName, labelOf, selfSendError } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, revealItermSession } from "../adapters/iterm/sessions.js";
@@ -301,13 +301,32 @@ export function registerCoreHandlers(
     return { ok: true, result: { adapters: registry.list() } };
   });
 
+  /**
+   * One row per listed session, in enumeration order.
+   *
+   * `sessions` (aibroker_sessions) and send_to_session's target resolution
+   * share this: same filter, same numbering, same display name. They used to
+   * enumerate separately, and the two lists disagreed — the error's own
+   * "Available sessions" line showed different names and indexes than the tool
+   * the caller had just read, and a target index taken from the list hit a
+   * different tab (live 2026-10-26).
+   */
+  function listedSessions(): SessionSnapshot[] {
+    return discoverLiveSessions().filter((s) => !s.workerPane);
+  }
+
+  /** The display name `sessions` shows for a row — the name a target must match. */
+  function displayLabelOf(s: SessionSnapshot): string {
+    return s.paiName ? displayName(s.paiName, s.cwd) : (s.tabTitle ?? s.name);
+  }
+
   server.on("sessions", async (_req) => {
     // The shared discovery, which is also what the hybrid manager syncs from,
     // so this tool and the channel commands cannot report different machines.
     // The note that used to sit here — "manager.listSessions() is always empty
     // (nothing populates the internal registry)" — described the defect and
     // routed around it; the registry now populates itself.
-    const snapshots = discoverLiveSessions().filter((s) => !s.workerPane);
+    const snapshots = listedSessions();
     const sessions = snapshots.map((s, i) => {
       const paiName = s.paiName;
       return {
@@ -316,7 +335,7 @@ export function registerCoreHandlers(
         // A chosen name IS the session's name; the tab title (auto-titler,
         // process string) is only what it falls back to. Raw title stays
         // beside it so a lying display can be told from a lying name.
-        name: paiName ? displayName(paiName, s.cwd) : (s.tabTitle ?? s.name),
+        name: displayLabelOf(s),
         tabTitle: s.tabTitle,
         paiName,
         atPrompt: s.atPrompt,
@@ -1142,10 +1161,16 @@ export function registerCoreHandlers(
   /**
    * send_to_session — Type a message into a target iTerm2 session.
    *
-   * Resolves the target by:
-   *   1. Number → session index (1-based) from snapshotAllSessions
+   * Resolves the target against the SAME list `sessions` returns
+   * (listedSessions(): worker panes dropped, enumeration order):
+   *   1. Number → that list's 1-based index, so an index read off
+   *      aibroker_sessions addresses the row it was read from
    *   2. iTerm UUID (contains hyphens and matches length) → used directly
-   *   3. String → case-insensitive match against paiName or session name
+   *   3. String → exact match against the displayed name, paiName or tab
+   *      title, then a unique substring; an ambiguous name errors with the
+   *      candidates' UUIDs instead of guessing (live 2026-10-26: the exact
+   *      name aibroker_sessions showed reported "not found", and the
+   *      fallback list renumbered to different names)
    *
    * Calls typeIntoSession which writes text + Enter into the session's stdin.
    *
@@ -1177,9 +1202,23 @@ export function registerCoreHandlers(
       }
     }
 
+    /**
+     * What one target resolves to, against the SAME list `sessions` shows.
+     *
+     * `id` null means no match; `ambiguous` carries every equally-ranked
+     * candidate when a name matches more than one session.
+     */
+    interface TargetMatch {
+      id: string | null;
+      name: string | null;
+      ambiguous?: { label: string; id: string; kind: string }[];
+    }
+
     // Enrich with persistent names so target-by-name matches a renamed session
     // (tmux names key on the durable @aibroker_id, not the volatile pane id).
-    function withPersistentNames(snaps: ReturnType<typeof snapshotAllSessions>) {
+    // discoverLiveSessions already fills paiName and replays the last good list
+    // on a failed enumeration — the same source `sessions` lists from.
+    function withPersistentNames(snaps: SessionSnapshot[]): SessionSnapshot[] {
       const persistentNames = getAllPersistentSessionNames();
       for (const snap of snaps) {
         snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
@@ -1188,26 +1227,34 @@ export function registerCoreHandlers(
       return snaps;
     }
 
-    function resolveTarget(snaps: ReturnType<typeof snapshotAllSessions>): { id: string | null; name: string | null } {
+    function resolveTarget(snaps: SessionSnapshot[]): TargetMatch {
       const asNumber = parseInt(target, 10);
       if (!Number.isNaN(asNumber) && String(asNumber) === target.trim()) {
-        // Numeric index (1-based)
+        // Numeric index (1-based) into the listed rows — the numbering
+        // aibroker_sessions shows. Indexing the raw snapshot (worker panes
+        // and all) shifted every index: target "10" from the list hit a
+        // worker tab (live 2026-10-26).
         const snap = snaps[asNumber - 1];
-        return snap ? { id: snap.id, name: snap.paiName ?? snap.name } : { id: null, name: null };
+        return snap ? { id: snap.id, name: displayLabelOf(snap) } : { id: null, name: null };
       }
       if (/^[0-9A-Fa-f-]{20,}$/.test(target)) {
         // Looks like an iTerm UUID — use directly if it exists. A pane that is
         // no longer Claude (or gone) whose session now runs behind an attach
-        // pane is redirected to that pane.
+        // pane is redirected to that pane. A Claude session UUID (what
+        // aibroker_sessions prints beside the row) resolves the same way:
+        // live 2026-10-26 the UUID alone worked only because the pane id
+        // matched; a session uuid with no remembered mapping was trusted as an
+        // id and typed into nothing.
         const snap = snaps.find((s) => s.id === target);
-        const uuid = claudeSessionOfId(target);
+        const uuid = claudeSessionOfId(target) ?? (snap?.isClaude === true ? snap.attachUuid ?? target : undefined);
         const viewer = uuid && snap?.isClaude !== true ? snaps.find((s) => s.attachUuid && sameClaudeSession(s.attachUuid, uuid)) : undefined;
-        if (viewer) return { id: viewer.id, name: viewer.paiName ?? viewer.name };
-        if (snap) return { id: snap.id, name: snap.paiName ?? snap.name };
+        if (viewer) return { id: viewer.id, name: displayLabelOf(viewer) };
+        if (snap) return { id: snap.id, name: displayLabelOf(snap) };
         // Trust the caller — they may have a valid ID not yet in the snapshot
         return { id: target, name: target };
       }
-      // Name match, case-insensitive, preferring paiName over the raw name.
+      // Name match, case-insensitive, against every name the list may show:
+      // the displayed label ("Archiware (Chenarlier)"), paiName, tab title.
       //
       // Ranked rather than first-match. A substring search over every tab will
       // happily resolve a departed session's name to a leftover SHELL whose
@@ -1217,23 +1264,51 @@ export function registerCoreHandlers(
       // session leaves such a tab behind, so this is not a rare state.
       //
       // Preference order: a live Claude session beats a shell; an exact name
-      // match beats a substring one.
+      // match beats a substring one. A target that matches nothing resolves
+      // to null and the caller is refused — never silently to a shell.
       // Shared with dispatch's project matching — see core/session-match.ts.
       // `prefer` is what keeps a live Claude session ahead of a shell, and
       // substring is enabled here (unlike dispatch) because a human typing a
       // target expects "clickr" to find "Clickr (node)".
-      const best = matchSession([target], snaps, {
+      const candidates = snaps.map((s) => ({
+        id: s.id,
+        name: s.name,
+        paiName: s.paiName,
+        isClaude: s.isClaude,
+        displayLabel: displayLabelOf(s),
+        cwd: s.cwd,
+      }));
+      const hits = matchAllSessions([target], candidates, {
         kinds: ["exact", "normalised", "substring"],
         // A session running in the project the target names outranks one that
         // merely carries the name (a "PAI" tab sitting in a CaseLeaf checkout).
-        prefer: (s) => (isClaudeSession(s.id) ? 1 : 0) + (cwdMatches(target, (s as { cwd?: string | null }).cwd) ? 0.5 : 0),
+        // Measured Claude outranks a measured shell — the process table, not
+        // the pane capture: a session mid-task has a busy screen, and reading
+        // "not ready" off it demoted it below a leftover shell that matched
+        // the same name exactly (live 2026-10-26: "Archiware (Chenarlier)"
+        // resolved to the shell tab and was refused as a shell).
+        prefer: (s) => (s.isClaude === true ? 1 : s.isClaude === false ? 0 : (isClaudeSession(s.id) ? 1 : 0)) + (cwdMatches(target, s.cwd) ? 0.5 : 0),
       });
-      return best ? { id: best.session.id, name: best.label } : { id: null, name: null };
+      if (hits.length === 0) return { id: null, name: null };
+      // Equal top score = the name means more than one session. Guessing here
+      // delivers work to the wrong session; the caller picks by UUID.
+      const top = hits[0];
+      const tied = hits.filter((h) => h.score === top.score);
+      if (tied.length > 1) {
+        return {
+          id: null,
+          name: null,
+          ambiguous: tied.map((h) => ({ label: h.label, id: h.session.id, kind: h.kind })),
+        };
+      }
+      return { id: top.session.id, name: top.label };
     }
 
-    let snapshots = withPersistentNames(snapshotAllSessions());
+    let snapshots = withPersistentNames(listedSessions());
     rememberIdSession(callerItermId(req) ?? "", req.claudeSessionId);
-    let { id: itermSessionId, name: resolvedName } = resolveTarget(snapshots);
+    let match = resolveTarget(snapshots);
+    let itermSessionId = match.id;
+    let resolvedName = match.name;
 
     /*
      * A failed/empty enumeration must not read as "no such session". Observed
@@ -1241,12 +1316,30 @@ export function registerCoreHandlers(
      * EMPTY session list, while that session was live — a listing seconds
      * later (past the snapshot cache TTL) showed 14 sessions. Retry fresh a
      * couple of times before giving up, since osascript failures are usually
-     * transient (iTerm busy, a slow poll).
+     * transient (iTerm busy, a slow poll). An ambiguous name is not a miss:
+     * it is an answer, and retrying cannot un-tie it.
      */
-    for (let attempt = 0; !itermSessionId && !wasLastEnumerationReliable() && attempt < 2; attempt++) {
+    for (let attempt = 0; !itermSessionId && !match.ambiguous && !wasLastEnumerationReliable() && attempt < 2; attempt++) {
       await new Promise((r) => setTimeout(r, 400));
-      snapshots = withPersistentNames(snapshotAllSessions({ fresh: true }));
-      ({ id: itermSessionId, name: resolvedName } = resolveTarget(snapshots));
+      snapshots = withPersistentNames(listedSessions());
+      match = resolveTarget(snapshots);
+      itermSessionId = match.id;
+      resolvedName = match.name;
+    }
+
+    if (match.ambiguous) {
+      audit({
+        action: "refuse", actor: `session:${resolveSenderLabel(req, snapshots)}`, target,
+        outcome: "refused", body: message,
+        reason: `target name "${target}" matches ${match.ambiguous.length} sessions — none picked, name the one by its id`,
+      });
+      return {
+        ok: false,
+        error:
+          `Target "${target}" is ambiguous — ${match.ambiguous.length} sessions match at the same rank: ` +
+          `${match.ambiguous.map((c) => `"${c.label}" (${c.id})`).join(", ")}. ` +
+          `Name the one by its id (or its index from aibroker_sessions).`,
+      };
     }
 
     if (!itermSessionId) {
@@ -1283,14 +1376,44 @@ export function registerCoreHandlers(
           };
         }
       }
+      // Same list, same numbering, same display names as aibroker_sessions —
+      // so the index in this error is one the caller can act on.
       return {
         ok: false,
-        error: `Session "${target}" not found. Available sessions: ${snapshots.map((s, i) => `${i + 1}:${s.paiName ?? s.name}`).join(", ")}`,
+        error: `Session "${target}" not found. Available sessions: ${snapshots.map((s, i) => `${i + 1}:${displayLabelOf(s)} (${s.id})`).join(", ")}`,
       };
     }
 
     // Resolve the sender's name for the mailbox "from" label and the prefix.
     const senderLabel = resolveSenderLabel(req, snapshots);
+
+    // A measured shell must never win a name against a Claude session that
+    // carries it. The prefer ranking usually keeps them apart, but when the
+    // measurement is unavailable (isClaude undefined) an exact shell hit can
+    // tie with a fuzzy Claude hit and enumeration order decides. Here the
+    // target is refused rather than typed into a shell that would execute it:
+    // if a Claude session shares the name, say so and name it by id.
+    if (!isClaudeSession(itermSessionId) && snapshots.find((s) => s.id === itermSessionId)?.isClaude !== true) {
+      const claudes = matchAllSessions([target], snapshots.map((s) => ({
+        id: s.id, name: s.name, paiName: s.paiName, isClaude: s.isClaude, displayLabel: displayLabelOf(s),
+      })), {
+        kinds: ["exact", "normalised", "substring"],
+      }).filter((h) => h.session.id !== itermSessionId && h.session.isClaude === true);
+      if (claudes.length) {
+        audit({
+          action: "refuse", actor: `session:${senderLabel}`, target: resolvedName ?? target,
+          outcome: "refused", body: message,
+          reason: "name matched a shell tab while a live Claude session carries the same name",
+        });
+        return {
+          ok: false,
+          error:
+            `Session "${resolvedName}" is a shell, not a live Claude prompt, so nothing was sent ` +
+            `(a shell would execute the message rather than read it). A Claude session carries this name: ` +
+            `${claudes.map((c) => `"${c.label}" (${c.session.id})`).join(", ")} — target it by its id.`,
+        };
+      }
+    }
 
     const selfErr = selfSendError(resolveCallerPane(req, snapshots)?.id, itermSessionId, senderLabel, resolvedName ?? target);
     if (selfErr) {

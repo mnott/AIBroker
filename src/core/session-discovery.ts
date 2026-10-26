@@ -51,6 +51,19 @@ export function discoverLiveSessions(opts: { fresh?: boolean } = {}): LiveSessio
     for (const snap of snaps) {
       snap.paiName = lookupPersistentName(persistentNames, snap.id, snap.aibrokerId);
     }
+    // A fresh enumeration that came back EMPTY while the previous one held
+    // rows is not a real "no sessions": iTerm can answer a valid empty result
+    // while it is busy (a window closing, a slow poll), and an empty machine
+    // is rare on a desktop. Replaying the last good list is what keeps a
+    // session aibroker_sessions had just shown from reading as "not found" on
+    // the next send (live 2026-10-26). A truly empty machine keeps reading
+    // empty: with no previous rows there is nothing to replay.
+    if (snaps.length === 0 && lastGoodSnapshots.length > 0) {
+      return lastGoodSnapshots.map((snap) => ({
+        ...snap,
+        paiName: lookupPersistentName(persistentNames, snap.id, snap.aibrokerId),
+      }));
+    }
     lastGoodSnapshots = snaps;
     return snaps;
   }

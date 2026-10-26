@@ -13,11 +13,16 @@ import { log } from "../core/log.js";
 import {
   isClaudeRunningInSession,
   pasteTextIntoSession,
-  runItermJxa,
+  _internal,
   snapshotAllSessions,
   typeIntoSession,
   withSessionJxa,
 } from "../adapters/iterm/core.js";
+
+// Every call goes through _internal, so a test that swaps
+// `_internal.runItermJxa` changes what this transport actually runs — a direct
+// import binds the original function once at load and silently keeps it.
+const runItermJxa = (body: string, timeoutMs?: number): string | null => _internal.runItermJxa(body, timeoutMs);
 import type { LaunchOptions, LaunchResult, ManagedSession, SendOptions, SessionTransport, TransportKind } from "./session-transport.js";
 
 

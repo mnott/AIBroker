@@ -8,7 +8,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
-import { parseAttachUuid } from "../../core/claude-attach.js";
+import { parseAttachUuid, parseSessionIdArg } from "../../core/claude-attach.js";
 import { transcriptCwd } from "../../core/claude-transcript-cwd.js";
 import { timeCall } from "../../core/call-timing.js";
 import { itermInPlay } from "../../transport/policy.js";
@@ -254,7 +254,9 @@ export async function runItermJxaAsync(body: string, timeoutMs = 15_000): Promis
  * Plain-object indirection so tests can replace the osascript call without
  * mocking node:child_process — a builtin's named export is a fixed snapshot
  * taken once at module load, so reassigning it post-load (the usual mock
- * technique) silently does nothing.
+ * technique) silently does nothing. Callers that must honour a swap (the
+ * transport wrapper, enumeration) read through this object rather than
+ * importing the function directly.
  */
 export const _internal = { runAppleScript, runItermJxa, runItermJxaAsync };
 
@@ -523,7 +525,14 @@ function ttysRunningClaude(pids?: Map<string, string>): Map<string, string | und
       // under a .claude directory is not a session.
       if (/(^|\/)claude(\s|$)/.test(command)) {
         const key = tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
-        found.set(key, parseAttachUuid(command));
+        // A `claude attach <uuid>` viewer shows another session's uuid; a
+        // plain `claude --session-id <uuid>` names its OWN session. Both make
+        // the transcript-cwd lookup meaningful — without the second, a
+        // launcher-started session had no uuid here, its cwd fell to the
+        // shell's "path" variable (often $HOME or nothing), and the display
+        // name aibroker_sessions shows ("Name (Project)") could not be
+        // rebuilt when a caller targeted that exact name.
+        found.set(key, parseAttachUuid(command) ?? parseSessionIdArg(command));
         pids?.set(key, pid);
       }
     }
@@ -642,8 +651,12 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
       // variable is the shell's, which stays at $HOME for a launcher-started Claude.
       // A viewer (`claude attach`) shows another process's session: that
       // session's transcript knows where it works, the viewer's cwd does not.
+      // `?? undefined` after parseItermPath: null would poison the whole
+      // coalesced window for every consumer reading `snap.cwd`, and a
+      // decorated display name (displayName(paiName, cwd)) needs the field to
+      // be present to match the target the list shows.
       cwd: (claudeTtys.get(parts[2]) ? transcriptCwd(claudeTtys.get(parts[2])!) : null)
-        ?? (claudePids.has(parts[2]) ? pidCwds.get(claudePids.get(parts[2])!) : undefined) ?? parseItermPath(parts[5]),
+        ?? (claudePids.has(parts[2]) ? pidCwds.get(claudePids.get(parts[2])!) : undefined) ?? parseItermPath(parts[5]) ?? undefined,
       attachUuid: claudeTtys.get(parts[2]),
     });
   }
