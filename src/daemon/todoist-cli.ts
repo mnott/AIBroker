@@ -13,10 +13,12 @@ import { authorizeUrl, beginAuth, loadToken } from "./todoist-oauth.js";
 const DEFAULT_SCOPE = "data:read_write";
 
 function usage(): void {
-  console.log("Usage: aibroker todoist <auth|status|ingress>");
+  console.log("Usage: aibroker todoist <auth|status|pause|resume|ingress>");
   console.log("");
   console.log("  auth [--scope <scopes>]        Authorise this account so webhooks are delivered");
   console.log("  status                         Show whether an authorisation is on file");
+  console.log("  pause [--minutes N]            Hold inbound delivery (default 60 min, then auto-resumes)");
+  console.log("  resume                         Resume delivery now");
   console.log("  ingress list                   Projects allowed to reach a session");
   console.log("  ingress add <id> [=owner]      Grant a project ingress, effective immediately");
   console.log("      --subtree                  ...and every project nested under it");
@@ -55,8 +57,18 @@ export async function runTodoist(args: string[]): Promise<void> {
     }
 
     case "status": {
+      // The pause is a delivery fact independent of the token: a paused
+      // channel is paused whether or not an authorisation is on file, and
+      // `status` is the one command asked to answer "is it delivering".
+      const { currentPause, DEFAULT_PAUSE_MINUTES } = await import("./todoist-pause.js");
+      const pause = currentPause();
+      const deliveryLine = pause
+        ? `Delivery: PAUSED until ${pause.pausedUntil} (${Math.round((Date.parse(pause.pausedUntil) - Date.now()) / 60000)} min left) — resume with \`aibroker todoist resume\``
+        : `Delivery: active (pause with \`aibroker todoist pause [--minutes N]\`, default ${DEFAULT_PAUSE_MINUTES} min)`;
+
       const token = loadToken();
       if (!token) {
+        console.log(deliveryLine);
         console.log("No Todoist authorisation on file — webhooks will not be delivered.");
         console.log("Run: aibroker todoist auth");
         process.exit(1);
@@ -77,6 +89,7 @@ export async function runTodoist(args: string[]): Promise<void> {
         console.log("the only remedy is re-authorising. Enable refresh tokens on the app in the");
         console.log("App Management console to stop this recurring.");
       }
+      console.log(deliveryLine);
 
       // The whole point of a status command is to answer "does it work", and
       // reading a file cannot answer that. This one reported "Authorised" for
@@ -103,6 +116,37 @@ export async function runTodoist(args: string[]): Promise<void> {
         console.log(`could not reach Todoist — ${e instanceof Error ? e.message : String(e)}`);
         process.exitCode = 1;
       }
+      break;
+    }
+
+    case "pause": {
+      const { setPause, currentPause, DEFAULT_PAUSE_MINUTES } = await import("./todoist-pause.js");
+      const minIdx = rest.indexOf("--minutes");
+      const minutes = minIdx !== -1 ? Number(rest[minIdx + 1]) : DEFAULT_PAUSE_MINUTES;
+      if (!Number.isFinite(minutes) || minutes <= 0) {
+        console.error(`--minutes must be a positive number (got "${rest[minIdx + 1]}").`);
+        process.exit(1);
+      }
+      const state = setPause(minutes);
+      console.log(`Todoist delivery paused until ${state.pausedUntil} (${minutes} min).`);
+      console.log("Webhooks are still acknowledged but dropped; the due poll skips its ticks.");
+      console.log("Events dropped while paused are not replayed on resume.");
+      const existing = currentPause();
+      if (existing && existing.pausedUntil !== state.pausedUntil) {
+        // Should not happen — we just wrote the file — but a concurrent writer
+        // means the printed expiry is not what the daemon will honour.
+        console.log(`Note: another pause is now in effect, until ${existing.pausedUntil}.`);
+      }
+      break;
+    }
+
+    case "resume": {
+      const { clearPause, currentPause } = await import("./todoist-pause.js");
+      const was = currentPause();
+      clearPause();
+      console.log(was
+        ? `Resumed. Webhooks and the due poll run again immediately.`
+        : "Not paused — nothing to resume.");
       break;
     }
 

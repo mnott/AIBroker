@@ -55,7 +55,7 @@ function printCommandList(): void {
   console.log("  dispatch <project> Deliver a work order to a project's session (--stdin --json)");
   console.log("  ask <project>      Ask a session a question and wait for its reply (--stdin --json)");
   console.log("  audit              What one session did to another (--session|--trace|--bodies)");
-  console.log("  todoist <sub>      Todoist inbound channel: auth|status");
+  console.log("  todoist <sub>      Todoist inbound channel: auth|status|pause|resume");
   console.log("  agentish <verb>    AG2 wire format: spec|check|measure");
   console.log("  help               Show this help");
   console.log("\nFlags:");
@@ -117,7 +117,7 @@ if (helpRequested && command !== undefined && command !== "help" && command !== 
     dispatch: ["Usage: aibroker dispatch <project> [--stdin --json]", "", "Deliver a work order to a project's session."],
     ask: ["Usage: aibroker ask <project> [--stdin --json]", "", "Ask a session a question and wait for its reply."],
     audit: ["Usage: aibroker audit [--session|--trace|--bodies]", "", "What one session did to another."],
-    todoist: ["Usage: aibroker todoist <auth|status>", "", "Todoist inbound channel."],
+    todoist: ["Usage: aibroker todoist <auth|status|pause|resume|ingress>", "", "Todoist inbound channel."],
     agentish: ["Usage: aibroker agentish <spec|check|measure>", "", "AG2 wire format."],
   };
   const lines = subHelp[command];

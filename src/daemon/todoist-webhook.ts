@@ -47,6 +47,7 @@ import {
   queuePendingEvent, removePendingEvent, bumpPendingEvent, listPendingEvents,
   PENDING_MAX_AGE_MS, type PendingEvent,
 } from "./todoist-pending.js";
+import { isPaused } from "./todoist-pause.js";
 
 const __a2a_dirname = dirname(fileURLToPath(import.meta.url));
 function a2aPackageVersion(): string {
@@ -869,6 +870,22 @@ export function createWebhookServer(cfg: WebhookConfig | null, deps: WebhookDeps
       res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
 
       const key = eventKey(event);
+
+      // Paused (`aibroker todoist pause`): the event is acknowledged and
+      // recorded, but nothing is delivered and nothing is queued — a clean-up
+      // burst must not reach a session later either. Not replayed on resume.
+      // Before the dedupe set: the dedupe is a retry guard for deliveries, and
+      // recording a drop as "seen" would let the same event slip past the
+      // dedupe once the pause ends.
+      if (isPaused()) {
+        audit({
+          action: "webhook", actor: "todoist", target: "aibroker", outcome: "dropped",
+          reason: "dropped (paused)",
+          meta: { event: event.event_name, taskId: event.event_data?.id },
+        });
+        log(`todoist-webhook: dropped (paused) ${event.event_name}`);
+        return;
+      }
       if (seen.has(key)) {
         log(`todoist-webhook: duplicate ${key}, ignored`);
         return;
@@ -955,6 +972,19 @@ export function createWebhookServer(cfg: WebhookConfig | null, deps: WebhookDeps
 export async function processResolvedEvent(
   event: TodoistEvent, cfg: WebhookConfig, deps: WebhookDeps,
 ): Promise<string | undefined> {
+  // Paused. Checked here as well as in the request path because the due poll
+  // and the pending-event sweep call this function directly: while paused,
+  // neither may deliver. Not replayed on resume.
+  if (isPaused()) {
+    audit({
+      action: "webhook", actor: "todoist", target: "aibroker", outcome: "dropped",
+      reason: "dropped (paused)",
+      meta: { event: event.event_name, taskId: event.event_data?.id },
+    });
+    log(`todoist-webhook: dropped (paused) ${event.event_name}`);
+    return "dropped";
+  }
+
   // A comment written on a MIRROR entry is meant for the real task.
   //
   // The mirror is where the reader's attention is, so replying there rather
@@ -1192,7 +1222,7 @@ export async function duePollProjectIds(cfg: WebhookConfig): Promise<string[]> {
 }
 
 /** Start the due-task poll. TODOIST_DUE_POLL_MINUTES=0 disables it. */
-function startDuePoll(cfg: WebhookConfig, deps: WebhookDeps): void {
+export function startDuePoll(cfg: WebhookConfig, deps: WebhookDeps): void {
   const raw = process.env.TODOIST_DUE_POLL_MINUTES;
   const minutes = raw === undefined || raw === "" ? 5 : Number(raw);
   if (!Number.isFinite(minutes) || minutes <= 0) {
@@ -1202,6 +1232,14 @@ function startDuePoll(cfg: WebhookConfig, deps: WebhookDeps): void {
   const maxOverdueDays = Number(process.env.TODOIST_DUE_POLL_MAX_OVERDUE_DAYS) || 7;
   const tick = () => {
     void import("./todoist-due-poll.js").then(async (m) => {
+      // Paused: skip the tick entirely. Checked here rather than in the timer
+      // callback so a test (or any caller) can drive the same tick function
+      // directly. Per tick, not at start, so a pause or resume from the CLI
+      // takes effect on the next tick without a daemon restart.
+      if (isPaused()) {
+        log("todoist-due-poll: tick skipped (paused)");
+        return;
+      }
       const decisions = await m.runDuePoll({
         projectIds: () => duePollProjectIds(cfg),
         listTasks: (id) => m.listProjectTasks(id),
