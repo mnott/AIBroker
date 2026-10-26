@@ -64,7 +64,7 @@ import {
 import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { readAttachment, withNote, type AttachmentRef, getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
-import { getAllPersistentSessionNames, getPersistentSessionName, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
+import { getAllPersistentSessionNames, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
 import { discoverLiveSessions, isClaudeRelated, listedLiveIds } from "../../core/session-discovery.js";
 
 /**
@@ -501,39 +501,6 @@ export function liveSession(id: string | undefined): string | undefined {
   return live;
 }
 
-/**
- * Resolve an id the client holds to a session in the current list.
- *
- * A Claude session or iTerm restart gives the tab a NEW iTerm UUID, so the id
- * the app kept finds nothing. The name survives the restart — it lives in the
- * persistent store — so a stale id is mapped through its chosen name to the
- * live session carrying that name. Returns the 1-based index, or undefined
- * when the id is unknown or its name matches no live session.
- */
-function resolveSessionIndexById(sessions: { backendSessionId: string; name: string }[], sessionId: string): number | undefined {
-  const direct = sessions.findIndex(s => s.backendSessionId === sessionId);
-  if (direct >= 0) return direct + 1;
-  const name = getPersistentSessionName(sessionId);
-  if (!name) return undefined;
-  const byName = sessions.findIndex(s => s.name === name);
-  if (byName < 0) return undefined;
-  log(`[PAILot] stale session id ${sessionId.slice(0, 8)}... resolved to live session "${name}" (${sessions[byName].backendSessionId.slice(0, 8)}...) via persistent name`);
-  return byName + 1;
-}
-
-/**
- * A session-not-found reply must resync the client.
- *
- * The app keys its sessions by backendSessionId, which a restart invalidates.
- * An error alone leaves it holding the same stale id forever — every retry
- * misses the same way, which is the "nothing recovers" the operator hit. The
- * fresh sessions list lets the app replace its stale ids.
- */
-function sendSessionNotFoundError(ws: WebSocket, message: string): void {
-  sendTo(ws, { type: "error", message });
-  handleSessionsCommand(ws);
-}
-
 function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): void {
   if (!hybridManager) {
     sendTo(ws, { type: "sessions", sessions: [] });
@@ -600,26 +567,24 @@ function handleSwitchCommand(ws: WebSocket, args: Record<string, unknown>): void
     return;
   }
 
-  // Resolve which session to switch to. Prefer sessionId over index: an index
-  // shifts when sessions close or are discovered in a different order after a
-  // restart, while an id — even a stale one resolved through the persistent
-  // name — names the session the user actually picked.
+  // Resolve which session to switch to (prefer index, fall back to sessionId lookup)
   let targetIndex: number | undefined;
-  if (sessionId) {
-    targetIndex = resolveSessionIndexById(hybridManager.listSessions(), sessionId);
-  }
-  if (!targetIndex && sessionIndex) {
+  if (sessionIndex) {
     targetIndex = sessionIndex;
+  } else if (sessionId) {
+    const sessions = hybridManager.listSessions();
+    const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
+    if (idx >= 0) targetIndex = idx + 1;
   }
 
   if (!targetIndex) {
-    sendSessionNotFoundError(ws, "Missing session index or ID");
+    sendTo(ws, { type: "error", message: "Missing session index or ID" });
     return;
   }
 
   const session = hybridManager.switchToIndex(targetIndex);
   if (!session) {
-    sendSessionNotFoundError(ws, "Session not found — it may have closed.");
+    sendTo(ws, { type: "error", message: "Session not found — it may have closed." });
     return;
   }
 
@@ -710,13 +675,11 @@ function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void
     return;
   }
 
-  // Find session by backendSessionId; a stale id (restart gave the tab a new
-  // UUID) resolves through the persistent name before failing.
+  // Find session by backendSessionId
   const sessions = hybridManager.listSessions();
-  const resolved = resolveSessionIndexById(sessions, sessionId);
-  const idx = resolved ? resolved - 1 : -1;
+  const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
   if (idx < 0) {
-    sendSessionNotFoundError(ws, "Session not found");
+    sendTo(ws, { type: "error", message: "Session not found" });
     return;
   }
 
