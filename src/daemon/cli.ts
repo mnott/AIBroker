@@ -45,6 +45,7 @@ function printCommandList(): void {
   console.log("  stop | restart     Stop or restart the daemon (service, IPC shutdown, or daemon.pid)");
   console.log("  launch <dir|proj>  Open a Claude session there [--name N]: tmux window or iTerm tab");
   console.log("  send <name> <text> Type a message into a session, by name");
+  console.log("  mailbox wait       Block until this session's mailbox has a message (background wake-up; --timeout <s>, exit 2 on timeout)");
   console.log("  ping               Quick heartbeat check");
   console.log("  setup              Install service, MCP entry, hooks, env (--no-service --no-mcp --no-hooks --dry-run --force)");
   console.log("  doctor             Check the install; non-zero exit on a required failure");
@@ -97,6 +98,7 @@ if (helpRequested && command !== undefined && command !== "help" && command !== 
     status: ["Usage: aibroker status", "", "Show daemon status and adapter health."],
     stop: ["Usage: aibroker stop", "", "Stop the daemon: active service, then IPC shutdown, then daemon.pid."],
     restart: ["Usage: aibroker restart", "", "Restart the daemon: the service restarts its own unit; otherwise stop, then start detached."],
+    mailbox: ["Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] | waiters>", "", "Block until this session's mailbox has an unshown message; print one line per message, exit 0 (2 on timeout). Does not consume."],
     ping: ["Usage: aibroker ping", "", "Quick heartbeat check."],
     launch: [
       "Usage: aibroker launch <dir|pai-project> [--name N]",
@@ -297,6 +299,12 @@ switch (command) {
   case "send": {
     const { runSend } = await import("./send-cli.js");
     await runSend(rest);
+    break;
+  }
+
+  case "mailbox": {
+    const { runMailbox } = await import("./mailbox-cli.js");
+    await runMailbox(rest);
     break;
   }
 
