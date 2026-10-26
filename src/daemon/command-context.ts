@@ -29,6 +29,13 @@ export interface CommandContext {
   /** External recipient identifier (phone JID, chat ID) if known. */
   recipient?: string;
 
+  /**
+   * Set to false by an adapter for a message that is not the operator's own
+   * (another contact, a group member). Such a message is never typed or
+   * prefixed — see whatsapp-external.ts. Absent means the operator.
+   */
+  fromOperator?: boolean;
+
   /** The active iTerm/Claude session ID, if known. Used for image context scoping. */
   sessionId?: string;
 }

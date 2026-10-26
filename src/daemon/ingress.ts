@@ -15,13 +15,16 @@
 /** `pointer`: mailbox plus the idle-only one-line pointer (no waiter to wake the session). */
 export type Delivery = "type" | "mailboxOnly" | "pointer";
 
-const INGRESS_DELIVERY: Record<string, "type" | "machine"> = {
+const INGRESS_DELIVERY: Record<string, "type" | "machine" | "external"> = {
   // The operator's own channels.
   telex: "type",
   telegram: "type",
   whazaa: "type",
   whatsapp: "type",
   pailot: "type",
+  // Third parties in a WhatsApp group a session subscribed to. Never typed, and
+  // never a pointer either: always mailbox-only, waiter or not.
+  "whatsapp-external": "external",
   // Machine ingress.
   todoist: "machine",
   forge: "machine",
@@ -41,5 +44,6 @@ const INGRESS_DELIVERY: Record<string, "type" | "machine"> = {
 export function deliveryFor(source: string | undefined, hasWaiter = false): Delivery {
   const hit = INGRESS_DELIVERY[(source ?? "").toLowerCase()];
   if (hit === "type") return "type";
+  if (hit === "external") return "mailboxOnly";
   return hasWaiter ? "mailboxOnly" : "pointer";
 }

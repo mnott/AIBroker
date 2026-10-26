@@ -1032,6 +1032,13 @@ export function createHubCommandHandler(): (
 
     // --- Plain text / unrecognized commands → dispatch to iTerm2 ---
 
+    // Backstop: only the operator's own words are typed. The adapter classifies
+    // with whatsapp_inbound; this keeps a mislabelled message from being typed.
+    if (ctx.fromOperator === false) {
+      log(`hub: ignoring non-operator ${ctx.source} message — never typed`);
+      return;
+    }
+
     dispatchIncomingMessage(text, timestamp);
 
     // Prefix with adapter source tag so Claude knows where to reply
