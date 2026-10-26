@@ -422,9 +422,13 @@ export async function launchResolvedPaiProject(
   // Single line only — see `initialPrompt` above. Newlines are what separate
   // queued prompts, so one embedded here would split the instruction in two.
   const next = opts.initialPrompt?.replace(/[\r\n]+/g, " ").replace(/'/g, "");
-  // Double backslash — collapsed to `\n` by AppleScript, then to a real newline
-  // by zsh's $'...', so the two lines arrive as two queued inputs.
-  const prompt = `$'/Name ${ansiC}${next ? `\\\\n${next}` : ""}'`;
+  // One backslash-n: the command reaches the terminal through JXA's
+  // JSON-encoded `session.write`, which does NOT collapse escapes (the old
+  // AppleScript path did, and needed two). Doubled, the shell received a
+  // literal `\\n` and `/Name` swallowed the work-order line as its argument.
+  // zsh's $'...' turns this single `\n` into the real newline that separates the
+  // two queued inputs.
+  const prompt = `$'/Name ${ansiC}${next ? `\\n${next}` : ""}'`;
   const claudeFlags = flags.includes("--dangerously-skip-permissions")
     ? flags
     : `--dangerously-skip-permissions ${flags}`.trim();
@@ -441,7 +445,7 @@ export async function launchResolvedPaiProject(
   // Open new iTerm2 tab and run the command
   const itermSessionId = createClaudeSession(command);
   if (!itermSessionId) {
-    throw new Error(`Failed to create iTerm2 tab for project "${name}"`);
+    throw new Error(`Failed to create iTerm2 tab for project "${name}" (iTerm would not open one, or the new tab was not at a shell prompt and was closed untouched)`);
   }
 
   log(`pai-projects: opened iTerm2 session ${itermSessionId} for project "${project.name}"`);

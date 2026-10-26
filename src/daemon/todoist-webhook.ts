@@ -1162,7 +1162,7 @@ export async function processResolvedEvent(
     // Remember who took it, so a later comment reaches the same session.
     // Recorded on the way out and only on a real delivery: a task nobody
     // accepted has no owner to inherit.
-    if (!isComment && r.outcome === "delivered") rememberOwner(decision.taskId, decision.project);
+    if (!isComment && (r.outcome === "delivered" || r.outcome === "queued" || r.outcome === "spawned")) rememberOwner(decision.taskId, decision.project);
 
     // Release a claim the dispatch did not earn. "queued" keeps it — the
     // work IS in flight, the session is simply mid-turn — but a trigger

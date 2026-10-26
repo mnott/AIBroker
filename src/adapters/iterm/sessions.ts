@@ -339,10 +339,18 @@ function openSessionScript(command: string): string {
   const write = command
     ? `ObjC.import("Foundation");
     $.NSThread.sleepForTimeInterval(1.5);
-    if (!session.isAtShellPrompt()) return "busy:" + session.id();
+    if (!session.isAtShellPrompt()) {
+      // Close what THIS call opened, so a refused launch leaves no stray tab;
+      // a session that already existed (reused tab) is never touched.
+      var sid = session.id();
+      if (!before[sid]) { try { session.close(); } catch (e) {} }
+      return "busy:" + sid;
+    }
     session.write({ text: ${cmd} });`
     : "";
   return `  var session = null;
+  var before = {};
+  eachSession(function (s) { before[s.id()] = true; });
   var targetWindow = null;
   try { targetWindow = app.currentWindow(); targetWindow.id(); } catch (e) { targetWindow = null; }
   if (!targetWindow) {
