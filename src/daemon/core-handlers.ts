@@ -1178,7 +1178,7 @@ export function registerCoreHandlers(
    * other message (mailbox + idle-only pointer); see sendToSessionDelivery().
    */
   server.on("send_to_session", async (req) => {
-    const { target: targetParam, message, noReply = false } = req.params as { target?: string; message?: string; noReply?: boolean };
+    const { target: targetParam, message, noReply = false, mailboxOnly = false } = req.params as { target?: string; message?: string; noReply?: boolean; mailboxOnly?: boolean };
     if (!targetParam) return { ok: false, error: "target is required" };
     if (!message) return { ok: false, error: "message is required" };
     const target = targetParam;
@@ -1194,7 +1194,7 @@ export function registerCoreHandlers(
      */
     {
       const { forwardToPeer } = await import("./peer-handlers.js");
-      const forwarded = await forwardToPeer(target, "send_to_session", { message, noReply });
+      const forwarded = await forwardToPeer(target, "send_to_session", { message, noReply, mailboxOnly });
       if (forwarded) {
         return forwarded.ok
           ? { ok: true, result: forwarded.result ?? { sent: true } }
@@ -1458,6 +1458,26 @@ export function registerCoreHandlers(
         outcome: "evicted", body: evicted.content,
         reason: "mailbox full — oldest undrained message discarded to make room",
       });
+    }
+
+    // mailboxOnly: the message is in the mailbox and nothing is typed. The
+    // target's UserPromptSubmit hook delivers it at the operator's next prompt,
+    // so the input line is never touched.
+    if (mailboxOnly) {
+      log(`send_to_session: mailbox-only delivery ${senderLabel} -> ${resolvedName ?? target} (${itermSessionId.slice(0, 8)}), nothing typed`);
+      const eventId = audit({
+        action: "send", actor: `session:${senderLabel}`, target: resolvedName ?? target,
+        outcome: "queued", body: message, reason: "mailboxOnly — stored in the mailbox, nothing typed", meta: { noReply, mailboxOnly },
+      });
+      noteInbound(resolvedName ?? target, eventId);
+      return {
+        ok: true,
+        result: {
+          sent: true, delivered: false, queued: true, mailboxOnly: true,
+          sessionId: itermSessionId, name: resolvedName,
+          note: "Stored in the session's mailbox only; nothing was typed. It is delivered at that session's next prompt (or aibroker_receive).",
+        },
+      };
     }
 
     // Confirm the target actually took it, rather than reporting success for a

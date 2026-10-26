@@ -815,10 +815,11 @@ server.tool(
   {
     target: z.string().min(1).describe("Session to send to: index (1-based), name substring, or iTerm2 session UUID"),
     message: z.string().min(1).describe("The raw message content. Do NOT include a [Session:...] prefix — the hub auto-prepends [Session:SENDER_NAME] for routing."),
+    mailboxOnly: z.boolean().optional().describe("Store the message in the target's mailbox and type NOTHING into its terminal; it is delivered at the target's next prompt. Default false."),
   },
-  async ({ target, message }) => {
+  async ({ target, message, mailboxOnly }) => {
     try {
-      const r = await hub.call_raw("send_to_session", { target, message }) as any;
+      const r = await hub.call_raw("send_to_session", { target, message, ...(mailboxOnly ? { mailboxOnly: true } : {}) }) as any;
       const name = r.name ?? target;
       if (r.delivered) return ok(`Delivered to session "${name}" — typed pointer observed submitted.`);
       if (r.queued) return ok(`Queued for session "${name}" — ${r.note ?? "not confirmed delivered; it is in the mailbox."}`);
