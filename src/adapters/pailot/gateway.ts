@@ -100,6 +100,26 @@ const clients = new Set<WebSocket>();
  *  which iTerm tab happens to be focused on the Mac at response time.
  */
 const pailotReplyMap = new Map<string, string>();
+
+/** The session that last sent something to PAILot: where an unknown id's text goes. */
+let lastOutboundSessionId: string | undefined;
+
+/**
+ * Where a text for a dead, unrecorded session id goes: the live session that
+ * last sent to PAILot, else the active one, else the newest live one.
+ */
+export function fallbackLiveSession<T extends { backendSessionId: string; createdAt: number }>(
+  live: T[],
+  activeId?: string,
+): { session: T; rule: string } | undefined {
+  const by = (id?: string) => (id ? live.find(s => s.backendSessionId === id) : undefined);
+  const sender = by(lastOutboundSessionId);
+  if (sender) return { session: sender, rule: "last sender to PAILot" };
+  const active = by(activeId);
+  if (active) return { session: active, rule: "active session" };
+  const newest = [...live].sort((a, b) => b.createdAt - a.createdAt)[0];
+  return newest && { session: newest, rule: "newest live session" };
+}
 /** Track which session each WebSocket client is currently viewing.
  *  Messages tagged with a different sessionId are NOT delivered to that client.
  *  This prevents cross-session content bleed in multi-session PAILot views.
@@ -1449,6 +1469,7 @@ function resolveSessionIdRaw(sessionId?: string): string | undefined {
 
 export function broadcastText(text: string, sessionId?: string, direct?: boolean): void {
   const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
+  if (resolvedSession) lastOutboundSessionId = resolvedSession;
   const traceId = randomUUID().slice(0, 8);
   const contentPreview = text.replace(/\s+/g, " ").trim().slice(0, 80);
 
@@ -1511,6 +1532,7 @@ export async function broadcastVoice(
   chunkMeta?: { groupId: string; chunkIndex: number; totalChunks: number },
 ): Promise<void> {
   const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
+  if (resolvedSession) lastOutboundSessionId = resolvedSession;
   const traceId = randomUUID().slice(0, 8);
   const contentPreview = transcript.replace(/\s+/g, " ").trim().slice(0, 80);
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
@@ -1589,6 +1611,7 @@ export async function broadcastVoice(
  */
 export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean, mimeType?: string): void {
   const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
+  if (resolvedSession) lastOutboundSessionId = resolvedSession;
   const imgBase64 = imageBuffer.toString("base64");
   broadcast({
     type: "image",
