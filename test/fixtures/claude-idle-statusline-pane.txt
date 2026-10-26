@@ -1,0 +1,37 @@
+ ▐▛███▛█   Claude Code v2.1.284
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   ~/demo
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+  1 more notice hidden
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "fix lint errors"           
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  👋 PAI 🧠 Opus 5.5 in 📁 demo                                                                                    
+  🔌 MCPs: 2: Aibroker, PAI                                                                                        
+  💎 Context: ... (78% left, 784K) │ 5h: 8% → 21:30 │ 1d: 7% / 14% │ 7d: 24% → Sat 08:00
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

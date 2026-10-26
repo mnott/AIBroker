@@ -24,7 +24,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/daemon/cli.js start",
-    "test": "npx tsx --experimental-test-module-mocks --import ./test/home-guard.ts --test --test-concurrency=2 test/*.test.ts",
+    "test": "npx tsx --experimental-test-module-mocks --import ./test/home-guard.ts --test test/*.test.ts",
     "test:vm": "bash test/linux/vm-acceptance.sh",
     "test:linux": "npm run build && docker build -f test/linux/Dockerfile -t aibroker-linux-smoke . && docker run --rm aibroker-linux-smoke",
     "prepublishOnly": "npm run build"
