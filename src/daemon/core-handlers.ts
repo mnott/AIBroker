@@ -36,7 +36,7 @@ import { listPaiProjects, findPaiProject, launchPaiProject } from "./pai-project
 import { readSessionContent, readAllSessionContent } from "./session-content.js";
 import { typeWhenInputEmpty } from "./pointer-guard.js";
 import { deliveryFor } from "./ingress.js";
-import { isGroupJid, subscribeGroup, unsubscribeGroup, listSubscriptions, routeInbound, deliverExternalToOwner, type InboundWhatsApp } from "./whatsapp-external.js";
+import { isGroupJid, decideTranscribe, subscribeGroup, unsubscribeGroup, listSubscriptions, routeInbound, deliverExternalToOwner, type InboundWhatsApp } from "./whatsapp-external.js";
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
@@ -2537,20 +2537,23 @@ export function registerCoreHandlers(
   const NO_OWNER = "cannot tell which session is asking by a stable name — name this session first (aibroker_rename), then subscribe";
 
   server.on("whatsapp_subscribe", async (req) => {
-    const { groupId, groupName } = req.params as { groupId?: string; groupName?: string };
-    if (!groupId || !isGroupJid(groupId)) return { ok: false, error: "groupId must be a WhatsApp group JID ending in @g.us" };
+    const { groupId, groupName, mode } = req.params as { groupId?: string; groupName?: string; mode?: string };
+    if (mode !== undefined && mode !== "deliver" && mode !== "transcribe") return { ok: false, error: 'mode must be "deliver" or "transcribe"' };
+    const m = mode ?? "deliver";
+    if (!groupId || (m === "deliver" && !isGroupJid(groupId))) return { ok: false, error: "groupId must be a WhatsApp group JID ending in @g.us" };
     const owner = callerOwner(req);
-    if (!owner) return { ok: false, error: NO_OWNER };
-    const sub = subscribeGroup(groupId, owner, groupName);
-    log(`whatsapp: ${owner} subscribed to group ${groupName ?? groupId}`);
-    return { ok: true, result: { ...sub, owner } };
+    if (!owner && m === "deliver") return { ok: false, error: NO_OWNER };
+    const sub = subscribeGroup(groupId, owner, groupName, m);
+    log(`whatsapp: ${owner ?? "(no session)"} subscribed to ${groupName ?? groupId} mode=${m}`);
+    return { ok: true, result: { ...sub, owner, mode: m } };
   });
 
   server.on("whatsapp_unsubscribe", async (req) => {
-    const { group } = req.params as { group?: string };
+    const { group, mode } = req.params as { group?: string; mode?: string };
+    const m = mode === "transcribe" ? "transcribe" : "deliver";
     const owner = callerOwner(req);
-    if (!owner) return { ok: false, error: NO_OWNER };
-    const changed = unsubscribeGroup(group ?? "", owner);
+    if (!owner && m === "deliver") return { ok: false, error: NO_OWNER };
+    const changed = unsubscribeGroup(group ?? "", owner, m);
     if (changed) log(`whatsapp: ${owner} unsubscribed from group ${group}`);
     return { ok: true, result: { changed } };
   });
@@ -2569,9 +2572,13 @@ export function registerCoreHandlers(
     const msg: InboundWhatsApp = {
       chatJid: p.chatJid, fromMe: p.fromMe === true, senderJid: p.senderJid,
       senderName: p.senderName, groupName: p.groupName, text: p.text,
+      live: p.live === true, timestamp: typeof p.timestamp === "number" ? p.timestamp : undefined,
+      audio: p.audio === true || (p.audio != null && typeof p.audio === "object"),
     };
     const r = await routeInbound(msg, p.designatedChats ?? [], { deliver: deliverExternalToOwner });
-    return { ok: true, result: r };
+    const t = decideTranscribe(msg);
+    if (t.reason !== "chat has no transcribe subscription") log(`whatsapp: transcribe=${t.transcribe} for ${msg.chatJid} from ${t.speaker}: ${t.reason}`);
+    return { ok: true, result: { ...r, transcribe: t.transcribe, speaker: t.speaker } };
   });
 
   /**
