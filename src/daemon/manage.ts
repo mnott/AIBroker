@@ -3230,13 +3230,17 @@ export async function tryExclusive<T>(busy: Set<string>, id: string, fn: () => P
  * was not harmless. "armed" — typed, read back, and seen to land. "failed" —
  * the attempt genuinely went wrong: the pane could not be read, the paste was
  * refused, the line read back mangled, or the landing was never confirmed.
- * "skipped" — a guard declined to type: the input line holds the operator's
- * own unsent text. A skip is the guard working as designed, not the arming
- * failing, so it counts toward nothing and simply retries next tick; counting
- * it as a failure is what killed a demanded arm on 2026-10-17 14:42 (see
+ * "untyped" — NOTHING was typed: an early return before the paste ever ran
+ * (unreadable pane, shell prompt, a clear that never took). Counts toward the
+ * failure book-keeping exactly like "failed", but the tick's queued-arm mark
+ * keeps it: nothing went into the session, so there is nothing queued to wait
+ * for and the next tick may try again. "skipped" — a guard declined to type
+ * (nudges). A skip is the guard working as designed, not the arming failing,
+ * so it counts toward nothing and simply retries next tick; counting it as a
+ * failure is what killed a demanded arm on 2026-10-17 14:42 (see
  * applyArmResult).
  */
-export type ArmResult = "armed" | "failed" | "skipped";
+export type ArmResult = "armed" | "failed" | "untyped" | "skipped";
 
 export async function arm(m: ManagedSession, reason: string): Promise<ArmResult> {
   const { text } = goalText(m);
@@ -3264,12 +3268,12 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   const live = await readSessionContentAsync(m.sessionId, 5);
   if (!live) {
     note(m, "the session could not be read — not typing anything");
-    return "failed";
+    return "untyped";
   }
   if (live.atPrompt && !isClaudePane(live.name)) {
     m.paused = true;
     alert(m, "PAUSED — that pane is at a shell prompt, so the session has exited. Not typing a goal into a shell. `resume` once it is back.");
-    return "failed";
+    return "untyped";
   }
 
   /**
@@ -3308,18 +3312,35 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
         `an arm (${reason}) could NOT clear the input line: ${clear.remaining.length} chars survive ${clear.attempts} Ctrl-U's ` +
           `("${clear.remaining.slice(0, 60)}") — not typing onto it, NOT armed`,
       );
-      return "failed";
+      return "untyped";
     }
   }
   delete m.forcedArmHoldNotedAt;
 
   // Last look, pane read fresh right before the paste (this also supplies the
   // vim-mode check below): never paste onto a line that does not read empty.
-  const preTypePane = await readPaneAsync(m.sessionId, { fresh: true });
-  const onLineNow = promptUnsentText(preTypePane);
+  // The operator rule is UNCONDITIONAL replacement, so this does not give up
+  // on the first sight of text: it clears again, and only a clear that fails
+  // a second time stops the arm.
+  let preTypePane = await readPaneAsync(m.sessionId, { fresh: true });
+  let onLineNow = promptUnsentText(preTypePane);
   if (onLineNow) {
-    alert(m, `an arm (${reason}) found ${onLineNow.length} chars on the input line just before typing ("${onLineNow.slice(0, 60)}") — not pasting onto it, NOT armed`);
-    return "failed";
+    note(m, `arm: ${onLineNow.length} chars on the line just before typing — clearing again before the paste`);
+    const secondClear = await clearLineUntilEmpty({
+      send: () => sendControlU(m.sessionId),
+      read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
+      sleep,
+    });
+    if (!secondClear.cleared) {
+      alert(m, `an arm (${reason}) found ${onLineNow.length} chars on the input line just before typing ("${onLineNow.slice(0, 60)}") and ${secondClear.remaining.length} survive ${secondClear.attempts} more Ctrl-U's — not pasting onto it, NOT armed`);
+      return "untyped";
+    }
+    preTypePane = await readPaneAsync(m.sessionId, { fresh: true });
+    onLineNow = promptUnsentText(preTypePane);
+    if (onLineNow) {
+      alert(m, `an arm (${reason}) cleared the input line and it refilled with ${onLineNow.length} chars ("${onLineNow.slice(0, 60)}") just before the paste — not pasting onto it, NOT armed`);
+      return "untyped";
+    }
   }
 
   // TYPE, READ BACK, VERIFY, THEN CR. Never combined in one shot: a `/goal …`
@@ -3403,6 +3424,7 @@ export function applyArmResult(m: ManagedSession, result: ArmResult, now: number
     return;
   }
   if (result === "skipped") return;
+  // "untyped" (nothing was ever typed) counts here exactly like "failed".
   m.armFails = (m.armFails ?? 0) + 1;
   m.armFailStreak = (m.armFailStreak ?? 0) + 1;
   if (m.armFails >= ARM_ATTEMPTS) {
@@ -4329,8 +4351,12 @@ async function tick(now = Date.now()): Promise<void> {
       // Pending whether or not the read-back saw it land: a queued line is invisible until the turn ends.
       m.queuedArmAt = now;
       const queued = await tryExclusive(arming, m.sessionId, () => arm(m, queuedReason));
-      // Only a line that was typed and seen to land waits behind the turn; any other outcome queued nothing.
-      if (queued !== "armed") delete m.queuedArmAt;
+      // Keep the mark whenever a line was typed and Enter sent — "armed" or
+      // "failed" (typed mid-turn, unconfirmed: it queues invisibly behind the
+      // turn). Dropping it on "failed" retypes another /goal every tick and
+      // piles them up behind the turn. Only "untyped" (nothing was ever typed)
+      // or undefined (lock busy) clears it, so the next tick may try again.
+      if (queued === undefined || queued === "untyped") delete m.queuedArmAt;
       if (queued === "failed") note(m, `${queuedReason} — not confirmed, waiting for the turn to end or the marker`);
       dirty = true;
       continue;
