@@ -392,7 +392,7 @@ export async function setGoal(
   if (a.every !== undefined) params.every = a.every;
   try {
     const r = (await call("manage", params)) as { message?: string };
-    return ok(`${r?.message ?? "(no answer)"}\ngoal set and armed — marker lands within one tick`);
+    return ok(r?.message ?? "(no answer)");
   } catch (e) { return err(e); }
 }
 

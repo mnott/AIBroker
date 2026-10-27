@@ -487,6 +487,7 @@ switch (command) {
       process.exit(1);
     }
     m.lastRearmAt = 0;
+    delete m.queuedArmAt;
     saveState(managers);
     console.log(
       "arming on the next tick — the /goal line is typed even mid-turn (it queues at the turn boundary). " +

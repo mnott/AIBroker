@@ -3,7 +3,9 @@ import "./home-guard.js";
  * test/manage-type-guard.test.ts — the read-back-first typing sequence, as
  * two pure decisions.
  *
- * `inputLineDecision` is the policy behind arm() and send_to_session: never
+ * `inputLineDecision` is the policy behind send_to_session nudges (arm() no
+ * longer uses it: since 2026-10-27 an arm replaces the input line
+ * unconditionally, clearing with a verified read-back): never
  * type over live input, never clear on sight. An outright refusal was tried
  * once, reverted (see test/manage-unsent-prompt.test.ts's own header — a
  * terminal's greyed-out Tab-completion suggestion cannot be told apart from
