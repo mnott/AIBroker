@@ -36,6 +36,23 @@ test("rename from a dead id plus uuid binds the attach pane (tty cannot)", () =>
   assert.equal(resolveCallerPane(req, live)?.id, "LIVE-PANE");
 });
 
+test("an env-claimed live pane loses to the pane attached to the caller's claude session", () => {
+  // The daemon case: claude daemon run was spawned in tab A, so a session
+  // hosted on its spare announces A's ITERM_SESSION_ID while tab B observably
+  // attaches the caller's claude uuid. The viewer wins.
+  const a = snap({ id: "A" });
+  const b = snap({ id: "B", attachUuid: "bbbbbbbb" });
+  assert.equal(
+    resolveCallerPane({ itermSessionId: "A", claudeSessionId: "bbbbbbbb-1111-2222-3333-444455556666" } as IpcRequest, [a, b])?.id,
+    "B",
+  );
+  // No pane attaches the claimed uuid: the env-claimed live pane is kept.
+  assert.equal(
+    resolveCallerPane({ itermSessionId: "A", claudeSessionId: "cccccccc-1111-2222-3333-444455556666" } as IpcRequest, [a, b])?.id,
+    "A",
+  );
+});
+
 test("a dead-id PAILot target resolves to the live attach pane", () => {
   rememberIdSession("DEAD-1", UUID);
   assert.equal(liveSessionFor("DEAD-1", [shell, attachPane]), "LIVE-PANE");
