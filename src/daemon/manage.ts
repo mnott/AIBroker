@@ -1316,6 +1316,7 @@ function endRollover(m: ManagedSession): void {
   // clearPendingSince deliberately survives: it records a clear that is still
   // out there somewhere, and forgetting it is what let a second one be typed.
   m.lastRearmAt = 0;
+  delete m.queuedArmAt;
 }
 
 /** A clear was seen to land. Forget it, and let rollovers happen again. */
@@ -2631,6 +2632,7 @@ export function applySupervise(m: ManagedSession, goal: string, until: number | 
     m.objective = goal;
     m.pending = [];
     m.lastRearmAt = 0;
+    delete m.queuedArmAt;
   }
   if (every !== null) m.nudgeEveryMin = every;
   if (until !== null) m.shift = { until, workers: 1, visual: false, startedAt: Date.now(), plain: true };
@@ -2651,6 +2653,7 @@ export function applySupervise(m: ManagedSession, goal: string, until: number | 
 export function setObjective(m: ManagedSession, objective: string): void {
   m.objective = objective;
   m.lastRearmAt = 0;
+  delete m.queuedArmAt;
 }
 
 /**
@@ -2664,6 +2667,7 @@ export function setObjective(m: ManagedSession, objective: string): void {
 export function queueInstruction(m: ManagedSession, instruction: string): void {
   m.pending.push(instruction);
   m.lastRearmAt = 0;
+  delete m.queuedArmAt;
 }
 
 // ── only the operator ends or shortens a goal ────────────────────────────────
@@ -3226,13 +3230,17 @@ export async function tryExclusive<T>(busy: Set<string>, id: string, fn: () => P
  * was not harmless. "armed" — typed, read back, and seen to land. "failed" —
  * the attempt genuinely went wrong: the pane could not be read, the paste was
  * refused, the line read back mangled, or the landing was never confirmed.
- * "skipped" — a guard declined to type: the input line holds the operator's
- * own unsent text. A skip is the guard working as designed, not the arming
- * failing, so it counts toward nothing and simply retries next tick; counting
- * it as a failure is what killed a demanded arm on 2026-10-17 14:42 (see
+ * "untyped" — NOTHING was typed: an early return before the paste ever ran
+ * (unreadable pane, shell prompt, a clear that never took). Counts toward the
+ * failure book-keeping exactly like "failed", but the tick's queued-arm mark
+ * keeps it: nothing went into the session, so there is nothing queued to wait
+ * for and the next tick may try again. "skipped" — a guard declined to type
+ * (nudges). A skip is the guard working as designed, not the arming failing,
+ * so it counts toward nothing and simply retries next tick; counting it as a
+ * failure is what killed a demanded arm on 2026-10-17 14:42 (see
  * applyArmResult).
  */
-export type ArmResult = "armed" | "failed" | "skipped";
+export type ArmResult = "armed" | "failed" | "untyped" | "skipped";
 
 export async function arm(m: ManagedSession, reason: string): Promise<ArmResult> {
   const { text } = goalText(m);
@@ -3260,161 +3268,79 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   const live = await readSessionContentAsync(m.sessionId, 5);
   if (!live) {
     note(m, "the session could not be read — not typing anything");
-    return "failed";
+    return "untyped";
   }
   if (live.atPrompt && !isClaudePane(live.name)) {
     m.paused = true;
     alert(m, "PAUSED — that pane is at a shell prompt, so the session has exited. Not typing a goal into a shell. `resume` once it is back.");
-    return "failed";
+    return "untyped";
   }
 
   /**
-   * TEXT ON THE INPUT LINE — READ BACK FIRST, NEVER DESTROY LIVE INPUT.
+   * AN ARM REPLACES THE INPUT LINE — UNCONDITIONALLY (operator rule, 2026-10-27 17:48).
    *
-   * An outright refusal was tried before and reverted (see the header of
-   * test/manage-unsent-prompt.test.ts): the terminal offers a greyed-out
-   * SUGGESTION on the same line, accepted with Tab, and no colour survives a
-   * pane capture to tell it apart from somebody mid-sentence. An earlier pass
-   * of THIS change reinstated that same refusal outright and was corrected
-   * mid-flight — clearing on sight, or refusing forever, both risk exactly
-   * the failure the revert was for.
+   * Whatever sits on the line — the operator's unsent text, a ghost suggestion,
+   * a half-typed word — is cleared and the /goal line is typed and submitted.
+   * No skip, no "held by unsent text", no GHOST_TICKS wait, no idle
+   * requirement for the clear. This overrides the earlier "never type over the
+   * input line" policy for arms (it stranded a demanded arm behind unsent text
+   * on 2026-10-27 CaseLeaf while the session was told it was armed). Nudges
+   * keep their own policy; only arm() is affected.
    *
-   * So: empty line types immediately (below). Anything else is only ever
-   * SKIPPED and retried next tick — never cleared, never typed over —
-   * unless the IDENTICAL text has sat there for GHOST_TICKS consecutive
-   * ticks (2 minutes) while the session is idle, which is inputLineDecision's
-   * job to decide. A skip is NOT a failure: it counts toward nothing (on
-   * 2026-10-17 14:42 the operator typing while a demanded arm waited was
-   * counted as arm failures, crossed the cap, and the arm was never even
-   * typed — see test/manage-arm-skip.test.ts). The skip says so in the log at
-   * most once per 5 minutes; a DEMANDED arm held this way says so loudly, and
-   * once.
+   * The one protection kept is anti-pile-up: after the clear the pane is read
+   * back, and a line that is still not empty is cleared again (up to
+   * CLEAR_VERIFY_ATTEMPTS Ctrl-U's) before anything is typed, so /goal lines
+   * never append onto leftover text (2026-10-20 CaseLeaf: ~7 pastes piled up
+   * after an unverified clear). A clear that still fails alerts loudly and the
+   * arm reports "failed" (not armed).
    */
-  const onLine = promptUnsentText(await readPaneAsync(m.sessionId));
   const armIdleMs = Math.max(0, Date.now() - m.lastChangeAt);
   const armIdle = armIdleMs >= HANDOVER_IDLE_FLOOR_MS;
 
-  const prevLine = inputLineTracking.get(m.sessionId);
-  const sameForTicks = onLine && prevLine && prevLine.text === onLine ? prevLine.sameForTicks + 1 : 1;
-  // A failed clear stays failed until the line is seen EMPTY — text changing
-  // on the line is not the line emptying (inputLineDecision holds the policy).
-  if (onLine) inputLineTracking.set(m.sessionId, { text: onLine, sameForTicks, clearFailed: prevLine?.clearFailed });
-  else inputLineTracking.delete(m.sessionId);
-
-  const lineDecision = inputLineDecision({
-    text: onLine ?? "",
-    sameForTicks,
-    idle: armIdle,
-    idleMs: armIdleMs,
-    clearFailed: prevLine?.clearFailed === true,
-  });
-
-  if (lineDecision.action === "skip") {
-    if (m.lastRearmAt !== 0) {
-      delete m.forcedArmHoldNotedAt;
-      if (!m.armSkipNotedAt || Date.now() - m.armSkipNotedAt >= 5 * 60_000) {
-        note(
-          m,
-          `arm deferred: input line holds '${onLine}' (unsent for ${sameForTicks} tick${sameForTicks === 1 ? "" : "s"}, idle ${Math.round(armIdleMs / 1000)}s)`,
-        );
-        m.armSkipNotedAt = Date.now();
-      }
-    } else {
-      // The operator demanded this arm; what is holding it is their own
-      // unsent line. Say so, once, where it will be seen.
-      if (!m.forcedArmHoldNotedAt) {
-        alert(
-          m,
-          `a demanded arm (${reason}) is NOT being typed: the input line holds the operator's own unsent text ` +
-            `("${(onLine ?? "").slice(0, 60)}") — clear or send that line to let the arm through; it is not typed over`,
-        );
-        m.forcedArmHoldNotedAt = Date.now();
-      }
-    }
-    return "skipped";
-  }
-
-  if (lineDecision.action === "stop") {
-    /**
-     * HANDS OFF AFTER A FAILED CLEAR — the anti-pile-up half of the fix.
-     *
-     * The previous cycle ordered clear-then-type and the line did not empty;
-     * re-ordering it here is how the CaseLeaf pile was built (seven /goal
-     * pastes appended by six consecutive ghost windows). So: nothing is sent,
-     * nothing is typed, and the arm simply waits — the turn boundary will
-     * submit or clear the line on its own, and the FIRST empty read lifts the
-     * escalation (the tracking entry above is deleted the moment onLine is
-     * empty). The blocked-check alert path owns telling the operator; this is
-     * the log that explains it afterwards.
-     */
-    if (!m.clearFailedNotedAt || Date.now() - m.clearFailedNotedAt >= CLEAR_RETRY_NOTE_MS) {
-      note(
-        m,
-        `clear did not take earlier — hands off the input line (${(onLine ?? "").length} chars on it) until it empties on its own; not clearing again, not typing`,
-      );
-      m.clearFailedNotedAt = Date.now();
-    }
-    return "skipped";
-  }
-
-  if (lineDecision.action === "clear-then-type") {
-    note(m, lineDecision.logCleared ?? "clearing persistent input-line text before typing");
-    /**
-     * A CLEAR THAT IS NOT VERIFIED IS NOT A CLEAR.
-     *
-     * sendControlU returning true says the keystroke was SENT; a session whose
-     * CLI defers keystrokes mid-turn executes none of them, and pasting after
-     * such a clear is pasting onto 1171 live characters (2026-10-20 04:25,
-     * CaseLeaf). So the clear is verified by reading the line back — up to
-     * three Ctrl-U's, one between reads — and ONLY an empty read-back may be
-     * followed by the paste. Anything still on the line: no paste, the
-     * decision escalates to hands-off (the tracking entry below), and the
-     * failure is noted loudly but deduped — the blocked check owns the
-     * operator alert.
-     */
+  const onLine = promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true }));
+  inputLineTracking.delete(m.sessionId);
+  if (onLine) {
+    note(m, `arm replaces the input line: clearing "${onLine.slice(0, 60)}" (${onLine.length} chars) before typing (${reason})`);
     const clear = await clearLineUntilEmpty({
       send: () => sendControlU(m.sessionId),
       read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
       sleep,
     });
     if (!clear.cleared) {
-      inputLineTracking.set(m.sessionId, { text: onLine ?? "", sameForTicks, clearFailed: true });
-      if (!m.clearFailedNotedAt || Date.now() - m.clearFailedNotedAt >= CLEAR_RETRY_NOTE_MS) {
-        note(
-          m,
-          `clear did not take — ${clear.remaining.length} chars survive Ctrl-U; not pasting, not feeding the pile`,
-        );
-        m.clearFailedNotedAt = Date.now();
-      }
-      return "skipped";
-    }
-    inputLineTracking.delete(m.sessionId);
-  }
-
-  /**
-   * VERIFY-EMPTY BEFORE EVERY TYPE — the last look, covering every arm path
-   * that reaches the paste, including the busy-queued one. The decision above
-   * read the line a moment ago; between that read and this one the terminal
-   * can have rendered deferred keystrokes, a stalled paste, or the tail of a
-   * pile. Pasting is only ever allowed into a line that JUST read back empty,
-   * so the check sits immediately before the vim escape and the paste and
-   * reads the pane fresh. Anything on the line: no paste, and the skip costs
-   * nothing (no streak, no sentinel) — retried next tick.
-   */
-  const preTypePane = await readPaneAsync(m.sessionId, { fresh: true });
-  const onLineNow = promptUnsentText(preTypePane);
-  if (onLineNow) {
-    if (!inputLineTracking.has(m.sessionId)) {
-      inputLineTracking.set(m.sessionId, { text: onLineNow, sameForTicks: 1 });
-    }
-    if (!m.armSkipNotedAt || Date.now() - m.armSkipNotedAt >= 5 * 60_000) {
-      note(
+      alert(
         m,
-        `arm deferred: input line holds ${onLineNow.length} chars just before typing ("${onLineNow.slice(0, 60)}") — not pasting onto it`,
+        `an arm (${reason}) could NOT clear the input line: ${clear.remaining.length} chars survive ${clear.attempts} Ctrl-U's ` +
+          `("${clear.remaining.slice(0, 60)}") — not typing onto it, NOT armed`,
       );
-      m.armSkipNotedAt = Date.now();
+      return "untyped";
     }
-    return "skipped";
+  }
+  delete m.forcedArmHoldNotedAt;
+
+  // Last look, pane read fresh right before the paste (this also supplies the
+  // vim-mode check below): never paste onto a line that does not read empty.
+  // The operator rule is UNCONDITIONAL replacement, so this does not give up
+  // on the first sight of text: it clears again, and only a clear that fails
+  // a second time stops the arm.
+  let preTypePane = await readPaneAsync(m.sessionId, { fresh: true });
+  let onLineNow = promptUnsentText(preTypePane);
+  if (onLineNow) {
+    note(m, `arm: ${onLineNow.length} chars on the line just before typing — clearing again before the paste`);
+    const secondClear = await clearLineUntilEmpty({
+      send: () => sendControlU(m.sessionId),
+      read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
+      sleep,
+    });
+    if (!secondClear.cleared) {
+      alert(m, `an arm (${reason}) found ${onLineNow.length} chars on the input line just before typing ("${onLineNow.slice(0, 60)}") and ${secondClear.remaining.length} survive ${secondClear.attempts} more Ctrl-U's — not pasting onto it, NOT armed`);
+      return "untyped";
+    }
+    preTypePane = await readPaneAsync(m.sessionId, { fresh: true });
+    onLineNow = promptUnsentText(preTypePane);
+    if (onLineNow) {
+      alert(m, `an arm (${reason}) cleared the input line and it refilled with ${onLineNow.length} chars ("${onLineNow.slice(0, 60)}") just before the paste — not pasting onto it, NOT armed`);
+      return "untyped";
+    }
   }
 
   // TYPE, READ BACK, VERIFY, THEN CR. Never combined in one shot: a `/goal …`
@@ -3498,6 +3424,7 @@ export function applyArmResult(m: ManagedSession, result: ArmResult, now: number
     return;
   }
   if (result === "skipped") return;
+  // "untyped" (nothing was ever typed) counts here exactly like "failed".
   m.armFails = (m.armFails ?? 0) + 1;
   m.armFailStreak = (m.armFailStreak ?? 0) + 1;
   if (m.armFails >= ARM_ATTEMPTS) {
@@ -3957,6 +3884,7 @@ async function tick(now = Date.now()): Promise<void> {
       // tick: this is a recovery, and a recovery that repeats is a loop.
       m.lastChangeAt = now;
       m.lastRearmAt = 0;
+      delete m.queuedArmAt;
       dirty = true;
     }
 
@@ -4035,6 +3963,7 @@ async function tick(now = Date.now()): Promise<void> {
           );
           m.noScreen = true;
           m.lastRearmAt = 0;
+          delete m.queuedArmAt;
           dirty = true;
         }
       } catch (e) {
@@ -4422,8 +4351,13 @@ async function tick(now = Date.now()): Promise<void> {
       // Pending whether or not the read-back saw it land: a queued line is invisible until the turn ends.
       m.queuedArmAt = now;
       const queued = await tryExclusive(arming, m.sessionId, () => arm(m, queuedReason));
-      if (queued === undefined) delete m.queuedArmAt;
-      else if (queued === "failed") note(m, `${queuedReason} — not confirmed, waiting for the turn to end or the marker`);
+      // Keep the mark whenever a line was typed and Enter sent — "armed" or
+      // "failed" (typed mid-turn, unconfirmed: it queues invisibly behind the
+      // turn). Dropping it on "failed" retypes another /goal every tick and
+      // piles them up behind the turn. Only "untyped" (nothing was ever typed)
+      // or undefined (lock busy) clears it, so the next tick may try again.
+      if (queued === undefined || queued === "untyped") delete m.queuedArmAt;
+      if (queued === "failed") note(m, `${queuedReason} — not confirmed, waiting for the turn to end or the marker`);
       dirty = true;
       continue;
     }
@@ -4732,7 +4666,7 @@ export async function handleManage(
     return {
       ok: true,
       managed: true,
-      message: `${name} is supervised${until !== null ? ` until ${hhmm(until)}` : ""}${m.nudgeEveryMin ? `, nudged after ${m.nudgeEveryMin} min idle` : ""}.\n  ${statusLines([m], Date.now(), contextK)[0]}`,
+      message: `${name} is supervised${until !== null ? ` until ${hhmm(until)}` : ""}${m.nudgeEveryMin ? `, nudged after ${m.nudgeEveryMin} min idle` : ""}.${goal ? "\n  arm pending, next tick (not typed yet; typed at once when idle, queued behind the running turn when busy)." : ""}\n  ${statusLines([m], Date.now(), contextK)[0]}`,
     };
   }
 
@@ -4922,6 +4856,7 @@ export async function handleManage(
     }
     // Arm on the next tick rather than typing over whatever is on screen now.
     existing.lastRearmAt = 0;
+    delete existing.queuedArmAt;
     note(existing, `shift started: ${hours}h, ${visual ? "screen granted" : "no screen"}, up to ${workers} worker(s)`);
     saveState(state);
 
@@ -5371,6 +5306,7 @@ export async function handleManage(
 
   if (word === "now") {
     existing.lastRearmAt = 0;
+    delete existing.queuedArmAt;
     saveState(state);
     return { ok: true, managed: true, message: `${name} will be armed on the next tick` };
   }

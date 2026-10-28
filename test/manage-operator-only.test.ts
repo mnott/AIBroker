@@ -137,3 +137,11 @@ test("armed text starts with the no-done-state prefix, within the line limit", (
   const open = M.buildGoalLine("~/.aibroker/manage-briefs/caseleaf.md", "work", null);
   assert.ok(open.startsWith("/goal Keep working. There is no done-state. Only the operator ends this goal."));
 });
+
+test("a fresh demand is not held by a stale queuedArmAt: busy session gets the forced arm", () => {
+  const m = entry({ queuedArmAt: NOW - 120_000 });
+  M.applySupervise(m, "new goal", null, null);
+  assert.equal(m.lastRearmAt, 0);
+  assert.equal(m.queuedArmAt, undefined);
+  assert.equal(M.busyGoalGoneReason(m, pane("", true), NOW, true), M.GOAL_FORCED_BUSY_REASON);
+});
