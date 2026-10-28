@@ -183,21 +183,35 @@ export function messagePreview(message: string): string {
 }
 
 /**
- * The pane a caller lives in. A caller whose own id has no live pane (its
- * session was moved into a Claude background session, the original pane is a
- * shell) is the pane that attaches to its session uuid.
+ * The pane a caller lives in.
+ *
+ * Precedence: a live pane OBSERVABLY attached to the caller's Claude session
+ * uuid wins over the pane the caller's environment claims. Only when no pane
+ * attaches that uuid does the claimed pane stand (a claimed pane known to be a
+ * shell yields too), else undefined.
+ *
+ * The env claim is inherited, so it can name the wrong tab: a `claude daemon
+ * run` spawned by another tab's claude process pre-spawns bg-pty spares that
+ * carry that tab's ITERM_SESSION_ID, and every session later hosted on them
+ * announces the spawning tab, not the tab the operator views it in (live
+ * 2026-10-27: set_goal(self) armed PAI's tab while CaseLeaf sat in its own).
+ * The attach viewer is observed now, so it is the fact; the env is a memory.
  */
 export function snapForCaller(id: string | undefined, claudeSessionId: string | undefined, snapshots: SessionSnapshot[]): SessionSnapshot | undefined {
   const own = id ? snapshots.find((s) => s.id === id) : undefined;
-  if (own && !(own.isClaude === false && claudeSessionId)) return own;
   const viewer = claudeSessionId ? snapshots.find((s) => s.attachUuid && sameClaudeSession(s.attachUuid, claudeSessionId)) : undefined;
-  return viewer ?? own;
+  // The attach viewer outranks the env-claimed pane, live or not — the env can
+  // name the tab that spawned the daemon, the viewer is where the session is.
+  if (viewer) return viewer;
+  return own;
 }
 
 /**
  * The one answer to "which live pane is the caller": manage self, caller
- * labels and sender labels all go through here. A caller whose own id is not a
- * live Claude pane is found by its session uuid (`claude attach <short>`).
+ * labels and sender labels all go through here. A live pane attached to the
+ * caller's Claude session uuid outranks the pane its environment claims (see
+ * snapForCaller — inherited env from a daemon spawned in another tab names the
+ * wrong tab); with no attach viewer, the claimed pane stands.
  */
 export function resolveCallerPane(req: IpcRequest, snapshots: SessionSnapshot[] = snapshotAllSessions()): SessionSnapshot | undefined {
   return snapForCaller(callerItermId(req), req.claudeSessionId, snapshots);
@@ -2073,14 +2087,17 @@ export function registerCoreHandlers(
      */
     const live = snapshotAllSessions();
     rememberIdSession(claimedId ?? "", req.claudeSessionId);
-    // A background session's pty is not an iTerm tty, so the uuid → attach pane
-    // lookup comes first; the tty is the fallback for everything else.
-    const viaAttach = claimedId && !live.some((s) => s.id === claimedId) ? resolveCallerPane(req, live)?.id : undefined;
+    // Same precedence as snapForCaller: the pane observably attached to the
+    // caller's Claude session wins even when the claimed id names a live pane —
+    // a daemon spawned in another tab hands its sessions that tab's env, and a
+    // rename keyed on it would name the wrong tab. The tty is the fallback for
+    // everything else (a background session's pty is not an iTerm tty).
+    const viaAttach = resolveCallerPane(req, live)?.id;
     const itermSessionId = viaAttach ?? resolveCallerSession(claimedId, req.callerTty, live);
 
     if (claimedId && itermSessionId && itermSessionId !== claimedId) {
       log(
-        `rename: caller claimed session ${claimedId.slice(0, 8)}, which is not open; ` +
+        `rename: caller claimed session ${claimedId.slice(0, 8)}, which is not where it sits; ` +
           (viaAttach
             ? `using ${itermSessionId.slice(0, 8)} found via claude attach ${req.claudeSessionId?.slice(0, 8)}`
             : `using ${itermSessionId.slice(0, 8)} found via tty ${req.callerTty}`),
