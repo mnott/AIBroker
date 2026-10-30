@@ -8,7 +8,7 @@
  *
  * Tool groups:
  *   - aibroker_*  (17) — hub-level: status, sessions, TTS, dictation, image gen, session orchestration
- *   - whatsapp_*  (11) — proxied to whazaa adapter via adapter_call
+ *   - whatsapp_*  (12) — proxied to whazaa adapter via adapter_call
  *   - telegram_*  (11) — proxied to telex adapter via adapter_call
  *   - pailot_*     (4) — direct hub calls for PAILot mobile app
  *
@@ -1069,6 +1069,24 @@ server.tool(
       if (msgs.length === 0) return ok("No messages found.");
       const lines = msgs.map((m: any) => `[${m.date}] ${m.fromMe ? "Me" : (m.pushName ?? "Them")}: ${m.text}`);
       return ok(`${msgs.length} message(s):\n${lines.join("\n")}`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "whatsapp_transcribe_last",
+  "Transcribe the newest voice note(s) already in a WhatsApp chat (on demand) and mirror the transcript back into that chat. Returns the transcript text. Fails with a clear error if the media can no longer be downloaded (expired keys) — nothing is posted then.",
+  {
+    jid: z.string().min(1).describe("Chat JID or phone number"),
+    count: z.number().min(1).max(20).optional().describe("Number of newest voice notes to transcribe (default 1)"),
+  },
+  async ({ jid, count }) => {
+    try {
+      const r = await adapterCall("whazaa", "transcribe_last", { jid, count }) as any;
+      const items = r?.transcripts ?? [];
+      if (items.length === 0) return ok("No voice notes transcribed.");
+      const lines = items.map((t: any) => `${t.speaker}: ${t.transcript}`);
+      return ok(`${items.length} voice note(s):\n${lines.join("\n")}`);
     } catch (e) { return err(e); }
   },
 );

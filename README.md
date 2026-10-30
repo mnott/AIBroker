@@ -54,7 +54,7 @@ The hub is the runtime; adapters are thin transport plugins. Internally every me
 
 ## MCP Tools
 
-One unified MCP server exposes 42 tools (`whatsapp_*`, `telegram_*`, `pailot_*`, `aibroker_*`). Message prefixes such as `[Whazaa:voice]` tell Claude which channel to reply through.
+One unified MCP server exposes 43 tools (`whatsapp_*`, `telegram_*`, `pailot_*`, `aibroker_*`). Message prefixes such as `[Whazaa:voice]` tell Claude which channel to reply through.
 
 → [docs/mcp-tools.md](docs/mcp-tools.md)
 

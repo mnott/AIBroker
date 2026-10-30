@@ -382,7 +382,7 @@ Retrieve stored summaries without re-probing terminal content. Fast lookup.
 
 ---
 
-## whatsapp_* Tools (11 tools) — Proxied to Whazaa
+## whatsapp_* Tools (12 tools) — Proxied to Whazaa
 
 These tools call `hub.adapter_call("whazaa", method, params)` internally. They fail if the Whazaa adapter is not running.
 
@@ -527,6 +527,21 @@ Trigger a new WhatsApp QR pairing flow. The QR code appears in the Whazaa watche
 **Parameters:** none
 
 **Returns:** `"Login flow triggered. Check watcher terminal for QR."`
+
+---
+
+### `whatsapp_transcribe_last`
+
+Transcribe the newest voice note(s) already in a WhatsApp chat on demand (download + Whisper), mirror `"📝 <Speaker> said: <transcript>"` back into that chat, and return the transcript text. If the media can no longer be downloaded (expired keys), returns a clear error and posts nothing.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `jid` | string | Chat JID or phone number |
+| `count` | number? | Number of newest voice notes (default 1, max 20) |
+
+**Returns:** `"N voice note(s):\nSpeaker: transcript"` lines.
 
 ---
 
@@ -748,10 +763,10 @@ Drain the queue of incoming PAILot messages.
 | Group | Count | Backend |
 |-------|-------|---------|
 | `aibroker_*` | 17 | Hub IPC direct |
-| `whatsapp_*` | 11 | `adapter_call("whazaa", ...)` |
+| `whatsapp_*` | 12 | `adapter_call("whazaa", ...)` |
 | `telegram_*` | 11 | `adapter_call("telex", ...)` |
 | `pailot_*` | 3 | Hub IPC direct |
-| **Total** | **42** | |
+| **Total** | **43** | |
 
 ## Related Documentation
 
@@ -764,7 +779,7 @@ Drain the queue of incoming PAILot messages.
 
 ## Overview (moved from the README)
 
-AIBroker exposes 42 MCP tools through a single unified server. Claude uses these automatically based on message routing rules — you don't need to call them manually.
+AIBroker exposes 43 MCP tools through a single unified server. Claude uses these automatically based on message routing rules — you don't need to call them manually.
 
 ### Message Routing
 
