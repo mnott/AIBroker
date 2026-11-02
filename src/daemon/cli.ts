@@ -51,7 +51,7 @@ function printCommandList(): void {
   console.log("  doctor             Check the install; non-zero exit on a required failure");
   console.log("  uninstall          Remove what setup added (--purge also deletes ~/.aibroker)");
   console.log("  create-adapter     Scaffold a new adapter project");
-  console.log("  ota <sub>          OTA hub: up|down|status|logs|setup-serve");
+  console.log("  ota <sub>          OTA hub: up|down|status|logs|setup-serve|publish (publish prints the install URL)");
   console.log("  sessions <sub>     Session backup: snapshot|restore|checkpoint|list|install");
   console.log("  dispatch <project> Deliver a work order to a project's session (--stdin --json)");
   console.log("  ask <project>      Ask a session a question and wait for its reply (--stdin --json)");
@@ -114,7 +114,7 @@ if (helpRequested && command !== undefined && command !== "help" && command !== 
       "",
       "Scaffold a new adapter project from the built-in template.",
     ],
-    ota: ["Usage: aibroker ota <up|down|status|logs|setup-serve>", "", "OTA install hub (Docker + Tailscale Serve)."],
+    ota: ["Usage: aibroker ota <up|down|status|logs|setup-serve|publish>", "", "OTA install hub (Docker + Tailscale Serve).", "publish: aibroker ota publish --slug S --name N --bundle B --version V --platform ios|android <file>  (prints the install URL)."],
     sessions: ["Usage: aibroker sessions <snapshot|restore|checkpoint|list|install>", "", "Session backup."],
     dispatch: ["Usage: aibroker dispatch <project> [--stdin --json]", "", "Deliver a work order to a project's session."],
     ask: ["Usage: aibroker ask <project> [--stdin --json]", "", "Ask a session a question and wait for its reply."],
@@ -155,7 +155,7 @@ async function hubSessionIds(): Promise<string[]> {
   }
 }
 
-if (args.includes("--version") || args.includes("-v")) {
+if (command === "--version" || command === "-v" || (command !== "ota" && (args.includes("--version") || args.includes("-v")))) {
   console.log(`aibroker ${getVersion()}`);
   process.exit(0);
 }

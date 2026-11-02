@@ -167,6 +167,12 @@ export async function runOta(args: string[]): Promise<void> {
       break;
     }
 
+    case "publish": {
+      const { runOtaPublish } = await import("./ota-publish-cli.js");
+      runOtaPublish(rest);
+      break;
+    }
+
     case "teardown-serve": {
       teardownTailscaleServe();
       break;
@@ -174,7 +180,7 @@ export async function runOta(args: string[]): Promise<void> {
 
     default:
       console.error(`Unknown ota subcommand: ${sub ?? "(none)"}`);
-      console.error("Usage: aibroker ota [up|down|status|logs|setup-serve|teardown-serve]");
+      console.error("Usage: aibroker ota [up|down|status|logs|setup-serve|teardown-serve|publish]");
       process.exit(1);
   }
 }

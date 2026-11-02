@@ -30,11 +30,10 @@ delete process.env.__CFBundleIdentifier;
 import { execSync } from "node:child_process";
 import { runItermJxa } from "../adapters/iterm/core.js";
 import { missingIssueLink } from "./issue-links.js";
-import { otaCurlArgs } from "./ota-args.js";
+import { publishOta } from "../ota/publish.js";
 import { realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { WatcherClient } from "../ipc/client.js";
-import { OTA_PORT } from "../daemon/ota.js";
 
 const DAEMON_SOCKET = "/tmp/aibroker.sock";
 
@@ -1387,21 +1386,11 @@ server.tool(
   },
   async ({ slug, name, bundleId, version, platform, filePath }) => {
     try {
-      const { existsSync } = await import("node:fs");
-      if (!existsSync(filePath)) return err(`File not found: ${filePath}`);
-
-      // Use curl for multipart upload — avoids pulling in a fetch FormData polyfill
-      const { execFileSync } = await import("node:child_process");
-      const result = execFileSync(
-        "curl",
-        otaCurlArgs(OTA_PORT, { slug, name, bundleId, version, platform, filePath }),
-        { encoding: "utf-8" },
-      );
-      const parsed = JSON.parse(result);
-      if (parsed.installUrl) {
-        return ok(`Published. Install URL: ${parsed.installUrl}`);
+      const { installUrl, raw } = publishOta({ slug, name, bundleId, version, platform, filePath });
+      if (installUrl) {
+        return ok(`Published. Install URL: ${installUrl}`);
       }
-      return ok(result);
+      return ok(raw);
     } catch (e) { return err(e); }
   },
 );
