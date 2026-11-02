@@ -113,3 +113,7 @@ Companion projects:
 ## License
 
 MIT — Matthias Nott
+
+## Publishing to the OTA hub
+
+`aibroker ota publish --slug myapp --name "My App" --bundle com.example.app --version 1.0.0 --platform ios build/app.ipa` uploads an IPA or APK to the OTA install hub and prints the install URL (only that, on stdout). Any failure exits non-zero with a one-line reason on stderr. It is the CLI twin of the MCP tool `ota_publish`.
