@@ -5,7 +5,7 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
-  typeWhenInputEmpty, resetPointerGuard, GIVEUP_MS, RETRY_MS, HELD_REASON, UNREADABLE_REASON, type GuardDeps,
+  typeWhenInputEmpty, resetPointerGuard, GIVEUP_MS, RETRY_MS, heldReason, UNREADABLE_REASON, type GuardDeps,
 } from "../src/daemon/pointer-guard.js";
 
 const BOX = (typed: string) => `output\n${"─".repeat(40)}\n❯ ${typed}\n${"─".repeat(40)}\n`;
@@ -14,6 +14,7 @@ function fake(pane: () => string | null, mailbox: () => number) {
   let t = 0;
   const timers: Array<{ fn: () => void; at: number; live: boolean }> = [];
   const typed: string[] = [];
+  const audits: Array<Record<string, unknown>> = [];
   const deps: GuardDeps = {
     read: async () => pane(),
     type: async (_id, text) => { typed.push(text); return "ok"; },
@@ -22,6 +23,7 @@ function fake(pane: () => string | null, mailbox: () => number) {
     sleep: async () => {},
     setTimer: (fn, ms) => { const e = { fn, at: t + ms, live: true }; timers.push(e); return e; },
     clearTimer: (h) => { (h as { live: boolean }).live = false; },
+    audit: (e) => { audits.push(e as Record<string, unknown>); },
   };
   /** Advance the clock one retry interval and run due timers, letting async work settle. */
   const tick = async () => {
@@ -29,7 +31,7 @@ function fake(pane: () => string | null, mailbox: () => number) {
     for (const e of timers.filter((x) => x.live && x.at <= t)) { e.live = false; e.fn(); }
     await new Promise((r) => setImmediate(r));
   };
-  return { deps, typed, tick, advance: (ms: number) => { t += ms; } };
+  return { deps, typed, audits, tick, advance: (ms: number) => { t += ms; } };
 }
 
 beforeEach(() => resetPointerGuard());
@@ -37,7 +39,7 @@ beforeEach(() => resetPointerGuard());
 test("line holds text: not typed, held reason", async () => {
   const f = fake(() => BOX("for local workess"), () => 1);
   const r = await typeWhenInputEmpty("S1", "[Session:A] hi", {}, f.deps);
-  assert.deepEqual(r, { typed: false, reason: HELD_REASON });
+  assert.deepEqual(r, { typed: false, reason: heldReason("for local workess") });
   assert.deepEqual(f.typed, []);
 });
 
@@ -94,4 +96,19 @@ test("gives up after the deadline", async () => {
   (f.deps as { read: GuardDeps["read"] }).read = async () => BOX("");
   await f.tick();
   assert.deepEqual(f.typed, []);
+});
+
+test("held reason carries the detected text; held then empty audits delivered-late", async () => {
+  let pane = BOX("half a sentence");
+  const f = fake(() => pane, () => 1);
+  const r = await typeWhenInputEmpty("S7", "x", {}, f.deps);
+  assert.equal(r.typed, false);
+  assert.ok(!r.typed && r.reason.includes('"half a sentence"'));
+  pane = BOX("");
+  await f.tick();
+  assert.deepEqual(f.typed, ["x"]);
+  assert.equal(f.audits.length, 1);
+  assert.equal(f.audits[0].outcome, "delivered-late");
+  assert.equal(f.audits[0].action, "send");
+  assert.equal(f.audits[0].target, "S7");
 });
