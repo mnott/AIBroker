@@ -7,7 +7,7 @@
  * /opt/homebrew/bin; a search of the current PATH covers everything else.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -42,11 +42,34 @@ export function localPlayerCommand(platform: NodeJS.Platform = process.platform)
   return null;
 }
 
+const PRIMED_CWD_TTL_MS = 5_000;
+const primedCwds = new Map<string, { at: number; cwd: string | null }>();
+
+/**
+ * Resolve a pid's cwd with an awaited lsof and park it for a few seconds, so
+ * the sync processCwd() calls that follow inside the same timer tick are
+ * answered from memory instead of blocking the event loop on a child process.
+ */
+export async function primeProcessCwd(pid: string): Promise<void> {
+  if (process.platform !== "darwin") return;
+  const out = await new Promise<string | null>((resolve) => {
+    try {
+      execFile("/usr/sbin/lsof", ["-p", pid, "-a", "-d", "cwd", "-Fn"], { encoding: "utf8", timeout: 4_000 }, (err, stdout) => {
+        resolve(err ? null : String(stdout));
+      });
+    } catch { resolve(null); }
+  });
+  if (primedCwds.size > 64) primedCwds.clear();
+  primedCwds.set(pid, { at: Date.now(), cwd: out === null ? null : (out.split("\n").find((l) => l.startsWith("n"))?.slice(1) ?? null) });
+}
+
 /**
  * A process's working directory from the operating system: /proc on Linux,
  * lsof on macOS (which has no /proc). null when it cannot be read.
  */
 export function processCwd(pid: string, platform: NodeJS.Platform = process.platform): string | null {
+  const primed = primedCwds.get(pid);
+  if (primed && platform === process.platform && Date.now() - primed.at < PRIMED_CWD_TTL_MS) return primed.cwd;
   try {
     if (platform === "linux") return readlinkSync(`/proc/${pid}/cwd`);
     const out = execFileSync("/usr/sbin/lsof", ["-p", pid, "-a", "-d", "cwd", "-Fn"], { encoding: "utf8", timeout: 4_000 });

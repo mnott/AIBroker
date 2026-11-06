@@ -40,7 +40,7 @@ import { AibpBridge } from "../aibp/bridge.js";
 import { findClaudeSession } from "../adapters/iterm/core.js";
 import { reassertPersistentTitles } from "../adapters/iterm/sessions.js";
 import { getPersistentSessionName, ITERM_UUID_KEY, pruneSessionNames, setHolderLivenessProbe } from "../core/persistence.js";
-import { typeIntoSession, isClaudeRunningInSession, snapshotAllSessions, logTransportPolicy } from "../transport/sync-facade.js";
+import { typeIntoSession, isClaudeRunningInSession, snapshotAllSessions, snapshotAllSessionsAsync, logTransportPolicy } from "../transport/sync-facade.js";
 import { activeItermSessionId, setActiveItermSessionId, setLastRoutedSessionId } from "../core/state.js";
 import { pruneStaleContexts } from "./image-context.js";
 import { instanceDeps, liveDaemonPid, alreadyRunningMessage, startSocketGuard } from "./daemon-instance.js";
@@ -464,15 +464,23 @@ export async function startDaemon(options?: {
   // while the live holder was never tried. pruneSessionNames itself refuses an
   // empty live set and requires consecutive misses; only iTerm-UUID keys are
   // eligible — durable-id keys outlive pane churn by design.
+  let nameTickRunning = false;
   setInterval(() => {
-    reassertPersistentTitles();
+    // One tick at a time: under load an enumeration can outlast the interval.
+    if (nameTickRunning) return;
+    nameTickRunning = true;
+    void (async () => {
+    // Enumerate with awaited children first; the sync calls below then hit the memo.
+    const snaps = await snapshotAllSessionsAsync();
+    reassertPersistentTitles({ sessions: snaps });
     recordSessions(manager.knownSessions());
-    const snaps = snapshotAllSessions();
     const dropped = pruneSessionNames(
       snaps.flatMap((s) => [s.id, ...(s.aibrokerId ? [s.aibrokerId] : [])]),
       { prunable: (key) => ITERM_UUID_KEY.test(key) },
     );
     if (dropped > 0) log(`Name store: pruned ${dropped} binding(s) to tabs no longer enumerated`);
+    })().catch((e) => log(`Name store tick failed — ${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => { nameTickRunning = false; });
   }, 60_000).unref();
 
   // Auto-discover adapters that were already running before the hub (re)started.

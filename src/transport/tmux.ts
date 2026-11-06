@@ -15,7 +15,7 @@
  * Synchronous (spawnSync) to match core.ts and the daemon's existing call sites.
  */
 
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { log } from "../core/log.js";
@@ -99,11 +99,35 @@ function spawnTmux(args: string[], timeoutMs = 4_000): string | null {
   return result.stdout ?? "";
 }
 
+/** runTmux without blocking the event loop; same socket gate, same null-on-failure and log. */
+function runTmuxAsync(args: string[], timeoutMs = 4_000): Promise<string | null> {
+  if (!existsSync(tmuxSocketPath())) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      execFile(TMUX_BIN, args, { encoding: "utf8", timeout: timeoutMs, env: TMUX_ENV }, (err, stdout, stderr) => {
+        if (err) {
+          const msg = (stderr ?? "").toString().trim();
+          if (msg && !msg.includes("no server running") && !msg.includes("error connecting to") && !msg.includes("can't find session")) {
+            log(`tmux ${args[0]} failed: ${msg}`);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(stdout ?? "");
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 /** Blocking sleep — used only for the short send-verify poll. */
 function syncSleep(ms: number): void {
   const shared = new Int32Array(new SharedArrayBuffer(4));
   Atomics.wait(shared, 0, 0, ms);
 }
+
+const LIST_FORMAT = ["#{pane_id}", "#{pane_current_command}", "#{pane_title}", "#{pane_tty}", "#{@aibroker_id}", "#{pane_current_path}"].join(FIELD_SEP);
 
 export class TmuxTransport implements SessionTransport {
   readonly kind: TransportKind = "tmux";
@@ -147,10 +171,24 @@ export class TmuxTransport implements SessionTransport {
   }
 
   listSessions(): ManagedSession[] {
-    const fmt = ["#{pane_id}", "#{pane_current_command}", "#{pane_title}", "#{pane_tty}", "#{@aibroker_id}", "#{pane_current_path}"].join(FIELD_SEP);
-    const out = runTmux(["list-panes", "-a", "-F", fmt]);
+    const out = runTmux(["list-panes", "-a", "-F", LIST_FORMAT]);
     if (out == null) return [];
+    return this.parsePanes(out, (paneId, id) => { runTmux(["set-option", "-p", "-t", paneId, "@aibroker_id", id]); });
+  }
 
+  /** listSessions without blocking the event loop. */
+  async listSessionsAsync(): Promise<ManagedSession[]> {
+    const out = await runTmuxAsync(["list-panes", "-a", "-F", LIST_FORMAT]);
+    if (out == null) return [];
+    const pending: Promise<unknown>[] = [];
+    const sessions = this.parsePanes(out, (paneId, id) => {
+      pending.push(runTmuxAsync(["set-option", "-p", "-t", paneId, "@aibroker_id", id]));
+    });
+    await Promise.all(pending);
+    return sessions;
+  }
+
+  private parsePanes(out: string, assignId: (paneId: string, id: string) => void): ManagedSession[] {
     const sessions: ManagedSession[] = [];
     for (const line of out.split("\n").filter(Boolean)) {
       const [paneId, cmd, title, tty, existingId, path] = line.split(FIELD_SEP);
@@ -160,7 +198,7 @@ export class TmuxTransport implements SessionTransport {
       let aibrokerId = existingId && existingId.length > 0 ? existingId : null;
       if (!aibrokerId) {
         aibrokerId = randomUUID();
-        runTmux(["set-option", "-p", "-t", paneId, "@aibroker_id", aibrokerId]);
+        assignId(paneId, aibrokerId);
       }
 
       const cleanTitle = title && title.trim().length > 0 ? title.trim() : null;
@@ -248,6 +286,12 @@ export class TmuxTransport implements SessionTransport {
    * running `tmux attach`). Used to de-dup: such a tab is a VIEWER of panes we
    * already enumerate directly, not a session of its own.
    */
+  async attachedClientTtysAsync(): Promise<Set<string>> {
+    const out = await runTmuxAsync(["list-clients", "-F", "#{client_tty}"]);
+    if (out == null) return new Set();
+    return new Set(out.split("\n").map((s) => s.trim()).filter(Boolean));
+  }
+
   attachedClientTtys(): Set<string> {
     const out = runTmux(["list-clients", "-F", "#{client_tty}"]);
     if (out == null) return new Set();

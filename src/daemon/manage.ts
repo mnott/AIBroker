@@ -28,14 +28,14 @@ import { log } from "../core/log.js";
 import { timeCall } from "../core/call-timing.js";
 import { readSessionContent, readSessionContentAsync } from "./session-content.js";
 import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode, wasLastEnumerationReliable } from "../transport/sync-facade.js";
-import { findItermBundleIdImpostors } from "../adapters/iterm/core.js";
-import { processCwd } from "../core/bins.js";
+import { findItermBundleIdImpostors, findItermBundleIdImpostorsAsync, runCaptureAsync } from "../adapters/iterm/core.js";
+import { processCwd, primeProcessCwd } from "../core/bins.js";
 import { parseAttachUuid, parseSessionIdArg } from "../core/claude-attach.js";
-import { discoverLiveSessions } from "../core/session-discovery.js";
+import { discoverLiveSessions, discoverLiveSessionsAsync } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
 import { getAibpBridge } from "../core/state.js";
 import { captureSessionPng } from "./screenshot.js";
-import { listDialogs, answerDialog } from "./dialogs.js";
+import { listDialogs, answerDialog, listDialogsAsync, answerDialogAsync } from "./dialogs.js";
 import {
   readControls,
   grantUntil,
@@ -1766,7 +1766,17 @@ function processReading(tty: string): { isSession: boolean; pid: string | null; 
     // No processes on that tty, or ps refused. Either way nothing can be said.
     return { isSession: false, pid: null };
   }
+  return parseProcessReading(out);
+}
 
+/** processReading without blocking the event loop (the recurring tick uses this one). */
+async function processReadingAsync(tty: string): Promise<{ isSession: boolean; pid: string | null; uuid?: string }> {
+  const dev = tty.replace(/^\/dev\//, "");
+  const out = await runCaptureAsync("/bin/ps", ["-t", dev, "-o", "pid=,ppid=,etime=,command="], 4_000);
+  return out === null ? { isSession: false, pid: null } : parseProcessReading(out);
+}
+
+function parseProcessReading(out: string): { isSession: boolean; pid: string | null; uuid?: string } {
   const rows = out
     .split("\n")
     .map((l) => l.trim())
@@ -3652,10 +3662,10 @@ let tickCount = 0;
 /** When the current iTerm enumeration failure began; null while reliable. Logged, never alerted. */
 let enumerationDownSince: number | null = null;
 
-function answerBlockingDialogs(): void {
+async function answerBlockingDialogs(): Promise<void> {
   if (Object.keys(state).length === 0) return;
-  for (const d of listDialogs()) {
-    const pressed = answerDialog(d);
+  for (const d of await listDialogsAsync()) {
+    const pressed = await answerDialogAsync(d);
     if (pressed) {
       log(`[dialogs] pressed "${pressed}" on ${d.process} — ${d.title}`);
       alertOperator(`A system dialog was blocking work — pressed "${pressed}" on ${d.process}${d.title ? ` (${d.title})` : ""}.`);
@@ -3680,7 +3690,7 @@ async function tick(now = Date.now()): Promise<void> {
   const reliable = wasLastEnumerationReliable();
   if (!reliable && enumerationDownSince === null) {
     enumerationDownSince = now;
-    const impostors = findItermBundleIdImpostors();
+    const impostors = await findItermBundleIdImpostorsAsync();
     log(`[manage] iTerm enumeration unreliable — episode started${impostors.length ? ` (impostors: ${impostors.map((i) => i.pid).join(", ")})` : ""}`);
   } else if (reliable && enumerationDownSince !== null) {
     log(`[manage] iTerm enumeration recovered after ${Math.round((now - enumerationDownSince) / 1000)}s`);
@@ -3689,7 +3699,7 @@ async function tick(now = Date.now()): Promise<void> {
 
   if (++tickCount % DIALOG_EVERY_TICKS === 0) {
     try {
-      answerBlockingDialogs();
+      await answerBlockingDialogs();
     } catch (e) {
       log(`[dialogs] check failed — ${(e as Error).message}`);
     }
@@ -3697,7 +3707,7 @@ async function tick(now = Date.now()): Promise<void> {
 
   // The live enumeration, once per tick: the drop rule needs it, and the
   // per-session readings below reuse it rather than re-enumerating.
-  const liveSnaps = reliable ? discoverLiveSessions() : [];
+  const liveSnaps = reliable ? await discoverLiveSessionsAsync() : [];
 
   /**
    * A record whose terminal is gone, or whose Claude process is gone, stops
@@ -3765,8 +3775,8 @@ async function tick(now = Date.now()): Promise<void> {
     // this file did before and it is one lsof/ps/tail call each time; doing
     // it once per session per tick is the same reading at a fraction of the
     // cost.
-    const tickTty = m.tty ?? snapshotTty(m.sessionId);
-    const tickProc = tickTty ? processReading(tickTty) : null;
+    const tickTty = m.tty ?? liveSnaps.find((s) => s.id === m.sessionId)?.tty;
+    const tickProc = tickTty ? await processReadingAsync(tickTty) : null;
     // A pane with no Claude on it is a gone session: drop it here, BEFORE any
     // typing happens below, so the "could not type — will retry" loop cannot
     // run against a terminal that no longer holds a session.
@@ -3775,7 +3785,8 @@ async function tick(now = Date.now()): Promise<void> {
       continue;
     }
     const tickPid = tickProc?.pid ?? null;
-    const tickUuid = tickProc?.uuid ?? (tickTty ? discoverLiveSessions().find((s) => s.id === m.sessionId)?.attachUuid : undefined);
+    const tickUuid = tickProc?.uuid ?? (tickTty ? liveSnaps.find((s) => s.id === m.sessionId)?.attachUuid : undefined);
+    if (tickPid) await primeProcessCwd(tickPid);
     const tickTranscript = tickPid ? transcriptReading(tickPid, tickUuid) : null;
     // A turn that ended with nothing running is a stop, not work: the 2-minute
     // "recent transcript" window must not hide it.

@@ -25,7 +25,7 @@
  * here instead, once, so every reader inherits it.
  */
 
-import { snapshotAllSessions, wasLastEnumerationReliable as wasLastSnapshotReliable } from "../transport/sync-facade.js";
+import { snapshotAllSessions, snapshotAllSessionsAsync, wasLastEnumerationReliable as wasLastSnapshotReliable } from "../transport/sync-facade.js";
 import { getAllPersistentSessionNames, lookupPersistentName } from "./persistence.js";
 
 export type LiveSession = ReturnType<typeof snapshotAllSessions>[0];
@@ -44,7 +44,15 @@ let lastGoodSnapshots: LiveSession[] = [];
  * unreadable machine must not read as an empty one (see file header).
  */
 export function discoverLiveSessions(opts: { fresh?: boolean } = {}): LiveSession[] {
-  const snaps = snapshotAllSessions(opts);
+  return withPersistentNames(snapshotAllSessions(opts));
+}
+
+/** discoverLiveSessions for timers and polls: the enumeration is awaited, not spawnSync'd. */
+export async function discoverLiveSessionsAsync(opts: { fresh?: boolean } = {}): Promise<LiveSession[]> {
+  return withPersistentNames(await snapshotAllSessionsAsync(opts));
+}
+
+function withPersistentNames(snaps: LiveSession[]): LiveSession[] {
   const persistentNames = getAllPersistentSessionNames();
 
   if (wasLastSnapshotReliable()) {
