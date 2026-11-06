@@ -98,23 +98,45 @@ export function tmuxToSnapshot(s: ManagedSession): SessionSnapshot {
  * adapters/iterm/core.ts. tmux's `listSessions()` has no such cache to bypass.
  */
 export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnapshot[] {
+  const now = Date.now();
+  if (merged && merged.epoch === iterm.snapshotCacheEpoch() && now - merged.at < STALE_LIMIT_MS) {
+    // A recent result exists: handlers never spawn. Refresh behind it once it is past the memo TTL.
+    if (opts.fresh || now - merged.at >= MEMO_TTL_MS) refreshMergedInBackground(opts);
+    return merged.rows;
+  }
+  // Cold start (or nothing newer than the stale limit): the only sync spawn left.
   // Query tmux first (returns [] if no server is running). This is the LIVE
   // availability check — a server that appears post-boot is seen immediately.
   const tmuxSessions = allowTmux ? tmuxTransport.listSessions() : [];
   const itermSessions: SessionSnapshot[] = allowIterm ? iterm.snapshotAllSessions(opts) : [];
-  return mergeTransports(itermSessions, tmuxSessions, () => tmuxTransport.attachedClientTtys());
+  const rows = mergeTransports(itermSessions, tmuxSessions, () => tmuxTransport.attachedClientTtys());
+  if (wasLastEnumerationReliable()) merged = { rows, at: now, epoch: iterm.snapshotCacheEpoch() };
+  return rows;
+}
+
+const MEMO_TTL_MS = 3_000;
+const STALE_LIMIT_MS = 60_000;
+let merged: { rows: SessionSnapshot[]; at: number; epoch: number } | null = null;
+let mergedInFlight: Promise<unknown> | null = null;
+
+function refreshMergedInBackground(opts: { fresh?: boolean }): void {
+  if (mergedInFlight) return;
+  mergedInFlight = snapshotAllSessionsAsync(opts).catch(() => {}).finally(() => { mergedInFlight = null; });
 }
 
 /**
  * snapshotAllSessions for timers and polls: identical answer, but every child
  * process is awaited instead of spawnSync'd, so the daemon's event loop keeps
- * serving requests while a loaded machine takes seconds to answer.
+ * serving requests while a loaded machine takes seconds to answer. A reliable
+ * result also becomes the one sync callers are served.
  */
 export async function snapshotAllSessionsAsync(opts: { fresh?: boolean } = {}): Promise<SessionSnapshot[]> {
   const tmuxSessions = allowTmux ? await tmuxTransport.listSessionsAsync() : [];
   const itermSessions: SessionSnapshot[] = allowIterm ? await iterm.snapshotAllSessionsAsync(opts) : [];
   const viewers = allowIterm && tmuxSessions.length ? await tmuxTransport.attachedClientTtysAsync() : new Set<string>();
-  return mergeTransports(itermSessions, tmuxSessions, () => viewers);
+  const rows = mergeTransports(itermSessions, tmuxSessions, () => viewers);
+  if (wasLastEnumerationReliable()) merged = { rows, at: Date.now(), epoch: iterm.snapshotCacheEpoch() };
+  return rows;
 }
 
 function mergeTransports(

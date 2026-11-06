@@ -660,6 +660,8 @@ async function cwdsOfPidsAsync(pids: string[]): Promise<Map<string, string>> {
  * back, which is what was blocking the daemon's one event loop.
  */
 const SNAPSHOT_TTL_MS = 3_000;
+/** A sync caller is served a result up to this old while an async refresh runs; it spawns only on a cold start. */
+const SNAPSHOT_STALE_LIMIT_MS = 60_000;
 let cachedSnapshots: SessionSnapshot[] | null = null;
 let cachedAt = 0;
 
@@ -862,6 +864,11 @@ export async function findItermBundleIdImpostorsAsync(): Promise<ItermBundleIdIm
 export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnapshot[] {
   const now = Date.now();
   if (!opts.fresh && cachedSnapshots && now - cachedAt < SNAPSHOT_TTL_MS) return cachedSnapshots;
+  // Handlers never spawn when a recent result exists: serve it, refresh behind it.
+  if (cachedSnapshots && now - cachedAt < SNAPSHOT_STALE_LIMIT_MS) {
+    refreshSnapshotInBackground(opts.fresh === true);
+    return cachedSnapshots;
+  }
   const result = snapshotAllSessionsUncached();
   if (lastSnapshotOk) {
     cachedSnapshots = result;
@@ -894,9 +901,27 @@ export function snapshotAllSessionsAsync(opts: { fresh?: boolean } = {}): Promis
   return snapshotInFlight;
 }
 
+let snapshotEpoch = 0;
+/** Bumped by invalidateSnapshotCache; layers above that keep their own memo drop it when this moves. */
+export function snapshotCacheEpoch(): number { return snapshotEpoch; }
+
+let lastRefreshFailLogAt = 0;
+
+/** Start (or join) one async enumeration; a failure keeps the old result and logs at most once a minute. */
+function refreshSnapshotInBackground(fresh: boolean): void {
+  if (snapshotInFlight) return;
+  snapshotAllSessionsAsync({ fresh }).then(() => {
+    if (!lastSnapshotOk && Date.now() - lastRefreshFailLogAt > 60_000) {
+      lastRefreshFailLogAt = Date.now();
+      log(`iterm: background session refresh failed; serving the last good result`);
+    }
+  }, () => {});
+}
+
 /** Force the next snapshotAllSessions() to re-enumerate rather than reuse. */
 export function invalidateSnapshotCache(): void {
   cachedSnapshots = null;
+  snapshotEpoch++;
 }
 
 /**
