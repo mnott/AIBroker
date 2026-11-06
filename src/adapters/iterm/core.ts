@@ -5,7 +5,7 @@
  * with zero transport-specific imports.
  */
 
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
 import { parseAttachUuid, parseSessionIdArg } from "../../core/claude-attach.js";
@@ -105,6 +105,20 @@ function runOsascript(args: string[], script: string, timeoutMs: number): string
  * duration. Same null-on-failure contract and failure log as the sync twin.
  */
 function runOsascriptAsync(args: string[], script: string, timeoutMs: number): Promise<string | null> {
+  // One in-flight child per identical script: a poller whose tick outlasts its
+  // interval (machine under load) joins the pending run instead of stacking
+  // another osascript behind it.
+  const key = `${args.join(" ")}\u0000${script}`;
+  const pending = osascriptInFlight.get(key);
+  if (pending) return pending;
+  const p = spawnOsascriptAsync(args, script, timeoutMs).finally(() => { osascriptInFlight.delete(key); });
+  osascriptInFlight.set(key, p);
+  return p;
+}
+
+const osascriptInFlight = new Map<string, Promise<string | null>>();
+
+function spawnOsascriptAsync(args: string[], script: string, timeoutMs: number): Promise<string | null> {
   return new Promise((resolve) => {
     const child = spawn("osascript", args, { stdio: ["pipe", "pipe", "pipe"], env: cleanChildEnv() });
     const out: Buffer[] = [];
@@ -144,6 +158,30 @@ export function runAppleScript(script: string, timeoutMs = 15_000): string | nul
   return runOsascript([], script, timeoutMs);
 }
 
+/** runAppleScript without blocking the event loop; same null-on-failure contract and log. */
+export async function runAppleScriptAsync(script: string, timeoutMs = 15_000): Promise<string | null> {
+  if (process.platform !== "darwin") return null;
+  return runOsascriptAsync([], script, timeoutMs);
+}
+
+/**
+ * Run a short-lived tool without blocking the event loop. Resolves with its
+ * stdout (also when it exits non-zero but printed something, as lsof does when
+ * a pid vanished), or null when it produced nothing / could not run.
+ */
+export function runCaptureAsync(cmd: string, args: string[], timeoutMs: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile(cmd, args, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+        const out = typeof stdout === "string" ? stdout : "";
+        resolve(err && !out ? null : out);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 export const REAL_ITERM_SUFFIX = "/iTerm.app/Contents/MacOS/iTerm2";
 
 /**
@@ -179,6 +217,24 @@ export function itermPid(): number | null {
   if (ps.status !== 0 || !ps.stdout) return null;
   cachedItermPid = parseItermPid(ps.stdout);
   return cachedItermPid;
+}
+
+let itermPidInFlight: Promise<number | null> | null = null;
+
+/** itermPid() without blocking the event loop. */
+export function itermPidAsync(): Promise<number | null> {
+  if (process.platform !== "darwin") return Promise.resolve(null);
+  if (cachedItermPid !== null && pidAlive(cachedItermPid)) return Promise.resolve(cachedItermPid);
+  cachedItermPid = null;
+  if (itermPidInFlight) return itermPidInFlight;
+  itermPidInFlight = runCaptureAsync("ps", ["-Ao", "pid=,comm="], 5_000)
+    .then((out) => {
+      if (!out) return null;
+      cachedItermPid = parseItermPid(out);
+      return cachedItermPid;
+    })
+    .finally(() => { itermPidInFlight = null; });
+  return itermPidInFlight;
 }
 
 /**
@@ -223,6 +279,17 @@ export function withEnumRetry(
   return run();
 }
 
+/** withEnumRetry without blocking the event loop (neither the run nor the pause). */
+export async function withEnumRetryAsync(
+  run: () => Promise<string | null>,
+  delayMs = 300,
+): Promise<string | null> {
+  const first = await run();
+  if (first !== null) return first;
+  await new Promise((r) => setTimeout(r, delayMs));
+  return run();
+}
+
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
@@ -243,7 +310,7 @@ export function runItermJxa(body: string, timeoutMs = 15_000): string | null {
 
 /** runItermJxa without blocking the event loop (see runOsascriptAsync). */
 export async function runItermJxaAsync(body: string, timeoutMs = 15_000): Promise<string | null> {
-  const pid = itermPid();
+  const pid = await itermPidAsync();
   if (pid === null) return null;
   const out = await runOsascriptAsync(["-l", "JavaScript"], buildItermJxa(pid, body), timeoutMs);
   if (out === null) cachedItermPid = null;
@@ -512,32 +579,40 @@ export function parseItermPath(raw: string | undefined): string | null {
  * tab count.
  */
 function ttysRunningClaude(pids?: Map<string, string>): Map<string, string | undefined> {
-  // tty -> the session uuid a `claude attach` viewer shows, undefined for a plain Claude
-  const found = new Map<string, string | undefined>();
   try {
     const out = timeCall("iterm-core:ps-claude-scan", () =>
       execFileSync("ps", ["-ao", "tty=,pid=,command="], { encoding: "utf8", timeout: 10_000 }));
-    for (const line of out.split("\n")) {
-      const m = line.match(/^\s*(\S+)\s+(\d+)\s+(.*)$/);
-      if (!m) continue;
-      const [, tty, pid, command] = m;
-      // The binary, not a path that merely mentions it: an MCP server living
-      // under a .claude directory is not a session.
-      if (/(^|\/)claude(\s|$)/.test(command)) {
-        const key = tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
-        // A `claude attach <uuid>` viewer shows another session's uuid; a
-        // plain `claude --session-id <uuid>` names its OWN session. Both make
-        // the transcript-cwd lookup meaningful — without the second, a
-        // launcher-started session had no uuid here, its cwd fell to the
-        // shell's "path" variable (often $HOME or nothing), and the display
-        // name aibroker_sessions shows ("Name (Project)") could not be
-        // rebuilt when a caller targeted that exact name.
-        found.set(key, parseAttachUuid(command) ?? parseSessionIdArg(command));
-        pids?.set(key, pid);
-      }
-    }
+    return parseClaudeTtys(out, pids);
   } catch {
     /* no answer: callers fall back to the title heuristic rather than see nothing */
+    return new Map();
+  }
+}
+
+/** ttysRunningClaude without blocking the event loop. */
+async function ttysRunningClaudeAsync(pids?: Map<string, string>): Promise<Map<string, string | undefined>> {
+  const out = await runCaptureAsync("ps", ["-ao", "tty=,pid=,command="], 10_000);
+  return out ? parseClaudeTtys(out, pids) : new Map();
+}
+
+/** Parse `ps -ao tty=,pid=,command=` into tty -> attach uuid (undefined for a plain Claude). */
+function parseClaudeTtys(out: string, pids?: Map<string, string>): Map<string, string | undefined> {
+  // tty -> the session uuid a `claude attach` viewer shows, undefined for a plain Claude
+  const found = new Map<string, string | undefined>();
+  for (const line of out.split("\n")) {
+    const m = line.match(/^\s*(\S+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const [, tty, pid, command] = m;
+    // The binary, not a path that merely mentions it: an MCP server living
+    // under a .claude directory is not a session.
+    if (/(^|\/)claude(\s|$)/.test(command)) {
+      const key = tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
+      // A `claude attach <uuid>` viewer shows another session's uuid; a
+      // plain `claude --session-id <uuid>` names its OWN session. Both make
+      // the transcript-cwd lookup meaningful.
+      found.set(key, parseAttachUuid(command) ?? parseSessionIdArg(command));
+      pids?.set(key, pid);
+    }
   }
   return found;
 }
@@ -567,6 +642,13 @@ function cwdsOfPids(pids: string[]): Map<string, string> {
   }
 }
 
+/** cwdsOfPids without blocking the event loop. */
+async function cwdsOfPidsAsync(pids: string[]): Promise<Map<string, string>> {
+  if (!pids.length) return new Map();
+  const out = await runCaptureAsync("/usr/sbin/lsof", ["-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"], 10_000);
+  return out ? parseLsofCwds(out) : new Map();
+}
+
 /**
  * Reuse window for one enumeration, mirroring HybridSessionManager's own
  * SYNC_COALESCE_MS (core/hybrid.ts) — same fix, same number, because this is
@@ -581,6 +663,20 @@ const SNAPSHOT_TTL_MS = 3_000;
 let cachedSnapshots: SessionSnapshot[] | null = null;
 let cachedAt = 0;
 
+// Fetch id, name, tty, tab.title. Skip `profile name` (~0.6s) and
+// `is at shell prompt` (~3.3s) — both derived or irrelevant.
+const ENUM_SCRIPT = `  var out = "";
+  eachSession(function (s) {
+    var tabTitle = "";
+    try { tabTitle = s.variable({ named: "tab.title" }); } catch (e) {}
+    var workerPane = "";
+    try { workerPane = s.variable({ named: "user.paiWorkerPane" }) || ""; } catch (e) {}
+    var path = "";
+    try { path = s.variable({ named: "path" }) || ""; } catch (e) {}
+    out += [s.id(), s.name(), s.tty(), tabTitle, workerPane, path].join("\\t") + "\\n";
+  });
+  return out;`;
+
 /**
  * True enumeration, always uncached. Split out so callers that must see a
  * mutation they just made (e.g. a session removed 600ms ago) can bypass the
@@ -594,20 +690,6 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
     lastSnapshotOk = true;
     return [];
   }
-  // Fetch id, name, tty, tab.title. Skip `profile name` (~0.6s) and
-  // `is at shell prompt` (~3.3s) — both derived or irrelevant.
-  const script = `  var out = "";
-  eachSession(function (s) {
-    var tabTitle = "";
-    try { tabTitle = s.variable({ named: "tab.title" }); } catch (e) {}
-    var workerPane = "";
-    try { workerPane = s.variable({ named: "user.paiWorkerPane" }) || ""; } catch (e) {}
-    var path = "";
-    try { path = s.variable({ named: "path" }) || ""; } catch (e) {}
-    out += [s.id(), s.name(), s.tty(), tabTitle, workerPane, path].join("\\t") + "\\n";
-  });
-  return out;`;
-
   // Timeout scales with the work: iTerm's AppleScript cost grows with the
   // number of open sessions, so a fixed budget silently expires as the user
   // opens more tabs. A previous 4s constant was measured at ~1.5s for 16
@@ -615,7 +697,7 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
   // 4.05s and every enumeration returned empty, killing all session features
   // at once. Budget generously — this is a correctness floor, not a latency
   // target, and a slow answer beats a confidently wrong empty one.
-  const result = timeCall("iterm-core:snapshot-enum", () => withEnumRetry(() => _internal.runItermJxa(script, 30_000)));
+  const result = timeCall("iterm-core:snapshot-enum", () => withEnumRetry(() => _internal.runItermJxa(ENUM_SCRIPT, 30_000)));
   if (!result) {
     lastSnapshotOk = false;
     return [];
@@ -625,6 +707,34 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
   const claudePids = new Map<string, string>();
   const claudeTtys = ttysRunningClaude(claudePids);
   const pidCwds = cwdsOfPids([...claudePids.values()]);
+  return buildSnapshots(result, claudeTtys, claudePids, pidCwds);
+}
+
+/** snapshotAllSessionsUncached without blocking the event loop; same flag and failure semantics. */
+async function snapshotAllSessionsUncachedAsync(): Promise<SessionSnapshot[]> {
+  if (!itermInPlay()) {
+    lastSnapshotOk = true;
+    return [];
+  }
+  const result = await withEnumRetryAsync(() => _internal.runItermJxaAsync(ENUM_SCRIPT, 30_000));
+  if (!result) {
+    lastSnapshotOk = false;
+    return [];
+  }
+  lastSnapshotOk = true;
+
+  const claudePids = new Map<string, string>();
+  const claudeTtys = await ttysRunningClaudeAsync(claudePids);
+  const pidCwds = await cwdsOfPidsAsync([...claudePids.values()]);
+  return buildSnapshots(result, claudeTtys, claudePids, pidCwds);
+}
+
+function buildSnapshots(
+  result: string,
+  claudeTtys: Map<string, string | undefined>,
+  claudePids: Map<string, string>,
+  pidCwds: Map<string, string>,
+): SessionSnapshot[] {
   const sessions: SessionSnapshot[] = [];
   for (const line of result.split("\n").filter(Boolean)) {
     const parts = line.split("\t");
@@ -731,6 +841,13 @@ export function findItermBundleIdImpostors(): ItermBundleIdImpostor[] {
   }
 }
 
+/** findItermBundleIdImpostors without blocking the event loop. */
+export async function findItermBundleIdImpostorsAsync(): Promise<ItermBundleIdImpostor[]> {
+  if (!itermInPlay()) return [];
+  const out = await runCaptureAsync("/usr/bin/lsappinfo", ["list"], 3_000);
+  return out ? parseLsappinfoImpostors(out) : [];
+}
+
 /**
  * Enumerate all iTerm2 sessions, reusing an answer up to SNAPSHOT_TTL_MS old.
  *
@@ -751,6 +868,30 @@ export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnap
     cachedAt = now;
   }
   return result;
+}
+
+let snapshotInFlight: Promise<SessionSnapshot[]> | null = null;
+
+/**
+ * snapshotAllSessions for timers and polls: same memo, same flag, but the
+ * osascript/ps/lsof children are awaited, never spawnSync'd, so the event loop
+ * keeps serving IPC while a loaded machine takes seconds to answer. Overlapping
+ * callers share one in-flight enumeration.
+ */
+export function snapshotAllSessionsAsync(opts: { fresh?: boolean } = {}): Promise<SessionSnapshot[]> {
+  const now = Date.now();
+  if (!opts.fresh && cachedSnapshots && now - cachedAt < SNAPSHOT_TTL_MS) return Promise.resolve(cachedSnapshots);
+  if (snapshotInFlight) return snapshotInFlight;
+  snapshotInFlight = snapshotAllSessionsUncachedAsync()
+    .then((result) => {
+      if (lastSnapshotOk) {
+        cachedSnapshots = result;
+        cachedAt = Date.now();
+      }
+      return result;
+    })
+    .finally(() => { snapshotInFlight = null; });
+  return snapshotInFlight;
 }
 
 /** Force the next snapshotAllSessions() to re-enumerate rather than reuse. */

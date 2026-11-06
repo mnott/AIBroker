@@ -18,7 +18,7 @@
  * motion; it may never grant something new.
  */
 
-import { runAppleScript } from "../adapters/iterm/core.js";
+import { runAppleScript, runAppleScriptAsync } from "../adapters/iterm/core.js";
 import { log } from "../core/log.js";
 
 /**
@@ -72,7 +72,15 @@ end tell`;
 
 /** Every dialog currently on screen that belongs to an answerable agent. */
 export function listDialogs(): SeenDialog[] {
-  const raw = runAppleScript(LIST_SCRIPT, 10_000);
+  return parseDialogs(runAppleScript(LIST_SCRIPT, 10_000));
+}
+
+/** listDialogs without blocking the event loop. */
+export async function listDialogsAsync(): Promise<SeenDialog[]> {
+  return parseDialogs(await runAppleScriptAsync(LIST_SCRIPT, 10_000));
+}
+
+function parseDialogs(raw: string | null): SeenDialog[] {
   if (!raw) return [];
   return raw
     .split("\n")
@@ -100,8 +108,22 @@ export function listDialogs(): SeenDialog[] {
 export function answerDialog(d: SeenDialog): string | null {
   const button = SAFE_BUTTONS.find((b) => d.buttons.includes(b));
   if (!button) return null;
-  const script = `tell application "System Events" to tell process "${d.process}" to click button "${button}" of window 1`;
-  const ok = runAppleScript(script, 10_000);
+  const ok = runAppleScript(pressScript(d, button), 10_000);
+  if (ok === null) {
+    log(`[dialogs] could not press "${button}" on ${d.process}`);
+    return null;
+  }
+  return button;
+}
+
+const pressScript = (d: SeenDialog, button: string): string =>
+  `tell application "System Events" to tell process "${d.process}" to click button "${button}" of window 1`;
+
+/** answerDialog without blocking the event loop. */
+export async function answerDialogAsync(d: SeenDialog): Promise<string | null> {
+  const button = SAFE_BUTTONS.find((b) => d.buttons.includes(b));
+  if (!button) return null;
+  const ok = await runAppleScriptAsync(pressScript(d, button), 10_000);
   if (ok === null) {
     log(`[dialogs] could not press "${button}" on ${d.process}`);
     return null;

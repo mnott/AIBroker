@@ -101,17 +101,36 @@ export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnap
   // Query tmux first (returns [] if no server is running). This is the LIVE
   // availability check — a server that appears post-boot is seen immediately.
   const tmuxSessions = allowTmux ? tmuxTransport.listSessions() : [];
-  let itermSessions: SessionSnapshot[] = allowIterm ? iterm.snapshotAllSessions(opts) : [];
+  const itermSessions: SessionSnapshot[] = allowIterm ? iterm.snapshotAllSessions(opts) : [];
+  return mergeTransports(itermSessions, tmuxSessions, () => tmuxTransport.attachedClientTtys());
+}
 
+/**
+ * snapshotAllSessions for timers and polls: identical answer, but every child
+ * process is awaited instead of spawnSync'd, so the daemon's event loop keeps
+ * serving requests while a loaded machine takes seconds to answer.
+ */
+export async function snapshotAllSessionsAsync(opts: { fresh?: boolean } = {}): Promise<SessionSnapshot[]> {
+  const tmuxSessions = allowTmux ? await tmuxTransport.listSessionsAsync() : [];
+  const itermSessions: SessionSnapshot[] = allowIterm ? await iterm.snapshotAllSessionsAsync(opts) : [];
+  const viewers = allowIterm && tmuxSessions.length ? await tmuxTransport.attachedClientTtysAsync() : new Set<string>();
+  return mergeTransports(itermSessions, tmuxSessions, () => viewers);
+}
+
+function mergeTransports(
+  iterm: SessionSnapshot[],
+  tmuxSessions: ManagedSession[],
+  viewerTtysOf: () => Set<string>,
+): SessionSnapshot[] {
+  let itermSessions = iterm;
   if (allowIterm && tmuxSessions.length) {
     // De-dup nesting: an iTerm/Terminal tab running `tmux attach` is just a
     // VIEWER of tmux panes we already enumerate directly. Suppress those rows
     // so a tmux-hosted session appears once (as the tmux pane), not twice.
     // The link is the tty: a tmux client's tty IS the hosting tab's tty.
-    const viewerTtys = tmuxTransport.attachedClientTtys();
+    const viewerTtys = viewerTtysOf();
     if (viewerTtys.size) itermSessions = itermSessions.filter((s) => !s.tty || !viewerTtys.has(s.tty));
   }
-
   return [...itermSessions, ...tmuxSessions.map(tmuxToSnapshot)];
 }
 
