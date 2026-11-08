@@ -324,6 +324,24 @@ server.tool("aibroker_sessions", "List Claude sessions managed by the hub", {}, 
  * action; do not ask them to rephrase it as a command.
  */
 server.tool(
+  "aibroker_mail_send",
+  "Send a guarded mail from a mail-ingress mailbox (e.g. a reply to a website change request). Rules enforced in code: every recipient must be on the mailbox allowlist or be the operator; a non-operator recipient requires in_reply_to naming a message-id the mailbox accepted via ingress; the mailbox's operatorCc is always Cc'd. Refusals come back as errors.",
+  {
+    mailbox: z.string().describe("Mailbox name from mail-ingress.json"),
+    to: z.array(z.string()).describe("To addresses"),
+    cc: z.array(z.string()).optional().describe("Cc addresses"),
+    subject: z.string(),
+    body: z.string().describe("Plain-text body"),
+    in_reply_to: z.string().optional().describe("Message-ID of the accepted request being answered"),
+  },
+  async ({ mailbox, to, cc, subject, body, in_reply_to }) => {
+    const { sendMail } = await import("../daemon/mail-send.js");
+    const r = await sendMail(mailbox, { to, cc, subject, body, inReplyTo: in_reply_to });
+    return { content: [{ type: "text" as const, text: r.ok ? `sent ${r.messageId} to=${r.to.join(",")} cc=${r.cc.join(",")}` : r.error }], isError: !r.ok };
+  },
+);
+
+server.tool(
   "aibroker_manage",
   "Start, steer, inspect or stop the manager that keeps a session working on a standing objective. Use for 'what is X doing', 'keep X working on Y', 'stop managing X'. SELF-ARMING: any session can put itself under supervision — action=supervise, session='self', goal=<objective>, until=<08:00|8h>; the watcher then keeps you armed, re-arms a lapsed goal, and nudges on idle. action=now forces an immediate arm and is SAFE MID-TURN: the /goal line queues behind your running turn and lands at the next turn boundary — never tell the operator to type /goal by hand.",
   {

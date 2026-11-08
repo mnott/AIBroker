@@ -1,0 +1,29 @@
+/**
+ * daemon/mail-cli.ts — `aibroker mail send --mailbox <name> --to a[,b] [--cc ..]
+ * --subject <s> --body-file <path> [--in-reply-to <msgid>]`.
+ * All rules live in mail-send.sendMail; this only parses arguments.
+ */
+import { readFileSync } from "node:fs";
+
+const USAGE = "Usage: aibroker mail send --mailbox <name> --to <addr[,addr]> [--cc <addr[,addr]>] --subject <text> --body-file <path> [--in-reply-to <message-id>]";
+
+export async function runMail(args: string[]): Promise<void> {
+  const [verb, ...rest] = args;
+  if (verb !== "send") { console.error(USAGE); process.exit(1); }
+  const o: Record<string, string> = {};
+  for (let i = 0; i < rest.length; i++) {
+    const k = rest[i];
+    if (!k.startsWith("--") || rest[i + 1] === undefined) { console.error(USAGE); process.exit(1); }
+    o[k.slice(2)] = rest[++i];
+  }
+  if (!o.mailbox || !o.to || !o.subject || !o["body-file"]) { console.error(USAGE); process.exit(1); }
+  const list = (v?: string) => (v ? v.split(/[,;]/).map((x) => x.trim()).filter(Boolean) : []);
+  const { sendMail } = await import("./mail-send.js");
+  const r = await sendMail(o.mailbox, {
+    to: list(o.to), cc: list(o.cc), subject: o.subject,
+    body: readFileSync(o["body-file"], "utf-8"), inReplyTo: o["in-reply-to"],
+  });
+  if (!r.ok) { console.error(r.error); process.exit(1); }
+  console.log(`sent ${r.messageId} to=${r.to.join(",")} cc=${r.cc.join(",")}`);
+  process.exit(0);
+}

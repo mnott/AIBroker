@@ -45,6 +45,7 @@ function printCommandList(): void {
   console.log("  stop | restart     Stop or restart the daemon (service, IPC shutdown, or daemon.pid)");
   console.log("  launch <dir|proj>  Open a Claude session there [--name N]: tmux window or iTerm tab");
   console.log("  send <name> <text> Type a message into a session, by name");
+  console.log("  mail send          Guarded reply from a mail-ingress mailbox (--mailbox --to --subject --body-file [--in-reply-to])");
   console.log("  mailbox wait       Block until this session's mailbox has a message (background wake-up; --timeout <s>, exit 2 on timeout)");
   console.log("  ping               Quick heartbeat check");
   console.log("  setup              Install service, MCP entry, hooks, env (--no-service --no-mcp --no-hooks --dry-run --force)");
@@ -57,6 +58,7 @@ function printCommandList(): void {
   console.log("  ask <project>      Ask a session a question and wait for its reply (--stdin --json)");
   console.log("  audit              What one session did to another (--session|--trace|--bodies)");
   console.log("  todoist <sub>      Todoist inbound channel: auth|status|pause|resume");
+  console.log("  owner rename <old> <new> [--dry-run]  Rewrite a renamed session/project name in AIBroker state");
   console.log("  agentish <verb>    AG2 wire format: spec|check|measure");
   console.log("  help               Show this help");
   console.log("\nFlags:");
@@ -296,12 +298,53 @@ switch (command) {
     break;
   }
 
+  case "owner": {
+    const [sub, ...a] = rest;
+    const dryRun = a.includes("--dry-run");
+    const pos = a.filter((x) => x !== "--dry-run");
+    if (sub !== "rename" || pos.length !== 2 || !pos[0] || !pos[1]) {
+      console.error('Usage: aibroker owner rename "OLD NAME" "NEW NAME" [--dry-run]');
+      process.exit(1);
+    }
+    const [from, to] = pos;
+    if (from === to) { console.error("OLD and NEW are the same name."); process.exit(1); }
+    const { renameOwner, formatReport, stateDir } = await import("./owner-rename.js");
+    type Rep = import("./owner-rename.js").RenameReport;
+    let rep: Rep | null = null;
+    let via = "files";
+    // An explicit state dir is a different tree from the daemon's: never route it there.
+    if (!process.env.AIBROKER_STATE_DIR) {
+      try {
+        rep = (await new WatcherClient(DAEMON_SOCKET_PATH).call_raw("owner-rename", { from, to, dryRun })) as unknown as Rep;
+        via = "daemon";
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Running but unable to do it (older build) must not fall through to a
+        // file edit its in-memory managers state would overwrite.
+        if (!/ENOENT|ECONNREFUSED|not running|connect/i.test(msg)) {
+          console.error(`Daemon refused owner-rename: ${msg}`);
+          process.exit(1);
+        }
+      }
+    }
+    if (!rep) rep = renameOwner(stateDir(), from, to, dryRun);
+    for (const line of formatReport(rep, from, to, dryRun)) console.log(line);
+    console.log(`(applied via ${via})`);
+    if (rep.errors.length) process.exit(1);
+    break;
+  }
+
   case "send": {
     const { runSend } = await import("./send-cli.js");
     await runSend(rest);
     break;
   }
 
+  case "mail": {
+    const { runMail } = await import("./mail-cli.js");
+    await runMail(rest);
+    break;
+  }
   case "mailbox": {
     const { runMailbox } = await import("./mailbox-cli.js");
     await runMailbox(rest);

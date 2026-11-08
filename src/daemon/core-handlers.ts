@@ -2290,6 +2290,18 @@ export function registerCoreHandlers(
     return { ok: true, result: { traces, count: traces.length } };
   });
 
+  /** owner-rename — rewrite name references in state (see owner-rename.ts). */
+  server.on("owner-rename", async (req) => {
+    const { from, to, dryRun } = req.params as { from?: string; to?: string; dryRun?: boolean };
+    if (!from || !to) return { ok: false, error: "owner-rename needs from and to" };
+    const { renameInFiles, stateDir } = await import("./owner-rename.js");
+    const { renameManagedOwner } = await import("./manage.js");
+    const rep = renameInFiles(stateDir(), from, to, dryRun === true);
+    const ids = renameManagedOwner(from, to, dryRun === true);
+    if (ids.length) rep.changes.push({ file: "managers.json", field: "<sessionId>.name", count: ids.length, ids });
+    return { ok: true, result: rep as unknown as Record<string, unknown> };
+  });
+
   /**
    * manage — start, steer or stop the manager for one session.
    *

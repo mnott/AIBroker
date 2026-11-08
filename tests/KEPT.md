@@ -29,4 +29,6 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/json-store.test.ts | a | durable state files must not overwrite themselves with an empty default (1d50424) |
 | test/persistence.test.ts | a | session registry and voice config never delete themselves (d4675f0, 7265d38, 6b07e99) |
 | test/session-names-durability.test.ts | a | session-names.json loss makes projects unroutable (1d50424) |
+| test/owner-rename.test.ts | b | `owner rename` rewrites live state: exact match only, history untouched, webhook secrets never printed (operator-requested) |
 | test/message-queue.test.ts | a | PAILot queue: 95 MB buffered messages must not be lost (61f48f4) |
+| test/mail-ingress.test.ts | b | mail ingress sender gate (allowlist + topmost Authentication-Results, spoofed lower header ignored) and unconditional send rules (allowlist, accepted in-reply-to for non-self, operatorCc always Cc) pin an operator-approved security exception |

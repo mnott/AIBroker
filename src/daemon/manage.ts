@@ -4562,6 +4562,20 @@ function dropGoneOnLoad(): void {
   if (dropped) saveState(state);
 }
 
+/**
+ * Rename a managed session's recorded name in the daemon's in-memory state and
+ * save it, for `aibroker owner rename`. Editing managers.json instead would be
+ * overwritten by the next saveState of this copy.
+ */
+export function renameManagedOwner(oldName: string, newName: string, dryRun: boolean): string[] {
+  const ids = Object.values(state).filter((m) => m.name === oldName).map((m) => m.sessionId);
+  if (ids.length && !dryRun) {
+    for (const id of ids) state[id].name = newName;
+    saveState(state);
+  }
+  return ids;
+}
+
 export function startManagerLoop(): void {
   if (timer) return;
   state = loadState();

@@ -117,3 +117,52 @@ MIT — Matthias Nott
 ## Publishing to the OTA hub
 
 `aibroker ota publish --slug myapp --name "My App" --bundle com.example.app --version 1.0.0 --platform ios build/app.ipa` uploads an IPA or APK to the OTA install hub and prints the install URL (only that, on stdout). Any failure exits non-zero with a one-line reason on stderr. It is the CLI twin of the MCP tool `ota_publish`.
+
+## Mail ingress
+
+A dedicated mailbox can feed change requests to a session. Config: `~/.aibroker/mail-ingress.json` (read on every reconnect; `aibroker owner rename` also rewrites `owner` here). The daemon holds one IMAPS (993) connection per mailbox, fetches all UNSEEN mail on every (re)connect and then uses IMAP IDLE; reconnects back off exponentially (5 s to 5 min).
+
+```json
+{
+  "mailboxes": [
+    {
+      "name": "site",
+      "credentialsFile": "~/.aibroker/mail-site.credentials",
+      "owner": "Example Project",
+      "allowlist": ["requester@example.org"],
+      "includeSelfEmails": false,
+      "operatorCc": "operator@example.org",
+      "displayName": "Example Site",
+      "folders": { "accepted": "Eingegangen", "rejected": "Abgelehnt", "sent": "Gesendet" }
+    }
+  ]
+}
+```
+
+The credentials file is `key=value` lines (`user`, `pass`, `imap`, `smtp`; `imap`/`smtp` as `host` or `host:port`, defaults 993 and 587, port 465 means implicit TLS) and must be mode 600 or it is refused. The password is never logged.
+
+Adding a mailbox: append one entry to `mailboxes` (own `name`, credentials file, `owner` session, `allowlist`, `operatorCc`) and create its credentials file with mode 600; it is picked up at the next reconnect or `aibroker restart`. Each mailbox has its own connection, allowlist, target session and Cc.
+
+Gate (per message), all of:
+
+1. Exactly one From address, on the mailbox's effective allowlist (`allowlist` + `operatorCc`, plus `identity.selfEmails` from `~/.pai/config.yaml` when `includeSelfEmails` is true).
+2. The mailbox's own address is in To or Cc.
+3. AIBroker verifies the DKIM signatures itself (`mailauth`, live DNS): at least one must pass (header and body hash), with `d=` aligned to the From domain, and its signed headers must cover `From` and the To/Cc header naming the mailbox (anti-replay).
+
+`Authentication-Results` and `Received` headers are not trusted. A DNS temperror leaves the message UNSEEN for the next cycle instead of rejecting it. A failed message is moved to the rejected folder with one log line (from, message-id, reason) and nothing else: no bounce, auto-reply or read receipt, so the mailbox never reveals that it is read.
+
+Accepted mail is deposited in the owner session's mailbox (text starts with `[Mail:<name>]`, attachments saved under `~/.aibroker/mail-attachments/<message-id>/`), then flagged `\Seen` and moved to the accepted folder. If the owner session is not running the message stays UNSEEN and is retried every 5 minutes and at the next reconnect. Accepted message-ids are persisted (`mail-accepted.json`) for dedupe and for the send rules.
+
+### Sending: `aibroker mail send` / MCP `aibroker_mail_send`
+
+```
+aibroker mail send --mailbox webseite --to requester@example.org [--cc ...] \
+  --subject "Re: ..." --body-file reply.txt --in-reply-to '<message-id>'
+```
+
+One function (`sendMail`) serves both, with unconditional rules (no override flag, no Bcc):
+
+1. Every To/Cc must be on the mailbox allowlist, in `identity.selfEmails`, or be `operatorCc`; otherwise nothing is sent or saved.
+2. A recipient that is not self/operator requires `--in-reply-to` naming a message-id this mailbox accepted via ingress.
+3. `operatorCc` is always added as Cc; sending is refused if it is unset.
+4. SMTP submission on 587 with STARTTLS, then the copy is saved to the sent folder via IMAP APPEND. One log line per send (mailbox, recipients, ids); never body or password.

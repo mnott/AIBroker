@@ -822,6 +822,19 @@ async function attemptMessageDelivery(route: InboundRoute, body: string): Promis
   };
 }
 
+/**
+ * Machine-ingress deposit for sources that keep their own retry (mail: the
+ * message stays UNSEEN until this returns ok). Same live-pane match, shell
+ * refusal, mailbox deposit and idle-only pointer as an inbound route.
+ */
+export async function deliverMachineMessage(
+  routeName: string, owner: string, body: string,
+): Promise<{ ok: boolean; detail: string }> {
+  const route: InboundRoute = { name: routeName, secret: "", owner, mode: "message", createdAt: new Date().toISOString() };
+  const r = await attemptMessageDelivery(route, body);
+  return { ok: r.ok, detail: r.detail };
+}
+
 // --- retry for a session that is not there yet ----------------------------
 
 /**

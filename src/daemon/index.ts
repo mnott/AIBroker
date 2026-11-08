@@ -346,6 +346,11 @@ export async function startDaemon(options?: {
   // is the thing that notices the difference.
   startMailboxWatch();
 
+  // Mail ingress: IMAP IDLE per configured mailbox (~/.aibroker/mail-ingress.json).
+  import("./mail-ingress.js")
+    .then(({ startMailIngress }) => startMailIngress())
+    .catch((err) => log(`mail-ingress: failed to start — ${err instanceof Error ? err.message : String(err)}`));
+
   // Keep the Todoist token valid here, in the daemon, because the daemon is the
   // one process that is always up. Every other holder of this responsibility is
   // occasional: a CLI invocation, an MCP shim loaded once per session, a reply
