@@ -800,3 +800,43 @@ test("redrive: a fetch that errors does not drop the record — it is sent", asy
   noRecordsLeft();
   cleanQueuedDir();
 });
+
+// ── spawned session visuals ─────────────────────────────────────────────────
+
+test("a spawned session is named after ready: id + label, nothing typed", async () => {
+  const calls: string[][] = [];
+  const order: string[] = [];
+  const r = await dispatch("whazaa", "x", {}, deps({
+    launch: async () => ({ itermSessionId: "NEW" }),
+    waitReady: async () => { order.push("ready"); return true; },
+    nameSession: (id, label) => { order.push("name"); calls.push([id, label]); },
+    deliver: async () => { throw new Error("must not type"); },
+  }));
+  assert.equal(r.outcome, "spawned");
+  assert.deepEqual(order, ["ready", "name"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "NEW");
+  assert.ok(calls[0][1].length > 0);
+});
+
+test("no naming when the launch fails or the tab never comes up", async () => {
+  let named = 0;
+  const nameSession = () => { named++; };
+  const a = await dispatch("whazaa", "x", {}, deps({
+    launch: async () => { throw new Error("boom"); }, nameSession,
+  }));
+  assert.equal(a.outcome, "unreachable");
+  const b = await dispatch("whazaa", "x", {}, deps({
+    launch: async () => ({ itermSessionId: "NEW" }), waitReady: async () => false, nameSession,
+  }));
+  assert.equal(b.outcome, "unreachable");
+  assert.equal(named, 0);
+});
+
+test("a naming failure does not change the dispatch outcome", async () => {
+  const r = await dispatch("whazaa", "x", {}, deps({
+    launch: async () => ({ itermSessionId: "NEW" }),
+    nameSession: () => { throw new Error("iterm gone"); },
+  }));
+  assert.equal(r.outcome, "spawned");
+});

@@ -109,7 +109,8 @@ const lines = messages.map((m) => {
   const when = m.timestamp ? new Date(m.timestamp).toLocaleTimeString("en-GB", { hour12: false }) : "";
   const waited = m.timestamp ? Math.round((Date.now() - m.timestamp) / 60000) : null;
   const age = waited !== null && waited >= 1 ? ` (waited ${waited} min)` : "";
-  return `[Session:${m.from}] ${when}${age}\n${m.content}`;
+  const label = m.kind === "beat" ? "Keepalive" : `Session:${m.from}`;
+  return `[${label}] ${when}${age}\n${m.content}`;
 });
 
 const out =

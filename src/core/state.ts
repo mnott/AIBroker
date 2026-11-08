@@ -153,6 +153,8 @@ export interface MailboxMessage {
    * entries that predate the flag, which therefore count as unshown.
    */
   shownAt?: number;
+  /** "beat": automated cache-keepalive (noReply). Shown by the prompt hook, never a wake-up for `mailbox wait`. */
+  kind?: "beat";
 }
 
 const sessionMailboxes = new Map<string, MailboxMessage[]>();
@@ -179,6 +181,7 @@ export function depositToSessionMailbox(
   itermSessionId: string,
   from: string,
   content: string,
+  kind?: "beat",
 ): MailboxMessage | undefined {
   let queue = sessionMailboxes.get(itermSessionId);
   if (!queue) {
@@ -192,7 +195,7 @@ export function depositToSessionMailbox(
     const i = queue.findIndex((m) => m.shownAt !== undefined);
     dropped = queue.splice(i === -1 ? 0 : i, 1)[0];
   }
-  queue.push({ from, content, timestamp: Date.now() });
+  queue.push({ from, content, timestamp: Date.now(), ...(kind ? { kind } : {}) });
   return dropped;
 }
 

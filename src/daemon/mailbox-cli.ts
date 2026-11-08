@@ -8,7 +8,9 @@
  * (aibroker_receive). This is how machine ingress wakes a session without
  * typing into its input line (ingress.ts).
  *
- * It only peeks. Nothing is consumed or marked shown, so aibroker_receive and
+ * Beat entries (kind "beat", the cache keepalive) never wake it. While waiting
+ * it prints one "waiting since HH:MM" line per --heartbeat seconds (default 1200,
+ * 0 = off) so the harness sees output. It only peeks. Nothing is consumed or marked shown, so aibroker_receive and
  * the UserPromptSubmit hook still deliver every message.
  */
 import { WatcherClient } from "../ipc/client.js";
@@ -17,7 +19,7 @@ import { DAEMON_SOCKET_PATH } from "./index.js";
 const SUMMARY_MAX = 120;
 const POLL_MS = 1000;
 
-interface Pending { from: string; content: string }
+interface Pending { from: string; content: string; kind?: string }
 
 export interface MailboxDeps {
   /** The unshown messages for this session (or `session`), oldest first. */
@@ -25,6 +27,12 @@ export interface MailboxDeps {
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   out: (line: string) => void;
+}
+
+const HEARTBEAT_DEFAULT_S = 1200;
+
+function hhmm(ms: number): string {
+  return new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 /** `T`..`X` for an Agentish message, the leading `[Tag]` for a tagged one, else `text`. */
@@ -45,11 +53,13 @@ export function summarise(m: Pending): string {
 export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<number> {
   let session: string | undefined;
   let timeoutS: number | undefined;
+  let heartbeatS = HEARTBEAT_DEFAULT_S;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--session") session = args[++i];
     else if (args[i] === "--timeout") timeoutS = Number(args[++i]);
+    else if (args[i] === "--heartbeat") heartbeatS = Number(args[++i]);
     else {
-      console.error("Usage: aibroker mailbox wait [--session <id>] [--timeout <s>]");
+      console.error("Usage: aibroker mailbox wait [--session <id>] [--timeout <s>] [--heartbeat <s>]");
       return 1;
     }
   }
@@ -57,16 +67,27 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
     console.error("--timeout takes a number of seconds");
     return 1;
   }
+  if (!(heartbeatS >= 0)) {
+    console.error("--heartbeat takes a number of seconds (0 = off)");
+    return 1;
+  }
+  const started = deps.now();
+  let nextBeat = heartbeatS > 0 ? started + heartbeatS * 1000 : Infinity;
   const deadline = timeoutS === undefined ? Infinity : deps.now() + timeoutS * 1000;
   for (;;) {
     // A daemon that is down or restarting is not an arrival and not a failure:
     // keep waiting, the mailbox is read again once it answers.
-    const messages = await deps.peek(session).catch(() => [] as Pending[]);
+    // Cache beats are not a wake-up: the prompt hook still shows them.
+    const messages = (await deps.peek(session).catch(() => [] as Pending[])).filter((m) => m.kind !== "beat");
     if (messages.length) {
       for (const m of messages) deps.out(summarise(m));
       return 0;
     }
     if (deps.now() >= deadline) return 2;
+    if (deps.now() >= nextBeat) {
+      deps.out(`waiting since ${hhmm(started)}`);
+      nextBeat = deps.now() + heartbeatS * 1000;
+    }
     await deps.sleep(Math.min(POLL_MS, Math.max(0, deadline - deps.now())));
   }
 }
@@ -79,7 +100,7 @@ export async function runMailbox(args: string[]): Promise<void> {
     process.exit(0);
   }
   if (verb !== "wait") {
-    console.error("Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] | waiters>");
+    console.error("Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] [--heartbeat <s>] | waiters>");
     process.exit(1);
   }
   const client = new WatcherClient(DAEMON_SOCKET_PATH);

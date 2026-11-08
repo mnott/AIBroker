@@ -40,8 +40,10 @@ import {
   curatedRegistryEmpty,
   launchResolvedPaiProject,
   invalidatePaiProjectCache,
+  sessionLabel,
   type PaiProject,
 } from "./pai-projects.js";
+import { nameSpawnedSession } from "./session-naming.js";
 import { getAllPersistentSessionNames, lookupPersistentName } from "../core/persistence.js";
 import { type AckResult } from "./sessions.js";
 import {
@@ -128,6 +130,12 @@ export interface DispatchDeps {
   deliver: (sessionId: string, body: string, timeoutMs: number, io?: TerminalIO, retries?: number) => Promise<AckResult>;
   launch: (project: PaiProject, opts?: { initialPrompt?: string }) => Promise<{ itermSessionId: string }>;
   waitReady: (sessionId: string, timeoutMs: number) => Promise<boolean>;
+  /**
+   * Set registry name, tab title, badge and paiName variable on a spawned
+   * session (the launch deliberately has no `/Name` prompt). Must not throw
+   * into dispatch; the default logs failures.
+   */
+  nameSession?: (itermSessionId: string, label: string, cwd: string) => void;
   /**
    * INTERNAL — Todoist fetch used only by the redrive freshness gate, so tests
    * can drive it without the network. Defaults to the global fetch.
@@ -330,6 +338,7 @@ const realDeps: DispatchDeps = {
   now: () => Date.now(),
   launch: launchResolvedPaiProject,
   waitReady: waitForReady,
+  nameSession: nameSpawnedSession,
 };
 
 function ackReason(res: AckResult): string {
@@ -602,6 +611,14 @@ export async function dispatch(
             `${Math.round(DEFAULT_SPAWN_TIMEOUT_MS / 1000)}s default, so raise the timeout before suspecting the session.`
           : `. The tab is open — check why it did not start.`),
     };
+  }
+
+  // The launch has no `/Name` prompt, so the Name skill never runs and the tab
+  // would stay anonymous. Apply the same visuals the rename handler does.
+  try {
+    deps.nameSession?.(itermSessionId, sessionLabel(project, project.sessionConfig?.env), project.rootPath);
+  } catch (err) {
+    log(`dispatch: naming "${label}" failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   // No budget check here any more, and its absence is the point.

@@ -670,12 +670,15 @@ export async function startDaemon(options?: {
               const { mqttPublishTranscript } = await import("../adapters/pailot/mqtt-broker.js");
               mqttPublishTranscript(voiceMessageId, text, routeSession);
             }
-            const routeText = text ? `[PAILot:voice] ${text} ${fileParts}` : fileParts;
+            const spoken = [caption, text].filter(Boolean).join(" ");
+            const routeText = text
+              ? `[PAILot:voice] ${spoken} ${fileParts}`
+              : [caption, fileParts].filter(Boolean).join(" ");
             log(`[MQTT→Hub] bundle delivering: ${routeText.slice(0, 100)}`);
             bridge.routeFromMobile(routeSession!, routeText);
           } catch (err) {
             log(`[MQTT→Hub] bundle voice transcription error: ${err}`);
-            bridge.routeFromMobile(routeSession!, fileParts);
+            bridge.routeFromMobile(routeSession!, [caption, fileParts].filter(Boolean).join(" "));
           }
         })();
       } else {
@@ -703,6 +706,8 @@ export async function startDaemon(options?: {
     await handleScreenshot(ctx);
   });
 
+  try { (await import("./inbound.js")).recoverHeldGroups(); } catch (e) { log(`inbound: held-group recovery failed: ${e}`); }
+
   console.log(`AIBroker daemon v${getVersion()} started (AIBP ${aibpBridge.registry.listPlugins().length > 0 ? "active" : "standby"})`);
   console.log(`  Socket:  ${socketPath}`);
   console.log(`  AppDir:  ${appDir}`);
@@ -713,8 +718,12 @@ export async function startDaemon(options?: {
   writePrivate(pidFile, `${process.pid}\n`);
 
   // Graceful shutdown — ensure socket cleanup even on abrupt exit
-  const shutdown = (signal: string) => {
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`\n[aibroker] ${signal} received. Stopping.`);
+    try { await (await import("./inbound.js")).flushHeldGroups(); } catch { /* kept on disk for next start */ }
     stopSocketGuard();
     try { unlinkSync(pidFile); } catch { /* already gone */ }
     adapterRegistry.stopHealthPolling();

@@ -1026,7 +1026,7 @@ export async function processResolvedEvent(
 
   const isComment = event.event_name === "note:added";
   const parentId = String(event.event_data?.id ?? "");
-  const { ownerOf, rememberOwner } = await import("./todoist-owners.js");
+  const { ownerRecordOf, rememberOwner } = await import("./todoist-owners.js");
   // Grants made since the daemon started take effect now, not at the next
   // restart. A project created and granted while you are using the system
   // has to work immediately, or the grant is indistinguishable from a
@@ -1052,11 +1052,38 @@ export async function processResolvedEvent(
       log(`todoist-webhook: subtree lookup failed — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  // A remembered owner is only trustworthy while the task sits where it was
+  // delivered. Moved to another granted project, the move is the newer
+  // decision (a missed move event must not strand comments on the old session).
+  let heldBy: string | undefined;
+  let reRemember = false;
+  if (isComment) {
+    const rec = ownerRecordOf(parentId);
+    if (rec) {
+      const grant = eventProject ? live.projectOwners.get(eventProject) : undefined;
+      const moved = rec.projectId
+        ? rec.projectId !== eventProject
+        : Boolean(grant) && grant!.toLowerCase() !== rec.owner.toLowerCase();
+      if (moved) reRemember = true;
+      else heldBy = rec.owner;
+    }
+  }
+  // A move into a granted project of another owner re-homes the task, even
+  // when the update itself is not a routing transition and delivers nothing.
+  if (event.event_name === "item:updated") {
+    const oldProject = (event.event_data_extra?.old_item as Record<string, unknown> | undefined)?.project_id;
+    const grant = eventProject ? live.projectOwners.get(eventProject) : undefined;
+    const rec = ownerRecordOf(parentId);
+    if (rec && grant && oldProject !== undefined && String(oldProject) !== eventProject
+        && grant.toLowerCase() !== rec.owner.toLowerCase()) {
+      rememberOwner(parentId, grant, eventProject);
+    }
+  }
   const decision = route(
     event,
     live,
     await (deps.knownOwners?.() ?? []),
-    isComment ? ownerOf(parentId) : undefined,
+    heldBy,
   );
   const who = event.initiator?.email ?? event.initiator?.full_name ?? "todoist";
 
@@ -1180,7 +1207,8 @@ export async function processResolvedEvent(
     // belongs to that owner. Skipping it let the follow-up comment re-derive
     // the owner from live session names, which had changed by then, and fall
     // through to the default owner.
-    if (!isComment) rememberOwner(decision.taskId, decision.project);
+    if (!isComment) rememberOwner(decision.taskId, decision.project, fromProject || undefined);
+    else if (reRemember || (heldBy && fromProject)) rememberOwner(parentId, decision.project, fromProject || undefined);
 
     // Release a claim the dispatch did not earn. "queued" keeps it — the
     // work IS in flight, the session is simply mid-turn — but a trigger

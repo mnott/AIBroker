@@ -169,3 +169,55 @@ test("C: a worker-shaped sender id is labelled by itself, not by the pane it sha
   assert.equal(label, "worker-42");
   assert.notEqual(label, "AIBroker", "a worker must never be attributed to the pane owner's identity");
 });
+
+// ── cache beats (noReply) ──
+const { sendToSessionDelivery } = await import("../src/daemon/core-handlers.js");
+const { mailboxWait } = await import("../src/daemon/mailbox-cli.js");
+const { depositToSessionMailbox, peekSessionMailbox } = await import("../src/core/state.js");
+
+test("beat: noReply is labelled [Keepalive], not [Session:..], and marked kind=beat in the mailbox", () => {
+  const d = sendToSessionDelivery("keepalive", "pai-cli", true);
+  assert.match(d.typed, /^\[Keepalive\] /);
+  assert.ok(!d.typed.includes("[Session:"));
+  assert.equal(d.deposit, true);
+  assert.match(sendToSessionDelivery("hi", "pai-cli", false).typed, /^\[Session:pai-cli\]/);
+  depositToSessionMailbox("beat-box", "pai-cli", "keepalive", "beat");
+  assert.equal(peekSessionMailbox("beat-box")[0].kind, "beat");
+});
+
+function fakeClock(peeks: Array<Array<{ from: string; content: string; kind?: string }>>) {
+  let t = 1_700_000_000_000;
+  const out: string[] = [];
+  let n = 0;
+  return {
+    out,
+    deps: {
+      peek: async () => peeks[Math.min(n++, peeks.length - 1)],
+      sleep: async (ms: number) => { t += ms; },
+      now: () => t,
+      out: (l: string) => { out.push(l); },
+    },
+  };
+}
+const beat = { from: "pai-cli", content: "keepalive", kind: "beat" };
+const real = { from: "alice", content: "hello" };
+
+test("beat: mailbox wait ignores a beat and still exits on a real message", async () => {
+  const c = fakeClock([[beat], [beat], [beat, real]]);
+  assert.equal(await mailboxWait(["--heartbeat", "0"], c.deps), 0);
+  assert.equal(c.out.length, 1);
+  assert.match(c.out[0], /^alice \| /);
+});
+
+test("beat: heartbeat line printed at the interval while waiting", async () => {
+  const c = fakeClock([[beat]]);
+  assert.equal(await mailboxWait(["--timeout", "125", "--heartbeat", "60"], c.deps), 2);
+  assert.equal(c.out.length, 2);
+  assert.match(c.out[0], /^waiting since \d\d:\d\d$/);
+});
+
+test("beat: --heartbeat 0 prints nothing while waiting", async () => {
+  const c = fakeClock([[beat]]);
+  assert.equal(await mailboxWait(["--timeout", "5000", "--heartbeat", "0"], c.deps), 2);
+  assert.deepEqual(c.out, []);
+});

@@ -636,3 +636,94 @@ test("an ordinary human comment is still mirrored", () => {
   const d = route(noteAdded("please include the Zurich postings too"), cfg);
   assert.equal(d.act, true);
 });
+
+// ---------------------------------------------------------------------------
+// Regression — 2026-11-08: a remembered owner outlived a move to another project
+// ---------------------------------------------------------------------------
+
+const PAI_PROJ = "proj-pai";
+const moveCfg: WebhookConfig = {
+  ...cfg,
+  ingressProjectIds: new Set([INGRESS, INBOX, OWNED, PAI_PROJ]),
+  projectOwners: new Map([[OWNED, "home"], [PAI_PROJ, "pai"]]),
+};
+const commentIn = (project: string, text = "make it next month"): TodoistEvent => ({
+  event_name: "note:added",
+  triggered_at: "2026-11-08T10:00:00.0Z",
+  initiator: { email: "owner@example.com", id: "1" },
+  event_data: { id: "task-move", item_id: "task-move", content: text, project_id: project },
+} as TodoistEvent);
+const sink = () => {
+  const calls: string[] = [];
+  return { calls, deps: { deliver: async (p: string) => { calls.push(p); return { outcome: "delivered", session: p }; } } as WebhookDeps };
+};
+
+test("comment after a move to another granted project goes to the new owner", async () => {
+  const { forgetAllOwners, rememberOwner, ownerOf } = await import("../src/daemon/todoist-owners.js");
+  const { processResolvedEvent } = await import("../src/daemon/todoist-webhook.js");
+  forgetAllOwners();
+  rememberOwner("task-move", "home", OWNED);
+  const { calls, deps } = sink();
+  await processResolvedEvent(commentIn(PAI_PROJ), moveCfg, deps);
+  assert.deepEqual(calls, ["pai"]);
+  assert.equal(ownerOf("task-move"), "pai", "re-remembered with the new project");
+});
+
+test("comment in the same project goes to the remembered owner", async () => {
+  const { forgetAllOwners, rememberOwner } = await import("../src/daemon/todoist-owners.js");
+  const { processResolvedEvent } = await import("../src/daemon/todoist-webhook.js");
+  forgetAllOwners();
+  rememberOwner("task-move", "clickr", OWNED);
+  const { calls, deps } = sink();
+  await processResolvedEvent(commentIn(OWNED), moveCfg, deps);
+  assert.deepEqual(calls, ["clickr"]);
+});
+
+test("a title-addressed owner is still held for a comment in the same project", async () => {
+  const { forgetAllOwners, rememberOwner } = await import("../src/daemon/todoist-owners.js");
+  const { processResolvedEvent } = await import("../src/daemon/todoist-webhook.js");
+  forgetAllOwners();
+  rememberOwner("task-move", "pai", INBOX);
+  const { calls, deps } = sink();
+  await processResolvedEvent(commentIn(INBOX), moveCfg, deps);
+  assert.deepEqual(calls, ["pai"], "inbox has no grant owner; the remembered owner stands");
+});
+
+test("an old string entry is read, kept when the project has no other owner, replaced when it does", async () => {
+  const { forgetAllOwners, ownerRecordOf } = await import("../src/daemon/todoist-owners.js");
+  const { processResolvedEvent } = await import("../src/daemon/todoist-webhook.js");
+  const { saveJson } = await import("../src/core/json-store.js");
+  const { join } = await import("node:path");
+  const { homedir } = await import("node:os");
+  forgetAllOwners();
+  saveJson(join(homedir(), ".aibroker", "todoist-owners.json"),
+    { order: ["task-move"], owners: { "task-move": "clickr" } });
+  assert.deepEqual(ownerRecordOf("task-move"), { owner: "clickr", projectId: undefined });
+
+  const a = sink();
+  await processResolvedEvent(commentIn(INBOX), moveCfg, a.deps);
+  assert.deepEqual(a.calls, ["clickr"], "no grant in the current project: keep");
+
+  saveJson(join(homedir(), ".aibroker", "todoist-owners.json"),
+    { order: ["task-move"], owners: { "task-move": "clickr" } });
+  const b = sink();
+  await processResolvedEvent(commentIn(PAI_PROJ), moveCfg, b.deps);
+  assert.deepEqual(b.calls, ["pai"], "current project granted to another owner: replace");
+});
+
+test("item:updated moving a task into another owner's project updates the remembered owner", async () => {
+  const { forgetAllOwners, rememberOwner, ownerRecordOf } = await import("../src/daemon/todoist-owners.js");
+  const { processResolvedEvent } = await import("../src/daemon/todoist-webhook.js");
+  forgetAllOwners();
+  rememberOwner("task-move", "home", OWNED);
+  const { calls, deps } = sink();
+  await processResolvedEvent({
+    event_name: "item:updated",
+    triggered_at: "2026-11-08T10:01:00.0Z",
+    initiator: { email: "owner@example.com", id: "1" },
+    event_data: { id: "task-move", content: "x", project_id: PAI_PROJ, labels: [] },
+    event_data_extra: { old_item: { id: "task-move", content: "x", project_id: OWNED, labels: [] } },
+  } as TodoistEvent, moveCfg, deps);
+  assert.deepEqual(calls, [], "an already routable task is not delivered again");
+  assert.deepEqual(ownerRecordOf("task-move"), { owner: "pai", projectId: PAI_PROJ });
+});

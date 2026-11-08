@@ -46,6 +46,7 @@ import { resolveSelfSessionId } from "./pai-session-map.js";
 import { matchSession, matchAllSessions, resolveCallerSession, cwdMatches, displayName, labelOf, selfSendError } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
+import { claimItermSessionName, applyItermVisuals } from "./session-naming.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, revealItermSession } from "../adapters/iterm/sessions.js";
 import { discoverLiveSessions } from "../core/session-discovery.js";
 import { log } from "../core/log.js";
@@ -143,8 +144,15 @@ export function sendToSessionDelivery(
 ): { typed: string; deposit: boolean } {
   // Never the body: noReply only drops the reply demand, not the mailbox. A
   // typed full message lands in whatever the operator is writing.
-  void noReply;
+  // A noReply message is a cache beat: labelled [Keepalive], not [Session:..],
+  // so the session does not try to reply to the (non-existent) sender.
+  if (noReply) return { typed: beatPointer(messagePreview(message)), deposit: true };
   return { typed: mailboxPointer(senderLabel, messagePreview(message)), deposit: true };
+}
+
+/** The one line typed for a cache beat (noReply): no sender, no reply expected. */
+export function beatPointer(preview: string): string {
+  return `[Keepalive] ${preview} — cache beat, no reply, no tools, answer with at most one word`;
 }
 
 /** The one line typed for a deposited message: it says the receiver must drain it. */
@@ -1369,7 +1377,7 @@ export function registerCoreHandlers(
           .find(([, name]) => name.toLowerCase() === target.toLowerCase())?.[0];
         if (persistedId) {
           const senderLabel = resolveSenderLabel(req, snapshots);
-          const evicted = depositToSessionMailbox(persistedId, senderLabel, message);
+          const evicted = depositToSessionMailbox(persistedId, senderLabel, message, noReply ? "beat" : undefined);
           if (evicted) {
             audit({
               action: "send", actor: `session:${evicted.from}`, target,
@@ -1460,7 +1468,8 @@ export function registerCoreHandlers(
 
     // Only the operator's own channels type into the input line; machine
     // ingress is mailbox-only once a waiter can wake the session (ingress.ts).
-    const mailboxOnly = mailboxOnlyParam || deliveryFor(source, hasActiveWaiter(mailboxKeys(itermSessionId, claudeSessionOfId(itermSessionId)))) === "mailboxOnly";
+    // A beat is always typed: it exists to cause a turn (warm the cache), and the waiter ignores it.
+    const mailboxOnly = !noReply && (mailboxOnlyParam || deliveryFor(source, hasActiveWaiter(mailboxKeys(itermSessionId, claudeSessionOfId(itermSessionId)))) === "mailboxOnly");
 
     // What gets typed and whether it goes to the mailbox — see
     // sendToSessionDelivery() for why noReply skips both.
@@ -1469,7 +1478,7 @@ export function registerCoreHandlers(
     // Deposit into the target session's mailbox (structured receive). This is
     // what makes the message recoverable even when the typed copy is not seen:
     // the target can always drain it with aibroker_receive.
-    const evicted = shouldDeposit ? depositToSessionMailbox(itermSessionId, senderLabel, message) : undefined;
+    const evicted = shouldDeposit ? depositToSessionMailbox(itermSessionId, senderLabel, message, noReply ? "beat" : undefined) : undefined;
     if (evicted) {
       // A full mailbox used to drop its oldest message with no trace — the
       // same silent loss this mailbox exists to prevent, one level down.
@@ -1525,7 +1534,7 @@ export function registerCoreHandlers(
     // already made the message recoverable and a retry types the pointer once
     // the line clears.
     const guarded = await typeWhenInputEmpty(itermSessionId, prefixedMessage, {
-      multi: shouldDeposit ? (n) => mailboxPointer(senderLabel, `${n} messages`) : undefined,
+      multi: shouldDeposit ? (n) => (noReply ? beatPointer(`${n} messages`) : mailboxPointer(senderLabel, `${n} messages`)) : undefined,
     });
     const ack = guarded.typed ? guarded.ack : "held";
 
@@ -2112,7 +2121,8 @@ export function registerCoreHandlers(
     // asked. Refused here, the existing holder keeps the name untouched.
     let nameClaim: { ok: boolean; heldBy?: string } = { ok: true };
     if (itermSessionId) {
-      nameClaim = setPersistentSessionName(itermSessionId, name);
+      const renamedCwd = live.find((x) => x.id === itermSessionId)?.cwd;
+      nameClaim = claimItermSessionName(itermSessionId, name, renamedCwd);
       if (!nameClaim.ok) {
         log(`rename: refused — name "${name}" held by live session ${nameClaim.heldBy?.slice(0, 8)}`);
         return {
@@ -2120,8 +2130,6 @@ export function registerCoreHandlers(
           error: `Name "${name}" is held by live session ${nameClaim.heldBy?.slice(0, 8) ?? "unknown"} — release it there first (close that tab, or rename it).`,
         };
       }
-      const renamedCwd = live.find((x) => x.id === itermSessionId)?.cwd;
-      setSessionProject(itermSessionId, renamedCwd);
       log(`Persisted name "${name}" for iTerm session ${itermSessionId.slice(0, 8)}${renamedCwd ? ` (cwd project ${displayName(name, renamedCwd)})` : ""}`);
     }
 
@@ -2136,9 +2144,7 @@ export function registerCoreHandlers(
 
     // Set iTerm2 visuals directly if we know the session
     if (itermSessionId) {
-      setItermSessionVar(itermSessionId, name);
-      setItermTabName(itermSessionId, name);
-      setItermBadge(itermSessionId, name);
+      applyItermVisuals(itermSessionId, name);
       // The /resume picker title is written into the transcript by the
       // PreToolUse hook hooks/aibroker-rename-title.mjs (matcher
       // mcp__aibroker__aibroker_rename) — typing /rename here raced the

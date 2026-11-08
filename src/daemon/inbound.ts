@@ -693,14 +693,48 @@ export function isTrusted(route: InboundRoute, payload: unknown): boolean {
 /**
  * Events waiting to be delivered together, keyed by route and group.
  *
- * In memory on purpose: a burst that a restart interrupts is a burst nobody
- * needed to hear about as a burst, and persisting it would mean replaying old
- * events into a session that has moved on.
+ * Mirrored to ~/.aibroker/inbound-held.json whenever a group is held, grows or
+ * leaves, so a daemon restart inside the coalescing window no longer loses the
+ * event (live case 2026-11-08: held 25s, daemon restarted, never delivered).
+ * A group leaves memory and disk BEFORE its delivery is attempted, so it can
+ * never be delivered twice; only the shutdown flush keeps a group on disk
+ * until its delivery has succeeded.
  */
-const pending = new Map<string, { events: unknown[]; timer: NodeJS.Timeout }>();
+interface Held { routeName: string; events: unknown[]; deadline: number; timer?: NodeJS.Timeout }
+const pending = new Map<string, Held>();
 
 /** How many events one group may hold before it is delivered regardless. */
 const COALESCE_MAX = 20;
+
+const heldFile = () => join(homedir(), ".aibroker", "inbound-held.json");
+
+interface HeldStore { groups: { id: string; route: string; events: unknown[]; deadline: number }[] }
+
+function persistHeld(): void {
+  const groups = [...pending.entries()].map(([id, g]) => ({ id, route: g.routeName, events: g.events, deadline: g.deadline }));
+  try { saveJson(heldFile(), { groups } as HeldStore); }
+  catch (e) { log(`inbound: could not persist held groups (${e instanceof Error ? e.message : String(e)})`); }
+}
+
+function logDelivered(route: InboundRoute, n: number, r: DeliveryResult, tag = ""): void {
+  log(`inbound: /hook/${route.name} → ${route.owner}: ${r.detail}${n > 1 ? ` (${n} events grouped)` : ""}${tag}`);
+}
+
+function armHeld(id: string, route: InboundRoute, g: Held): void {
+  if (g.timer) clearTimeout(g.timer);
+  g.timer = setTimeout(() => fireHeld(id, route), Math.max(0, g.deadline - Date.now()));
+  g.timer.unref?.();
+}
+
+/** Take a group out (memory and disk), then deliver it. Once. */
+function fireHeld(id: string, route: InboundRoute): void {
+  const g = pending.get(id);
+  if (!g) return;
+  if (g.timer) clearTimeout(g.timer);
+  pending.delete(id);
+  persistHeld();
+  void deliverBatch(route, g.events).then((r) => logDelivered(route, g.events.length, r));
+}
 
 /**
  * Hold an event briefly so that one human action arrives as one interruption.
@@ -708,33 +742,75 @@ const COALESCE_MAX = 20;
  * Returns immediately; the delivery happens on the timer. The caller has
  * already acknowledged the sender, so nothing is waiting on this.
  */
-function coalesceThenDeliver(route: InboundRoute, payload: unknown, deliver: (batch: unknown[]) => void): void {
+function coalesceThenDeliver(route: InboundRoute, payload: unknown): void {
   const cfg = route.coalesce!;
   const group = scalar(pick(payload, cfg.key)) ?? "";
   const id = `${route.name}#${group}`;
-  const held = pending.get(id);
+  let held = pending.get(id);
+  if (held) held.events.push(payload);
+  else { held = { routeName: route.name, events: [payload], deadline: 0 }; pending.set(id, held); }
+  // Wait from the LAST event, so a burst collapses into one delivery.
+  held.deadline = Date.now() + cfg.ms;
+  if (held.events.length >= COALESCE_MAX) { fireHeld(id, route); return; }
+  armHeld(id, route, held);
+  persistHeld();
+}
 
-  if (held) {
-    clearTimeout(held.timer);
-    held.events.push(payload);
-    if (held.events.length >= COALESCE_MAX) {
-      pending.delete(id);
-      deliver(held.events);
-      return;
+/**
+ * Daemon start: pick up groups a previous run was still holding. Overdue ones
+ * go out at once, the rest at their remaining time. One audit line each.
+ */
+export function recoverHeldGroups(): number {
+  const r = loadJson<HeldStore>(heldFile());
+  if (r.status !== "ok" || !Array.isArray(r.data?.groups)) return 0;
+  let n = 0;
+  for (const rec of r.data.groups) {
+    if (pending.has(rec.id) || !Array.isArray(rec.events) || !rec.events.length) continue;
+    const route = findRoute(rec.route);
+    if (!route || route.enabled === false) {
+      audit({ action: "inbound", actor: `hook:${rec.route}`, target: `group:${rec.id}`, outcome: "undelivered", reason: `held group lost: route gone (${rec.events.length} events)` });
+      log(`inbound: held group ${rec.id} dropped on start — route /hook/${rec.route} no longer exists`);
+      continue;
     }
-    // Wait from the LAST event, so a burst collapses into one delivery.
-    held.timer = setTimeout(() => { pending.delete(id); deliver(held.events); }, cfg.ms);
-    held.timer.unref?.();
-    return;
+    const g: Held = { routeName: rec.route, events: rec.events, deadline: Number(rec.deadline) || 0 };
+    pending.set(rec.id, g);
+    armHeld(rec.id, route, g);
+    const wait = Math.max(0, g.deadline - Date.now());
+    audit({ action: "inbound", actor: `hook:${rec.route}`, target: `session:${route.owner}`, outcome: "recovered", reason: `held group ${rec.id} (${rec.events.length} events) recovered after restart, delivering in ${wait}ms` });
+    log(`inbound: /hook/${rec.route}: recovered held group ${rec.id} (${rec.events.length} events), delivering in ${wait}ms`);
+    n++;
   }
+  persistHeld();
+  return n;
+}
 
-  const timer = setTimeout(() => {
-    const g = pending.get(id);
-    pending.delete(id);
-    if (g) deliver(g.events);
-  }, cfg.ms);
-  timer.unref?.();
-  pending.set(id, { events: [payload], timer });
+/**
+ * Graceful shutdown: deliver held groups now. A group stays on disk until its
+ * delivery reports success, so a failed or timed-out flush is picked up by the
+ * next start instead of lost.
+ */
+export async function flushHeldGroups(timeoutMs = 3000): Promise<void> {
+  const groups = [...pending.entries()];
+  for (const [, g] of groups) if (g.timer) clearTimeout(g.timer);
+  const deadline = new Promise<"timeout">((res) => { const t = setTimeout(() => res("timeout"), timeoutMs); t.unref?.(); });
+  await Promise.all(groups.map(async ([id, g]) => {
+    const route = findRoute(g.routeName);
+    if (!route) return;
+    const out = await Promise.race([deliverBatch(route, g.events), deadline]);
+    if (out !== "timeout" && out.ok) {
+      pending.delete(id);
+      persistHeld();
+      logDelivered(route, g.events.length, out, " (flushed at shutdown)");
+    } else {
+      log(`inbound: /hook/${route.name}: held group ${id} not delivered at shutdown — kept for next start`);
+    }
+  }));
+}
+
+/** For tests: forget in-memory groups as a process exit would, leaving the file. */
+export function __dropHeldMemory(): void {
+  for (const g of pending.values()) if (g.timer) clearTimeout(g.timer);
+  pending.clear();
 }
 
 export async function deliverInbound(route: InboundRoute, payload: unknown): Promise<DeliveryResult> {
@@ -758,11 +834,7 @@ export async function deliverInbound(route: InboundRoute, payload: unknown): Pro
   }
 
   if (route.coalesce?.ms) {
-    coalesceThenDeliver(route, payload, (batch) => {
-      void deliverBatch(route, batch).then((r) => {
-        log(`inbound: /hook/${route.name} → ${route.owner}: ${r.detail}${batch.length > 1 ? ` (${batch.length} events grouped)` : ""}`);
-      });
-    });
+    coalesceThenDeliver(route, payload);
     return { ok: true, detail: `held for grouping (${route.coalesce.ms}ms)` };
   }
   return deliverBatch(route, [payload]);

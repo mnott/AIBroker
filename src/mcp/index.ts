@@ -235,6 +235,7 @@ const server = new McpServer(
       "| `[PAILot]` | PAILot text | `pailot_send` |",
       "| `[PAILot:voice]` | PAILot voice | `pailot_tts` |",
       "| `[Session:NAME]` | another Claude session | `aibroker_send_to_session` |",
+      "| `[Keepalive]` | cache beat | no reply, no tools, answer with at most one word |",
       "| `[Task]` | task-bus work order | act, see Task rules below |",
       "| `[Task:comment]` | follow-up on a Task | act, see Task rules below |",
       "| _none_ | terminal | terminal only |",

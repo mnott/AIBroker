@@ -27,7 +27,15 @@ const MAX = 500;
 interface Store {
   /** taskId -> owner, oldest first so trimming is a shift. */
   order: string[];
-  owners: Record<string, string>;
+  /** Old files hold a bare owner string; read as `{ owner }`. */
+  owners: Record<string, string | OwnerRecord>;
+}
+
+/** Who took a task, and the project it sat in when they did. */
+export interface OwnerRecord {
+  owner: string;
+  /** Unknown for entries written before the project was stored. */
+  projectId?: string;
 }
 
 function empty(): Store {
@@ -44,11 +52,11 @@ function read(): Store {
 }
 
 /** Record who took a task, so a later comment on it reaches the same session. */
-export function rememberOwner(taskId: string, owner: string): void {
+export function rememberOwner(taskId: string, owner: string, projectId?: string): void {
   if (!taskId || !owner) return;
   const s = read();
   if (!(taskId in s.owners)) s.order.push(taskId);
-  s.owners[taskId] = owner;
+  s.owners[taskId] = projectId ? { owner, projectId } : { owner };
   while (s.order.length > MAX) {
     const drop = s.order.shift();
     if (drop) delete s.owners[drop];
@@ -56,10 +64,18 @@ export function rememberOwner(taskId: string, owner: string): void {
   saveJson(FILE, s);
 }
 
+/** Who took this task, and from which project, if we still know. */
+export function ownerRecordOf(taskId: string): OwnerRecord | undefined {
+  if (!taskId) return undefined;
+  const v = read().owners[taskId];
+  if (!v) return undefined;
+  if (typeof v === "string") return { owner: v, projectId: undefined };
+  return typeof v.owner === "string" && v.owner ? { owner: v.owner, projectId: v.projectId } : undefined;
+}
+
 /** Who took this task, if we still know. */
 export function ownerOf(taskId: string): string | undefined {
-  if (!taskId) return undefined;
-  return read().owners[taskId];
+  return ownerRecordOf(taskId)?.owner;
 }
 
 /** Test seam: forget everything. */
