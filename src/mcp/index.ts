@@ -334,11 +334,12 @@ server.tool(
     subject: z.string(),
     body: z.string().describe("Plain-text body"),
     in_reply_to: z.string().optional().describe("Message-ID of the accepted request being answered"),
+    quote: z.boolean().optional().describe("Quote the original mail below the reply when in_reply_to is set (default true)"),
   },
-  async ({ mailbox, to, cc, subject, body, in_reply_to }) => {
+  async ({ mailbox, to, cc, subject, body, in_reply_to, quote }) => {
     const { sendMail } = await import("../daemon/mail-send.js");
-    const r = await sendMail(mailbox, { to, cc, subject, body, inReplyTo: in_reply_to });
-    return { content: [{ type: "text" as const, text: r.ok ? `sent ${r.messageId} to=${r.to.join(",")} cc=${r.cc.join(",")}` : r.error }], isError: !r.ok };
+    const r = await sendMail(mailbox, { to, cc, subject, body, inReplyTo: in_reply_to, quote });
+    return { content: [{ type: "text" as const, text: r.ok ? `sent ${r.messageId} to=${r.to.join(",")} cc=${r.cc.join(",")}${r.warning ? `\nwarning: ${r.warning}` : ""}` : r.error }], isError: !r.ok };
   },
 );
 

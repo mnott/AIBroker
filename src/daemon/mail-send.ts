@@ -22,6 +22,31 @@ export interface SendDeps {
   transmit?: (creds: Credentials, mb: MailboxConfig, msg: BuiltMessage) => Promise<void>;
   /** Save the raw message to the sent folder via IMAP APPEND. */
   append?: (creds: Credentials, mb: MailboxConfig, raw: Buffer) => Promise<void>;
+  /** Look up the mail being answered by Message-ID (accepted folder, then INBOX). */
+  findOriginal?: (creds: Credentials, mb: MailboxConfig, messageId: string) => Promise<OriginalMail | undefined>;
+}
+
+export interface OriginalMail {
+  from: { name?: string; address: string };
+  date: Date;
+  text: string;
+  references?: string;
+}
+
+/** Subject with exactly one reply prefix ("Re:"/"AW:" in any case counts as present). */
+export function ensureRe(subject: string): string {
+  return /^\s*(re|aw)\s*:/i.test(subject) ? subject : `Re: ${subject}`;
+}
+
+const pad = (n: number) => String(n).padStart(2, "0");
+
+/** German attribution line plus the original text, every line prefixed with ">" (no space before another ">"). */
+export function formatQuote(orig: OriginalMail): string {
+  const d = orig.date;
+  const who = orig.from.name ? `${orig.from.name} <${orig.from.address}>` : orig.from.address;
+  const head = `Am ${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} um ${pad(d.getHours())}:${pad(d.getMinutes())} schrieb ${who}:`;
+  const lines = orig.text.replace(/\r\n?/g, "\n").replace(/\n+$/, "").split("\n");
+  return `${head}\n${lines.map((l) => (l.startsWith(">") ? `>${l}` : `> ${l}`)).join("\n")}`;
 }
 
 export interface BuiltMessage {
@@ -29,7 +54,7 @@ export interface BuiltMessage {
   messageId: string; inReplyTo?: string; references?: string;
 }
 
-export type SendResult = { ok: true; messageId: string; to: string[]; cc: string[] } | { ok: false; error: string };
+export type SendResult = { ok: true; messageId: string; to: string[]; cc: string[]; warning?: string } | { ok: false; error: string };
 
 const bracket = (id: string) => (id.startsWith("<") ? id : `<${id.replace(/^<|>$/g, "")}>`);
 
@@ -44,11 +69,26 @@ export async function sendMail(mailboxName: string, input: SendInput, deps: Send
     const creds = deps.creds ?? loadCredentials(mb.credentialsFile);
     const domain = creds.user.split("@")[1] ?? "localhost";
     const messageId = `<${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}@${domain}>`;
+    let text = input.body;
+    let references = input.inReplyTo ? bracket(input.inReplyTo) : undefined;
+    if (input.inReplyTo && input.quote !== false) {
+      try {
+        const orig = await (deps.findOriginal ?? findOriginalImap)(creds, mb, bracket(input.inReplyTo));
+        if (orig) {
+          text = `${input.body}\n\n${formatQuote(orig)}\n`;
+          if (orig.references?.trim()) references = `${orig.references.trim()} ${bracket(input.inReplyTo)}`;
+        } else {
+          log(`mail-send: ${mb.name} original not found, sending without quote`);
+        }
+      } catch (e) {
+        log(`mail-send: ${mb.name} original lookup failed (${e instanceof Error ? e.message : String(e)}), sending without quote`);
+      }
+    }
     const msg: BuiltMessage = {
       from: `${(mb.displayName ?? mb.name).replace(/["\r\n]/g, "")} <${creds.user}>`,
       to: decision.to, cc: decision.cc,
-      subject: input.subject, text: input.body, messageId,
-      ...(input.inReplyTo ? { inReplyTo: bracket(input.inReplyTo), references: bracket(input.inReplyTo) } : {}),
+      subject: input.inReplyTo ? ensureRe(input.subject) : input.subject, text, messageId,
+      ...(input.inReplyTo ? { inReplyTo: bracket(input.inReplyTo), references } : {}),
     };
 
     let raw: Buffer | undefined;
@@ -73,13 +113,30 @@ export async function sendMail(mailboxName: string, input: SendInput, deps: Send
       if (deps.append) await deps.append(creds, mb, raw ?? Buffer.from(msg.text));
       else await appendToSent(creds, mb, msg);
     } catch (e) {
-      log(`mail-send: ${mb.name} sent but could not save to sent folder: ${e instanceof Error ? e.message : String(e)}`);
-      return { ok: true, messageId, to: msg.to, cc: msg.cc };
+      const why = e instanceof Error ? e.message : String(e);
+      log(`mail-send: ${mb.name} sent but could not save to sent folder: ${why}`);
+      return { ok: true, messageId, to: msg.to, cc: msg.cc, warning: `sent, but the copy could not be saved to the sent folder: ${why}` };
     }
     return { ok: true, messageId, to: msg.to, cc: msg.cc };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/** Minimal IMAP surface used by saveToSent (lets tests pass a fake). */
+export interface SentClient {
+  list(): Promise<Array<{ path: string; specialUse?: string }>>;
+  mailboxCreate(path: string): Promise<unknown>;
+  append(path: string, raw: Buffer, flags: string[]): Promise<unknown>;
+}
+
+/** Folder: configured > \\Sent special-use > "Gesendet"; created when missing, then APPEND with \\Seen. */
+export async function saveToSent(client: SentClient, mb: MailboxConfig, raw: Buffer): Promise<string> {
+  const folders = await client.list();
+  let folder = mb.folders?.sent ?? folders.find((f) => f.specialUse === "\\Sent")?.path ?? "Gesendet";
+  if (!folders.some((f) => f.path === folder)) await client.mailboxCreate(folder);
+  await client.append(folder, raw, ["\\Seen"]);
+  return folder;
 }
 
 async function appendToSent(creds: Credentials, mb: MailboxConfig, msg: BuiltMessage): Promise<void> {
@@ -92,12 +149,41 @@ async function appendToSent(creds: Credentials, mb: MailboxConfig, msg: BuiltMes
   const client = new ImapFlow({ ...imapEndpoint(creds), auth: { user: creds.user, pass: creds.pass }, logger: false });
   await client.connect();
   try {
-    let folder = mb.folders?.sent ?? "Gesendet";
-    if (!mb.folders?.sent) {
-      const hit = (await client.list()).find((f) => f.specialUse === "\\Sent");
-      if (hit) folder = hit.path;
+    await saveToSent(client, mb, raw);
+  } finally {
+    await client.logout().catch(() => {});
+  }
+}
+
+async function findOriginalImap(creds: Credentials, mb: MailboxConfig, messageId: string): Promise<OriginalMail | undefined> {
+  const { ImapFlow } = await import("imapflow");
+  const { simpleParser } = await import("mailparser");
+  const client = new ImapFlow({ ...imapEndpoint(creds), auth: { user: creds.user, pass: creds.pass }, logger: false });
+  await client.connect();
+  try {
+    for (const folder of [mb.folders?.accepted ?? "Eingegangen", "INBOX"]) {
+      let uid: number | undefined;
+      try {
+        const lock = await client.getMailboxLock(folder);
+        try {
+          const hits = await client.search({ header: { "message-id": messageId } }, { uid: true });
+          uid = hits && hits.length ? hits[0] : undefined;
+          if (uid === undefined) continue;
+          const m = await client.fetchOne(String(uid), { source: true }, { uid: true });
+          if (!m || !m.source) continue;
+          const p = await simpleParser(m.source);
+          const f = p.from?.value?.[0];
+          if (!f?.address) continue;
+          const refs = Array.isArray(p.references) ? p.references.join(" ") : p.references;
+          return { from: { name: f.name || undefined, address: f.address }, date: p.date ?? new Date(), text: p.text ?? "", references: refs };
+        } finally {
+          lock.release();
+        }
+      } catch {
+        continue; // folder missing: try the next one
+      }
     }
-    await client.append(folder, raw, ["\\Seen"]);
+    return undefined;
   } finally {
     await client.logout().catch(() => {});
   }

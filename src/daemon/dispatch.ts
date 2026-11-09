@@ -104,6 +104,8 @@ export interface DispatchOptions {
    * adjust what it already has.
    */
   prefix?: string;
+  /** Name given to a session this dispatch launches, instead of the project label. */
+  sessionName?: string;
   /**
    * INTERNAL — set only by redriveQueuedDispatches. Marks this dispatch as the
    * one redrive a queued record gets, so the fresh record a `queued` outcome
@@ -616,7 +618,7 @@ export async function dispatch(
   // The launch has no `/Name` prompt, so the Name skill never runs and the tab
   // would stay anonymous. Apply the same visuals the rename handler does.
   try {
-    deps.nameSession?.(itermSessionId, sessionLabel(project, project.sessionConfig?.env), project.rootPath);
+    deps.nameSession?.(itermSessionId, opts.sessionName ?? sessionLabel(project, project.sessionConfig?.env), project.rootPath);
   } catch (err) {
     log(`dispatch: naming "${label}" failed: ${err instanceof Error ? err.message : String(err)}`);
   }

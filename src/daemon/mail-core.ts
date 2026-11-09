@@ -21,6 +21,10 @@ export interface MailboxConfig {
   credentialsFile: string;
   /** Session / project name that receives accepted mail. Follows `owner rename`. */
   owner: string;
+  /** Start the owner session when none is running (default true). */
+  autoLaunch?: boolean;
+  /** PAI project slug or folder path to launch; default: resolve by the owner name. */
+  project?: string;
   allowlist: string[];
   includeSelfEmails: boolean;
   /** Mandatory Cc on every outgoing mail of this mailbox; implicitly allowlisted both ways. */
@@ -240,6 +244,8 @@ export interface SendInput {
   subject: string;
   body: string;
   inReplyTo?: string;
+  /** Quote the original below the reply when inReplyTo is set. Default true. */
+  quote?: boolean;
 }
 
 export type SendDecision =

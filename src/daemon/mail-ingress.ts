@@ -74,23 +74,93 @@ async function saveAttachments(messageId: string, p: Parsed): Promise<string[]> 
   return out;
 }
 
-/** Deposit text into the owner's session mailbox. Returns true when it was taken. */
-async function deliverToOwner(mb: MailboxConfig, body: string): Promise<{ ok: boolean; detail: string }> {
-  const { deliverMachineMessage } = await import("./inbound.js");
-  return deliverMachineMessage(`mail-${mb.name}`, mb.owner, body);
+type DeliverFn = (mb: MailboxConfig, body: string) => Promise<{ ok: boolean; detail: string }>;
+type LaunchFn = (project: string, message: string, opts: { prefix: string; sessionName: string }) => Promise<{ outcome: string; reason: string }>;
+
+export interface IngressDeps {
+  deliver?: DeliverFn;
+  dispatch?: LaunchFn;
+  notify?: (text: string) => void;
+  now?: () => number;
 }
 
-/** Process one fetched message. Returns the action taken. */
-export async function handleMessage(
-  mb: MailboxConfig, raw: Buffer, user: string, identity?: Identity,
-  resolver?: GateInput["resolver"],
-): Promise<{ action: "accepted" | "rejected" | "duplicate" | "deferred"; reason: string }> {
+const LAUNCH_RETRY_MS = 10 * 60_000;
+const inflightLaunch = new Map<string, Promise<boolean>>();
+const lastLaunchFailure = new Map<string, number>();
+
+/** For tests. */
+export function __resetLaunchState(): void { inflightLaunch.clear(); lastLaunchFailure.clear(); }
+
+/** Deposit text into the owner's session mailbox. Returns true when it was taken. */
+const deliverToOwner: DeliverFn = async (mb, body) => {
+  const { deliverMachineMessage } = await import("./inbound.js");
+  return deliverMachineMessage(`mail-${mb.name}`, mb.owner, body);
+};
+
+async function realDispatch(project: string, message: string, opts: { prefix: string; sessionName: string }) {
+  const { dispatch } = await import("./dispatch.js");
+  return dispatch(project, message, opts);
+}
+
+async function realNotify(text: string): Promise<void> {
+  const { broadcastText } = await import("../adapters/pailot/gateway.js");
+  broadcastText(text);
+}
+
+/**
+ * Launch the owner session with the mail as its work order, through dispatch().
+ * One launch per owner at a time; a failure blocks relaunch for 10 minutes.
+ * Returns "launched" (mail consumed as work order), "wait" (another launch
+ * finished OK — deliver normally) or "failed".
+ */
+async function launchOwner(
+  mb: MailboxConfig, body: string, subject: string, deps: IngressDeps, opts: { notify?: boolean } = {},
+): Promise<"launched" | "wait" | "failed"> {
+  const key = mb.owner.toLowerCase();
+  const pending = inflightLaunch.get(key);
+  if (pending) return (await pending) ? "wait" : "failed";
+  const now = (deps.now ?? Date.now)();
+  const failedAt = lastLaunchFailure.get(key);
+  if (failedAt !== undefined && now - failedAt < LAUNCH_RETRY_MS) return "failed";
+
+  const prefix = `[Mail:${mb.name}]`;
+  const message = body.startsWith(prefix) ? body.slice(prefix.length).trimStart() : body;
+  const run = (async () => {
+    try {
+      const r = await (deps.dispatch ?? realDispatch)(mb.project || mb.owner, message, { prefix, sessionName: mb.owner });
+      if (r.outcome === "spawned" || r.outcome === "delivered" || r.outcome === "queued") return true;
+      log(`mail-ingress: ${mb.name} auto-launch of ${mb.owner} failed: ${r.outcome}: ${r.reason}`);
+    } catch (e) {
+      log(`mail-ingress: ${mb.name} auto-launch of ${mb.owner} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    lastLaunchFailure.set(key, (deps.now ?? Date.now)());
+    return false;
+  })();
+  inflightLaunch.set(key, run);
+  try {
+    const ok = await run;
+    if (ok && opts.notify !== false) {
+      try { await (deps.notify ?? realNotify)(`Started ${mb.owner} for mail ${subject}`); } catch { /* best effort */ }
+    }
+    return ok ? "launched" : "failed";
+  } finally {
+    inflightLaunch.delete(key);
+  }
+}
+
+type Outcome = { action: "accepted" | "rejected" | "duplicate" | "deferred"; reason: string };
+interface Prepared { messageId: string; text: string; subject: string; fromAddr: string; date: number }
+
+/** Parse and gate one message: either a final outcome (rejected/duplicate/deferred) or a deliverable. */
+async function prepare(
+  mb: MailboxConfig, raw: Buffer, user: string, identity: Identity | undefined, resolver: GateInput["resolver"],
+): Promise<{ done: Outcome } | { prep: Prepared }> {
   const { simpleParser } = await import("mailparser");
   const p = await simpleParser(raw);
   const messageId = p.messageId ?? `<noid-${Date.now()}@local>`;
   const fromAddr = p.from?.value?.[0]?.address ?? "";
 
-  if (isAccepted(mb.name, messageId)) return { action: "duplicate", reason: "already accepted" };
+  if (isAccepted(mb.name, messageId)) return { done: { action: "duplicate", reason: "already accepted" } };
 
   const addrs = (v: unknown): string[] => {
     const list = Array.isArray(v) ? v : v ? [v] : [];
@@ -102,22 +172,89 @@ export async function handleMessage(
   );
   if (g.deferred) {
     log(`mail-ingress: ${mb.name} deferred id=${messageId} reason=${g.reason}`);
-    return { action: "deferred", reason: g.reason };
+    return { done: { action: "deferred", reason: g.reason } };
   }
   if (!g.ok) {
     log(`mail-ingress: ${mb.name} rejected from=${fromAddr || "?"} id=${messageId} reason=${g.reason}`);
-    return { action: "rejected", reason: g.reason };
+    return { done: { action: "rejected", reason: g.reason } };
   }
-
   const files = await saveAttachments(messageId, p);
-  const r = await deliverToOwner(mb, formatMessage(mb, p, messageId, files));
-  if (!r.ok) {
-    log(`mail-ingress: ${mb.name} deferred id=${messageId}: ${r.detail}`);
-    return { action: "deferred", reason: r.detail };
+  return { prep: { messageId, text: formatMessage(mb, p, messageId, files), subject: p.subject ?? "", fromAddr, date: p.date?.getTime() ?? 0 } };
+}
+
+function accepted(mb: MailboxConfig, pr: Prepared, detail: string): Outcome {
+  recordAccepted(mb.name, pr.messageId);
+  log(`mail-ingress: ${mb.name} accepted from=${pr.fromAddr} id=${pr.messageId} → ${mb.owner}: ${detail}`);
+  return { action: "accepted", reason: detail };
+}
+
+function deferredOutcome(mb: MailboxConfig, pr: Prepared, detail: string): Outcome {
+  log(`mail-ingress: ${mb.name} deferred id=${pr.messageId}: ${detail}`);
+  return { action: "deferred", reason: detail };
+}
+
+/** Process one fetched message. Returns the action taken. */
+export async function handleMessage(
+  mb: MailboxConfig, raw: Buffer, user: string, identity?: Identity,
+  resolver?: GateInput["resolver"], deps: IngressDeps = {},
+): Promise<Outcome> {
+  const x = await prepare(mb, raw, user, identity, resolver);
+  if ("done" in x) return x.done;
+  const pr = x.prep;
+  const deliver = deps.deliver ?? deliverToOwner;
+  let r = await deliver(mb, pr.text);
+  if (!r.ok && mb.autoLaunch !== false && r.detail.startsWith("no live session")) {
+    const l = await launchOwner(mb, pr.text, pr.subject, deps);
+    if (l === "launched") r = { ok: true, detail: `started ${mb.owner} with the mail as work order` };
+    else if (l === "wait") r = await deliver(mb, pr.text);
   }
-  recordAccepted(mb.name, messageId);
-  log(`mail-ingress: ${mb.name} accepted from=${fromAddr} id=${messageId} → ${mb.owner}: ${r.detail}`);
-  return { action: "accepted", reason: r.detail };
+  return r.ok ? accepted(mb, pr, r.detail) : deferredOutcome(mb, pr, r.detail);
+}
+
+/**
+ * Catch-up batch: gate every message, sort the accepted ones by IMAP UID (then
+ * Date), deliver each as its own [Mail:] message in that order. When the owner
+ * has no live session at most one launch happens for the whole batch (the first
+ * mail is the work order and names the queued rest). Exactly one PAILot line per
+ * batch with N > 1. onResult fires after each mail's own outcome so the caller
+ * can flag/move it only once that mail was delivered.
+ */
+export async function handleBatch(
+  mb: MailboxConfig, items: { uid: number; raw: Buffer }[], user: string, identity: Identity | undefined,
+  resolver: GateInput["resolver"], deps: IngressDeps,
+  onResult: (uid: number, r: Outcome) => Promise<void> | void,
+): Promise<void> {
+  const queue: { uid: number; pr: Prepared }[] = [];
+  for (const it of items) {
+    const x = await prepare(mb, it.raw, user, identity, resolver);
+    if ("done" in x) await onResult(it.uid, x.done);
+    else queue.push({ uid: it.uid, pr: x.prep });
+  }
+  queue.sort((a, b) => a.uid - b.uid || a.pr.date - b.pr.date);
+  const deliver = deps.deliver ?? deliverToOwner;
+  let delivered = 0;
+  let launched = false;
+  let launchTried = false;
+  for (let i = 0; i < queue.length; i++) {
+    const { uid, pr } = queue[i];
+    let r = await deliver(mb, pr.text);
+    if (!r.ok && !launchTried && mb.autoLaunch !== false && r.detail.startsWith("no live session")) {
+      launchTried = true;
+      const rest = queue.slice(i + 1).map((q) => q.pr.messageId);
+      const order = rest.length
+        ? `${pr.text}\n---\nQueued after this request, delivered next as separate [Mail:${mb.name}] messages in arrival order: ${rest.join(" ")}`
+        : pr.text;
+      const l = await launchOwner(mb, order, pr.subject, deps, { notify: queue.length === 1 });
+      if (l === "launched") { launched = true; r = { ok: true, detail: `started ${mb.owner} with the mail as work order` }; }
+      else if (l === "wait") r = await deliver(mb, pr.text);
+    }
+    const out = r.ok ? accepted(mb, pr, r.detail) : deferredOutcome(mb, pr, r.detail);
+    if (r.ok) delivered++;
+    await onResult(uid, out);
+  }
+  if (delivered > 1) {
+    try { await (deps.notify ?? realNotify)(`${delivered} requests caught up, session ${mb.owner} ${launched ? "started" : "delivered"}`); } catch { /* best effort */ }
+  }
 }
 
 async function runMailbox(name: string, signal: { stopped: boolean }): Promise<void> {
@@ -165,18 +302,20 @@ async function session(mb0: MailboxConfig, creds: Credentials, signal: { stopped
     chain = chain.then(async () => {
       const mb = findMailbox(mb0.name) ?? mb0;
       const uids = await client.search({ seen: false }, { uid: true });
+      const items: { uid: number; raw: Buffer }[] = [];
       for (const uid of uids || []) {
         const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
-        if (!msg || !msg.source) continue;
-        const r = await handleMessage(mb, msg.source, creds.user);
-        if (r.action === "deferred") continue; // stays UNSEEN, retried by the poll / reconnect
+        if (msg && msg.source) items.push({ uid: Number(uid), raw: msg.source });
+      }
+      await handleBatch(mb, items, creds.user, undefined, undefined, {}, async (uid, r) => {
+        if (r.action === "deferred") return; // stays UNSEEN, retried by the poll / reconnect
         if (r.action === "rejected") {
           await client.messageMove(String(uid), folders.rejected, { uid: true });
         } else {
           await client.messageFlagsAdd(String(uid), ["\\Seen"], { uid: true });
           await client.messageMove(String(uid), folders.accepted, { uid: true });
         }
-      }
+      });
     }).catch((e) => log(`mail-ingress: ${mb0.name} sweep failed: ${e instanceof Error ? e.message : String(e)}`));
     return chain;
   };

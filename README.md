@@ -129,6 +129,8 @@ A dedicated mailbox can feed change requests to a session. Config: `~/.aibroker/
       "name": "site",
       "credentialsFile": "~/.aibroker/mail-site.credentials",
       "owner": "Example Project",
+      "autoLaunch": true,
+      "project": "example-project",
       "allowlist": ["requester@example.org"],
       "includeSelfEmails": false,
       "operatorCc": "operator@example.org",
@@ -151,13 +153,13 @@ Gate (per message), all of:
 
 `Authentication-Results` and `Received` headers are not trusted. A DNS temperror leaves the message UNSEEN for the next cycle instead of rejecting it. A failed message is moved to the rejected folder with one log line (from, message-id, reason) and nothing else: no bounce, auto-reply or read receipt, so the mailbox never reveals that it is read.
 
-Accepted mail is deposited in the owner session's mailbox (text starts with `[Mail:<name>]`, attachments saved under `~/.aibroker/mail-attachments/<message-id>/`), then flagged `\Seen` and moved to the accepted folder. If the owner session is not running the message stays UNSEEN and is retried every 5 minutes and at the next reconnect. Accepted message-ids are persisted (`mail-accepted.json`) for dedupe and for the send rules.
+Accepted mail is deposited in the owner session's mailbox (text starts with `[Mail:<name>]`, attachments saved under `~/.aibroker/mail-attachments/<message-id>/`), then flagged `\Seen` and moved to the accepted folder. If the owner session is not running, AIBroker starts it (per mailbox `autoLaunch`, default `true`): the mail becomes the work order of a new session launched through the normal dispatch path (prefix `[Mail:<name>]`), the session is named exactly `owner`, and PAILot gets one line (`Started <owner> for mail <subject>`; no body, no addresses). `project` (optional, PAI project slug or folder path) selects what to launch; without it the project is resolved from the `owner` name like any dispatch target. One launch runs per owner at a time; further mail waits and is delivered to the running session. A failed launch leaves the mail UNSEEN and is not retried sooner than 10 minutes. With `autoLaunch: false` (or when the launch failed) the message stays UNSEEN and is retried every 5 minutes and at the next reconnect. Accepted message-ids are persisted (`mail-accepted.json`) for dedupe and for the send rules.
 
 ### Sending: `aibroker mail send` / MCP `aibroker_mail_send`
 
 ```
 aibroker mail send --mailbox webseite --to requester@example.org [--cc ...] \
-  --subject "Re: ..." --body-file reply.txt --in-reply-to '<message-id>'
+  --subject "Re: ..." --body-file reply.txt --in-reply-to '<message-id>' [--no-quote]
 ```
 
 One function (`sendMail`) serves both, with unconditional rules (no override flag, no Bcc):
@@ -165,4 +167,5 @@ One function (`sendMail`) serves both, with unconditional rules (no override fla
 1. Every To/Cc must be on the mailbox allowlist, in `identity.selfEmails`, or be `operatorCc`; otherwise nothing is sent or saved.
 2. A recipient that is not self/operator requires `--in-reply-to` naming a message-id this mailbox accepted via ingress.
 3. `operatorCc` is always added as Cc; sending is refused if it is unset.
-4. SMTP submission on 587 with STARTTLS, then the copy is saved to the sent folder via IMAP APPEND. One log line per send (mailbox, recipients, ids); never body or password.
+4. SMTP submission on 587 with STARTTLS, then the copy is saved to the sent folder via IMAP APPEND (the sent folder is created if missing; a failed save is reported as a warning). One log line per send (mailbox, recipients, ids); never body or password.
+5. Quoting: with `--in-reply-to`, the original (looked up by Message-ID in the accepted folder, then INBOX) is quoted below the body like a normal reply: `Am dd.mm.yyyy um HH:MM schrieb Name <addr>:` (local time) followed by the original plain text with every line prefixed `> ` (already quoted lines become `>>`). `References` is the original's References plus its Message-ID, and the subject gets exactly one `Re:`. If the original cannot be found the mail is sent without quote and one warning line is logged. `--no-quote` (MCP: `quote: false`) skips the lookup.
