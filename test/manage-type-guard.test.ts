@@ -202,3 +202,10 @@ test("isClaudePane: any node foreground process is not a shell", () => {
 test("isClaudePane: no title at all is not a Claude pane", () => {
   assert.equal(isClaudePane(undefined), false);
 });
+
+import { projectDirName } from "../src/daemon/manage.js";
+
+test("projectDirName encodes spaces and ' - ' like Claude Code (context=unknown regression)", () => {
+  assert.equal(projectDirName("/Users/u/Cloud/08 - Others/Proj/Sub"), "-Users-u-Cloud-08---Others-Proj-Sub");
+  assert.equal(projectDirName("/Users/u/.claude/a_b"), "-Users-u--claude-a-b");
+});

@@ -1889,13 +1889,23 @@ export function sessionProjectCwd(
  * measured-compaction reading (every .jsonl in the project, not only the
  * live one).
  */
-function projectTranscriptDir(claudePid: string, uuid?: string): string | null {
+export function projectTranscriptDir(claudePid: string, uuid?: string): string | null {
   const byId = uuid ? sessionTranscriptFile(uuid) : null;
   if (byId) return dirname(byId);
   const cwd = sessionCwd(claudePid);
   if (!cwd) return null;
-  const dir = join(homedir(), ".claude", "projects", cwd.replace(/\//g, "-"));
+  const dir = join(homedir(), ".claude", "projects", projectDirName(cwd));
   return existsSync(dir) ? dir : null;
+}
+
+/**
+ * Claude Code's directory name under ~/.claude/projects for a cwd: every
+ * non-alphanumeric character becomes a dash (spaces, dots, "~", "_" too), so
+ * "/a/08 - Others/x" is "-a-08---Others-x". Replacing only "/" misses any
+ * cwd with a space and leaves the session's context reading unknown.
+ */
+export function projectDirName(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
 const transcriptFileCache = new Map<string, string>();

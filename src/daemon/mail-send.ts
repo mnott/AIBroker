@@ -7,6 +7,8 @@
  * network. The body and password are never logged.
  */
 
+import { basename } from "node:path";
+import { statSync } from "node:fs";
 import { log } from "../core/log.js";
 import {
   decideSend, findMailbox, imapEndpoint, loadCredentials, loadIdentity, smtpEndpoint,
@@ -22,6 +24,8 @@ export interface SendDeps {
   transmit?: (creds: Credentials, mb: MailboxConfig, msg: BuiltMessage) => Promise<void>;
   /** Save the raw message to the sent folder via IMAP APPEND. */
   append?: (creds: Credentials, mb: MailboxConfig, raw: Buffer) => Promise<void>;
+  /** Total attachment size cap in bytes (default MAX_ATTACHMENT_BYTES). */
+  maxAttachmentBytes?: number;
   /** Look up the mail being answered by Message-ID (accepted folder, then INBOX). */
   findOriginal?: (creds: Credentials, mb: MailboxConfig, messageId: string) => Promise<OriginalMail | undefined>;
 }
@@ -52,6 +56,32 @@ export function formatQuote(orig: OriginalMail): string {
 export interface BuiltMessage {
   from: string; to: string[]; cc: string[]; subject: string; text: string;
   messageId: string; inReplyTo?: string; references?: string;
+  attachments?: Array<{ filename: string; path: string }>;
+}
+
+/** Total size cap for all attachments of one mail. */
+export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+const mb1 = (n: number) => `${(n / 1048576).toFixed(2)} MB`;
+
+/** Check every path is a regular file and the total fits the cap; returns the nodemailer attachment list. */
+export function validateAttachments(paths: string[] | undefined, cap = MAX_ATTACHMENT_BYTES): { ok: true; attachments: Array<{ filename: string; path: string }> } | { ok: false; error: string } {
+  let total = 0;
+  const attachments: Array<{ filename: string; path: string }> = [];
+  for (const path of paths ?? []) {
+    let size: number;
+    try {
+      const st = statSync(path);
+      if (!st.isFile()) return { ok: false, error: `attachment is not a regular file: ${path}` };
+      size = st.size;
+    } catch {
+      return { ok: false, error: `attachment not found: ${path}` };
+    }
+    total += size;
+    if (total > cap) return { ok: false, error: `attachments too large: ${path} (${mb1(size)}) brings the total to ${mb1(total)}, cap is ${mb1(cap)}` };
+    attachments.push({ filename: basename(path), path });
+  }
+  return { ok: true, attachments };
 }
 
 export type SendResult = { ok: true; messageId: string; to: string[]; cc: string[]; warning?: string } | { ok: false; error: string };
@@ -65,6 +95,9 @@ export async function sendMail(mailboxName: string, input: SendInput, deps: Send
     const identity = deps.identity ?? loadIdentity();
     const decision = decideSend(mb, identity, input, deps.isAccepted);
     if (!decision.ok) return { ok: false, error: decision.error };
+
+    const att = validateAttachments(input.attachments, deps.maxAttachmentBytes);
+    if (!att.ok) return { ok: false, error: att.error };
 
     const creds = deps.creds ?? loadCredentials(mb.credentialsFile);
     const domain = creds.user.split("@")[1] ?? "localhost";
@@ -89,6 +122,7 @@ export async function sendMail(mailboxName: string, input: SendInput, deps: Send
       to: decision.to, cc: decision.cc,
       subject: input.inReplyTo ? ensureRe(input.subject) : input.subject, text, messageId,
       ...(input.inReplyTo ? { inReplyTo: bracket(input.inReplyTo), references } : {}),
+      ...(att.attachments.length ? { attachments: att.attachments } : {}),
     };
 
     let raw: Buffer | undefined;
@@ -103,6 +137,7 @@ export async function sendMail(mailboxName: string, input: SendInput, deps: Send
       const info = await transport.sendMail({
         from: msg.from, to: msg.to, cc: msg.cc, subject: msg.subject, text: msg.text,
         messageId: msg.messageId, inReplyTo: msg.inReplyTo, references: msg.references,
+        attachments: msg.attachments,
       });
       raw = (info as unknown as { message?: Buffer }).message;
     }
@@ -110,7 +145,7 @@ export async function sendMail(mailboxName: string, input: SendInput, deps: Send
 
     // Copy to the sent folder. A failure here does not unsend; report it.
     try {
-      if (deps.append) await deps.append(creds, mb, raw ?? Buffer.from(msg.text));
+      if (deps.append) await deps.append(creds, mb, raw ?? await buildRaw(msg));
       else await appendToSent(creds, mb, msg);
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e);
@@ -139,13 +174,19 @@ export async function saveToSent(client: SentClient, mb: MailboxConfig, raw: Buf
   return folder;
 }
 
-async function appendToSent(creds: Credentials, mb: MailboxConfig, msg: BuiltMessage): Promise<void> {
-  const { ImapFlow } = await import("imapflow");
+/** The raw RFC 5322 message for the sent copy (same attachments as the transmitted one). */
+async function buildRaw(msg: BuiltMessage): Promise<Buffer> {
   const MailComposer = (await import("nodemailer/lib/mail-composer/index.js")).default;
-  const raw = await new MailComposer({
+  return new MailComposer({
     from: msg.from, to: msg.to, cc: msg.cc, subject: msg.subject, text: msg.text,
     messageId: msg.messageId, inReplyTo: msg.inReplyTo, references: msg.references, date: new Date(),
+    attachments: msg.attachments,
   }).compile().build();
+}
+
+async function appendToSent(creds: Credentials, mb: MailboxConfig, msg: BuiltMessage): Promise<void> {
+  const { ImapFlow } = await import("imapflow");
+  const raw = await buildRaw(msg);
   const client = new ImapFlow({ ...imapEndpoint(creds), auth: { user: creds.user, pass: creds.pass }, logger: false });
   await client.connect();
   try {
