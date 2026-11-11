@@ -423,3 +423,48 @@ test("sendMail: append failure is ok with a warning", async () => {
   assert.equal(r.ok, true);
   assert.match((r as { warning?: string }).warning ?? "", /no folder/);
 });
+
+// --- attachments -----------------------------------------------------------
+function attFixture(): { dir: string; pdf: string } {
+  const dir = mkdtempSync(join(tmpdir(), "mail-att-"));
+  const pdf = join(dir, "Rechnung Ä vom 11.11.2026.pdf");
+  writeFileSync(pdf, "%PDF-1.4 example");
+  return { dir, pdf };
+}
+
+test("attachments: reach transmit and sent copy, together with the quote", async () => {
+  const { pdf } = attFixture();
+  const sent: BuiltMessage[] = [];
+  let saved = "";
+  const r = await sendMail("site", { to: ["requester@example.org"], subject: "Rechnung", body: "Anbei.", inReplyTo: "a@x", attachments: [pdf] },
+    { mailbox: mb, identity: id, creds, isAccepted: () => true, findOriginal: async () => orig,
+      transmit: async (_c, _m, m) => { sent.push(m); }, append: async (_c, _m, raw) => { saved = raw.toString("utf-8"); } });
+  assert.equal(r.ok, true);
+  assert.deepEqual(sent[0].attachments, [{ filename: "Rechnung Ä vom 11.11.2026.pdf", path: pdf }]);
+  assert.match(saved, /multipart\/mixed/);
+  assert.match(saved, /application\/pdf/);
+  assert.match(saved, /filename\*=utf-8''|=\?UTF-8\?/i);
+  assert.match(saved, /Anbei\./);
+  assert.match(saved, /schrieb Example Requester/);
+});
+
+test("attachments: missing file or directory -> ok:false, nothing transmitted", async () => {
+  const { dir } = attFixture();
+  let touched = 0;
+  const deps = { mailbox: mb, identity: id, creds, isAccepted: () => true, transmit: async () => { touched++; }, append: async () => { touched++; } };
+  for (const p of [join(dir, "nope.pdf"), dir]) {
+    const r = await sendMail("site", { to: ["requester@example.org"], subject: "x", body: "y", inReplyTo: "a@x", quote: false, attachments: [p] }, deps);
+    assert.equal(r.ok, false);
+  }
+  assert.equal(touched, 0);
+});
+
+test("attachments: over the cap -> ok:false naming file and sizes, nothing transmitted", async () => {
+  const { pdf } = attFixture();
+  let touched = 0;
+  const r = await sendMail("site", { to: ["requester@example.org"], subject: "x", body: "y", inReplyTo: "a@x", quote: false, attachments: [pdf] },
+    { mailbox: mb, identity: id, creds, isAccepted: () => true, maxAttachmentBytes: 4, transmit: async () => { touched++; }, append: async () => { touched++; } });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.error, /too large: .*Rechnung.*cap is/);
+  assert.equal(touched, 0);
+});

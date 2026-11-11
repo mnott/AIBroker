@@ -246,6 +246,8 @@ export interface SendInput {
   inReplyTo?: string;
   /** Quote the original below the reply when inReplyTo is set. Default true. */
   quote?: boolean;
+  /** File paths to attach. */
+  attachments?: string[];
 }
 
 export type SendDecision =

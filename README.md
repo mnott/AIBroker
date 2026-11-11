@@ -159,7 +159,7 @@ Accepted mail is deposited in the owner session's mailbox (text starts with `[Ma
 
 ```
 aibroker mail send --mailbox webseite --to requester@example.org [--cc ...] \
-  --subject "Re: ..." --body-file reply.txt --in-reply-to '<message-id>' [--no-quote]
+  --subject "Re: ..." --body-file reply.txt --in-reply-to '<message-id>' [--no-quote] [--attach file]...
 ```
 
 One function (`sendMail`) serves both, with unconditional rules (no override flag, no Bcc):
@@ -169,3 +169,4 @@ One function (`sendMail`) serves both, with unconditional rules (no override fla
 3. `operatorCc` is always added as Cc; sending is refused if it is unset.
 4. SMTP submission on 587 with STARTTLS, then the copy is saved to the sent folder via IMAP APPEND (the sent folder is created if missing; a failed save is reported as a warning). One log line per send (mailbox, recipients, ids); never body or password.
 5. Quoting: with `--in-reply-to`, the original (looked up by Message-ID in the accepted folder, then INBOX) is quoted below the body like a normal reply: `Am dd.mm.yyyy um HH:MM schrieb Name <addr>:` (local time) followed by the original plain text with every line prefixed `> ` (already quoted lines become `>>`). `References` is the original's References plus its Message-ID, and the subject gets exactly one `Re:`. If the original cannot be found the mail is sent without quote and one warning line is logged. `--no-quote` (MCP: `quote: false`) skips the lookup.
+6. Attachments: `--attach <path>` (repeatable; MCP: `attachments: [paths]`), 20 MB total; a missing file or exceeding the cap refuses the send before any network. The same files go into the sent copy.
