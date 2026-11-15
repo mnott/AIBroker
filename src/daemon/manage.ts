@@ -923,7 +923,7 @@ export function measuredCompactK(
     if (!line.trim()) continue;
     try {
       const j = JSON.parse(line);
-      if (j.type === "system" && j.subtype === "compact_boundary" && typeof j.compactMetadata?.preTokens === "number") {
+      if (j.type === "system" && j.subtype === "compact_boundary" && j.compactMetadata?.trigger === "auto" && typeof j.compactMetadata?.preTokens === "number") {
         events.push({ at: j.timestamp ?? "", preTokens: j.compactMetadata.preTokens });
       }
     } catch { /* not JSON, or a truncated line from a tail — skip */ }
@@ -2128,52 +2128,36 @@ function readOverridePct(pid: string | null): OverrideReading | undefined {
   return reading;
 }
 
-const measuredCompactCache = new Map<string, { mtimeSum: number; result: ReturnType<typeof measuredCompactK> }>();
+const measuredCompactCache = new Map<string, { mtime: number; result: ReturnType<typeof measuredCompactK> }>();
 
 /**
- * measuredCompactK, wired to a project directory — every .jsonl in it, not
- * only the session's own live transcript, because the last three
- * compactions for this PROJECT may belong to sessions that have since ended.
- *
- * Bounded to the five most recently modified files and a tail of each,
- * rather than reading whole transcripts that reach tens of megabytes: recent
- * compactions are, definitionally, recent, so they live in recently-touched
- * files near their own end. Cached by the summed mtime of those files so a
- * tick where nothing in the project changed does no file I/O at all — the
- * cache mostly does NOT help the live file, whose mtime moves most ticks,
- * but it is nearly free to keep and helps every other managed session
- * sharing this call.
+ * measuredCompactK, wired to ONE session's own transcript (<sessionId>.jsonl).
+ * Other sessions in the same project directory may run a different model with
+ * a different window, so their compactions say nothing about this one; only
+ * automatic compactions count (measuredCompactK). Reads a tail of the file,
+ * cached by mtime.
  */
-function measuredCompactForProject(dir: string): ReturnType<typeof measuredCompactK> {
-  let entries: { f: string; m: number }[];
+export function measuredCompactForTranscript(file: string): ReturnType<typeof measuredCompactK> {
+  let mtime: number;
   try {
-    entries = readdirSync(dir)
-      .filter((f) => f.endsWith(".jsonl"))
-      .map((f) => ({ f, m: statSync(join(dir, f)).mtimeMs }))
-      .sort((a, b) => b.m - a.m)
-      .slice(0, 5);
+    mtime = statSync(file).mtimeMs;
   } catch {
     return undefined;
   }
-  if (!entries.length) return undefined;
+  const cached = measuredCompactCache.get(file);
+  if (cached && cached.mtime === mtime) return cached.result;
 
-  const mtimeSum = entries.reduce((s, e) => s + e.m, 0);
-  const cached = measuredCompactCache.get(dir);
-  if (cached && cached.mtimeSum === mtimeSum) return cached.result;
-
-  const lines: string[] = [];
-  for (const e of entries) {
-    try {
-      const raw = execFileSync("/usr/bin/tail", ["-n", "500", join(dir, e.f)], {
-        encoding: "utf8",
-        timeout: 4_000,
-        maxBuffer: 8 * 1024 * 1024,
-      });
-      lines.push(...raw.split("\n"));
-    } catch { /* file raced a delete, or tail refused — skip it */ }
-  }
+  let lines: string[] = [];
+  try {
+    const raw = execFileSync("/usr/bin/tail", ["-n", "500", file], {
+      encoding: "utf8",
+      timeout: 4_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    lines = raw.split("\n");
+  } catch { /* file raced a delete, or tail refused */ }
   const result = measuredCompactK(lines);
-  measuredCompactCache.set(dir, { mtimeSum, result });
+  measuredCompactCache.set(file, { mtime, result });
   return result;
 }
 
@@ -2183,9 +2167,9 @@ function measuredCompactForProject(dir: string): ReturnType<typeof measuredCompa
  * per-tick log line, because a number nobody can trace back to a source is a
  * number nobody can debug when it is wrong again.
  */
-function compactionReading(m: ManagedSession, pid: string | null, dir: string | null): { effectiveK: number; label: string } {
+function compactionReading(m: ManagedSession, pid: string | null, file: string | null | undefined): { effectiveK: number; label: string } {
   const windowK = m.contextWindowK ?? 1000;
-  const measured = dir ? measuredCompactForProject(dir) : undefined;
+  const measured = file ? measuredCompactForTranscript(file) : undefined;
   const override = readOverridePct(pid);
   const effectiveK = effectiveCompactK({ windowK, overridePct: override?.pct, measuredK: measured?.k });
 
@@ -2196,7 +2180,7 @@ function compactionReading(m: ManagedSession, pid: string | null, dir: string | 
     label = `${src}; measured ${measured.k.toLocaleString("en-US")}k is stale-high and ignored`;
   } else if (measured) {
     const vals = measured.events.map((e) => e.preTokens.toLocaleString("en-US")).join(" / ");
-    label = `measured: min of ${measured.events.length} event${measured.events.length > 1 ? "s" : ""} ${vals} in this project`;
+    label = `measured: min of ${measured.events.length} event${measured.events.length > 1 ? "s" : ""} ${vals} in this session`;
   } else if (override) {
     label = `${override.source} override=${override.pct}`;
   } else {
@@ -2254,8 +2238,7 @@ function liveReading(sessionId: string, idleSec: number, m?: ManagedSession): st
       // session's own margin, so all three are printed together and only
       // when a managed session (`m`) is available to supply it.
       if (m) {
-        const dir = proc.pid ? projectTranscriptDir(proc.pid, uuid) : null;
-        const { effectiveK, label } = compactionReading(m, proc.pid, dir);
+        const { effectiveK, label } = compactionReading(m, proc.pid, t.file);
         const marginK = resolvedMarginK(m);
         const warmUpK = Math.round(effectiveK - marginK);
         out.push(`  compaction trigger ≈${Math.round(effectiveK)}k (${label})`);
@@ -3803,7 +3786,6 @@ async function tick(now = Date.now()): Promise<void> {
     const stopped = turnStoppedIdle(tickTranscript, content, now);
     const working = !stopped && sessionIsWorking(tickTranscript, now);
     const tickUsed = tickTranscript?.contextK ?? null;
-    const tickDir = tickPid ? projectTranscriptDir(tickPid, tickUuid) : null;
     const tickCwd = tickPid ? sessionProjectCwd(tickPid, tickUuid) : null;
 
     // Sample context for the fill-rate reading in `status`. Pushed only when
@@ -3840,7 +3822,7 @@ async function tick(now = Date.now()): Promise<void> {
         ? Math.max(0, now - tickTranscript.lastAt)
         : 0;
 
-    const tickCompaction = compactionReading(m, tickPid, tickDir);
+    const tickCompaction = compactionReading(m, tickPid, tickTranscript?.file);
     const tickHandoverDecision = handoverDue({
       contextK: tickUsed ?? undefined,
       effectiveK: tickCompaction.effectiveK,
