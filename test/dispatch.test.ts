@@ -6,7 +6,7 @@ import "./home-guard.js";
  * outcome matrix IS the interface. These drive dispatch() with injected deps —
  * no iTerm, no daemon, no `pai` binary.
  */
-import { test, mock } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, rmSync, readdirSync, utimesSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
