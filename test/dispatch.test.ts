@@ -8,7 +8,7 @@ import "./home-guard.js";
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, rmSync, readdirSync, utimesSync, mkdirSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, readdirSync, utimesSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -18,7 +18,7 @@ import {
   TASK_PREFIX,
   type DispatchDeps,
 } from "../src/daemon/dispatch.js";
-import type { PaiProject } from "../src/daemon/pai-projects.js";
+import { buildClaudeInvocation, findCuratedPaiProject, invalidatePaiProjectCache, __setPaiProjectFetcher, type PaiProject } from "../src/daemon/pai-projects.js";
 
 // The redrive freshness gate fetches the trailer's task through the real
 // token-protected path; without a token every lookup fails "no authorisation"
@@ -84,6 +84,183 @@ test("no curated alias -> unlaunchable, and nothing is launched", async () => {
   assert.equal(r.outcome, "unlaunchable");
   assert.equal(r.project, "mystery", "echoes back what was asked for");
   assert.match(r.reason, /pai project name/, "reason must say how to fix it");
+});
+
+test("the missing-alias advice is possible: a legal alias form and the slug option", async () => {
+  // `pai project name <id> "MDF - Webseiten"` is REJECTED by PAI ("Use letters,
+  // digits, hyphens, underscores"), so advice naming the owner verbatim as an
+  // alias was advice that could not be followed.
+  const r = await dispatch("mystery", "x", {}, deps({ resolve: async () => undefined }));
+  assert.match(r.reason, /letters, digits, hyphens, underscores/);
+  assert.match(r.reason, /slug/);
+  assert.doesNotMatch(r.reason, /name <identifier> mystery/, "must not tell someone to register an impossible alias");
+});
+
+// ── an owner given by the project's DISPLAY NAME (mail ingress, 2026-11-16) ──
+//
+// ~/.aibroker/mail-ingress.json names the owner "MDF - Webseiten" — exactly the
+// displayName of curated project mdf-webseiten (names ["20-webseiten",
+// "webseiten"]). Curated matching knew only names+slug, so the auto-launch
+// failed "No curated alias" while the manual `aibroker launch webseiten --name
+// "MDF - Webseiten"` worked. findCuratedPaiProject now falls back to a UNIQUE
+// row whose displayName or slug equals the owner, and hands back its first
+// curated name as the launch handle.
+
+const websites = (): PaiProject => ({
+  name: "20-webseiten",
+  names: ["20-webseiten", "webseiten"],
+  slug: "mdf-webseiten",
+  displayName: "MDF - Webseiten",
+  // A path that exists (launchResolvedPaiProject refuses to launch into a
+  // missing root, and the test home is a real directory).
+  rootPath: homedir(),
+  sessionCount: 0,
+  lastActive: "",
+});
+
+// The real fetcher shells out to `pai`; serve a fixed curated list through the
+// module's test seam instead (internal calls cannot be reached by mock.module),
+// and hand the seam back afterwards: the dispatch tests' redrive paths re-enter
+// real resolution, and those must keep the real fetcher (which in this sandbox
+// fails to `[]`/last-good, never touching a machine).
+let stubProjects: PaiProject[] | undefined;
+const withStub = async <T>(projects: PaiProject[], fn: () => Promise<T>): Promise<T> => {
+  const real = __setPaiProjectFetcher(async () => stubProjects ?? []);
+  stubProjects = projects;
+  // The module caches the curated list for 30s; a previous case's list must not
+  // answer for this one.
+  invalidatePaiProjectCache();
+  try { return await fn(); } finally { stubProjects = undefined; __setPaiProjectFetcher(real); }
+};
+
+test("owner \"MDF - Webseiten\" resolves to the first curated name \"webseiten\"", async () => {
+  const p = await withStub([websites()], () => findCuratedPaiProject("MDF - Webseiten"));
+  assert.ok(p, "a unique curated row answering to the display name must resolve");
+  // The requirement's project lists names as ["20-webseiten","webseiten"]; this
+  // machine's registry has them in the other order. Either way: a curated name,
+  // and the session ends up named after the owner regardless (sessionName).
+  assert.ok(["20-webseiten", "webseiten"].includes(p!.name), `launch handle must be a curated name, got "${p!.name}"`);
+  assert.equal(p!.names[0], p!.name, "the handle leads the alias list");
+});
+
+test("display-name resolution is case-insensitive and also answers to the slug", async () => {
+  await withStub([websites()], async () => {
+    assert.ok(await findCuratedPaiProject("mdf - webseiten"));
+    assert.ok(await findCuratedPaiProject("MDF - WEBSEITEN"));
+    const bySlug = await findCuratedPaiProject("mdf-webseiten");
+    assert.equal(bySlug?.name, "20-webseiten", "slug is already a curated match — the first curated name wins");
+  });
+});
+
+test("a display name shared by two curated rows stays unlaunchable — no guessing", async () => {
+  // The Glidr case curated matching exists to refuse: three registry rows share
+  // one display name, and picking one dispatches work into the wrong directory.
+  // Distinct curated NAMES, or the alias match resolves it before the display
+  // fallback is ever reached — which is correct; ambiguity is about the name.
+  // Distinct names AND distinct slugs: a slug is a curated match on its own, so
+  // twins sharing one would resolve through the alias path before the display
+  // fallback is ever reached — which is correct; ambiguity is about the row.
+  const twin = (k: string): PaiProject => ({ ...websites(), name: `webseiten-${k}`, names: [`webseiten-${k}`], slug: `mdf-webseiten-${k}` });
+  await withStub([twin("a"), twin("b")], async () => {
+    assert.equal(await findCuratedPaiProject("MDF - Webseiten"), undefined);
+  });
+});
+
+test("an owner matching nothing still keeps the existing error", async () => {
+  await withStub([websites()], async () => {
+    assert.equal(await findCuratedPaiProject("Nope Nope"), undefined);
+  });
+});
+
+test("a display-name launch names the session after the owner, as --name does", async () => {
+  // What delivery matching looks for is the OWNER ("MDF - Webseiten"), so the
+  // launched tab must carry that name, not the curated handle it launched by.
+  const p = websites();
+  const inv = buildClaudeInvocation(p, { env: { PAI_SESSION_NAME: "MDF - Webseiten" } });
+  assert.match(inv, /--name 'MDF - Webseiten'/);
+});
+
+test("dispatch passes sessionName to the launch and names the spawned tab after it", async () => {
+  const named: string[][] = [];
+  let gotSessionName = "";
+  const r = await dispatch("mdf-webseiten", "x", { sessionName: "MDF - Webseiten" }, deps({
+    resolve: async () => websites(),
+    sessions: () => [],
+    launch: async (_p, o) => { gotSessionName = o?.sessionName ?? ""; return { itermSessionId: "NEW" }; },
+    nameSession: (id, label) => { named.push([id, label]); },
+  }));
+  assert.equal(r.outcome, "spawned");
+  assert.equal(gotSessionName, "MDF - Webseiten", "the launch must carry the owner name");
+  assert.deepEqual(named, [["NEW", "MDF - Webseiten"]], "the tab is titled after the owner");
+});
+
+// ── a flaky iTerm tab gets ONE retry (mail auto-launch) ─────────────────────
+//
+// The first manual launch of an owner failed with "Failed to create iTerm2 tab
+// … (iTerm would not open one, or the new tab was not at a shell prompt and was
+// closed untouched)" and worked on an immediate retry. One transient hiccup
+// must not defer the mail for 10 minutes (the relaunch block).
+
+test("a failed tab creation is retried once after the delay -> spawned", async () => {
+  const slept: number[] = [];
+  let attempts = 0;
+  const r = await dispatch("whazaa", "x", { launchRetryDelayMs: 3_000 }, deps({
+    sessions: () => [],
+    sleep: async (ms) => { slept.push(ms); },
+    launch: async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("Failed to create iTerm2 tab … closed untouched");
+      return { itermSessionId: "NEW" };
+    },
+  }));
+  assert.equal(r.outcome, "spawned");
+  assert.equal(attempts, 2, "one retry after the first failure");
+  assert.deepEqual(slept, [3_000], "exactly one short wait between attempts");
+});
+
+test("a tab creation that fails twice defers: unreachable, exactly two attempts", async () => {
+  const slept: number[] = [];
+  let attempts = 0;
+  const r = await dispatch("whazaa", "x", { launchRetryDelayMs: 3_000 }, deps({
+    sessions: () => [],
+    sleep: async (ms) => { slept.push(ms); },
+    launch: async () => { attempts++; throw new Error("iTerm would not open one"); },
+  }));
+  assert.equal(r.outcome, "unreachable");
+  assert.match(r.reason, /retried once/);
+  assert.match(r.reason, /iTerm would not open one/);
+  assert.equal(attempts, 2, "the retry is bounded at one");
+  assert.equal(slept.length, 1);
+});
+
+test("without launchRetryDelayMs a failed launch is NOT retried (other callers unchanged)", async () => {
+  let attempts = 0;
+  const r = await dispatch("whazaa", "x", {}, deps({
+    sessions: () => [],
+    launch: async () => { attempts++; throw new Error("iTerm refused"); },
+  }));
+  assert.equal(r.outcome, "unreachable");
+  assert.equal(attempts, 1);
+});
+
+test("launchResolvedPaiProject: sessionName names the tab and outranks configured env", async () => {
+  // Cross-module mocks are unreliable under this loader (observed: a real iTerm
+  // tab opened from the test), and no real session may be launched from tests.
+  // So the naming contract is pinned where it is built — the env rule plus
+  // buildClaudeInvocation, which reads --name back out of that same env.
+  const p = websites();
+  const env: Record<string, string> = { PAI_SESSION_NAME: "Configured Name" };
+  // What launchResolvedPaiProject does with opts.sessionName: it overwrites the
+  // configured value (the caller looks the session up by the name it chose).
+  env.PAI_SESSION_NAME = "MDF - Webseiten";
+  const inv = buildClaudeInvocation(p, { env }, "do it");
+  assert.match(inv, /--name 'MDF - Webseiten'/);
+  assert.ok(!inv.includes("Configured Name"), "the caller's name outranks the configured one");
+  assert.ok(!inv.includes("/Name"), "with a work order there is no /Name prompt");
+
+  // Without sessionName the project's own label names the tab (unchanged).
+  const plain = buildClaudeInvocation(p, { env: {} });
+  assert.match(plain, /--name 'MDF - Webseiten'/); // sessionLabel picks the display name
 });
 
 test("--no-spawn with no live session -> skipped", async () => {

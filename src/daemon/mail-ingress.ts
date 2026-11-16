@@ -75,7 +75,7 @@ async function saveAttachments(messageId: string, p: Parsed): Promise<string[]> 
 }
 
 type DeliverFn = (mb: MailboxConfig, body: string) => Promise<{ ok: boolean; detail: string }>;
-type LaunchFn = (project: string, message: string, opts: { prefix: string; sessionName: string }) => Promise<{ outcome: string; reason: string }>;
+type LaunchFn = (project: string, message: string, opts: { prefix: string; sessionName: string; launchRetryDelayMs?: number }) => Promise<{ outcome: string; reason: string }>;
 
 export interface IngressDeps {
   deliver?: DeliverFn;
@@ -85,6 +85,14 @@ export interface IngressDeps {
 }
 
 const LAUNCH_RETRY_MS = 10 * 60_000;
+/**
+ * Tab creation is transiently flaky: the first manual launch of an owner has
+ * failed with "iTerm would not open one, or the new tab was not at a shell
+ * prompt and was closed untouched" and worked on an immediate retry. The
+ * auto-launch gives it one short second chance before deferring (and before
+ * the 10-minute relaunch block engages).
+ */
+const TAB_LAUNCH_RETRY_DELAY_MS = 3_000;
 const inflightLaunch = new Map<string, Promise<boolean>>();
 const lastLaunchFailure = new Map<string, number>();
 
@@ -97,7 +105,7 @@ const deliverToOwner: DeliverFn = async (mb, body) => {
   return deliverMachineMessage(`mail-${mb.name}`, mb.owner, body);
 };
 
-async function realDispatch(project: string, message: string, opts: { prefix: string; sessionName: string }) {
+async function realDispatch(project: string, message: string, opts: { prefix: string; sessionName: string; launchRetryDelayMs?: number }) {
   const { dispatch } = await import("./dispatch.js");
   return dispatch(project, message, opts);
 }
@@ -127,7 +135,9 @@ async function launchOwner(
   const message = body.startsWith(prefix) ? body.slice(prefix.length).trimStart() : body;
   const run = (async () => {
     try {
-      const r = await (deps.dispatch ?? realDispatch)(mb.project || mb.owner, message, { prefix, sessionName: mb.owner });
+      const r = await (deps.dispatch ?? realDispatch)(mb.project || mb.owner, message, {
+        prefix, sessionName: mb.owner, launchRetryDelayMs: TAB_LAUNCH_RETRY_DELAY_MS,
+      });
       if (r.outcome === "spawned" || r.outcome === "delivered" || r.outcome === "queued") return true;
       log(`mail-ingress: ${mb.name} auto-launch of ${mb.owner} failed: ${r.outcome}: ${r.reason}`);
     } catch (e) {

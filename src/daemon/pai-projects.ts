@@ -80,6 +80,23 @@ function loadLastGoodCurated(): PaiProject[] {
   return r.status === "ok" && Array.isArray(r.data?.projects) ? r.data.projects : [];
 }
 
+/**
+ * Injectable registry source, for tests. `pai project names --json` cannot be
+ * stubbed with `mock.module`: a module's own internal calls bind to its local
+ * declarations, so only this seam lets a test serve a fixed curated list — and
+ * keeping the seam here (not in the test) means production behaviour is the
+ * default unless something replaces it.
+ */
+export type PaiProjectFetcher = (all: boolean) => Promise<PaiProject[] | null>;
+let fetchProjects: PaiProjectFetcher = fetchFromCli;
+
+/** Test-only: replace the `pai` CLI call. Returns the previous fetcher. */
+export function __setPaiProjectFetcher(f: PaiProjectFetcher): PaiProjectFetcher {
+  const prev = fetchProjects;
+  fetchProjects = f;
+  return prev;
+}
+
 /** Invalidate the project list cache (e.g. after launching a project). */
 export function invalidatePaiProjectCache(): void {
   _cache = null;
@@ -163,7 +180,7 @@ export async function listPaiProjects(all = false): Promise<PaiProject[]> {
     return cache.projects;
   }
 
-  let fetched = await fetchFromCli(all);
+  let fetched = await fetchProjects(all);
   // The curated list is never legitimately empty once it has had entries: `pai`
   // exits 0 with `[]` while its registry (Postgres) is down or restarting, and
   // taking that at face value made every alias unresolvable — a dispatch then
@@ -203,6 +220,40 @@ function matchProject(projects: PaiProject[], name: string): PaiProject | undefi
 }
 
 /**
+ * A curated project addressed by its DISPLAY NAME or slug, not an alias.
+ *
+ * Curated matching is names+slug only — deliberately, so a display name shared
+ * by three registry rows never resolves to the wrong one. But an owner can be
+ * written as the display name: `~/.aibroker/mail-ingress.json` names the owner
+ * "MDF - Webseiten", which is exactly the displayName of curated project
+ * `mdf-webseiten`, and the resolver then reports "No curated alias" while the
+ * manual launch by slug works fine. Its advice was impossible too:
+ * `pai project name mdf-webseiten "MDF - Webseiten"` is rejected by PAI
+ * ("Use letters, digits, hyphens, underscores") — a display name is not a
+ * legal alias.
+ *
+ * So when no curated row matches the needle as an alias, a UNIQUE curated row
+ * whose displayName or slug equals it (case-insensitive, exact) is used, and
+ * its first curated name becomes the launch handle. Ambiguity — two rows share
+ * the display name — is not resolved: that is the Glidr case curated matching
+ * exists to refuse, and guessing dispatches work into the wrong directory.
+ */
+function matchCuratedByDisplayNameOrSlug(projects: PaiProject[], name: string): PaiProject | undefined {
+  const needle = name.trim().toLowerCase();
+  if (!needle) return undefined;
+  const hits = projects.filter(
+    (p) => p.displayName.toLowerCase() === needle || p.slug.toLowerCase() === needle,
+  );
+  if (hits.length !== 1) return undefined;
+  const hit = hits[0];
+  // The FIRST curated name is the launch handle (`pai project config <name>`,
+  // the session's `--name`); a row with none cannot be launched by it.
+  const handle = hit.name || hit.names.find((n) => n) || "";
+  if (!handle) return undefined;
+  return { ...hit, name: handle, names: [handle, ...hit.names.filter((n) => n && n !== handle)] };
+}
+
+/**
  * Find a project by any of its names or aliases, among CURATED projects only.
  *
  * Deliberately narrower than findPaiProject(). The `--all` set is ~118 entries
@@ -213,10 +264,14 @@ function matchProject(projects: PaiProject[], name: string): PaiProject | undefi
  * (`pai project name <identifier> <shortname>`), and anything without one is
  * reported as unlaunchable rather than guessed at.
  *
- * Matching is case-insensitive.
+ * Matching is case-insensitive. A project with no alias hit is still found
+ * when the needle equals its displayName or slug and only ONE curated row says
+ * so — see matchCuratedByDisplayNameOrSlug for why that fallback is allowed and
+ * what it refuses.
  */
 export async function findCuratedPaiProject(name: string): Promise<PaiProject | undefined> {
-  return matchProject(await listPaiProjects(false), name);
+  const projects = await listPaiProjects(false);
+  return matchProject(projects, name) ?? matchCuratedByDisplayNameOrSlug(projects, name);
 }
 
 /**
@@ -371,6 +426,8 @@ export function buildClaudeInvocation(
   effective: { flags?: string; env?: Record<string, string> },
   initialPrompt?: string,
 ): string {
+  // `--name` must equal PAI_SESSION_NAME; buildClaudeInvocation reads the label
+  // back out of env, so a caller-chosen name is written there before this runs.
   const label = sessionLabel(project, effective.env);
   const flags = effective.flags ?? "";
   const claudeFlags = flags.includes("--dangerously-skip-permissions")
@@ -395,6 +452,13 @@ export async function launchResolvedPaiProject(
      * fragments the instruction into several.
      */
     initialPrompt?: string;
+    /**
+     * Name the launched session carries, instead of the project's own label —
+     * what `aibroker launch webseiten --name "MDF - Webseiten"` does. The mail
+     * ingress auto-launch uses it so the tab answers to the owner name its
+     * delivery matching looks for, not to the curated alias.
+     */
+    sessionName?: string;
   } = {},
 ): Promise<{ itermSessionId: string; sessionId: string }> {
   const name = project.name;
@@ -434,7 +498,10 @@ export async function launchResolvedPaiProject(
   const effective = await getEffectiveConfig(name) ?? project.sessionConfig ?? {};
 
   const env = { ...(effective.env ?? {}) };
-  env.PAI_SESSION_NAME ||= sessionLabel(project);
+  // An explicit session name outranks the configured one too: it is what the
+  // caller will look the session up by afterwards.
+  if (opts.sessionName) env.PAI_SESSION_NAME = opts.sessionName;
+  else env.PAI_SESSION_NAME ||= sessionLabel(project);
 
   // Build the shell command: export envs, cd, run claude
   const parts: string[] = [];
