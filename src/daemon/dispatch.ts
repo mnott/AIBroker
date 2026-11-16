@@ -97,6 +97,13 @@ export interface DispatchOptions {
   /** Cap on the delivery wait, within the budget. */
   deliverTimeoutMs?: number;
   /**
+   * Mail ingress only: retry a failed tab creation once after this many ms
+   * before reporting `unreachable`. The first manual launch of an owner has
+   * failed once with "iTerm would not open one…" and succeeded on an immediate
+   * retry, so one transient iTerm hiccup must not defer the mail for 10 minutes.
+   */
+  launchRetryDelayMs?: number;
+  /**
    * Routing prefix, when the default does not fit.
    *
    * A comment on a task in flight is a correction, not a new work order, and
@@ -130,7 +137,7 @@ export interface DispatchDeps {
    */
   sessionsReliable: () => boolean;
   deliver: (sessionId: string, body: string, timeoutMs: number, io?: TerminalIO, retries?: number) => Promise<AckResult>;
-  launch: (project: PaiProject, opts?: { initialPrompt?: string }) => Promise<{ itermSessionId: string }>;
+  launch: (project: PaiProject, opts?: { initialPrompt?: string; sessionName?: string }) => Promise<{ itermSessionId: string }>;
   waitReady: (sessionId: string, timeoutMs: number) => Promise<boolean>;
   /**
    * Set registry name, tab title, badge and paiName variable on a spawned
@@ -145,6 +152,8 @@ export interface DispatchDeps {
   todoistFetch?: typeof fetch;
   /** Read a session's screen, to confirm Claude still owns the tty. */
   capture: (sessionId: string) => string | null;
+  /** Wait between launch attempts; injectable so the retry is testable without real seconds. */
+  sleep?: (ms: number) => Promise<void>;
   /** Clock for the shared budget; injectable so budget maths is testable. */
   now: () => number;
 }
@@ -399,8 +408,14 @@ export async function dispatch(
       project: projectName,
       session: "",
       reason:
+        // The advice must be POSSIBLE: an alias is a short machine-style name,
+        // and PAI rejects spaces in it ("Use letters, digits, hyphens,
+        // underscores"), so telling someone to run `pai project name <id> "MDF -
+        // Webseiten"` points at a command that cannot work. A display-name owner
+        // is registered by its slug instead — or just given an alias.
         `No curated alias for "${projectName}". Bus participation is opt-in: ` +
-        `run \`pai project name <identifier> ${projectName}\` to register one.`,
+        `run \`pai project name <identifier> <short-alias>\` (letters, digits, hyphens, underscores — no spaces) to register one, ` +
+        `or address the owner by the project's slug if it has one.`,
     };
   }
 
@@ -580,21 +595,59 @@ export async function dispatch(
     };
   }
 
-  let itermSessionId: string;
+  const initialPrompt =
+    `${opts.prefix ?? TASK_PREFIX} Your work order is in ${orderPath} — read that file and carry it out. ` +
+    `It was written for this session only; delete it once you have read it.`;
+
+  // The session the mail path names after its owner (`--name "MDF - Webseiten"`),
+  // not the project label: a launch by display name or slug must produce the
+  // session the delivery matching looks for, as the manual launch does.
+  const launchOpts = { initialPrompt, ...(opts.sessionName ? { sessionName: opts.sessionName } : {}) };
+
+  // `launched` rather than a bare id + flag: every path that leaves this block
+  // without a session returns from inside it, so below the block the tab exists.
+  let launched: { itermSessionId: string } | undefined;
+  let launchErr: unknown = undefined;
   try {
-    ({ itermSessionId } = await deps.launch(project, {
-      initialPrompt:
-        `${opts.prefix ?? TASK_PREFIX} Your work order is in ${orderPath} — read that file and carry it out. ` +
-        `It was written for this session only; delete it once you have read it.`,
-    }));
+    launched = await deps.launch(project, launchOpts);
   } catch (err) {
+    launchErr = err;
+  }
+  if (launchErr !== undefined && opts.launchRetryDelayMs !== undefined && left() > opts.launchRetryDelayMs) {
+    // Tab creation is flaky in a way that an immediate retry fixes: the first
+    // manual launch of an owner failed with "iTerm would not open one, or the
+    // new tab was not at a shell prompt and was closed untouched" and worked on
+    // the next try. One short wait, one more attempt — then defer as before.
+    const firstErr = launchErr;
+    log(`dispatch: launch of "${label}" failed (${firstErr instanceof Error ? firstErr.message : String(firstErr)}), retrying once in ${Math.round(opts.launchRetryDelayMs / 1000)}s`);
+    try {
+      await (deps.sleep ?? sleep)(opts.launchRetryDelayMs);
+      launched = await deps.launch(project, launchOpts);
+      launchErr = undefined;
+    } catch (err) {
+      // The retry threw before assigning: keep the first failure's message,
+      // which is the one that describes what iTerm refused to open.
+      launchErr ??= err;
+    }
+    if (launchErr !== undefined) {
+      return {
+        outcome: "unreachable",
+        project: label,
+        session: "",
+        reason:
+          `Failed to launch a session (retried once after ${Math.round(opts.launchRetryDelayMs / 1000)}s): ` +
+          `${launchErr instanceof Error ? launchErr.message : String(launchErr)}`,
+      };
+    }
+  } else if (launchErr !== undefined) {
     return {
       outcome: "unreachable",
       project: label,
       session: "",
-      reason: `Failed to launch a session: ${err instanceof Error ? err.message : String(err)}`,
+      reason: `Failed to launch a session: ${launchErr instanceof Error ? launchErr.message : String(launchErr)}`,
     };
   }
+  const itermSessionId = launched!.itermSessionId;
   invalidatePaiProjectCache();
   log(`dispatch: launched "${label}" as ${itermSessionId}, waiting for it to accept input`);
 

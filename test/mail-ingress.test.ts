@@ -239,7 +239,7 @@ const NO_SESSION = { ok: false, detail: 'no live session matches owner "Site Own
 
 function harness(deliverResults: { ok: boolean; detail: string }[], dispatchImpl?: () => Promise<{ outcome: string; reason: string }>) {
   __resetLaunchState();
-  const calls = { dispatch: [] as { project: string; message: string; prefix: string; sessionName: string }[], deliver: 0, notify: [] as string[] };
+  const calls = { dispatch: [] as { project: string; message: string; prefix: string; sessionName: string; launchRetryDelayMs?: number }[], deliver: 0, notify: [] as string[] };
   let clock = 1_000_000;
   const deps = {
     deliver: async () => deliverResults[Math.min(calls.deliver++, deliverResults.length - 1)],
@@ -262,6 +262,9 @@ test("auto-launch: owner not running -> dispatch once with owner name and [Mail:
   assert.equal(h.calls.dispatch[0].project, "example-project");
   assert.equal(h.calls.dispatch[0].prefix, "[Mail:site]");
   assert.match(h.calls.dispatch[0].message, /^change request received/);
+  // A transient "iTerm would not open a tab" gets ONE retry after a few seconds
+  // inside dispatch (see dispatch.test.ts) before the mail defers.
+  assert.equal(h.calls.dispatch[0].launchRetryDelayMs, 3_000);
   assert.deepEqual(h.calls.notify, ["Started Site Owner for mail change"]);
 });
 
