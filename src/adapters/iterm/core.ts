@@ -853,9 +853,14 @@ export function snapshotAllSessions(opts: { fresh?: boolean } = {}): Promise<Ses
   // A recent result exists: serve it, refresh behind it — handlers answer from
   // the memo within microseconds even while iTerm is wedged.
   if (cachedSnapshots && now - cachedAt < SNAPSHOT_STALE_LIMIT_MS) {
-    refreshSnapshotInBackground(opts.fresh === true);
+    refreshSnapshotInBackground();
     return Promise.resolve(cachedSnapshots);
   }
+  return startEnumeration();
+}
+
+/** Return the in-flight enumeration, or start the one single-flight run. Never calls snapshotAllSessions. */
+function startEnumeration(): Promise<SessionSnapshot[]> {
   if (snapshotInFlight) return snapshotInFlight;
   snapshotInFlight = snapshotAllSessionsUncached()
     .then((result) => {
@@ -863,9 +868,7 @@ export function snapshotAllSessions(opts: { fresh?: boolean } = {}): Promise<Ses
         cachedSnapshots = result;
         cachedAt = Date.now();
       } else if (cachedSnapshots) {
-        // Failure: the previous good snapshot stays in place for stale-serving,
-        // and is what this call answers with — an empty list must never be read
-        // as "no sessions" while iTerm merely failed to answer.
+        // Failure: keep the previous good snapshot; an empty list must never read as "no sessions".
         return cachedSnapshots;
       }
       return result;
@@ -884,9 +887,9 @@ export function snapshotCacheEpoch(): number { return snapshotEpoch; }
 let lastRefreshFailLogAt = 0;
 
 /** Start (or join) one async enumeration; a failure keeps the old result and logs at most once a minute. */
-function refreshSnapshotInBackground(fresh: boolean): void {
+function refreshSnapshotInBackground(): void {
   if (snapshotInFlight) return;
-  snapshotAllSessionsAsync({ fresh }).then(() => {
+  startEnumeration().then(() => {
     if (!lastSnapshotOk && Date.now() - lastRefreshFailLogAt > 60_000) {
       lastRefreshFailLogAt = Date.now();
       log(`iterm: background session refresh failed; serving the last good result`);
