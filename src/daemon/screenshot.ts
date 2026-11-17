@@ -74,7 +74,7 @@ async function handleTmuxScreenshot(ctx: CommandContext, paneId: string): Promis
     await ctx.reply("The tmux pane is empty.");
     return;
   }
-  if (ctx.source !== "pailot") broadcastText(`Terminal capture:\n\n${text}`);
+  if (ctx.source !== "pailot") await broadcastText(`Terminal capture:\n\n${text}`);
   const maxLen = 4000;
   const trimmed = text.length > maxLen ? "...\n" + text.slice(-maxLen) : text;
   await ctx.reply(`*Terminal capture (tmux):*\n\n\`\`\`\n${trimmed}\n\`\`\``);
@@ -118,7 +118,7 @@ async function handleTextScreenshot(ctx: CommandContext): Promise<void> {
           .filter((line: string) => line.trim() !== "")
           .slice(-50)
           .join("\n");
-        broadcastText(`Terminal capture (screen locked):\n\n${cleaned}`);
+        await broadcastText(`Terminal capture (screen locked):\n\n${cleaned}`);
       }
 
       // Send to originating adapter
@@ -226,7 +226,7 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
         .slice(-30)
         .join("\n");
       if (lines) {
-        broadcastText(lines);
+        await broadcastText(lines);
         await ctx.reply(`*Terminal (unchanged):*\n\n\`\`\`\n${lines}\n\`\`\``);
         log("/ss: content unchanged, sent tail as text");
         return;
@@ -304,7 +304,7 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
     const buffer = capturePngForWindow(windowId);
 
     // Send to PAILot WebSocket clients (skip if request came from PAILot)
-    if (ctx.source !== "pailot") broadcastImage(buffer, "Screenshot");
+    if (ctx.source !== "pailot") await broadcastImage(buffer, "Screenshot");
 
     // Send to originating adapter
     await ctx.replyImage(buffer, "Screenshot");

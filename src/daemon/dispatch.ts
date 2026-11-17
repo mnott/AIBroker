@@ -144,7 +144,7 @@ export interface DispatchDeps {
    * session (the launch deliberately has no `/Name` prompt). Must not throw
    * into dispatch; the default logs failures.
    */
-  nameSession?: (itermSessionId: string, label: string, cwd: string) => void;
+  nameSession?: (itermSessionId: string, label: string, cwd: string) => void | Promise<void>;
   /**
    * INTERNAL — Todoist fetch used only by the redrive freshness gate, so tests
    * can drive it without the network. Defaults to the global fetch.
@@ -671,7 +671,7 @@ export async function dispatch(
   // The launch has no `/Name` prompt, so the Name skill never runs and the tab
   // would stay anonymous. Apply the same visuals the rename handler does.
   try {
-    deps.nameSession?.(itermSessionId, opts.sessionName ?? sessionLabel(project, project.sessionConfig?.env), project.rootPath);
+    await deps.nameSession?.(itermSessionId, opts.sessionName ?? sessionLabel(project, project.sessionConfig?.env), project.rootPath);
   } catch (err) {
     log(`dispatch: naming "${label}" failed: ${err instanceof Error ? err.message : String(err)}`);
   }

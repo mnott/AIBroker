@@ -28,7 +28,7 @@
 import { snapshotAllSessions, snapshotAllSessionsAsync, wasLastEnumerationReliable as wasLastSnapshotReliable } from "../transport/sync-facade.js";
 import { getAllPersistentSessionNames, lookupPersistentName } from "./persistence.js";
 
-export type LiveSession = ReturnType<typeof snapshotAllSessions>[0];
+export type LiveSession = Awaited<ReturnType<typeof snapshotAllSessions>>[0];
 
 let lastGoodSnapshots: LiveSession[] = [];
 
@@ -43,14 +43,13 @@ let lastGoodSnapshots: LiveSession[] = [];
  * good list instead of the `[]` iTerm hands back on an osascript fault — an
  * unreadable machine must not read as an empty one (see file header).
  */
-export function discoverLiveSessions(opts: { fresh?: boolean } = {}): LiveSession[] {
-  return withPersistentNames(snapshotAllSessions(opts));
+/** Async: the enumeration's children are awaited, never spawnSync'd. */
+export async function discoverLiveSessions(opts: { fresh?: boolean } = {}): Promise<LiveSession[]> {
+  return withPersistentNames(await snapshotAllSessions(opts));
 }
 
-/** discoverLiveSessions for timers and polls: the enumeration is awaited, not spawnSync'd. */
-export async function discoverLiveSessionsAsync(opts: { fresh?: boolean } = {}): Promise<LiveSession[]> {
-  return withPersistentNames(await snapshotAllSessionsAsync(opts));
-}
+/** Alias — every path is async now. */
+export const discoverLiveSessionsAsync = discoverLiveSessions;
 
 function withPersistentNames(snaps: LiveSession[]): LiveSession[] {
   const persistentNames = getAllPersistentSessionNames();

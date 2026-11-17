@@ -819,7 +819,7 @@ export function registerCoreHandlers(
             mimeType: "image/png",
           });
         } else {
-          broadcastImage(result.images[0], prompt.slice(0, 200));
+          await broadcastImage(result.images[0], prompt.slice(0, 200));
         }
       }
 
@@ -951,7 +951,7 @@ export function registerCoreHandlers(
     // chosen (persistent) name first, then the tab title, with the raw title
     // kept in tabTitle. The content read reports the terminal's own process
     // name, which is not what a human calls the session.
-    const snaps = new Map(snapshotAllSessions().map((s) => [s.id, s]));
+    const snaps = new Map((await snapshotAllSessions()).map((s) => [s.id, s]));
     const persistentNames = getAllPersistentSessionNames();
     const display = (id: string, raw: { name: string; paiName: string | null }) => {
       const snap = snaps.get(id);
@@ -961,7 +961,7 @@ export function registerCoreHandlers(
     };
 
     if (sessionId) {
-      const content = readSessionContent(sessionId, lineCount);
+      const content = await readSessionContent(sessionId, lineCount);
       if (!content) return { ok: false, error: `Session ${sessionId} not found` };
 
       const contentHash = hashContent(content.content);
@@ -988,7 +988,7 @@ export function registerCoreHandlers(
     }
 
     // All sessions
-    const contents = readAllSessionContent(lineCount);
+    const contents = await readAllSessionContent(lineCount);
     const sessions = contents.map((c) => {
       const contentHash = hashContent(c.content);
       const changed = statusCache.hasChanged(c.sessionId, contentHash);
@@ -1251,7 +1251,7 @@ export function registerCoreHandlers(
       return snaps;
     }
 
-    function resolveTarget(snaps: SessionSnapshot[]): TargetMatch {
+    async function resolveTarget(snaps: SessionSnapshot[]): Promise<TargetMatch> {
       const asNumber = parseInt(target, 10);
       if (!Number.isNaN(asNumber) && String(asNumber) === target.trim()) {
         // Numeric index (1-based) into the listed rows — the numbering
@@ -1311,7 +1311,7 @@ export function registerCoreHandlers(
         // "not ready" off it demoted it below a leftover shell that matched
         // the same name exactly (live 2026-10-26: "Archiware (Chenarlier)"
         // resolved to the shell tab and was refused as a shell).
-        prefer: (s) => (s.isClaude === true ? 1 : s.isClaude === false ? 0 : (isClaudeSession(s.id) ? 1 : 0)) + (cwdMatches(target, s.cwd) ? 0.5 : 0),
+        prefer: async (s) => (s.isClaude === true ? 1 : s.isClaude === false ? 0 : (await isClaudeSession(s.id) ? 1 : 0)) + (cwdMatches(target, s.cwd) ? 0.5 : 0),
       });
       if (hits.length === 0) return { id: null, name: null };
       // Equal top score = the name means more than one session. Guessing here
@@ -1330,7 +1330,7 @@ export function registerCoreHandlers(
 
     let snapshots = withPersistentNames(listedSessions());
     rememberIdSession(callerItermId(req) ?? "", req.claudeSessionId);
-    let match = resolveTarget(snapshots);
+    let match = await resolveTarget(snapshots);
     let itermSessionId = match.id;
     let resolvedName = match.name;
 
@@ -1346,7 +1346,7 @@ export function registerCoreHandlers(
     for (let attempt = 0; !itermSessionId && !match.ambiguous && !wasLastEnumerationReliable() && attempt < 2; attempt++) {
       await new Promise((r) => setTimeout(r, 400));
       snapshots = withPersistentNames(listedSessions());
-      match = resolveTarget(snapshots);
+      match = await resolveTarget(snapshots);
       itermSessionId = match.id;
       resolvedName = match.name;
     }
@@ -1417,7 +1417,7 @@ export function registerCoreHandlers(
     // tie with a fuzzy Claude hit and enumeration order decides. Here the
     // target is refused rather than typed into a shell that would execute it:
     // if a Claude session shares the name, say so and name it by id.
-    if (!isClaudeSession(itermSessionId) && snapshots.find((s) => s.id === itermSessionId)?.isClaude !== true) {
+    if (!await isClaudeSession(itermSessionId) && snapshots.find((s) => s.id === itermSessionId)?.isClaude !== true) {
       const claudes = matchAllSessions([target], snapshots.map((s) => ({
         id: s.id, name: s.name, paiName: s.paiName, isClaude: s.isClaude, displayLabel: displayLabelOf(s),
       })), {
@@ -1448,7 +1448,7 @@ export function registerCoreHandlers(
     // Refuse before depositing OR typing: if the target is a shell, the message
     // is not merely undeliverable, it is executable. Say so plainly rather than
     // reporting a generic write failure.
-    if (!isClaudeSession(itermSessionId)) {
+    if (!await isClaudeSession(itermSessionId)) {
       // Recorded: a refusal is part of the history too, and "the hub declined
       // to type this into a shell" is exactly the kind of thing that otherwise
       // leaves no trace anywhere.
@@ -1722,7 +1722,7 @@ export function registerCoreHandlers(
             mimeType: mimeType ?? "image/png",
           });
         } else {
-          broadcastImage(imgBuffer, caption, sessionId);
+          await broadcastImage(imgBuffer, caption, sessionId);
         }
         return { ok: true, result: { sent: true, type: "image" } };
       }
@@ -1752,7 +1752,7 @@ export function registerCoreHandlers(
         if (bridge) {
           bridge.routeToMobile(sessionId ?? "", text!);
         } else {
-          broadcastText(text!, sessionId);
+          await broadcastText(text!, sessionId);
         }
       }
       return { ok: true, result: { sent: true } };
@@ -2039,14 +2039,14 @@ export function registerCoreHandlers(
       // One name, one live holder: refused here while another live session owns
       // it (2026-09-26 — a second tab took a live session's name, and the parked
       // sweeps two mornings later traced back to exactly that write).
-      const claim = setPersistentSessionName(durableId, name);
+      const claim = await setPersistentSessionName(durableId, name);
       if (!claim.ok) {
         return {
           ok: false,
           error: `Name "${name}" is held by live session ${claim.heldBy?.slice(0, 8) ?? "unknown"} — release it there first (close that tab, or rename it).`,
         };
       }
-      setSessionTitle(tmuxPane, name);
+      await setSessionTitle(tmuxPane, name);
       manager.updateName(durableId, name);
 
       // Visible surfaces: if this pane is being viewed in an iTerm tab, set the
@@ -2056,9 +2056,9 @@ export function registerCoreHandlers(
       // unlike the tmux pane title, these stick.
       const viewerId = itermViewerSessionId(tmuxPane);
       if (viewerId) {
-        setItermSessionVar(viewerId, name);
+        await setItermSessionVar(viewerId, name);
         setItermTabName(viewerId, name);
-        setItermBadge(viewerId, name);
+        await setItermBadge(viewerId, name);
       }
       log(`Persisted name "${name}" for tmux pane ${tmuxPane} (key ${durableId.slice(0, 8)}, ${viewerId ? `iterm viewer ${viewerId.slice(0, 8)}` : "detached"})`);
 
@@ -2069,7 +2069,7 @@ export function registerCoreHandlers(
 
       // Refresh PAILot's session list (the daemon rename otherwise only reaches
       // whazaa/telex, never the in-process PAILot gateway).
-      handleMqttCommand("sessions");
+      await handleMqttCommand("sessions");
       for (const adapter of registry.list()) {
         try {
           const client = new WatcherClient(adapter.socketPath);
@@ -2122,7 +2122,7 @@ export function registerCoreHandlers(
     let nameClaim: { ok: boolean; heldBy?: string } = { ok: true };
     if (itermSessionId) {
       const renamedCwd = live.find((x) => x.id === itermSessionId)?.cwd;
-      nameClaim = claimItermSessionName(itermSessionId, name, renamedCwd);
+      nameClaim = await claimItermSessionName(itermSessionId, name, renamedCwd);
       if (!nameClaim.ok) {
         log(`rename: refused — name "${name}" held by live session ${nameClaim.heldBy?.slice(0, 8)}`);
         return {
@@ -2144,7 +2144,7 @@ export function registerCoreHandlers(
 
     // Set iTerm2 visuals directly if we know the session
     if (itermSessionId) {
-      applyItermVisuals(itermSessionId, name);
+      await applyItermVisuals(itermSessionId, name);
       // The /resume picker title is written into the transcript by the
       // PreToolUse hook hooks/aibroker-rename-title.mjs (matcher
       // mcp__aibroker__aibroker_rename) — typing /rename here raced the
@@ -2152,7 +2152,7 @@ export function registerCoreHandlers(
     }
 
     // Refresh PAILot's session list (in-process gateway is not a registry adapter).
-    handleMqttCommand("sessions");
+    await handleMqttCommand("sessions");
     // Forward to all adapters (best effort — Whazaa/Telex session list sync)
     for (const adapter of registry.list()) {
       try {
@@ -2325,7 +2325,7 @@ export function registerCoreHandlers(
     // the caller could name itself no other way, PAI's session map (callerSelfId).
     const target = resolveManageTarget(session, await callerSelfId(req));
     if (!target) return { ok: false, error: "cannot tell which session is asking — name it" };
-    const refusal = refuseAgentManage(target, arg ?? "", { until }, operator === true);
+    const refusal = await refuseAgentManage(target, arg ?? "", { until }, operator === true);
     if (refusal) return { ok: false, error: refusal };
     const r = await handleManage(target, arg ?? "", { goal, until, every });
     return r.ok

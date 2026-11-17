@@ -113,7 +113,7 @@ export interface MatchOptions {
    * needs, where a substring hit on a live session beats an exact hit on a
    * dead tab.
    */
-  prefer?: (s: SessionCandidate) => number;
+  prefer?: (s: SessionCandidate) => number | Promise<number>;
 }
 
 export interface MatchHit {
@@ -150,11 +150,11 @@ function matchKind(label: string, refs: { raw: string; norm: string }[], kinds: 
   return kind;
 }
 
-export function matchAllSessions(
+export async function matchAllSessions(
   references: string[],
   sessions: SessionCandidate[],
   opts: MatchOptions = {},
-): MatchHit[] {
+): Promise<MatchHit[]> {
   const kinds = opts.kinds ?? ["exact", "normalised"];
   const prefer = opts.prefer ?? (() => 0);
 
@@ -164,6 +164,7 @@ export function matchAllSessions(
   const hits: MatchHit[] = [];
 
   for (const s of sessions) {
+    const pref = await prefer(s);
     const label = labelOf(s);
     // The display label is a second label for the same row, tried only when the
     // plain name did not match: a session named "Archiware" shown as
@@ -176,7 +177,7 @@ export function matchAllSessions(
     if (!kind) continue;
 
     // Preference dominates: 100 leaves room for every match kind beneath it.
-    hits.push({ session: s, label, kind, score: prefer(s) * 100 + KIND_RANK[kind], viaDisplay });
+    hits.push({ session: s, label, kind, score: pref * 100 + KIND_RANK[kind], viaDisplay });
   }
 
   // Stable descending: equal scores keep enumeration order, which is what the
@@ -191,12 +192,12 @@ export function matchAllSessions(
  * every session whose title happens to contain those letters, and for dispatch
  * a wrong match spawns nothing and delivers to the wrong place instead.
  */
-export function matchSession(
+export async function matchSession(
   references: string[],
   sessions: SessionCandidate[],
   opts: MatchOptions = {},
-): MatchHit | null {
-  const best = matchAllSessions(references, sessions, opts)[0];
+): Promise<MatchHit | null> {
+  const best = (await matchAllSessions(references, sessions, opts))[0];
   return best ?? null;
 }
 

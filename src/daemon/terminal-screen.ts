@@ -32,8 +32,8 @@ export interface TerminalIO {
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export const realIO: TerminalIO = {
-  capture: (id) => captureSession(id, 80),
-  send: (id, text) => { typeIntoSession(id, text); },
+  capture: async (id) => await captureSession(id, 80),
+  send: async (id, text) => { await typeIntoSession(id, text); },
   sleep,
   now: () => Date.now(),
 };

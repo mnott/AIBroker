@@ -75,9 +75,9 @@ async function deliverA2A(session: string, text: string): Promise<{ delivered: b
     const candidates = snapshots.map((s) => ({ id: s.id, name: lookupPersistentName(names, s.id, s.aibrokerId) ?? s.name }));
     // A name can be answered by a stale shell tab next to its live holder —
     // prefer the one actually running Claude (same ranking as send_to_session).
-    const hit = matchSession([session], candidates, { prefer: (s) => (isClaudeSession(s.id) ? 1 : 0) });
+    const hit = await matchSession([session], candidates, { prefer: async (s) => ((await isClaudeSession(s.id)) ? 1 : 0) });
     if (!hit) return { delivered: false, detail: `no live session matches "${session}"` };
-    if (!isClaudeSession(hit.session.id)) return { delivered: false, detail: `session "${hit.session.name}" is at a shell prompt` };
+    if (!await isClaudeSession(hit.session.id)) return { delivered: false, detail: `session "${hit.session.name}" is at a shell prompt` };
 
     depositToSessionMailbox(hit.session.id, "a2a", text);
     // Not into a line the operator is mid-sentence in — pointer-guard.ts.

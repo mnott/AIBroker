@@ -18,7 +18,7 @@
  * motion; it may never grant something new.
  */
 
-import { runAppleScript, runAppleScriptAsync } from "../adapters/iterm/core.js";
+import { runAppleScript } from "../adapters/iterm/core.js";
 import { log } from "../core/log.js";
 
 /**
@@ -70,15 +70,13 @@ tell application "System Events"
   return out
 end tell`;
 
-/** Every dialog currently on screen that belongs to an answerable agent. */
-export function listDialogs(): SeenDialog[] {
-  return parseDialogs(runAppleScript(LIST_SCRIPT, 10_000));
+/** Every dialog currently on screen that belongs to an answerable agent. Async — the AppleScript runs as an awaited child. */
+export async function listDialogs(): Promise<SeenDialog[]> {
+  return parseDialogs(await runAppleScript(LIST_SCRIPT, 10_000));
 }
 
-/** listDialogs without blocking the event loop. */
-export async function listDialogsAsync(): Promise<SeenDialog[]> {
-  return parseDialogs(await runAppleScriptAsync(LIST_SCRIPT, 10_000));
-}
+/** Alias — listDialogs is async now. */
+export const listDialogsAsync = listDialogs;
 
 function parseDialogs(raw: string | null): SeenDialog[] {
   if (!raw) return [];
@@ -105,10 +103,10 @@ function parseDialogs(raw: string | null): SeenDialog[] {
  * reported rather than guessed at, because the whole value of a closed list is
  * lost the moment something falls back to "press the default".
  */
-export function answerDialog(d: SeenDialog): string | null {
+export async function answerDialog(d: SeenDialog): Promise<string | null> {
   const button = SAFE_BUTTONS.find((b) => d.buttons.includes(b));
   if (!button) return null;
-  const ok = runAppleScript(pressScript(d, button), 10_000);
+  const ok = await runAppleScript(pressScript(d, button), 10_000);
   if (ok === null) {
     log(`[dialogs] could not press "${button}" on ${d.process}`);
     return null;
@@ -119,14 +117,5 @@ export function answerDialog(d: SeenDialog): string | null {
 const pressScript = (d: SeenDialog, button: string): string =>
   `tell application "System Events" to tell process "${d.process}" to click button "${button}" of window 1`;
 
-/** answerDialog without blocking the event loop. */
-export async function answerDialogAsync(d: SeenDialog): Promise<string | null> {
-  const button = SAFE_BUTTONS.find((b) => d.buttons.includes(b));
-  if (!button) return null;
-  const ok = await runAppleScriptAsync(pressScript(d, button), 10_000);
-  if (ok === null) {
-    log(`[dialogs] could not press "${button}" on ${d.process}`);
-    return null;
-  }
-  return button;
-}
+/** Alias — answerDialog is async now. */
+export const answerDialogAsync = answerDialog;

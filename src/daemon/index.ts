@@ -133,7 +133,7 @@ export async function startDaemon(options?: {
   const manager = new HybridSessionManager(apiBackend);
   // The session list a channel shows and the one the MCP tool returns must come
   // from the same place, or they disagree and only one of them is believed.
-  manager.setDiscovery(() => discoverLiveSessions().filter(isClaudeRelated));
+  manager.setDiscovery(async () => (await discoverLiveSessions()).filter(isClaudeRelated));
   setHybridManager(manager);
 
   // The name-theft guard's oracle: is a store key a session the enumeration can
@@ -141,8 +141,8 @@ export async function startDaemon(options?: {
   // hiccup would license exactly the theft this exists to refuse (2026-09-26:
   // a second tab took a live session's name, and the parked sweeps the next
   // morning traced back to that write).
-  setHolderLivenessProbe((key) => {
-    const snaps = snapshotAllSessions();
+  setHolderLivenessProbe(async (key) => {
+    const snaps = await snapshotAllSessions();
     if (snaps.length === 0) return "unknown";
     return snaps.some((s) => s.id === key || s.aibrokerId === key) ? "live" : "gone";
   });
@@ -161,7 +161,7 @@ export async function startDaemon(options?: {
   // Register PAILot as a mobile plugin. The callback receives AIBP messages
   // to deliver to connected WebSocket clients (wired after gateway starts).
   // This is registered early so it's available before the first connection.
-  aibpBridge.registerMobile("pailot", (aibpMsg) => {
+  aibpBridge.registerMobile("pailot", async (aibpMsg) => {
     // Forward AIBP messages to PAILot gateway broadcast functions
     const sessionId = aibpMsg.src.startsWith("session:")
       ? aibpMsg.src.slice(8)
@@ -171,7 +171,7 @@ export async function startDaemon(options?: {
       case "TEXT": {
         const p = aibpMsg.payload as { content: string };
         // direct=true: explicit pailot_send replies bypass session gate
-        broadcastText(p.content, sessionId, true);
+        await broadcastText(p.content, sessionId, true);
         break;
       }
       case "VOICE": {
@@ -182,7 +182,7 @@ export async function startDaemon(options?: {
       }
       case "IMAGE": {
         const p = aibpMsg.payload as { imageBase64: string; caption?: string; mimeType?: string };
-        broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId, true, p.mimeType);
+        await broadcastImage(Buffer.from(p.imageBase64, "base64"), p.caption, sessionId, true, p.mimeType);
         break;
       }
       case "TYPING": {
@@ -197,7 +197,7 @@ export async function startDaemon(options?: {
 
   // Register the hub as an AIBP session handler — receives inbound messages
   // routed to session channels (e.g., from PAILot via routeFromMobile).
-  aibpBridge.registerSessionHandler((aibpMsg) => {
+  aibpBridge.registerSessionHandler(async (aibpMsg) => {
     // Extract session ID from destination (session:XYZ) or source
     const sessionId = aibpMsg.dst.startsWith("session:")
       ? aibpMsg.dst.slice(8)
@@ -264,7 +264,7 @@ export async function startDaemon(options?: {
     { name: "right", description: "Send Right arrow to active session", args: "" },
     { name: "pick", description: "Select menu option N", args: "<N> [text]" },
   ];
-  aibpBridge.registerTerminal(terminalPluginId(), (aibpMsg) => {
+  aibpBridge.registerTerminal(terminalPluginId(), async (aibpMsg) => {
     if (aibpMsg.type === "TEXT") {
       const content = (aibpMsg.payload as { content: string }).content;
       // Determine target session from AIBP message source address
@@ -273,13 +273,13 @@ export async function startDaemon(options?: {
         : activeItermSessionId;
 
       if (targetSession) {
-        typeIntoSession(targetSession, content);
+        await typeIntoSession(targetSession, content);
       } else {
         // Fallback: find any Claude session
-        const found = findClaudeSession();
-        if (found && isClaudeRunningInSession(found)) {
+        const found = await findClaudeSession();
+        if (found && await isClaudeRunningInSession(found)) {
           setActiveItermSessionId(found);
-          typeIntoSession(found, content);
+          await typeIntoSession(found, content);
         } else {
           log(`[AIBP→Terminal] No iTerm session available for delivery`);
         }
@@ -289,7 +289,7 @@ export async function startDaemon(options?: {
       if (payload.command === "type" && payload.args.text) {
         const sessionId = (payload.args.sessionId as string) || activeItermSessionId;
         if (sessionId) {
-          typeIntoSession(sessionId, payload.args.text as string);
+          await typeIntoSession(sessionId, payload.args.text as string);
         }
       }
     }
@@ -389,7 +389,7 @@ export async function startDaemon(options?: {
   // dispatch in the first place.
   setTimeout(() => {
     import("./dispatch.js")
-      .then(({ redriveQueuedDispatches }) => redriveQueuedDispatches())
+      .then(async ({ redriveQueuedDispatches }) => await redriveQueuedDispatches())
       .catch((err) => log(`dispatch: queued-redrive failed to start — ${err instanceof Error ? err.message : String(err)}`));
   }, 10_000).unref();
 
@@ -411,7 +411,7 @@ export async function startDaemon(options?: {
       } catch (e) {
         log(`todoist: could not list PAI projects for addressing — ${e instanceof Error ? e.message : String(e)}`);
       }
-      for (const s of snapshotAllSessions()) {
+      for (const s of await snapshotAllSessions()) {
         const n = s.paiName ?? s.name;
         if (n) names.push(n);
       }
@@ -477,7 +477,7 @@ export async function startDaemon(options?: {
     void (async () => {
     // Enumerate with awaited children first; the sync calls below then hit the memo.
     const snaps = await snapshotAllSessionsAsync();
-    reassertPersistentTitles({ sessions: snaps });
+    await reassertPersistentTitles({ sessions: snaps });
     recordSessions(manager.knownSessions());
     const dropped = pruneSessionNames(
       snaps.flatMap((s) => [s.id, ...(s.aibrokerId ? [s.aibrokerId] : [])]),
@@ -505,7 +505,7 @@ export async function startDaemon(options?: {
   // });
 
   // PAILot MQTT broker — takes over port 8765
-  setMqttInboundHandler((sessionId, type, payload) => {
+  setMqttInboundHandler(async (sessionId, type, payload) => {
     const bridge = aibpBridge;
 
     // APNs device token registration — app publishes on pailot/device/token
@@ -532,7 +532,7 @@ export async function startDaemon(options?: {
       const nested = payload.args as Record<string, unknown> | undefined;
       const args = nested ?? payload;
       log(`[MQTT→Hub] command: ${command} args=${JSON.stringify(args).slice(0, 100)}`);
-      handleMqttCommand(command, args);
+      await handleMqttCommand(command, args);
       return;
     }
 
@@ -551,9 +551,10 @@ export async function startDaemon(options?: {
     // This runs on every inbound message, so ask the registry first and only
     // pay for a live enumeration when the id looks unknown — rejecting a
     // session that does exist is the expensive mistake here, not the lookup.
-    const known = (list: { backendSessionId: string }[]) =>
+    const known = async (list: { backendSessionId: string }[]) =>
       list.some(s => s.backendSessionId === routeSession);
-    let knownSession = known(manager.knownSessions()) || known(manager.listSessions());
+    let knownSession = await known(manager.knownSessions());
+    if (!knownSession) knownSession = await known(manager.listSessions());
     if (knownSession) {
       recordSessions(manager.knownSessions());
     } else {
@@ -571,7 +572,7 @@ export async function startDaemon(options?: {
       if (successor) {
         log(`[MQTT→Hub] ${type} for stale session ${routeSession.slice(0, 8)} re-routed to "${successor.name}" (${successor.backendSessionId.slice(0, 8)}) by ${rule}`);
         mqttPublishControl({ type: "session_moved", old: routeSession, new: successor.backendSessionId, oldSessionId: routeSession, sessionId: successor.backendSessionId, name: successor.name });
-        handleMqttCommand("sessions");
+        await handleMqttCommand("sessions");
         routeSession = successor.backendSessionId;
         knownSession = true;
       }
@@ -579,7 +580,7 @@ export async function startDaemon(options?: {
     if (!knownSession) {
       log(`[MQTT→Hub] Rejecting ${type} — sessionId=${routeSession.slice(0, 8)} is stale (no matching session). Refreshing client list.`);
       mqttPublishControl({ type: "session_not_found", sessionId: routeSession });
-      handleMqttCommand("sessions");
+      await handleMqttCommand("sessions");
       mqttPublishText(routeSession, "⚠️ That session no longer exists on the host. Pick a session from the refreshed list and resend.");
       return;
     }
@@ -696,8 +697,8 @@ export async function startDaemon(options?: {
   setScreenshotHandler(async (source, targetSessionId) => {
     const sessionId = targetSessionId ?? manager.activeSession?.backendSessionId;
     const ctx: CommandContext = {
-      reply: async (text) => { broadcastText(text, sessionId); },
-      replyImage: async (buf, caption) => { broadcastImage(buf, caption, sessionId); },
+      reply: async (text) => { await broadcastText(text, sessionId); },
+      replyImage: async (buf, caption) => { await broadcastImage(buf, caption, sessionId); },
       replyVoice: async () => {},
       typing: () => {},
       source: source ?? "pailot",

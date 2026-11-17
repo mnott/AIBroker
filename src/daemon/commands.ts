@@ -112,7 +112,7 @@ export function createHubCommandHandler(): (
 
   // ── Session resolution ──
 
-  function ensureActiveSession(): string {
+  async function ensureActiveSession(): Promise<string> {
     const allSessions = getSessionList();
     const allSessionIds = new Set(allSessions.map((s) => s.id));
 
@@ -148,7 +148,7 @@ export function createHubCommandHandler(): (
 
   // ── Message delivery to iTerm2 ──
 
-  function deliverMessage(text: string, targetSessionId?: string): boolean {
+  async function deliverMessage(text: string, targetSessionId?: string): Promise<boolean> {
     const resolvedId = targetSessionId
       ? (stripItermPrefix(targetSessionId) ?? targetSessionId)
       : (stripItermPrefix(activeItermSessionId) ?? activeItermSessionId);
@@ -157,18 +157,18 @@ export function createHubCommandHandler(): (
       log(`[deliver] target=${resolvedId.slice(0, 8)}...`);
 
       // Try AppleScript paste first (works when session accepts input)
-      if (typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok`); return true; }
+      if (await typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok`); return true; }
 
       // Paste failed — session might be frozen. Try to wake it by selecting
       // its tab and sending a no-op keystroke, then retry.
       log(`[deliver] paste failed for ${resolvedId.slice(0, 8)}, attempting wake...`);
-      runItermJxa(withSessionJxa(resolvedId, `          aTab.select();
+      await runItermJxa(withSessionJxa(resolvedId, `          aTab.select();
           return "selected";`));
       // Brief delay for iTerm to process the tab selection
       const { execSync: execSyncWake } = require("child_process");
       try { execSyncWake("sleep 0.3"); } catch {}
       // Retry paste after wake
-      if (typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok after wake`); return true; }
+      if (await typeIntoSession(resolvedId, text)) { log(`[deliver] paste ok after wake`); return true; }
 
       // Fallback: direct TTY write (works even when AppleScript paste is blocked).
       //
@@ -179,7 +179,7 @@ export function createHubCommandHandler(): (
       // been delivered, while the trail recorded a refusal and nothing after it.
       // isClaudeSession is the guard's own predicate and answers from the 2s
       // cache the refusal just populated, so asking costs nothing here.
-      if (!isClaudeSession(resolvedId)) {
+      if (!await isClaudeSession(resolvedId)) {
         log(`[deliver] ${resolvedId.slice(0, 8)} is not at a live Claude prompt — no TTY fallback`);
         return false;
       }
@@ -205,15 +205,15 @@ export function createHubCommandHandler(): (
     // Legacy fallbacks
     const bareSessionId = stripItermPrefix(activeItermSessionId) ?? activeItermSessionId;
     if (bareSessionId && bareSessionId !== resolvedId && managedSessions.has(bareSessionId)) {
-      if (typeIntoSession(bareSessionId, text)) return true;
+      if (await typeIntoSession(bareSessionId, text)) return true;
       managedSessions.delete(bareSessionId);
     }
 
     if (activeItermSessionId && activeItermSessionId !== resolvedId) {
-      if (typeIntoSession(activeItermSessionId, text)) return true;
+      if (await typeIntoSession(activeItermSessionId, text)) return true;
     }
 
-    if (isScreenLocked()) {
+    if (await isScreenLocked()) {
       const targetId = bareSessionId || activeItermSessionId;
       if (!targetId) {
         log("Screen locked — no target session for PTY fallback");
@@ -222,7 +222,7 @@ export function createHubCommandHandler(): (
       // Same guard as the paste path above. A locked screen does not make a
       // shell tab a Claude prompt; it only takes away the route that would have
       // noticed.
-      if (!isClaudeSession(targetId)) {
+      if (!await isClaudeSession(targetId)) {
         log(`Screen locked — ${targetId.slice(0, 8)} is not at a live Claude prompt, refusing PTY write`);
         return false;
       }
@@ -231,7 +231,7 @@ export function createHubCommandHandler(): (
 
       if (!ttyPath) {
         log("Screen locked — TTY cache miss, attempting live snapshot refresh");
-        updateSessionTtyCache(snapshotAllSessions());
+        updateSessionTtyCache(await snapshotAllSessions());
         ttyPath = sessionTtyCache.get(targetId);
         // No "first available TTY" fallback. It delivered the message to
         // whichever session happened to enumerate first — a stranger's tab —
@@ -251,16 +251,16 @@ export function createHubCommandHandler(): (
     log(`${activeItermSessionId ? `Session ${activeItermSessionId} is not running Claude.` : "No cached session."} Searching for another...`);
 
     const found = findClaudeSession();
-    if (found && isClaudeRunningInSession(found)) {
+    if (found && await isClaudeRunningInSession(found)) {
       setActiveItermSessionId(found);
-      if (typeIntoSession(found, text)) return true;
+      if (await typeIntoSession(found, text)) return true;
     }
 
     log("No running Claude session found. Starting new one...");
     const created = createClaudeSession();
     if (created) {
       setActiveItermSessionId(created);
-      if (typeIntoSession(created, text)) return true;
+      if (await typeIntoSession(created, text)) return true;
     }
 
     log("Failed to deliver message");
@@ -281,7 +281,7 @@ export function createHubCommandHandler(): (
   // ── End session (close iTerm2 tab + cleanup) ──
 
   async function handleEndSessionVisual(session: { id: string; name: string; paiName: string | null }): Promise<void> {
-    killSession(session.id);
+    await killSession(session.id);
     // Cleanup registry entries pointing to this iTerm session
     for (const [sid, entry] of sessionRegistry) {
       if (entry.itermSessionId === session.id) {
@@ -332,11 +332,11 @@ export function createHubCommandHandler(): (
 
   // ── Main command handler ──
 
-  return function handleMessage(
+  return async function handleMessage(
     text: string,
     timestamp: number,
     ctx: CommandContext,
-  ): void | Promise<void> {
+  ): Promise<void> {
     const trimmedText = text.trim();
 
     // --- /h, /help ---
@@ -423,12 +423,12 @@ export function createHubCommandHandler(): (
         const liveSnapshots = snapshotAllSessions();
         const liveIds = listedLiveIds(liveSnapshots);
         hybridManager.pruneDeadVisualSessions(liveIds);
-        const list = hybridManager.formatSessionList();
+        const list = await hybridManager.formatSessionList();
         ctx.reply(list).catch(() => {});
         return;
       }
 
-      ensureActiveSession();
+      await ensureActiveSession();
       const allSessions = cachedSessionList ?? getSessionList();
       if (allSessions.length === 0 && sessionRegistry.size === 0) {
         ctx.reply("No sessions found.").catch(() => {});
@@ -478,7 +478,7 @@ export function createHubCommandHandler(): (
       const sessions =
         cachedSessionList && (Date.now() - cachedSessionListTime < CACHE_TTL_MS)
           ? cachedSessionList
-          : getSessionList();
+          : await getSessionList();
       if (sessions.length === 0) {
         ctx.reply("No sessions found.").catch(() => {});
         return;
@@ -506,13 +506,13 @@ export function createHubCommandHandler(): (
           // Explicit rename: persist, or the daemon's chosen-name re-assert
           // reverts it within a minute. A refused claim (the name is held by
           // another live session) changes nothing and says so.
-          if (!setPersistentSessionName(chosen.id, newName).ok) {
+          if (!(await setPersistentSessionName(chosen.id, newName)).ok) {
             ctx.reply(`Name *${newName}* is held by another live session — nothing was changed.`).catch(() => {});
             return;
           }
-          setItermSessionVar(chosen.id, newName);
+          await setItermSessionVar(chosen.id, newName);
           setItermTabName(chosen.id, newName);
-          setItermBadge(chosen.id, newName);
+          await setItermBadge(chosen.id, newName);
           if (regEntry) regEntry.name = newName;
         }
 
@@ -604,7 +604,7 @@ export function createHubCommandHandler(): (
         }
       }
 
-      ensureActiveSession();
+      await ensureActiveSession();
       if (!activeItermSessionId) {
         ctx.reply("No active session.").catch(() => {});
         return;
@@ -613,11 +613,11 @@ export function createHubCommandHandler(): (
       (async () => {
         const sid = activeItermSessionId;
         await new Promise((r) => setTimeout(r, 10000));
-        typeIntoSession(sid, "/clear");
+        await typeIntoSession(sid, "/clear");
         await new Promise((r) => setTimeout(r, 8000));
-        pasteTextIntoSession(sid, "go");
+        await pasteTextIntoSession(sid, "go");
         await new Promise((r) => setTimeout(r, 500));
-        sendKeystrokeToSession(sid, 13);
+        await sendKeystrokeToSession(sid, 13);
         ctx.reply("Sent /clear + go").catch(() => {});
       })().catch((err) => log(`/c: error — ${err}`));
       return;
@@ -625,12 +625,12 @@ export function createHubCommandHandler(): (
 
     // --- /p — send "pause session" to active Claude session ---
     if (trimmedText === "/p") {
-      ensureActiveSession();
+      await ensureActiveSession();
       if (!activeItermSessionId) {
         ctx.reply("No active session.").catch(() => {});
         return;
       }
-      typeIntoSession(activeItermSessionId, "pause session");
+      await typeIntoSession(activeItermSessionId, "pause session");
       ctx.reply("Sent \"pause session\"").catch(() => {});
       return;
     }
@@ -651,49 +651,49 @@ export function createHubCommandHandler(): (
         ctx.reply("Keyboard commands need a visual session. Use /nv to create one.").catch(() => {});
         return;
       }
-      ensureActiveSession();
+      await ensureActiveSession();
       if (!activeItermSessionId) {
         ctx.reply("No active session.").catch(() => {});
         return;
       }
 
       if (trimmedText === "/cc") {
-        sendKeystrokeToSession(activeItermSessionId, 3);
+        await sendKeystrokeToSession(activeItermSessionId, 3);
         ctx.reply("Ctrl+C sent").catch(() => {});
         return;
       }
       if (trimmedText === "/esc") {
-        sendKeystrokeToSession(activeItermSessionId, 27);
+        await sendKeystrokeToSession(activeItermSessionId, 27);
         ctx.reply("Esc sent").catch(() => {});
         return;
       }
       if (trimmedText === "/enter") {
-        sendKeystrokeToSession(activeItermSessionId, 13);
+        await sendKeystrokeToSession(activeItermSessionId, 13);
         ctx.reply("Enter sent").catch(() => {});
         return;
       }
       if (trimmedText === "/tab") {
-        sendKeystrokeToSession(activeItermSessionId, 9);
+        await sendKeystrokeToSession(activeItermSessionId, 9);
         ctx.reply("Tab sent").catch(() => {});
         return;
       }
       if (trimmedText === "/up") {
-        sendEscapeSequenceToSession(activeItermSessionId, "A");
+        await sendEscapeSequenceToSession(activeItermSessionId, "A");
         ctx.reply("\u2191").catch(() => {});
         return;
       }
       if (trimmedText === "/down") {
-        sendEscapeSequenceToSession(activeItermSessionId, "B");
+        await sendEscapeSequenceToSession(activeItermSessionId, "B");
         ctx.reply("\u2193").catch(() => {});
         return;
       }
       if (trimmedText === "/left") {
-        sendEscapeSequenceToSession(activeItermSessionId, "D");
+        await sendEscapeSequenceToSession(activeItermSessionId, "D");
         ctx.reply("\u2190").catch(() => {});
         return;
       }
       if (trimmedText === "/right") {
-        sendEscapeSequenceToSession(activeItermSessionId, "C");
+        await sendEscapeSequenceToSession(activeItermSessionId, "C");
         ctx.reply("\u2192").catch(() => {});
         return;
       }
@@ -709,13 +709,13 @@ export function createHubCommandHandler(): (
         const sessionId = activeItermSessionId;
         (async () => {
           for (let i = 0; i < pickNum - 1; i++) {
-            sendEscapeSequenceToSession(sessionId, "B");
+            await sendEscapeSequenceToSession(sessionId, "B");
             await new Promise((r) => setTimeout(r, 50));
           }
-          sendKeystrokeToSession(sessionId, 13);
+          await sendKeystrokeToSession(sessionId, 13);
           if (pickText) {
             await new Promise((r) => setTimeout(r, 200));
-            typeIntoSession(sessionId, pickText);
+            await typeIntoSession(sessionId, pickText);
           }
           const msgText = pickText ? `Picked option ${pickNum}: ${pickText}` : `Picked option ${pickNum}`;
           ctx.reply(msgText).catch(() => {});

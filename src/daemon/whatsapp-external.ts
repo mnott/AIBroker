@@ -210,8 +210,8 @@ export async function deliverExternalToOwner(owner: string, body: string): Promi
   const { depositToSessionMailbox } = await import("../core/state.js");
   const names = getAllPersistentSessionNames();
   const candidates = snapshotAllSessions().map((s) => ({ id: s.id, name: lookupPersistentName(names, s.id, s.aibrokerId) ?? s.name }));
-  const hit = matchSession([owner], candidates, { prefer: (s) => (isClaudeSession(s.id) ? 1 : 0) });
-  if (!hit || !isClaudeSession(hit.session.id)) return false;
+  const hit = await matchSession([owner], candidates, { prefer: async (s) => ((await isClaudeSession(s.id)) ? 1 : 0) });
+  if (!hit || !await isClaudeSession(hit.session.id)) return false;
   depositToSessionMailbox(hit.session.id, "whatsapp-external", body);
   return true;
 }

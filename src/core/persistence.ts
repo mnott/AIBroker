@@ -232,7 +232,7 @@ export interface NameClaimResult {
  *   "gone"   — the snapshot answered and does not contain it
  *   "unknown" — no probe, or the enumeration came back empty/failed
  */
-export type HolderLiveness = (key: string) => "live" | "gone" | "unknown";
+export type HolderLiveness = (key: string) => "live" | "gone" | "unknown" | Promise<"live" | "gone" | "unknown">;
 let _holderLiveness: HolderLiveness | null = null;
 
 /** Wire/unwire the liveness oracle the theft guard asks. Tests use this too. */
@@ -256,17 +256,20 @@ export function setHolderLivenessProbe(fn: HolderLiveness | null): void {
  * Unknown liveness keeps the old binding (it may still be live) and allows the
  * write — resolution prefers the live holder either way.
  */
-export function setPersistentSessionName(itermSessionId: string, name: string): NameClaimResult {
+export async function setPersistentSessionName(itermSessionId: string, name: string): Promise<NameClaimResult> {
   const store = loadSessionNames();
   const others = Object.entries(store).filter(([id, n]) => n === name && id !== itermSessionId);
   if (_holderLiveness && others.length > 0) {
-    const liveHolder = others.find(([id]) => _holderLiveness!(id) === "live");
+    let liveHolder: [string, string] | undefined;
+    for (const o of others) {
+      if ((await _holderLiveness(o[0])) === "live") { liveHolder = o; break; }
+    }
     if (liveHolder) {
       log(`Persisted names: refused to give "${name}" to ${itermSessionId.slice(0, 8)} — held by live session ${liveHolder[0].slice(0, 8)}`);
       return { ok: false, heldBy: liveHolder[0] };
     }
     for (const [id] of others) {
-      if (_holderLiveness(id) === "gone") delete store[id];
+      if ((await _holderLiveness(id)) === "gone") delete store[id];
     }
   }
   store[itermSessionId] = name;

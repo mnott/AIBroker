@@ -190,7 +190,7 @@ export class AdapterRegistry {
               if (bridge) {
                 bridge.routeToMobile("", text);
               } else {
-                broadcastText(text);
+                await broadcastText(text);
               }
             } else if (sourceAdapter) {
               const replyMsg = createBrokerMessage("hub", "text", {
@@ -210,7 +210,7 @@ export class AdapterRegistry {
                   mimeType: "image/png",
                 });
               } else {
-                broadcastImage(buffer, caption);
+                await broadcastImage(buffer, caption);
               }
             } else if (sourceAdapter) {
               const replyMsg = createBrokerMessage("hub", "image", {
