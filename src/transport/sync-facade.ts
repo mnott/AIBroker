@@ -102,7 +102,8 @@ let mergedInFlight: Promise<unknown> | null = null;
 
 function refreshMergedInBackground(opts: { fresh?: boolean }): void {
   if (mergedInFlight) return;
-  mergedInFlight = snapshotAllSessions(opts).catch(() => {}).finally(() => { mergedInFlight = null; });
+  // Start the enumeration directly: going back through snapshotAllSessions would re-enter this branch (merged is still recent) before mergedInFlight is assigned.
+  mergedInFlight = enumerateTransports(opts, Date.now()).catch(() => {}).finally(() => { mergedInFlight = null; });
 }
 
 /**
