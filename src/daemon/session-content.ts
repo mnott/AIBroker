@@ -48,11 +48,11 @@ function sliceToLines(content: SessionContent, lines: number): SessionContent {
  * Read terminal content from a specific iTerm2 session.
  * Returns the last N lines of terminal output + busy/idle flag.
  */
-export function readSessionContent(
+export async function readSessionContent(
   sessionId: string,
   lines = 100,
   opts: { fresh?: boolean } = {},
-): SessionContent | null {
+): Promise<SessionContent | null> {
   if (!opts.fresh) {
     const cached = cache.get(sessionId);
     if (cached && Date.now() - cached.at < CONTENT_TTL_MS && cached.lines >= lines) {
@@ -61,7 +61,7 @@ export function readSessionContent(
   }
 
   const fetchLines = Math.max(lines, MIN_CACHE_LINES);
-  const result = readSessionContentUncached(sessionId, fetchLines);
+  const result = await readSessionContentUncached(sessionId, fetchLines);
   cache.set(sessionId, { at: Date.now(), lines: fetchLines, result });
   return result ? sliceToLines(result, lines) : null;
 }
@@ -84,34 +84,34 @@ export async function readSessionContentAsync(
   }
   const fetchLines = Math.max(lines, MIN_CACHE_LINES);
   const result = routeToTmux(sessionId)
-    ? readTmuxContent(sessionId, fetchLines)
-    : parseItermContent(sessionId, await _internal.runItermJxaAsync(itermReadScript(sessionId, fetchLines)));
+    ? await readTmuxContent(sessionId, fetchLines)
+    : parseItermContent(sessionId, await _internal.runItermJxa(itermReadScript(sessionId, fetchLines)));
   cache.set(sessionId, { at: Date.now(), lines: fetchLines, result });
   return result ? sliceToLines(result, lines) : null;
 }
 
 /** tmux path: `capture-pane -p -J -S -<lines>` through the transport, no AppleScript. */
-function readTmuxContent(sessionId: string, lines: number): SessionContent | null {
-  const raw = timeCall("session-content:read", () => captureSession(sessionId, lines));
+async function readTmuxContent(sessionId: string, lines: number): Promise<SessionContent | null> {
+  const raw = await timeCall("session-content:read", () => captureSession(sessionId, lines));
   if (raw === null) return null;
   // capture-pane pads the visible area with blank rows; they are not content.
   const content = raw.replace(/\s+$/, "");
-  const snap = snapshotAllSessions().find((s) => s.id === sessionId);
+  const snap = (await snapshotAllSessions()).find((s) => s.id === sessionId);
   return {
     sessionId,
     name: snap?.name ?? sessionId,
     content,
     lineCount: content ? content.split("\n").length : 0,
-    atPrompt: snap ? snap.atPrompt : !isClaudeRunningInSession(sessionId),
+    atPrompt: snap ? snap.atPrompt : !await isClaudeRunningInSession(sessionId),
     paiName: lookupPersistentName(getAllPersistentSessionNames(), sessionId, snap?.aibrokerId),
   };
 }
 
-function readSessionContentUncached(sessionId: string, lines: number): SessionContent | null {
-  if (routeToTmux(sessionId)) return readTmuxContent(sessionId, lines);
+async function readSessionContentUncached(sessionId: string, lines: number): Promise<SessionContent | null> {
+  if (routeToTmux(sessionId)) return await readTmuxContent(sessionId, lines);
   // _internal indirection, as in core.ts's own enumeration, so tests can
   // replace the osascript call without mocking node:child_process.
-  return parseItermContent(sessionId, timeCall("session-content:read", () => _internal.runItermJxa(itermReadScript(sessionId, lines))));
+  return parseItermContent(sessionId, await timeCall("session-content:read", () => _internal.runItermJxa(itermReadScript(sessionId, lines))));
 }
 
 /** JXA: contents, name, atPrompt for one session; the tail is cut inside osascript so only `lines` cross the pipe. */
@@ -154,14 +154,14 @@ function parseItermContent(sessionId: string, result: string | null): SessionCon
  * Read terminal content from ALL iTerm2 sessions.
  * Returns array of session contents with busy/idle flags.
  */
-export function readAllSessionContent(lines = 100): SessionContent[] {
+export async function readAllSessionContent(lines = 100): Promise<SessionContent[]> {
   // First get all session IDs via snapshot
-  const snapshots = snapshotAllSessions();
+  const snapshots = await snapshotAllSessions();
   if (snapshots.length === 0) return [];
 
   const results: SessionContent[] = [];
   for (const snap of snapshots) {
-    const content = readSessionContent(snap.id, lines);
+    const content = await readSessionContent(snap.id, lines);
     if (content) {
       results.push(content);
     }

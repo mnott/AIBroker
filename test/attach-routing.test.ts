@@ -29,14 +29,14 @@ const snap = (over: Record<string, unknown>) => ({ name: "", isClaude: true, ...
 const attachPane = snap({ id: "LIVE-PANE", attachUuid: "cdd93e8d" });
 const shell = snap({ id: "SHELL", isClaude: false });
 
-test("rename from a dead id plus uuid binds the attach pane (tty cannot)", () => {
+test("rename from a dead id plus uuid binds the attach pane (tty cannot)", async () => {
   const live = [shell, attachPane];
   const req = { itermSessionId: "w0t0p0:DEAD-ID", claudeSessionId: UUID, callerTty: "/dev/ttys099" } as IpcRequest;
   assert.equal(resolveCallerSession("DEAD-ID", "/dev/ttys099", live as never), "DEAD-ID", "tty fallback alone keeps the dead id");
   assert.equal(resolveCallerPane(req, live)?.id, "LIVE-PANE");
 });
 
-test("an env-claimed live pane loses to the pane attached to the caller's claude session", () => {
+test("an env-claimed live pane loses to the pane attached to the caller's claude session", async () => {
   // The daemon case: claude daemon run was spawned in tab A, so a session
   // hosted on its spare announces A's ITERM_SESSION_ID while tab B observably
   // attaches the caller's claude uuid. The viewer wins.
@@ -53,29 +53,29 @@ test("an env-claimed live pane loses to the pane attached to the caller's claude
   );
 });
 
-test("a dead-id PAILot target resolves to the live attach pane", () => {
+test("a dead-id PAILot target resolves to the live attach pane", async () => {
   rememberIdSession("DEAD-1", UUID);
   assert.equal(liveSessionFor("DEAD-1", [shell, attachPane]), "LIVE-PANE");
 });
 
-test("a live Claude pane and an unknown id are returned unchanged", () => {
+test("a live Claude pane and an unknown id are returned unchanged", async () => {
   rememberIdSession("OWN-1", UUID);
   assert.equal(liveSessionFor("OWN-1", [snap({ id: "OWN-1" }), attachPane]), "OWN-1");
   assert.equal(liveSessionFor("NEVER-SEEN", [attachPane]), "NEVER-SEEN");
 });
 
-test("name authority moves a stale name to the attach pane", () => {
+test("name authority moves a stale name to the attach pane", async () => {
   rememberIdSession("DEAD-2", UUID);
   setPersistentSessionName("DEAD-2", "CaseLeaf");
-  assert.equal(moveStaleNamesToAttachPanes([shell, attachPane]), 1);
+  assert.equal(await moveStaleNamesToAttachPanes([shell, attachPane]), 1);
   assert.equal(getPersistentSessionName("LIVE-PANE"), "CaseLeaf");
   assert.equal(getPersistentSessionName("DEAD-2"), undefined);
 });
 
-test("name authority leaves a live holder and an already-named attach pane alone", () => {
+test("name authority leaves a live holder and an already-named attach pane alone", async () => {
   rememberIdSession("DEAD-3", UUID);
   setPersistentSessionName("DEAD-3", "Other");
-  assert.equal(moveStaleNamesToAttachPanes([shell, attachPane]), 0, "attach pane already named CaseLeaf");
+  assert.equal(await moveStaleNamesToAttachPanes([shell, attachPane]), 0, "attach pane already named CaseLeaf");
   assert.equal(getPersistentSessionName("DEAD-3"), "Other");
-  assert.equal(moveStaleNamesToAttachPanes([snap({ id: "DEAD-3" }), attachPane]), 0, "live id is not stale");
+  assert.equal(await moveStaleNamesToAttachPanes([snap({ id: "DEAD-3" }), attachPane]), 0, "live id is not stale");
 });

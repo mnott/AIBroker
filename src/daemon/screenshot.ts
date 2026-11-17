@@ -11,10 +11,14 @@
 import { readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync, execSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 import {
   runItermJxa,
+  isScreenLocked,
   stripItermPrefix,
   snapshotAllSessions,
   withSessionJxa,
@@ -34,14 +38,14 @@ import type { CommandContext } from "./command-context.js";
 
 let lastScreenshotContent: string | null = null;
 
-function getActiveSessionContent(): string | null {
+async function getActiveSessionContent(): Promise<string | null> {
   const activeEntry = activeClientId ? sessionRegistry.get(activeClientId) : undefined;
   const itermId = stripItermPrefix(
     (activeItermSessionId || undefined) ?? activeEntry?.itermSessionId
   );
   if (!itermId) return null;
 
-  const stdout = runItermJxa(withSessionJxa(itermId, "          return aSession.contents();"), 10_000) ?? "";
+  const stdout = await runItermJxa(withSessionJxa(itermId, "          return aSession.contents();"), 10_000) ?? "";
   return stdout || null;
 }
 
@@ -50,16 +54,16 @@ function getActiveSessionContent(): string | null {
  * (or nothing). Where iTerm is not in play at all, an unaddressed /ss falls
  * back to the first live pane — there is no other kind of session to pick.
  */
-function tmuxTargetFor(ctx: CommandContext): string | null {
+async function tmuxTargetFor(ctx: CommandContext): Promise<string | null> {
   const activeEntry = activeClientId ? sessionRegistry.get(activeClientId) : undefined;
   const id = stripItermPrefix(ctx.sessionId ?? (activeItermSessionId || undefined) ?? activeEntry?.itermSessionId);
   if (id) return routeToTmux(id) ? id : null;
-  return itermInPlay() ? null : snapshotAllTransportSessions()[0]?.id ?? null;
+  return itermInPlay() ? null : (await snapshotAllTransportSessions())[0]?.id ?? null;
 }
 
 /** /ss on tmux: there is no window to photograph, so reply with the pane's text. */
 async function handleTmuxScreenshot(ctx: CommandContext, paneId: string): Promise<void> {
-  const raw = captureSession(paneId, 60);
+  const raw = await captureSession(paneId, 60);
   if (raw === null) {
     await ctx.reply("Could not read the tmux pane — it may have closed.");
     return;
@@ -74,7 +78,7 @@ async function handleTmuxScreenshot(ctx: CommandContext, paneId: string): Promis
     await ctx.reply("The tmux pane is empty.");
     return;
   }
-  if (ctx.source !== "pailot") broadcastText(`Terminal capture:\n\n${text}`);
+  if (ctx.source !== "pailot") await broadcastText(`Terminal capture:\n\n${text}`);
   const maxLen = 4000;
   const trimmed = text.length > maxLen ? "...\n" + text.slice(-maxLen) : text;
   await ctx.reply(`*Terminal capture (tmux):*\n\n\`\`\`\n${trimmed}\n\`\`\``);
@@ -105,7 +109,7 @@ async function handleTextScreenshot(ctx: CommandContext): Promise<void> {
     }
 
     for (const candidate of candidates) {
-      const stdout = runItermJxa(withSessionJxa(candidate.id, "          return aSession.contents();", '"::NOT_FOUND::"'), 10_000) ?? "";
+      const stdout = await runItermJxa(withSessionJxa(candidate.id, "          return aSession.contents();", '"::NOT_FOUND::"'), 10_000) ?? "";
       if (stdout === "::NOT_FOUND::" || stdout === "") continue;
 
       lastScreenshotContent = stdout;
@@ -118,7 +122,7 @@ async function handleTextScreenshot(ctx: CommandContext): Promise<void> {
           .filter((line: string) => line.trim() !== "")
           .slice(-50)
           .join("\n");
-        broadcastText(`Terminal capture (screen locked):\n\n${cleaned}`);
+        await broadcastText(`Terminal capture (screen locked):\n\n${cleaned}`);
       }
 
       // Send to originating adapter
@@ -144,8 +148,8 @@ async function handleTextScreenshot(ctx: CommandContext): Promise<void> {
  * front first — this is that step, shared by the ctx-driven screenshot and
  * the headless capture below. Returns "" if the session cannot be found.
  */
-function resolveWindowIdForSession(sessionId: string): string {
-  const result = runItermJxa(withSessionJxa(
+async function resolveWindowIdForSession(sessionId: string): Promise<string> {
+  const result = await runItermJxa(withSessionJxa(
     sessionId,
     `          aTab.select();\n          return String(aWindow.id());`,
   ));
@@ -159,10 +163,10 @@ function resolveWindowIdForSession(sessionId: string): string {
  * text fallback catch it themselves; `captureSessionPng` below catches it to
  * return null instead, since a headless caller has no text fallback to run.
  */
-function capturePngForWindow(windowId: string): Buffer {
+async function capturePngForWindow(windowId: string): Promise<Buffer> {
   const filePath = join(tmpdir(), `aibroker-screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
   try {
-    execSync(`/usr/sbin/screencapture -x -l ${windowId} "${filePath}"`, { timeout: 15_000 });
+    await execFileAsync("/usr/sbin/screencapture", ["-x", "-l", windowId, filePath], { timeout: 15_000, killSignal: "SIGKILL" });
     return readFileSync(filePath);
   } finally {
     try { unlinkSync(filePath); } catch { /* ignore */ }
@@ -181,11 +185,11 @@ function capturePngForWindow(windowId: string): Buffer {
 export async function captureSessionPng(sessionId: string): Promise<{ buffer: Buffer; mime: string } | null> {
   if (routeToTmux(sessionId)) return null; // no window to photograph; the caller falls back to text
   try {
-    const windowId = resolveWindowIdForSession(sessionId);
+    const windowId = await resolveWindowIdForSession(sessionId);
     if (!windowId) return null;
     // Brief delay for the just-selected tab to render before capture.
-    spawnSync("sleep", ["0.3"]);
-    const buffer = capturePngForWindow(windowId);
+    await new Promise((r) => setTimeout(r, 300));
+    const buffer = await capturePngForWindow(windowId);
     return { buffer, mime: "image/png" };
   } catch (err) {
     log(`captureSessionPng: failed — ${(err as Error).message}`);
@@ -210,12 +214,12 @@ export async function handleScreenshot(ctx: CommandContext): Promise<void> {
 }
 
 async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
-  const tmuxPane = tmuxTargetFor(ctx);
+  const tmuxPane = await tmuxTargetFor(ctx);
   if (tmuxPane) return handleTmuxScreenshot(ctx, tmuxPane);
 
   // Content-unchanged optimization: skip text fallback for non-PAILot sources
   // PAILot always gets a real screenshot (window capture is fast)
-  const currentContent = getActiveSessionContent();
+  const currentContent = await getActiveSessionContent();
   if (ctx.source !== "pailot" && currentContent && lastScreenshotContent) {
     const tail = (s: string) => s.split("\n").slice(-100).join("\n").trim();
     if (tail(currentContent) === tail(lastScreenshotContent)) {
@@ -226,7 +230,7 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
         .slice(-30)
         .join("\n");
       if (lines) {
-        broadcastText(lines);
+        await broadcastText(lines);
         await ctx.reply(`*Terminal (unchanged):*\n\n\`\`\`\n${lines}\n\`\`\``);
         log("/ss: content unchanged, sent tail as text");
         return;
@@ -237,12 +241,7 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
 
   // Check screen lock
   try {
-    const lockCheck = spawnSync(
-      "sh",
-      ["-c", "ioreg -n Root -d1 -a | grep -c CGSSessionScreenIsLocked"],
-      { timeout: 5_000, encoding: "utf8" }
-    );
-    if (parseInt((lockCheck.stdout ?? "0").trim(), 10) > 0) {
+    if (await isScreenLocked()) {
       log("/ss: screen is locked — falling back to terminal text capture");
       await handleTextScreenshot(ctx);
       return;
@@ -272,7 +271,7 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
     }
 
     if (!itermSessionId) {
-      const liveSessions = listClaudeSessions();
+      const liveSessions = await listClaudeSessions();
       if (liveSessions.length > 0) {
         itermSessionId = liveSessions[0].id;
         setActiveItermSessionId(liveSessions[0].id);
@@ -282,16 +281,16 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
     // Find the window and SELECT the tab containing the target session
     // screencapture -l captures the visible tab, so we must switch to it
     if (itermSessionId) {
-      windowId = resolveWindowIdForSession(itermSessionId);
+      windowId = await resolveWindowIdForSession(itermSessionId);
       // Brief delay for tab to render
       if (windowId) {
-        spawnSync("sleep", ["0.3"]);
+        await new Promise((r) => setTimeout(r, 300));
       }
     }
 
     if (!windowId) {
       // Fallback: use frontmost window
-      const fb = runItermJxa("return String(app.windows()[0].id());") ?? "";
+      const fb = (await runItermJxa("return String(app.windows()[0].id());")) ?? "";
       windowId = fb.trim();
     }
 
@@ -301,10 +300,10 @@ async function _handleScreenshotImpl(ctx: CommandContext): Promise<void> {
     }
 
     log(`/ss: capturing window ${windowId}`);
-    const buffer = capturePngForWindow(windowId);
+    const buffer = await capturePngForWindow(windowId);
 
     // Send to PAILot WebSocket clients (skip if request came from PAILot)
-    if (ctx.source !== "pailot") broadcastImage(buffer, "Screenshot");
+    if (ctx.source !== "pailot") await broadcastImage(buffer, "Screenshot");
 
     // Send to originating adapter
     await ctx.replyImage(buffer, "Screenshot");

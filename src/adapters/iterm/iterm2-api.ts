@@ -163,9 +163,9 @@ function findTabIdForSession(buf: Buffer, targetSessionId: string): string | nul
 
 // ── Auth ──
 
-function getCookieAndKey(): { cookie: string; key: string } | null {
+async function getCookieAndKey(): Promise<{ cookie: string; key: string } | null> {
   try {
-    const result = runItermJxa(`  return app.requestCookie({ andKeyForAppNamed: "AIBroker" });`, 5_000)?.trim();
+    const result = (await runItermJxa(`  return app.requestCookie({ andKeyForAppNamed: "AIBroker" });`, 5_000))?.trim();
     if (!result) return null;
     const [cookie, key] = result.split(" ");
     if (!cookie || !key) return null;
@@ -211,7 +211,7 @@ function createIterm2WebSocket(auth: { cookie: string; key: string }): WebSocket
  * No Python dependency required.
  */
 export async function iterm2SetTabTitle(sessionId: string, newTitle: string): Promise<void> {
-  const auth = getCookieAndKey();
+  const auth = await getCookieAndKey();
   if (!auth) throw new Error("Failed to get iTerm2 auth cookie");
 
   const ws = createIterm2WebSocket(auth);

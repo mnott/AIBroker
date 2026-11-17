@@ -5,8 +5,8 @@
  * with zero transport-specific imports.
  */
 
-import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
-import { statSync, writeFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { log } from "../../core/log.js";
 import { parseAttachUuid, parseSessionIdArg } from "../../core/claude-attach.js";
 import { transcriptCwd } from "../../core/claude-transcript-cwd.js";
@@ -75,27 +75,20 @@ function reportOsascriptFailure(
   );
 }
 
-/** Run osascript with a script on stdin; null (and a throttled log line) on any failure. */
-function runOsascript(args: string[], script: string, timeoutMs: number): string | null {
-  const result = spawnSync("osascript", args, {
-    input: script,
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: timeoutMs,
-    env: cleanChildEnv(),
-    maxBuffer: OSASCRIPT_MAX_BUFFER,
-  });
-
-  if (result.status !== 0 || result.error) {
-    reportOsascriptFailure(script, timeoutMs, {
-      status: result.status,
-      signal: result.signal,
-      error: result.error,
-      stderr: result.stderr?.toString() ?? "",
-    });
-    return null;
-  }
-
-  return result.stdout?.toString().trim() ?? null;
+/**
+ * Run osascript with a script on stdin; null (and a throttled log line) on any failure.
+ *
+ * NOT spawnSync. A synchronous child freezes this process's whole event loop
+ * for the call's duration, and when iTerm was wedged on 2026-11-17 that meant
+ * ~30 s blocks — six in a row — during which IPC answered nothing, the MQTT
+ * loopback missed keep-alives ("keep alive timeout", then "connack timeout")
+ * and `aibroker mailbox wait` hung. The daemon must stay responsive while iTerm
+ * hangs; an awaited child that times out and is killed keeps the loop turning.
+ * Same null-on-failure contract and failure log as before, same in-flight
+ * coalescing: every osascript path in the process goes through here.
+ */
+function runOsascript(args: string[], script: string, timeoutMs: number): Promise<string | null> {
+  return runOsascriptAsync(args, script, timeoutMs);
 }
 
 /**
@@ -125,8 +118,15 @@ function spawnOsascriptAsync(args: string[], script: string, timeoutMs: number):
     const err: Buffer[] = [];
     let timedOut = false;
     let settled = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMs);
-    const done = (status: number | null, signal: string | null, error?: Error) => {
+    // On timeout: SIGKILL and answer NOW. Waiting for "close" would hang on a child
+    // (or grandchild) still holding the stdio pipes open - the very wedge guarded against.
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      child.stdout.destroy(); child.stderr.destroy();
+      done(null, "SIGKILL");
+    }, timeoutMs);
+    const done = (status: number | null, signal: string | null, error?: Error): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -152,17 +152,14 @@ function spawnOsascriptAsync(args: string[], script: string, timeoutMs: number):
 // default trades a rare slow call for a silent wrong answer. iTerm AppleScript
 // cost scales with open sessions and scrollback, both of which grow over time.
 // For OTHER apps only — iTerm is addressed through runItermJxa.
-export function runAppleScript(script: string, timeoutMs = 15_000): string | null {
+export async function runAppleScript(script: string, timeoutMs = 15_000): Promise<string | null> {
   // No osascript off macOS — not a failure, so nothing to log or throttle.
   if (process.platform !== "darwin") return null;
   return runOsascript([], script, timeoutMs);
 }
 
-/** runAppleScript without blocking the event loop; same null-on-failure contract and log. */
-export async function runAppleScriptAsync(script: string, timeoutMs = 15_000): Promise<string | null> {
-  if (process.platform !== "darwin") return null;
-  return runOsascriptAsync([], script, timeoutMs);
-}
+/** Alias — runAppleScript is async now; same null-on-failure contract and log. */
+export const runAppleScriptAsync = runAppleScript;
 
 /**
  * Run a short-lived tool without blocking the event loop. Resolves with its
@@ -208,20 +205,22 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** Pid of the real iTerm (cached, re-resolved once that pid is gone); null when it is not running. */
+/**
+ * Pid of the real iTerm, from the cache only — re-resolved by every async path
+ * (itermPidAsync, and any osascript failure invalidates it). Never a sync spawn:
+ * even a 5 s `ps` on a wedged machine stalls IPC and MQTT keep-alives, and the
+ * daemon's iTerm paths are all async now. CLI entry points resolve through
+ * itermPidAsync first.
+ */
 export function itermPid(): number | null {
   if (process.platform !== "darwin") return null;
   if (cachedItermPid !== null && pidAlive(cachedItermPid)) return cachedItermPid;
-  cachedItermPid = null;
-  const ps = spawnSync("ps", ["-Ao", "pid=,comm="], { encoding: "utf8", timeout: 5_000 });
-  if (ps.status !== 0 || !ps.stdout) return null;
-  cachedItermPid = parseItermPid(ps.stdout);
-  return cachedItermPid;
+  return null;
 }
 
 let itermPidInFlight: Promise<number | null> | null = null;
 
-/** itermPid() without blocking the event loop. */
+/** itermPid() with a live (async) resolve when the cache is cold. */
 export function itermPidAsync(): Promise<number | null> {
   if (process.platform !== "darwin") return Promise.resolve(null);
   if (cachedItermPid !== null && pidAlive(cachedItermPid)) return Promise.resolve(cachedItermPid);
@@ -268,19 +267,10 @@ export function buildItermJxa(pid: number, body: string): string {
  * Run an enumeration, and if it fails (null) retry once after a short pause —
  * a window closing mid-walk is usually gone by then.
  */
-export function withEnumRetry(
-  run: () => string | null,
-  sleep: (ms: number) => void = sleepSync,
-  delayMs = 300,
-): string | null {
-  const first = run();
-  if (first !== null) return first;
-  sleep(delayMs);
-  return run();
-}
-
-/** withEnumRetry without blocking the event loop (neither the run nor the pause). */
-export async function withEnumRetryAsync(
+/** Retry an enumeration once after a short, awaited pause — a window closing
+ *  mid-walk is usually gone by then. Async: neither the run nor the pause may
+ *  block the event loop (the old sync twin slept with Atomics.wait). */
+export async function withEnumRetry(
   run: () => Promise<string | null>,
   delayMs = 300,
 ): Promise<string | null> {
@@ -290,9 +280,8 @@ export async function withEnumRetryAsync(
   return run();
 }
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
+/** Alias — the retry is async now. */
+export const withEnumRetryAsync = withEnumRetry;
 
 /**
  * Run JXA against iTerm, addressed by PROCESS ID — never by name, bundle id or
@@ -300,22 +289,16 @@ function sleepSync(ms: number): void {
  * that an impostor process poisons (-600 / -1708). The body sees `app` and
  * must `return` a string. Same failure value as runAppleScript: null.
  */
-export function runItermJxa(body: string, timeoutMs = 15_000): string | null {
-  const pid = itermPid();
+export async function runItermJxa(body: string, timeoutMs = 15_000): Promise<string | null> {
+  const pid = await itermPidAsync();
   if (pid === null) return null;
-  const out = runOsascript(["-l", "JavaScript"], buildItermJxa(pid, body), timeoutMs);
+  const out = await runOsascript(["-l", "JavaScript"], buildItermJxa(pid, body), timeoutMs);
   if (out === null) cachedItermPid = null; // maybe iTerm restarted; resolve afresh next time
   return out;
 }
 
-/** runItermJxa without blocking the event loop (see runOsascriptAsync). */
-export async function runItermJxaAsync(body: string, timeoutMs = 15_000): Promise<string | null> {
-  const pid = await itermPidAsync();
-  if (pid === null) return null;
-  const out = await runOsascriptAsync(["-l", "JavaScript"], buildItermJxa(pid, body), timeoutMs);
-  if (out === null) cachedItermPid = null;
-  return out;
-}
+/** Alias — every osascript path is async now; kept so imports read the same everywhere. */
+export const runItermJxaAsync = runItermJxa;
 
 /**
  * Plain-object indirection so tests can replace the osascript call without
@@ -325,7 +308,7 @@ export async function runItermJxaAsync(body: string, timeoutMs = 15_000): Promis
  * transport wrapper, enumeration) read through this object rather than
  * importing the function directly.
  */
-export const _internal = { runAppleScript, runItermJxa, runItermJxaAsync };
+export const _internal = { runAppleScript, runItermJxa, snapshotAllSessions };
 
 export function stripItermPrefix(id: string | undefined): string | undefined {
   if (!id) return id;
@@ -364,45 +347,45 @@ ${body}
 }
 
 /** Type raw text into a session as though typed, without a trailing newline. */
-function writeToSession(sessionId: string, textJs: string): boolean {
+async function writeToSession(sessionId: string, textJs: string): Promise<boolean> {
   const body = withSessionJxa(
     sessionId,
     `          aSession.write({ text: ${textJs}, newline: false });\n          return "ok";`,
     '"not_found"',
   );
-  return runItermJxa(body) === "ok";
+  return (await runItermJxa(body)) === "ok";
 }
 
-export function sendKeystrokeToSession(sessionId: string, asciiCode: number): boolean {
+export async function sendKeystrokeToSession(sessionId: string, asciiCode: number): Promise<boolean> {
   return writeToSession(sessionId, `String.fromCharCode(${asciiCode})`);
 }
 
-export function sendEscapeSequenceToSession(sessionId: string, dirChar: string): boolean {
+export async function sendEscapeSequenceToSession(sessionId: string, dirChar: string): Promise<boolean> {
   return writeToSession(sessionId, JSON.stringify(`\x1b[${dirChar}`));
 }
 
-export function typeIntoSession(sessionId: string, text: string): boolean {
+export async function typeIntoSession(sessionId: string, text: string): Promise<boolean> {
   // Claude Code terminal can get stuck in vi normal mode.
   // Send 'i' (insert) then backspace to ensure we're in editing mode.
-  sendKeystrokeToSession(sessionId, 105); // 'i'
-  sendKeystrokeToSession(sessionId, 127); // backspace (DEL)
-  if (!pasteTextIntoSession(sessionId, text)) return false;
-  sendKeystrokeToSession(sessionId, 13);
+  await sendKeystrokeToSession(sessionId, 105); // 'i'
+  await sendKeystrokeToSession(sessionId, 127); // backspace (DEL)
+  if (!(await pasteTextIntoSession(sessionId, text))) return false;
+  await sendKeystrokeToSession(sessionId, 13);
   return true;
 }
 
-export function pasteTextIntoSession(sessionId: string, text: string): boolean {
+export async function pasteTextIntoSession(sessionId: string, text: string): Promise<boolean> {
   return writeToSession(sessionId, JSON.stringify(text));
 }
 
-export function findClaudeSession(): string | null {
+export async function findClaudeSession(): Promise<string | null> {
   const script = `  var out = "";
   eachSession(function (s) {
     out += s.id() + "\\t" + s.name() + "\\n";
   });
   return out;`;
 
-  const result = runItermJxa(script);
+  const result = await runItermJxa(script);
   if (!result) return null;
 
   const lines = result.split("\n").filter(Boolean);
@@ -419,13 +402,13 @@ export function findClaudeSession(): string | null {
   return null;
 }
 
-export function isClaudeRunningInSession(sessionId: string): boolean {
+export async function isClaudeRunningInSession(sessionId: string): Promise<boolean> {
   const script = withSessionJxa(
     sessionId,
     `          return aSession.isAtShellPrompt() ? "shell" : "running";`,
     '"not_found"',
   );
-  const result = runItermJxa(script);
+  const result = await runItermJxa(script);
   if (result === "running") return true;
   if (result === "shell") {
     log(`Session ${sessionId} is at shell prompt — Claude has exited.`);
@@ -435,32 +418,27 @@ export function isClaudeRunningInSession(sessionId: string): boolean {
   return false;
 }
 
-export function isItermRunning(): boolean {
+/** Is iTerm running? Async `pgrep` — a sync spawn here would block the event loop. */
+export async function isItermRunning(): Promise<boolean> {
   if (!itermInPlay()) return false;
-  const result = spawnSync("pgrep", ["-x", "iTerm2"], {
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: 3_000,
-  });
-  return result.status === 0;
+  const out = await runCaptureAsync("pgrep", ["-x", "iTerm2"], 3_000);
+  // pgrep prints the pid on success and nothing when no process matches.
+  return out !== null && out.trim() !== "";
 }
 
-export function isItermSessionAlive(sessionId: string): boolean {
+export async function isItermSessionAlive(sessionId: string): Promise<boolean> {
   const script = withSessionJxa(sessionId, `          return "alive";`, '"gone"');
-  return runItermJxa(script) === "alive";
+  return (await runItermJxa(script)) === "alive";
 }
 
-export function isScreenLocked(): boolean {
+/** Is the screen locked? Async `ioreg` + in-process match — a sync spawn here would block the event loop. */
+export async function isScreenLocked(): Promise<boolean> {
   if (process.platform !== "darwin") return false;
-  try {
-    const result = spawnSync(
-      "sh",
-      ["-c", "ioreg -n Root -d1 -a | grep -c CGSSessionScreenIsLocked"],
-      { timeout: 3_000, encoding: "utf8" }
-    );
-    return parseInt((result.stdout ?? "0").trim(), 10) > 0;
-  } catch {
-    return false;
-  }
+  // Same read as the old `ioreg -n Root -d1 -a | grep -c CGSSessionScreenIsLocked`,
+  // minus the shell: grep counted a property NAME in the plist dump, so an
+  // in-process substring match answers identically.
+  const out = await runCaptureAsync("ioreg", ["-n", "Root", "-d1", "-a"], 3_000);
+  return out !== null && out.includes("CGSSessionScreenIsLocked");
 }
 
 /**
@@ -578,19 +556,8 @@ export function parseItermPath(raw: string | undefined): string | null {
  * open — the same shape of mistake as the AppleScript timeout that scaled with
  * tab count.
  */
-function ttysRunningClaude(pids?: Map<string, string>): Map<string, string | undefined> {
-  try {
-    const out = timeCall("iterm-core:ps-claude-scan", () =>
-      execFileSync("ps", ["-ao", "tty=,pid=,command="], { encoding: "utf8", timeout: 10_000 }));
-    return parseClaudeTtys(out, pids);
-  } catch {
-    /* no answer: callers fall back to the title heuristic rather than see nothing */
-    return new Map();
-  }
-}
-
-/** ttysRunningClaude without blocking the event loop. */
-async function ttysRunningClaudeAsync(pids?: Map<string, string>): Promise<Map<string, string | undefined>> {
+/** ttysRunningClaude — async; a sync `ps` here would block the event loop. */
+async function ttysRunningClaude(pids?: Map<string, string>): Promise<Map<string, string | undefined>> {
   const out = await runCaptureAsync("ps", ["-ao", "tty=,pid=,command="], 10_000);
   return out ? parseClaudeTtys(out, pids) : new Map();
 }
@@ -628,26 +595,13 @@ export function parseLsofCwds(out: string): Map<string, string> {
   return res;
 }
 
-/** cwd of each given pid in ONE lsof call (macOS has no /proc); empty on failure. */
-function cwdsOfPids(pids: string[]): Map<string, string> {
-  if (!pids.length) return new Map();
-  try {
-    const out = timeCall("iterm-core:lsof-cwd", () =>
-      execFileSync("/usr/sbin/lsof", ["-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }));
-    return parseLsofCwds(out);
-  } catch (e) {
-    // lsof exits 1 when some pid vanished but still prints the rest
-    const out = (e as { stdout?: string }).stdout;
-    return typeof out === "string" ? parseLsofCwds(out) : new Map();
-  }
-}
-
-/** cwdsOfPids without blocking the event loop. */
-async function cwdsOfPidsAsync(pids: string[]): Promise<Map<string, string>> {
+/** cwd of each given pid in ONE async lsof call (macOS has no /proc); empty on failure. */
+async function cwdsOfPids(pids: string[]): Promise<Map<string, string>> {
   if (!pids.length) return new Map();
   const out = await runCaptureAsync("/usr/sbin/lsof", ["-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"], 10_000);
   return out ? parseLsofCwds(out) : new Map();
 }
+
 
 /**
  * Reuse window for one enumeration, mirroring HybridSessionManager's own
@@ -685,11 +639,60 @@ const ENUM_SCRIPT = `  var out = "";
  * memo via `snapshotAllSessions({ fresh: true })` instead of waiting out the
  * TTL.
  */
-function snapshotAllSessionsUncached(): SessionSnapshot[] {
+/**
+ * Back-off while iTerm's enumeration keeps failing.
+ *
+ * Without this, every caller during a wedged-iTerm episode issued a fresh
+ * 30 s osascript (plus withEnumRetry's second attempt) on every tick and every
+ * request — six 30 s timeouts in three minutes on 2026-11-17, each one another
+ * keep-alive lost. During an "unreliable" episode the next real attempt waits:
+ * first failure +60 s, second +120 s, then flat at ENUM_BACKOFF_MAX_MS. A
+ * successful enumeration clears the ladder immediately, so a one-off hiccup is
+ * never punished twice.
+ */
+const ENUM_BACKOFF_BASE_MS = 60_000;
+const ENUM_BACKOFF_MAX_MS = 120_000;
+let enumFailures = 0;
+let enumBackoffUntil = 0;
+
+function enumBackoffMs(): number {
+  return Math.min(ENUM_BACKOFF_BASE_MS * 2 ** (enumFailures - 1), ENUM_BACKOFF_MAX_MS);
+}
+
+/** True while an enumeration attempt is allowed; false during the back-off window. */
+function enumAttemptAllowed(now: number): boolean {
+  return now >= enumBackoffUntil;
+}
+
+function onEnumSuccess(): void {
+  enumFailures = 0;
+  enumBackoffUntil = 0;
+}
+
+/** The next attempt is only allowed after the grown window. */
+function onEnumFailure(now: number): void {
+  enumFailures++;
+  enumBackoffUntil = now + enumBackoffMs();
+}
+
+/** Test hook: put the back-off ladder into a known state. */
+export function _resetEnumBackoffForTest(): void {
+  enumFailures = 0;
+  enumBackoffUntil = 0;
+}
+
+async function snapshotAllSessionsUncached(): Promise<SessionSnapshot[]> {
   // iTerm is not in play (tmux transport / non-macOS): an empty answer, and a
   // reliable one — "no iTerm sessions" is true, not a dropped enumeration.
   if (!itermInPlay()) {
     lastSnapshotOk = true;
+    return [];
+  }
+  // Single-flight + back-off: while a previous failure's window is open, no
+  // new osascript runs — callers share the last good snapshot (the memo above
+  // serves it) rather than stacking another 30 s child on a wedged iTerm.
+  if (!enumAttemptAllowed(Date.now())) {
+    lastSnapshotOk = false;
     return [];
   }
   // Timeout scales with the work: iTerm's AppleScript cost grows with the
@@ -699,35 +702,18 @@ function snapshotAllSessionsUncached(): SessionSnapshot[] {
   // 4.05s and every enumeration returned empty, killing all session features
   // at once. Budget generously — this is a correctness floor, not a latency
   // target, and a slow answer beats a confidently wrong empty one.
-  const result = timeCall("iterm-core:snapshot-enum", () => withEnumRetry(() => _internal.runItermJxa(ENUM_SCRIPT, 30_000)));
+  const result = await withEnumRetryAsync(() => _internal.runItermJxa(ENUM_SCRIPT, 30_000));
   if (!result) {
     lastSnapshotOk = false;
+    onEnumFailure(Date.now());
     return [];
   }
   lastSnapshotOk = true;
+  onEnumSuccess();
 
   const claudePids = new Map<string, string>();
-  const claudeTtys = ttysRunningClaude(claudePids);
-  const pidCwds = cwdsOfPids([...claudePids.values()]);
-  return buildSnapshots(result, claudeTtys, claudePids, pidCwds);
-}
-
-/** snapshotAllSessionsUncached without blocking the event loop; same flag and failure semantics. */
-async function snapshotAllSessionsUncachedAsync(): Promise<SessionSnapshot[]> {
-  if (!itermInPlay()) {
-    lastSnapshotOk = true;
-    return [];
-  }
-  const result = await withEnumRetryAsync(() => _internal.runItermJxaAsync(ENUM_SCRIPT, 30_000));
-  if (!result) {
-    lastSnapshotOk = false;
-    return [];
-  }
-  lastSnapshotOk = true;
-
-  const claudePids = new Map<string, string>();
-  const claudeTtys = await ttysRunningClaudeAsync(claudePids);
-  const pidCwds = await cwdsOfPidsAsync([...claudePids.values()]);
+  const claudeTtys = await ttysRunningClaude(claudePids);
+  const pidCwds = await cwdsOfPids([...claudePids.values()]);
   return buildSnapshots(result, claudeTtys, claudePids, pidCwds);
 }
 
@@ -828,27 +814,14 @@ export function parseLsappinfoImpostors(text: string): ItermBundleIdImpostor[] {
  * anything, never throws — on any error this is "found nothing" to a caller
  * that already treats [] as the safe default.
  */
-export function findItermBundleIdImpostors(): ItermBundleIdImpostor[] {
-  if (!itermInPlay()) return [];
-  try {
-    const result = spawnSync("/usr/bin/lsappinfo", ["list"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 3_000,
-      encoding: "utf8",
-    });
-    if (result.status !== 0 || result.error || !result.stdout) return [];
-    return parseLsappinfoImpostors(result.stdout);
-  } catch {
-    return [];
-  }
-}
-
-/** findItermBundleIdImpostors without blocking the event loop. */
-export async function findItermBundleIdImpostorsAsync(): Promise<ItermBundleIdImpostor[]> {
+export async function findItermBundleIdImpostors(): Promise<ItermBundleIdImpostor[]> {
   if (!itermInPlay()) return [];
   const out = await runCaptureAsync("/usr/bin/lsappinfo", ["list"], 3_000);
   return out ? parseLsappinfoImpostors(out) : [];
 }
+
+/** Alias — async now; a sync lsappinfo on a wedged machine blocks the event loop. */
+export const findItermBundleIdImpostorsAsync = findItermBundleIdImpostors;
 
 /**
  * Enumerate all iTerm2 sessions, reusing an answer up to SNAPSHOT_TTL_MS old.
@@ -861,45 +834,48 @@ export async function findItermBundleIdImpostorsAsync(): Promise<ItermBundleIdIm
  * previous good snapshot in place (or null, if there was none), so the next
  * call retries iTerm instead of replaying the failure.
  */
-export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnapshot[] {
-  const now = Date.now();
-  if (!opts.fresh && cachedSnapshots && now - cachedAt < SNAPSHOT_TTL_MS) return cachedSnapshots;
-  // Handlers never spawn when a recent result exists: serve it, refresh behind it.
-  if (cachedSnapshots && now - cachedAt < SNAPSHOT_STALE_LIMIT_MS) {
-    refreshSnapshotInBackground(opts.fresh === true);
-    return cachedSnapshots;
-  }
-  const result = snapshotAllSessionsUncached();
-  if (lastSnapshotOk) {
-    cachedSnapshots = result;
-    cachedAt = now;
-  }
-  return result;
-}
-
 let snapshotInFlight: Promise<SessionSnapshot[]> | null = null;
 
 /**
- * snapshotAllSessions for timers and polls: same memo, same flag, but the
- * osascript/ps/lsof children are awaited, never spawnSync'd, so the event loop
- * keeps serving IPC while a loaded machine takes seconds to answer. Overlapping
- * callers share one in-flight enumeration.
+ * Enumerate all iTerm2 sessions. Same memo, same reliability flag — and never a
+ * blocking child any more: the osascript/ps/lsof runs are awaited, so a wedged
+ * iTerm cannot stall IPC, MQTT or the mailbox while a 30 s call times out.
+ * Single-flight: overlapping callers share one in-flight enumeration (that is
+ * what makes "never more than one enumeration osascript at a time" true), and
+ * repeated failures back off (see the ladder above) instead of issuing a fresh
+ * 30 s call every tick. During the back-off window the last good snapshot is
+ * served with the reliability flag false, so callers that must not act on an
+ * unreliable enumeration still refuse to.
  */
-export function snapshotAllSessionsAsync(opts: { fresh?: boolean } = {}): Promise<SessionSnapshot[]> {
+export function snapshotAllSessions(opts: { fresh?: boolean } = {}): Promise<SessionSnapshot[]> {
   const now = Date.now();
   if (!opts.fresh && cachedSnapshots && now - cachedAt < SNAPSHOT_TTL_MS) return Promise.resolve(cachedSnapshots);
+  // A recent result exists: serve it, refresh behind it — handlers answer from
+  // the memo within microseconds even while iTerm is wedged.
+  if (cachedSnapshots && now - cachedAt < SNAPSHOT_STALE_LIMIT_MS) {
+    refreshSnapshotInBackground(opts.fresh === true);
+    return Promise.resolve(cachedSnapshots);
+  }
   if (snapshotInFlight) return snapshotInFlight;
-  snapshotInFlight = snapshotAllSessionsUncachedAsync()
+  snapshotInFlight = snapshotAllSessionsUncached()
     .then((result) => {
       if (lastSnapshotOk) {
         cachedSnapshots = result;
         cachedAt = Date.now();
+      } else if (cachedSnapshots) {
+        // Failure: the previous good snapshot stays in place for stale-serving,
+        // and is what this call answers with — an empty list must never be read
+        // as "no sessions" while iTerm merely failed to answer.
+        return cachedSnapshots;
       }
       return result;
     })
     .finally(() => { snapshotInFlight = null; });
   return snapshotInFlight;
 }
+
+/** Alias — every enumeration path is async now. */
+export const snapshotAllSessionsAsync = snapshotAllSessions;
 
 let snapshotEpoch = 0;
 /** Bumped by invalidateSnapshotCache; layers above that keep their own memo drop it when this moves. */
@@ -929,13 +905,13 @@ export function invalidateSnapshotCache(): void {
  * Used for recovery when session names are corrupt.
  * Does a single AppleScript pass over all sessions.
  */
-export function clearAllPaiNames(): number {
+export async function clearAllPaiNames(): Promise<number> {
   const script = `  var cleared = 0;
   eachSession(function (s) {
     try { s.setVariable({ named: "user.paiName", to: "" }); cleared++; } catch (e) {}
   });
   return String(cleared);`;
   // Allow 10s since this iterates all sessions with variable writes
-  const result = runItermJxa(script, 10_000);
+  const result = await runItermJxa(script, 10_000);
   return result ? parseInt(result, 10) || 0 : 0;
 }

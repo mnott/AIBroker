@@ -112,7 +112,7 @@ async function realDispatch(project: string, message: string, opts: { prefix: st
 
 async function realNotify(text: string): Promise<void> {
   const { broadcastText } = await import("../adapters/pailot/gateway.js");
-  broadcastText(text);
+  await broadcastText(text);
 }
 
 /**

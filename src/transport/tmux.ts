@@ -121,21 +121,40 @@ function runTmuxAsync(args: string[], timeoutMs = 4_000): Promise<string | null>
   });
 }
 
-/** Blocking sleep — used only for the short send-verify poll. */
-function syncSleep(ms: number): void {
-  const shared = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(shared, 0, 0, ms);
-}
+// The send-verify poll used to sleep with Atomics.wait — a blocking wait inside
+// the daemon's event loop. It is an awaited setTimeout now (see sendText).
 
 const LIST_FORMAT = ["#{pane_id}", "#{pane_current_command}", "#{pane_title}", "#{pane_tty}", "#{@aibroker_id}", "#{pane_current_path}"].join(FIELD_SEP);
+
+/** Coarse busy verdict from a `pane_current_command` reading. */
+function busyFromCommand(out: string | null): boolean {
+  if (out == null) return false;
+  const cmd = out.trim();
+  // Coarse layer: shell command => idle. A program (node/claude/ssh/…) => busy.
+  // NOTE: while Claude runs, this always reads "node" — it cannot distinguish
+  // "thinking" from "awaiting input". Fine-grained readiness needs output-diff
+  // silence detection (a future waitIdle helper), tracked separately.
+  return cmd.length > 0 && !SHELL_COMMANDS.has(cmd);
+}
+
+/** Parse `list-panes -F "#{@aibroker_id}<sep>#{pane_id}"` for one stable id. */
+function parsePaneFor(out: string | null, stableId: string): string | null {
+  if (out == null) return null;
+  for (const line of out.split("\n").filter(Boolean)) {
+    const [aid, pane] = line.split(FIELD_SEP);
+    if (aid && aid === stableId) return pane ?? null;
+  }
+  return null;
+}
 
 export class TmuxTransport implements SessionTransport {
   readonly kind: TransportKind = "tmux";
 
-  isAvailable(): boolean {
+  async isAvailable(): Promise<boolean> {
     // `list-panes -a` exits non-zero ("no server running") when no server exists,
-    // zero otherwise — a cheap, reliable probe.
-    return runTmux(["list-panes", "-a"], 2_000) != null;
+    // zero otherwise — a cheap, reliable probe. Awaited: a sync tmux child on a
+    // loaded machine is still a blocked event loop.
+    return (await runTmuxAsync(["list-panes", "-a"], 2_000)) != null;
   }
 
   /**
@@ -148,12 +167,14 @@ export class TmuxTransport implements SessionTransport {
   paneFor(stableId: string): string | null {
     if (stableId.startsWith("%")) return stableId;
     const out = runTmux(["list-panes", "-a", "-F", `#{@aibroker_id}${FIELD_SEP}#{pane_id}`]);
-    if (out == null) return null;
-    for (const line of out.split("\n").filter(Boolean)) {
-      const [aid, pane] = line.split(FIELD_SEP);
-      if (aid && aid === stableId) return pane ?? null;
-    }
-    return null;
+    return parsePaneFor(out, stableId);
+  }
+
+  /** paneFor without blocking the event loop. */
+  async paneForAsync(stableId: string): Promise<string | null> {
+    if (stableId.startsWith("%")) return stableId;
+    const out = await runTmuxAsync(["list-panes", "-a", "-F", `#{@aibroker_id}${FIELD_SEP}#{pane_id}`]);
+    return parsePaneFor(out, stableId);
   }
 
   /**
@@ -170,14 +191,7 @@ export class TmuxTransport implements SessionTransport {
     return fresh;
   }
 
-  listSessions(): ManagedSession[] {
-    const out = runTmux(["list-panes", "-a", "-F", LIST_FORMAT]);
-    if (out == null) return [];
-    return this.parsePanes(out, (paneId, id) => { runTmux(["set-option", "-p", "-t", paneId, "@aibroker_id", id]); });
-  }
-
-  /** listSessions without blocking the event loop. */
-  async listSessionsAsync(): Promise<ManagedSession[]> {
+  async listSessions(): Promise<ManagedSession[]> {
     const out = await runTmuxAsync(["list-panes", "-a", "-F", LIST_FORMAT]);
     if (out == null) return [];
     const pending: Promise<unknown>[] = [];
@@ -219,15 +233,30 @@ export class TmuxTransport implements SessionTransport {
     return sessions;
   }
 
-  sendText(id: string, text: string, opts: SendOptions = {}): boolean {
-    const { enter = true, verify = true, maxRetries = 3 } = opts;
-    const pane = this.paneFor(id);
+  /** sendText — awaited tmux children and an awaited poll: no blocking sleep anywhere. */
+  async sendText(id: string, text: string, opts: SendOptions = {}): Promise<boolean> {
+    const pane = await this.paneForAsync(id);
     if (pane == null) return false;
+    return this.sendTextToPane(
+      pane, text, opts,
+      (a) => runTmuxAsync(a),
+      (ms) => new Promise((r) => setTimeout(r, ms)),
+      (p, l) => this.capture(p, l),
+    );
+  }
+
+  private async sendTextToPane(
+    pane: string, text: string, opts: SendOptions,
+    exec: (args: string[]) => string | null | Promise<string | null>,
+    sleep: (ms: number) => void | Promise<void>,
+    capture: (pane: string, lines?: number) => string | null | Promise<string | null>,
+  ): Promise<boolean> {
+    const { enter = true, verify = true, maxRetries = 3 } = opts;
 
     let landed = false;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       // Literal send: `--` guards against text starting with '-'; `-l` = no key-name interpretation.
-      const sent = runTmux(["send-keys", "-t", pane, "-l", "--", text]);
+      const sent = await exec(["send-keys", "-t", pane, "-l", "--", text]);
       if (sent == null) return false;
 
       if (!verify) {
@@ -242,8 +271,8 @@ export class TmuxTransport implements SessionTransport {
         break;
       }
       for (let poll = 0; poll < 10; poll++) {
-        syncSleep(60);
-        const shown = this.capture(pane);
+        await sleep(60);
+        const shown = await capture(pane);
         if (shown && shown.includes(probe)) {
           landed = true;
           break;
@@ -260,7 +289,7 @@ export class TmuxTransport implements SessionTransport {
 
     if (enter) {
       // Separate keystroke — combining text+Enter in one send is the unreliable path.
-      if (runTmux(["send-keys", "-t", pane, "Enter"]) == null) return false;
+      if (await exec(["send-keys", "-t", pane, "Enter"]) == null) return false;
     }
     return true;
   }
@@ -272,13 +301,21 @@ export class TmuxTransport implements SessionTransport {
     return runTmux(["send-keys", "-t", pane, key]) != null;
   }
 
-  capture(id: string, lines?: number): string | null {
-    const pane = this.paneFor(id);
+  /** sendKey without blocking the event loop. */
+  async sendKeyAsync(id: string, key: string): Promise<boolean> {
+    const pane = await this.paneForAsync(id);
+    if (pane == null) return false;
+    return (await runTmuxAsync(["send-keys", "-t", pane, key])) != null;
+  }
+
+  /** capture — async: the tmux child is awaited, never spawnSync'd. */
+  async capture(id: string, lines?: number): Promise<string | null> {
+    const pane = await this.paneForAsync(id);
     if (pane == null) return null;
     // -J joins wrapped lines so a long line reads as one, not as fragments.
     const args = ["capture-pane", "-t", pane, "-p", "-J"];
     if (lines && lines > 0) args.push("-S", `-${lines}`);
-    return runTmux(args);
+    return runTmuxAsync(args);
   }
 
   /**
@@ -317,23 +354,17 @@ export class TmuxTransport implements SessionTransport {
     return tty ?? null;
   }
 
-  isBusy(id: string): boolean {
-    const pane = this.paneFor(id);
+  /** isBusy — async: the tmux child is awaited. */
+  async isBusy(id: string): Promise<boolean> {
+    const pane = await this.paneForAsync(id);
     if (pane == null) return false;
-    const out = runTmux(["display-message", "-p", "-t", pane, "#{pane_current_command}"]);
-    if (out == null) return false;
-    const cmd = out.trim();
-    // Coarse layer: shell command => idle. A program (node/claude/ssh/…) => busy.
-    // NOTE: while Claude runs, this always reads "node" — it cannot distinguish
-    // "thinking" from "awaiting input". Fine-grained readiness needs output-diff
-    // silence detection (a future waitIdle helper), tracked separately.
-    return cmd.length > 0 && !SHELL_COMMANDS.has(cmd);
+    return busyFromCommand(await runTmuxAsync(["display-message", "-p", "-t", pane, "#{pane_current_command}"]));
   }
 
-  setTitle(id: string, title: string): boolean {
-    const pane = this.paneFor(id);
+  async setTitle(id: string, title: string): Promise<boolean> {
+    const pane = await this.paneForAsync(id);
     if (pane == null) return false;
-    return runTmux(["select-pane", "-t", pane, "-T", title]) != null;
+    return (await runTmuxAsync(["select-pane", "-t", pane, "-T", title])) != null;
   }
 
   /**
@@ -343,11 +374,11 @@ export class TmuxTransport implements SessionTransport {
    * and the pane gets its durable @aibroker_id straight away, so the hub can
    * address it by name on its very next enumeration. `io` lets tests replace tmux.
    */
-  launch(
+  async launch(
     opts: LaunchOptions,
-    io: { exec?: (args: string[]) => string | null; env?: NodeJS.ProcessEnv; claudeBin?: string } = {},
-  ): LaunchResult | null {
-    const exec = io.exec ?? spawnTmux;
+    io: { exec?: (args: string[]) => string | null | Promise<string | null>; env?: NodeJS.ProcessEnv; claudeBin?: string } = {},
+  ): Promise<LaunchResult | null> {
+    const exec = io.exec ?? runTmuxAsync;
     const env = io.env ?? process.env;
     const argv = ["--", io.claudeBin ?? resolveBin("claude"), ...claudeArgs(opts)];
     const pane = ["-c", opts.dir, "-n", opts.name, "-P", "-F", "#{pane_id}"];
@@ -356,25 +387,29 @@ export class TmuxTransport implements SessionTransport {
     let where = "";
     let attach: string | undefined;
     if (env.TMUX) {
-      out = exec(["new-window", ...pane, ...argv]);
+      out = await exec(["new-window", ...pane, ...argv]);
       where = `window "${opts.name}" in the current tmux session`;
     }
     if (out == null) {
       where = `window "${opts.name}" in tmux session "${DETACHED_SESSION}"`;
       attach = `tmux attach -t ${DETACHED_SESSION}`;
-      out = exec(["has-session", "-t", `=${DETACHED_SESSION}`]) != null
-        ? exec(["new-window", "-t", `${DETACHED_SESSION}:`, ...pane, ...argv])
-        : exec(["new-session", "-d", "-s", DETACHED_SESSION, ...pane, ...argv]);
+      // Launch is the one call that may START the server, so it skips the socket gate.
+      const spawn = io.exec ?? ((a: string[]) => new Promise<string | null>((res) => {
+        execFile(TMUX_BIN, a, { encoding: "utf8", timeout: 10_000, env: TMUX_ENV }, (err, stdout) => res(err ? null : stdout ?? ""));
+      }));
+      out = (await spawn(["has-session", "-t", `=${DETACHED_SESSION}`])) != null
+        ? await spawn(["new-window", "-t", `${DETACHED_SESSION}:`, ...pane, ...argv])
+        : await spawn(["new-session", "-d", "-s", DETACHED_SESSION, ...pane, ...argv]);
     }
     const paneId = out?.trim();
     if (!paneId) return null;
 
     const id = randomUUID();
-    exec(["set-option", "-p", "-t", paneId, "@aibroker_id", id]);
-    exec(["select-pane", "-t", paneId, "-T", opts.name]);
+    await exec(["set-option", "-p", "-t", paneId, "@aibroker_id", id]);
+    await exec(["select-pane", "-t", paneId, "-T", opts.name]);
     // Claude retitles its terminal; keep the name the session is addressed by
     // (pane option exists from tmux 3.5 — older servers reject it, harmlessly).
-    exec(["set-option", "-p", "-t", paneId, "allow-set-title", "off"]);
+    await exec(["set-option", "-p", "-t", paneId, "allow-set-title", "off"]);
     return { id, transport: this.kind, where, attach };
   }
 }

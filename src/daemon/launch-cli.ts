@@ -22,7 +22,7 @@ import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import { WatcherClient } from "../ipc/client.js";
 import { resolveBin } from "../core/bins.js";
-import { selectTransport } from "../transport/index.js";
+import { selectTransportAsync } from "../transport/index.js";
 import type { LaunchResult, SessionTransport } from "../transport/index.js";
 import { DAEMON_SOCKET_PATH } from "./index.js";
 
@@ -36,7 +36,7 @@ export interface LiveRow {
 }
 
 export interface LaunchDeps {
-  transport: () => SessionTransport;
+  transport: () => Promise<SessionTransport>;
   /** Live rows from the daemon; an unreachable daemon is an empty list, not an error. */
   sessions: () => Promise<LiveRow[]>;
   paiLaunch: (name: string) => Promise<{ itermSessionId?: string; name?: string }>;
@@ -114,7 +114,7 @@ export function findRunning(rows: LiveRow[], name: string, dir?: string): LiveRo
 }
 
 const liveDeps = (): LaunchDeps => ({
-  transport: selectTransport,
+  transport: selectTransportAsync,
   sessions: async () => {
     try {
       const res = (await new WatcherClient(DAEMON_SOCKET_PATH).call_raw("sessions", {})) as
@@ -189,7 +189,8 @@ export async function launch(args: string[], deps: LaunchDeps): Promise<number> 
 
   let res: LaunchResult | null = null;
   try {
-    res = deps.transport().launch({ dir: resolved.dir, name: resolved.name });
+    const transport = await deps.transport();
+    res = await transport.launch({ dir: resolved.dir, name: resolved.name });
   } catch (err) {
     console.error(`Could not launch ${resolved.name}: ${err instanceof Error ? err.message : String(err)}`);
     return 1;

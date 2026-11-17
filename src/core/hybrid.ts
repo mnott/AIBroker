@@ -59,7 +59,7 @@ export class HybridSessionManager {
   private readonly sessions: HybridSession[] = [];
   private _activeIndex = -1;
   private nextNum = 1;
-  private discover?: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }>;
+  private discover?: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }> | Promise<Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }>>;
   /** True when the last attempt to look could not complete, so the list is last-known. */
   private lastDiscoveryFailed = false;
   /** When discovery last ran, so a burst of readers costs one enumeration. */
@@ -74,7 +74,7 @@ export class HybridSessionManager {
    * Where live sessions come from. Injected rather than imported so this stays
    * a registry rather than growing a dependency on a particular terminal.
    */
-  setDiscovery(fn: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }>): void {
+  setDiscovery(fn: () => Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }> | Promise<Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }>>): void {
     this.discover = fn;
   }
 
@@ -234,12 +234,18 @@ export class HybridSessionManager {
   /**
    * All sessions in creation order, after checking what is actually running.
    *
-   * For anything a person asked for. Discovery is an AppleScript round trip, so
-   * this is the wrong call on a path that runs per message — use
-   * `knownSessions()` there.
+   * For anything a person asked for. Discovery is an AppleScript round trip
+   * (awaited, never blocking), so this is the wrong call on a path that runs
+   * per message — use `knownSessions()` there.
    */
+  /** The registry after a live look. Async — discovery is an awaited round trip. */
+  async listAsync(): Promise<HybridSession[]> {
+    await this.syncFromLive();
+    return [...this.sessions];
+  }
+
+  /** Snapshot of the registry WITHOUT going out to look; use listAsync when freshness matters. */
   listSessions(): HybridSession[] {
-    this.syncFromLive();
     return [...this.sessions];
   }
 
@@ -275,16 +281,13 @@ export class HybridSessionManager {
    * empty prunes, because a registry that keeps dead rows after looking is
    * showing sessions that do not exist.
    */
-  private syncFromLive(): void {
+  private async syncFromLive(): Promise<void> {
     if (!this.discover) return;
-    // COALESCE. Discovery is a blocking AppleScript round trip — measured at
-    // 1.26 s on this machine — and Node has one thread. A mobile client that
-    // reconnects every two seconds asks for the list on every connect, so each
-    // reconnect stalled the whole daemon for seconds: heartbeats from other
-    // adapters timed out, their re-registrations queued behind the same lock,
-    // and the phone's own connection dropped because nothing could service it,
-    // which made it reconnect again. The hub spent fifteen seconds at a time
-    // unable to answer anything.
+    // COALESCE. Discovery is an AppleScript round trip — measured at 1.26 s on
+    // this machine. It no longer BLOCKS the loop (the children are awaited), but
+    // a mobile client that reconnects every two seconds would still ask for a
+    // fresh enumeration per connect and stack load behind a slow iTerm, so the
+    // reuse window stands.
     //
     // A short reuse window, not a cache with a lifetime: it exists to make a
     // BURST cost one enumeration, and it is deliberately shorter than a human
@@ -294,7 +297,7 @@ export class HybridSessionManager {
     this.lastSyncAt = now;
     let live: Array<{ id: string; name: string; paiName?: string | null; tabTitle?: string | null; isClaude?: boolean }>;
     try {
-      live = this.discover();
+      live = await this.discover();
     } catch (e) {
       this.lastDiscoveryFailed = true;
       log(`HybridManager: discovery failed, keeping the known list — ${e instanceof Error ? e.message : String(e)}`);
@@ -374,8 +377,8 @@ export class HybridSessionManager {
    * daemon restart: ask over a channel before that and you were told the
    * machine was empty, in the same words it would use if it were.
    */
-  formatSessionList(): string {
-    this.syncFromLive();
+  async formatSessionList(): Promise<string> {
+    await this.syncFromLive();
     // Say which of the two it is. A reader cannot otherwise tell a machine with
     // nothing running from one we could not ask.
     if (this.sessions.length === 0) {

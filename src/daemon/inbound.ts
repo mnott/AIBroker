@@ -852,7 +852,7 @@ async function attemptMessageDelivery(route: InboundRoute, body: string): Promis
   const { getAllPersistentSessionNames, lookupPersistentName } = await import("../core/persistence.js");
   const { depositToSessionMailbox } = await import("../core/state.js");
 
-  const snapshots = snapshotAllSessions();
+  const snapshots = await snapshotAllSessions();
   const names = getAllPersistentSessionNames();
   const candidates = snapshots.map((s) => ({
     id: s.id,
@@ -860,14 +860,14 @@ async function attemptMessageDelivery(route: InboundRoute, body: string): Promis
   }));
   // Prefer a live Claude pane when the owner's name is also answered by a
   // stale shell tab — same ranking as send_to_session.
-  const hit = matchSession([route.owner], candidates, { prefer: (s) => (isClaudeSession(s.id) ? 1 : 0) });
+  const hit = await matchSession([route.owner], candidates, { prefer: async (s) => ((await isClaudeSession(s.id)) ? 1 : 0) });
   if (!hit) return { ok: false, retry: true, detail: `no live session matches owner "${route.owner}"` };
   const target = hit.session;
 
   // Same refusal as send_to_session: a shell would execute what a Claude
   // prompt would merely read, and an inbound payload is the last thing that
   // should ever reach a shell.
-  if (!isClaudeSession(target.id)) {
+  if (!await isClaudeSession(target.id)) {
     return { ok: false, detail: `session "${target.name}" is at a shell prompt, not a Claude prompt` };
   }
 

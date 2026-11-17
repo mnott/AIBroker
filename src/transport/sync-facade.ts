@@ -1,6 +1,9 @@
 /**
- * transport/sync-facade.ts — Drop-in replacements for the iTerm primitives,
- * with MULTI-TRANSPORT enumeration.
+ * transport/facade.ts (filename kept for history) — Drop-in replacements for
+ * the iTerm primitives, with MULTI-TRANSPORT enumeration. ALL ASYNC: nothing
+ * here may run a blocking child. A sync osascript in this layer is what froze
+ * the daemon on 2026-11-17 — six 30 s blocks that starved IPC, MQTT keep-alives
+ * and the mailbox while iTerm was wedged.
  *
  * The daemon historically imported `snapshotAllSessions`, `typeIntoSession`,
  * `pasteTextIntoSession`, and `isClaudeRunningInSession` directly from
@@ -57,29 +60,29 @@ const idleCache = new Map<string, { at: number; idle: boolean }>();
  * claude/node panes are captured, cached briefly; the ✳ title is the fallback
  * when capture fails.
  */
-export function tmuxAtPrompt(
+export async function tmuxAtPrompt(
   s: ManagedSession,
-  capture: (id: string, lines: number) => string | null = (id, n) => tmuxTransport.capture(id, n),
-): boolean {
+  capture: (id: string, lines: number) => string | null | Promise<string | null> = (id, n) => tmuxTransport.capture(id, n),
+): Promise<boolean> {
   if (!s.busy) return true;
   if (!/^(claude|node)$/.test(s.command ?? "")) return false;
   const hit = idleCache.get(s.id);
   const now = Date.now();
   if (hit && now - hit.at < IDLE_TTL_MS) return hit.idle;
-  const frame = capture(s.id, 40);
+  const frame = await capture(s.id, 40);
   const idle = frame == null ? isClaudeTitleIdle(s.tabTitle) : isClaudeFrameIdle(frame);
   idleCache.set(s.id, { at: now, idle });
   return idle;
 }
 
-export function tmuxToSnapshot(s: ManagedSession): SessionSnapshot {
+export async function tmuxToSnapshot(s: ManagedSession): Promise<SessionSnapshot> {
   return {
     id: s.id,
     name: s.name,
     profileName: "Default",
     tabTitle: s.tabTitle,
     tty: s.tty ?? "",
-    atPrompt: tmuxAtPrompt(s),
+    atPrompt: await tmuxAtPrompt(s),
     // A claude foreground command is a Claude session, idle or not: without
     // this an idle pane (atPrompt) with no chosen name was listed as "shell".
     isClaude: s.command === "claude" ? true : undefined,
@@ -92,28 +95,6 @@ export function tmuxToSnapshot(s: ManagedSession): SessionSnapshot {
   };
 }
 
-/**
- * Enumerate sessions across all permitted transports, availability checked live.
- * `fresh` bypasses iTerm's short-lived cache — forwarded verbatim, see
- * adapters/iterm/core.ts. tmux's `listSessions()` has no such cache to bypass.
- */
-export function snapshotAllSessions(opts: { fresh?: boolean } = {}): SessionSnapshot[] {
-  const now = Date.now();
-  if (merged && merged.epoch === iterm.snapshotCacheEpoch() && now - merged.at < STALE_LIMIT_MS) {
-    // A recent result exists: handlers never spawn. Refresh behind it once it is past the memo TTL.
-    if (opts.fresh || now - merged.at >= MEMO_TTL_MS) refreshMergedInBackground(opts);
-    return merged.rows;
-  }
-  // Cold start (or nothing newer than the stale limit): the only sync spawn left.
-  // Query tmux first (returns [] if no server is running). This is the LIVE
-  // availability check — a server that appears post-boot is seen immediately.
-  const tmuxSessions = allowTmux ? tmuxTransport.listSessions() : [];
-  const itermSessions: SessionSnapshot[] = allowIterm ? iterm.snapshotAllSessions(opts) : [];
-  const rows = mergeTransports(itermSessions, tmuxSessions, () => tmuxTransport.attachedClientTtys());
-  if (wasLastEnumerationReliable()) merged = { rows, at: now, epoch: iterm.snapshotCacheEpoch() };
-  return rows;
-}
-
 const MEMO_TTL_MS = 3_000;
 const STALE_LIMIT_MS = 60_000;
 let merged: { rows: SessionSnapshot[]; at: number; epoch: number } | null = null;
@@ -121,29 +102,54 @@ let mergedInFlight: Promise<unknown> | null = null;
 
 function refreshMergedInBackground(opts: { fresh?: boolean }): void {
   if (mergedInFlight) return;
-  mergedInFlight = snapshotAllSessionsAsync(opts).catch(() => {}).finally(() => { mergedInFlight = null; });
+  mergedInFlight = snapshotAllSessions(opts).catch(() => {}).finally(() => { mergedInFlight = null; });
 }
 
 /**
- * snapshotAllSessions for timers and polls: identical answer, but every child
- * process is awaited instead of spawnSync'd, so the daemon's event loop keeps
- * serving requests while a loaded machine takes seconds to answer. A reliable
- * result also becomes the one sync callers are served.
+ * Enumerate sessions across all permitted transports, availability checked
+ * live. `fresh` bypasses iTerm's short-lived cache — forwarded verbatim, see
+ * adapters/iterm/core.ts. tmux's `listSessions()` has no such cache to bypass.
+ *
+ * Async, and the memo is what keeps handlers fast: a recent merged result is
+ * answered from memory in microseconds while a refresh runs behind it as an
+ * awaited child — so an IPC request or a mailbox wait answers inside a
+ * millisecond even while an iTerm enumeration sits in its 30 s timeout.
  */
-export async function snapshotAllSessionsAsync(opts: { fresh?: boolean } = {}): Promise<SessionSnapshot[]> {
-  const tmuxSessions = allowTmux ? await tmuxTransport.listSessionsAsync() : [];
-  const itermSessions: SessionSnapshot[] = allowIterm ? await iterm.snapshotAllSessionsAsync(opts) : [];
-  const viewers = allowIterm && tmuxSessions.length ? await tmuxTransport.attachedClientTtysAsync() : new Set<string>();
-  const rows = mergeTransports(itermSessions, tmuxSessions, () => viewers);
-  if (wasLastEnumerationReliable()) merged = { rows, at: Date.now(), epoch: iterm.snapshotCacheEpoch() };
-  return rows;
+export function snapshotAllSessions(opts: { fresh?: boolean } = {}): Promise<SessionSnapshot[]> {
+  const now = Date.now();
+  if (merged && merged.epoch === iterm.snapshotCacheEpoch() && now - merged.at < STALE_LIMIT_MS) {
+    // A recent result exists: handlers never spawn. Refresh behind it once it is past the memo TTL.
+    if (opts.fresh || now - merged.at >= MEMO_TTL_MS) refreshMergedInBackground(opts);
+    return Promise.resolve(merged.rows);
+  }
+  return enumerateTransports(opts, now);
 }
 
-function mergeTransports(
+/** Alias — every path here is async now. */
+export const snapshotAllSessionsAsync = snapshotAllSessions;
+
+let transportsInFlight: Promise<SessionSnapshot[]> | null = null;
+
+async function enumerateTransports(opts: { fresh?: boolean }, now: number): Promise<SessionSnapshot[]> {
+  if (transportsInFlight) return transportsInFlight;
+  transportsInFlight = (async () => {
+    // Query tmux first (returns [] if no server is running). This is the LIVE
+    // availability check — a server that appears post-boot is seen immediately.
+    const tmuxSessions = allowTmux ? await tmuxTransport.listSessions() : [];
+    const itermSessions: SessionSnapshot[] = allowIterm ? await iterm.snapshotAllSessions(opts) : [];
+    const viewers = allowIterm && tmuxSessions.length ? await tmuxTransport.attachedClientTtysAsync() : new Set<string>();
+    const rows = await mergeTransports(itermSessions, tmuxSessions, () => viewers);
+    if (wasLastEnumerationReliable()) merged = { rows, at: Date.now(), epoch: iterm.snapshotCacheEpoch() };
+    return rows;
+  })().finally(() => { transportsInFlight = null; });
+  return transportsInFlight;
+}
+
+async function mergeTransports(
   iterm: SessionSnapshot[],
   tmuxSessions: ManagedSession[],
   viewerTtysOf: () => Set<string>,
-): SessionSnapshot[] {
+): Promise<SessionSnapshot[]> {
   let itermSessions = iterm;
   if (allowIterm && tmuxSessions.length) {
     // De-dup nesting: an iTerm/Terminal tab running `tmux attach` is just a
@@ -153,7 +159,7 @@ function mergeTransports(
     const viewerTtys = viewerTtysOf();
     if (viewerTtys.size) itermSessions = itermSessions.filter((s) => !s.tty || !viewerTtys.has(s.tty));
   }
-  return [...itermSessions, ...tmuxSessions.map(tmuxToSnapshot)];
+  return [...itermSessions, ...(await Promise.all(tmuxSessions.map(tmuxToSnapshot)))];
 }
 
 /**
@@ -208,13 +214,13 @@ export function aibrokerIdForPane(paneId: string): string | null {
 const READY_TTL_MS = 2_000;
 const readyCache = new Map<string, { at: number; ready: boolean }>();
 
-/** Is this session showing a live Claude prompt? Cached briefly for chunked writes. */
-function claudeHasTty(id: string): boolean {
+/** Is this session showing a live Claude prompt? Cached briefly for chunked writes. Async: the capture never blocks the event loop. */
+async function claudeHasTty(id: string): Promise<boolean> {
   const hit = readyCache.get(id);
   const now = Date.now();
   if (hit && now - hit.at < READY_TTL_MS) return hit.ready;
 
-  const frame = captureSession(id, 80);
+  const frame = await captureSession(id, 80);
   // Unreadable is NOT treated as safe: refusing a legitimate send is recoverable,
   // executing a message in a shell is not.
   const ready = frame !== null && isClaudeReady(frame);
@@ -243,15 +249,15 @@ function refuse(id: string, text: string): false {
 }
 
 /** Inject text + Enter into a session. Refuses a shell unless `allowShell`. */
-export function typeIntoSession(id: string, text: string, opts: { allowShell?: boolean } = {}): boolean {
-  if (!opts.allowShell && !claudeHasTty(id)) return refuse(id, text);
+export async function typeIntoSession(id: string, text: string, opts: { allowShell?: boolean } = {}): Promise<boolean> {
+  if (!opts.allowShell && !(await claudeHasTty(id))) return refuse(id, text);
   if (routeToTmux(id)) return tmuxTransport.sendText(id, text, { enter: true });
   return iterm.typeIntoSession(id, text);
 }
 
 /** Inject text WITHOUT Enter (chunked / partial sends). Same guard. */
-export function pasteTextIntoSession(id: string, text: string, opts: { allowShell?: boolean } = {}): boolean {
-  if (!opts.allowShell && !claudeHasTty(id)) return refuse(id, text);
+export async function pasteTextIntoSession(id: string, text: string, opts: { allowShell?: boolean } = {}): Promise<boolean> {
+  if (!opts.allowShell && !(await claudeHasTty(id))) return refuse(id, text);
   if (routeToTmux(id)) return tmuxTransport.sendText(id, text, { enter: false });
   return iterm.pasteTextIntoSession(id, text);
 }
@@ -262,15 +268,15 @@ export function pasteTextIntoSession(id: string, text: string, opts: { allowShel
  * only after text has been confirmed to have sat unchanged for minutes — see
  * inputLineDecision. Never sent blind ahead of a type.
  */
-export function sendControlU(id: string): boolean {
-  if (routeToTmux(id)) return tmuxTransport.sendKey(id, "C-u");
+export async function sendControlU(id: string): Promise<boolean> {
+  if (routeToTmux(id)) return tmuxTransport.sendKeyAsync(id, "C-u");
   return iterm.sendKeystrokeToSession(id, 21);
 }
 
 /** Send a bare Enter/CR — the last step of the read-back-first sequence,
  *  only once the line has been read back and verified. */
-export function sendEnterKey(id: string): boolean {
-  if (routeToTmux(id)) return tmuxTransport.sendKey(id, "Enter");
+export async function sendEnterKey(id: string): Promise<boolean> {
+  if (routeToTmux(id)) return tmuxTransport.sendKeyAsync(id, "Enter");
   return iterm.sendKeystrokeToSession(id, 13);
 }
 
@@ -282,10 +288,10 @@ export function sendEnterKey(id: string): boolean {
  * enters insert mode (or types nothing new if already in it beyond one
  * transient char), the backspace removes exactly what that keystroke added.
  */
-export function escapeInputMode(id: string): void {
+export async function escapeInputMode(id: string): Promise<void> {
   if (routeToTmux(id)) return;
-  iterm.sendKeystrokeToSession(id, 105); // 'i'
-  iterm.sendKeystrokeToSession(id, 127); // backspace (DEL)
+  await iterm.sendKeystrokeToSession(id, 105); // 'i'
+  await iterm.sendKeystrokeToSession(id, 127); // backspace (DEL)
 }
 
 /** Drop a cached readiness verdict (call right after launching into a tab). */
@@ -294,22 +300,23 @@ export function invalidateReadyCache(id?: string): void {
 }
 
 /** True when the session is currently showing a live Claude prompt. */
-export function isClaudeSession(id: string): boolean {
+export async function isClaudeSession(id: string): Promise<boolean> {
   return claudeHasTty(id);
 }
 
 /**
  * Read what a session is currently showing. Used by checkpoint's ack detection,
  * which watches for the screen to change (message landed) and then settle
- * (Claude finished). Returns null when the session can't be read.
+ * (Claude finished). Returns null when the session can't be read. Async: the
+ * tmux/iTerm child is awaited, never spawnSync'd.
  */
-export function captureSession(id: string, lines?: number): string | null {
+export async function captureSession(id: string, lines?: number): Promise<string | null> {
   if (routeToTmux(id)) return tmuxTransport.capture(id, lines);
   return itermTransport.capture(id);
 }
 
 /** True when a foreground program (Claude) is running, not at a shell prompt. */
-export function isClaudeRunningInSession(id: string): boolean {
+export async function isClaudeRunningInSession(id: string): Promise<boolean> {
   if (routeToTmux(id)) return tmuxTransport.isBusy(id);
   return iterm.isClaudeRunningInSession(id);
 }
@@ -318,7 +325,7 @@ export function isClaudeRunningInSession(id: string): boolean {
  * Set a tmux pane's title. Returns false for non-tmux ids — iTerm visuals are
  * set separately by the caller via the iTerm sessions adapter.
  */
-export function setSessionTitle(id: string, title: string): boolean {
+export async function setSessionTitle(id: string, title: string): Promise<boolean> {
   if (routeToTmux(id)) return tmuxTransport.setTitle(id, title);
   return false;
 }
@@ -329,11 +336,11 @@ export function setSessionTitle(id: string, title: string): boolean {
  * iTerm. Uses the RAW iTerm enumeration (not the de-duped facade list, which
  * suppresses viewer tabs) so the host tab can still receive iTerm visuals.
  */
-export function itermViewerSessionId(tmuxPaneId: string): string | null {
+export async function itermViewerSessionId(tmuxPaneId: string): Promise<string | null> {
   if (!allowTmux || !allowIterm) return null;
   const tty = tmuxTransport.clientTtyForPane(tmuxPaneId);
   if (!tty) return null;
-  return iterm.snapshotAllSessions().find((s) => s.tty === tty)?.id ?? null;
+  return (await iterm.snapshotAllSessions()).find((s) => s.tty === tty)?.id ?? null;
 }
 
 /** Daemon-only diagnostic: module-load logging would leak into every CLI verb's stderr. */

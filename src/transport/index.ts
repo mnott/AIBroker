@@ -33,6 +33,13 @@ function build(kind: TransportKind): SessionTransport {
   }
 }
 
+/**
+ * Pick a host WITHOUT probing: the env override and the deterministic rules.
+ * Availability probes are async now — a sync iTerm probe (`osascript`) on a
+ * wedged iTerm would block whatever selected, so callers that need a probed
+ * choice await selectTransportAsync(); this stays the cheap path and defaults
+ * to iterm exactly as before when nothing is decided earlier.
+ */
 export function selectTransport(): SessionTransport {
   const override = (process.env.AIBROKER_TRANSPORT ?? "").trim().toLowerCase();
   if (override === "tmux" || override === "iterm") {
@@ -45,18 +52,32 @@ export function selectTransport(): SessionTransport {
     return build("tmux");
   }
 
+  // Inside a tmux client, tmux is the host whether or not we can probe it here.
+  if (process.env.TMUX) {
+    log("transport: tmux (inside $TMUX)");
+    return build("tmux");
+  }
+  return build("iterm");
+}
+
+/** selectTransport with live availability probes, all async. */
+export async function selectTransportAsync(): Promise<SessionTransport> {
+  const override = (process.env.AIBROKER_TRANSPORT ?? "").trim().toLowerCase();
+  if (override === "tmux" || override === "iterm") return build(override);
+  if (!itermInPlay()) return build("tmux");
+
   const tmux = new TmuxTransport();
   const iterm = new ItermTransport();
 
-  if (process.env.TMUX && tmux.isAvailable()) {
+  if (process.env.TMUX && await tmux.isAvailable()) {
     log("transport: tmux (inside $TMUX)");
     return tmux;
   }
-  if (process.env.TERM_PROGRAM === "iTerm.app" && iterm.isAvailable()) {
+  if (process.env.TERM_PROGRAM === "iTerm.app" && await iterm.isAvailable()) {
     log("transport: iterm (TERM_PROGRAM)");
     return iterm;
   }
-  if (tmux.isAvailable()) {
+  if (await tmux.isAvailable()) {
     log("transport: tmux (server running, headless)");
     return tmux;
   }

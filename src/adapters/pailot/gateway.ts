@@ -403,21 +403,21 @@ export function setScreenshotHandler(handler: (source?: "whatsapp" | "pailot", s
  *  If the client passes activeSessionId, preserve that selection instead of
  *  jumping to whatever iTerm has focused on the Mac.
  */
-function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void {
+async function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): Promise<void> {
   if (!hybridManager) {
-    handleSessionsCommand(ws);
+    await handleSessionsCommand(ws);
     return;
   }
 
   const clientActiveId = typeof args?.activeSessionId === "string" ? args.activeSessionId : undefined;
 
   // Auto-discover Claude-related iTerm2 tabs so freshly-started daemons can match
-  const liveSnapshots = enrichedSnapshots();
+  const liveSnapshots = await enrichedSnapshots();
   const liveIds = listedLiveIds(liveSnapshots);
   if (liveSnapshots.length > 0) {
     hybridManager.pruneDeadVisualSessions(liveIds);
   }
-  const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+  const knownIds = new Set(await (await hybridManager.listAsync()).map(s => s.backendSessionId));
   const seenTabs = new Set<string>();
   for (const snap of liveSnapshots) {
     if (!isClaudeRelated(snap)) continue;
@@ -432,7 +432,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
   // If the client had a session open, try to restore it
   if (clientActiveId) {
     // First pass: check if it was already registered (by auto-discovery above or a prior sync)
-    let sessions = hybridManager.listSessions();
+    let sessions = await hybridManager.listAsync();
     let idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
 
     // Second pass: the session may exist in liveSnapshots but wasn't registered because
@@ -444,7 +444,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
       if (snap) {
         const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
         hybridManager.registerVisualSession(displayName, "", clientActiveId);
-        sessions = hybridManager.listSessions();
+        sessions = await hybridManager.listAsync();
         idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
         log(`[PAILot] sync: force-registered client session "${displayName}" (${clientActiveId.slice(0, 8)}...)`);
       }
@@ -456,7 +456,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
       setLastRoutedSessionId(clientActiveId);
       clientActiveSession.set(ws, clientActiveId);
       log(`[PAILot] sync: restored client session "${sessions[idx].name}" (${clientActiveId.slice(0, 8)}...)`);
-      handleSessionsCommand(ws);
+      await handleSessionsCommand(ws);
       return;
     }
     // Client's session no longer exists in iTerm — fall through to iTerm focus
@@ -464,20 +464,20 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
   }
 
   // No client preference (or client's session is gone) — ask iTerm2 which session is focused
-  const focusedId = runItermJxa(`  try { return app.currentWindow().currentTab().currentSession().id(); } catch (e) { return ""; }`)?.trim() ?? "";
+  const focusedId = (await runItermJxa(`  try { return app.currentWindow().currentTab().currentSession().id(); } catch (e) { return ""; }`))?.trim() ?? "";
 
   if (focusedId) {
     // Find this session in the hybrid manager and activate it.
     // If it wasn't registered by the Claude-related filter, register it now since the
     // user is actively looking at it.
-    let sessions = hybridManager.listSessions();
+    let sessions = await hybridManager.listAsync();
     let idx = sessions.findIndex(s => s.backendSessionId === focusedId);
     if (idx < 0 && liveIds.has(focusedId)) {
       const snap = liveSnapshots.find(s => s.id === focusedId);
       if (snap) {
         const displayName = snap.paiName ?? snap.tabTitle ?? snap.name;
         hybridManager.registerVisualSession(displayName, "", focusedId);
-        sessions = hybridManager.listSessions();
+        sessions = await hybridManager.listAsync();
         idx = sessions.findIndex(s => s.backendSessionId === focusedId);
       }
     }
@@ -494,7 +494,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
 
   // Last resort: if nothing is active yet but we have registered sessions, activate the first one
   if (!hybridManager.activeSession) {
-    const sessions = hybridManager.listSessions();
+    const sessions = await hybridManager.listAsync();
     if (sessions.length > 0) {
       hybridManager.switchToIndex(1);
       setActiveItermSessionId(sessions[0].backendSessionId);
@@ -505,7 +505,7 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
   }
 
   // Return sessions with updated active state
-  handleSessionsCommand(ws);
+  await handleSessionsCommand(ws);
 }
 
 /**
@@ -513,11 +513,11 @@ function handleSyncCommand(ws: WebSocket, args?: Record<string, unknown>): void 
  * Claude session now runs behind a `claude attach` pane maps to that pane; the
  * snapshot is only read when the session of the id is known.
  */
-export function liveSession(id: string): string;
-export function liveSession(id: string | undefined): string | undefined;
-export function liveSession(id: string | undefined): string | undefined {
+export async function liveSession(id: string): Promise<string>;
+export async function liveSession(id: string | undefined): Promise<string | undefined>;
+export async function liveSession(id: string | undefined): Promise<string | undefined> {
   if (!id || !claudeSessionOfId(id)) return id;
-  const live = liveSessionFor(id, snapshotAllSessions());
+  const live = liveSessionFor(id, await snapshotAllSessions());
   if (live !== id) log(`[PAILot] session ${id.slice(0, 8)} is dead — redirected to attach pane ${live.slice(0, 8)}`);
   return live;
 }
@@ -550,12 +550,12 @@ function resolveSessionIndexById(sessions: { backendSessionId: string; name: str
  * misses the same way, which is the "nothing recovers" the operator hit. The
  * fresh sessions list lets the app replace its stale ids.
  */
-function sendSessionNotFoundError(ws: WebSocket, message: string): void {
+async function sendSessionNotFoundError(ws: WebSocket, message: string): Promise<void> {
   sendTo(ws, { type: "error", message });
-  handleSessionsCommand(ws);
+  await handleSessionsCommand(ws);
 }
 
-function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): void {
+async function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): Promise<void> {
   if (!hybridManager) {
     sendTo(ws, { type: "sessions", sessions: [] });
     return;
@@ -564,7 +564,7 @@ function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): v
   // Prune visual sessions whose iTerm2 tabs have been closed.
   // ONLY prune if snapshotAllSessions returns results — an empty result
   // likely means AppleScript failed, not that all sessions are gone.
-  const liveSnapshots = discoverLiveSessions(opts);
+  const liveSnapshots = await discoverLiveSessions(opts);
   if (liveSnapshots.length > 0) {
     const liveIds = listedLiveIds(liveSnapshots);
     hybridManager.pruneDeadVisualSessions(liveIds);
@@ -573,7 +573,7 @@ function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): v
   // Auto-discover Claude-related iTerm2 tabs not yet in the hybrid manager,
   // and sync names of existing sessions from live iTerm state.
   // Deduplicate by tab title — only register first session per tab.
-  const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+  const knownIds = new Set(await (await hybridManager.listAsync()).map(s => s.backendSessionId));
   const seenTabs = new Set<string>();
   for (const snap of liveSnapshots) {
     if (!isClaudeRelated(snap)) continue;
@@ -588,7 +588,7 @@ function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): v
     }
   }
 
-  const hybridSessions = hybridManager.listSessions();
+  const hybridSessions = await hybridManager.listAsync();
   const active = hybridManager.activeSession;
 
   const sessions: WsSession[] = hybridSessions.map((s, i) => ({
@@ -611,7 +611,7 @@ function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = {}): v
   }
 }
 
-function handleSwitchCommand(ws: WebSocket, args: Record<string, unknown>): void {
+async function handleSwitchCommand(ws: WebSocket, args: Record<string, unknown>): Promise<void> {
   const sessionIndex = args.index as number | undefined;
   const sessionId = args.sessionId as string | undefined;
   const newName = args.name as string | undefined;
@@ -627,42 +627,42 @@ function handleSwitchCommand(ws: WebSocket, args: Record<string, unknown>): void
   // name — names the session the user actually picked.
   let targetIndex: number | undefined;
   if (sessionId) {
-    targetIndex = resolveSessionIndexById(hybridManager.listSessions(), sessionId);
+    targetIndex = resolveSessionIndexById(await hybridManager.listAsync(), sessionId);
   }
   if (!targetIndex && sessionIndex) {
     targetIndex = sessionIndex;
   }
 
   if (!targetIndex) {
-    sendSessionNotFoundError(ws, "Missing session index or ID");
+    await sendSessionNotFoundError(ws, "Missing session index or ID");
     return;
   }
 
   const session = hybridManager.switchToIndex(targetIndex);
   if (!session) {
-    sendSessionNotFoundError(ws, "Session not found — it may have closed.");
+    await sendSessionNotFoundError(ws, "Session not found — it may have closed.");
     return;
   }
 
   // For visual sessions, also focus the iTerm2 tab
   if (session.kind === "visual") {
     setActiveItermSessionId(session.backendSessionId);
-    runItermJxa(withSessionJxa(session.backendSessionId, `          aSession.select();\n          return "focused";`));
+    await runItermJxa(withSessionJxa(session.backendSessionId, `          aSession.select();\n          return "focused";`));
   }
 
   if (newName) {
     // Explicit rename: persist, or the daemon's chosen-name re-assert would
     // revert it within a minute. A refused claim (name held by a live session)
     // changes nothing — not the store, not the visuals, not the row's name.
-    if (!setPersistentSessionName(session.backendSessionId, newName).ok) {
+    if (!(await setPersistentSessionName(session.backendSessionId, newName)).ok) {
       sendTo(ws, { type: "error", message: `Name "${newName}" is held by another live session — nothing was changed.` });
       return;
     }
     session.name = newName;
     if (session.kind === "visual") {
-      setItermSessionVar(session.backendSessionId, newName);
+      await setItermSessionVar(session.backendSessionId, newName);
       setItermTabName(session.backendSessionId, newName);
-      setItermBadge(session.backendSessionId, newName);
+      await setItermBadge(session.backendSessionId, newName);
     }
   }
 
@@ -685,7 +685,7 @@ function handleSwitchCommand(ws: WebSocket, args: Record<string, unknown>): void
   handleCatchUp(ws, { lastSeq: 0 });
 }
 
-function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void {
+async function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): Promise<void> {
   const sessionId = args.sessionId as string | undefined;
   const name = args.name as string | undefined;
 
@@ -695,21 +695,21 @@ function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void
   }
 
   // Find the hybrid session by backendSessionId
-  const sessions = hybridManager.listSessions();
+  const sessions = await hybridManager.listAsync();
   const session = sessions.find(s => s.backendSessionId === sessionId);
   if (session) {
     // Explicit rename: persist like the MQTT rename path does, or the
     // chosen-name re-assert reverts it. A refused claim leaves everything as it
     // was — the live holder keeps the name.
-    if (!setPersistentSessionName(sessionId, name).ok) {
+    if (!(await setPersistentSessionName(sessionId, name)).ok) {
       sendTo(ws, { type: "error", message: `Name "${name}" is held by another live session — nothing was changed.` });
       return;
     }
     session.name = name;
     if (session.kind === "visual") {
-      setItermSessionVar(sessionId, name);
+      await setItermSessionVar(sessionId, name);
       setItermTabName(sessionId, name);
-      setItermBadge(sessionId, name);
+      await setItermBadge(sessionId, name);
     }
   }
 
@@ -719,11 +719,11 @@ function handleRenameCommand(ws: WebSocket, args: Record<string, unknown>): void
     mqttPublishControl({ type: "session_renamed", sessionId, name });
   }
   // Send updated sessions list so PAILot refreshes the header
-  handleSessionsCommand(ws);
+  await handleSessionsCommand(ws);
   log(`[PAILot] renamed session ${sessionId} to "${name}"`);
 }
 
-function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void {
+async function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): Promise<void> {
   const sessionId = args.sessionId as string | undefined;
 
   if (!sessionId || !hybridManager) {
@@ -733,11 +733,11 @@ function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void
 
   // Find session by backendSessionId; a stale id (restart gave the tab a new
   // UUID) resolves through the persistent name before failing.
-  const sessions = hybridManager.listSessions();
+  const sessions = await hybridManager.listAsync();
   const resolved = resolveSessionIndexById(sessions, sessionId);
   const idx = resolved ? resolved - 1 : -1;
   if (idx < 0) {
-    sendSessionNotFoundError(ws, "Session not found");
+    await sendSessionNotFoundError(ws, "Session not found");
     return;
   }
 
@@ -749,7 +749,7 @@ function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void
   // rediscovered. If the tab was already closed this is a harmless no-op and the
   // prune in handleSessionsCommand removes the ghost.
   if (target.backendSessionId) {
-    typeIntoSession(target.backendSessionId, "/exit");
+    await typeIntoSession(target.backendSessionId, "/exit");
   }
   const removed = hybridManager.removeByIndex(idx + 1);
   if (removed) {
@@ -757,7 +757,7 @@ function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>): void
   }
 
   // Send updated session list
-  handleSessionsCommand(ws);
+  await handleSessionsCommand(ws);
 }
 
 /**
@@ -782,10 +782,10 @@ function createThrottled(): boolean {
  * for a proper /exit + end-session finalization to finish instead of guessing a
  * fixed delay. Falls through after ~24s so a stuck exit can't hang the tab.
  */
-function whenAtShellPrompt(sessionId: string, cb: () => void, attempts = 30): void {
-  const snap = snapshotAllSessions().find(s => s.id === sessionId);
+async function whenAtShellPrompt(sessionId: string, cb: () => void, attempts = 30): Promise<void> {
+  const snap = (await snapshotAllSessions()).find(s => s.id === sessionId);
   if ((snap && snap.atPrompt) || attempts <= 0) { cb(); return; }
-  setTimeout(() => whenAtShellPrompt(sessionId, cb, attempts - 1), 800);
+  setTimeout(() => { void whenAtShellPrompt(sessionId, cb, attempts - 1); }, 800);
 }
 
 /**
@@ -805,7 +805,7 @@ function claudeLaunchCommand(cwd: string, name: string): string {
   return `cd ${sq(cwd)} && claude --name ${sq(name)} --dangerously-skip-permissions ${prompt}`;
 }
 
-function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}): void {
+async function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}): Promise<void> {
   const projectName = args.project as string | undefined;
   const path = args.path as string | undefined;
   const requestedName = typeof args.name === "string" ? args.name.trim() : "";
@@ -816,14 +816,14 @@ function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}):
     return;
   }
 
-  if (createThrottled()) { handleSessionsCommand(ws); return; }
+  if (createThrottled()) { await handleSessionsCommand(ws); return; }
 
   // Launch via clc (the user's launcher: pins model + skip-perms so PAILot can
   // drive the session without a permission prompt). cd into path first if given.
   const command = path ? `cd ${path.replace(/"/g, '\\"')} && clc` : "clc";
   const fallbackName = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
 
-  const sessionId = createClaudeSession(command);
+  const sessionId = await createClaudeSession(command);
   if (!sessionId) {
     sendTo(ws, { type: "error", message: "Failed to create new session" });
     return;
@@ -833,13 +833,13 @@ function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}):
   // must not displace a chosen one there.
   const name = requestedName || autoTabName(sessionId, fallbackName);
 
-  setItermSessionVar(sessionId, name);
+  await setItermSessionVar(sessionId, name);
   setItermTabName(sessionId, name);
-  setItermBadge(sessionId, name);
+  await setItermBadge(sessionId, name);
 
   if (hybridManager) {
     hybridManager.registerVisualSession(name, "", sessionId);
-    const sessions = hybridManager.listSessions();
+    const sessions = await hybridManager.listAsync();
     const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
     if (idx >= 0) {
       hybridManager.switchToIndex(idx + 1);
@@ -850,7 +850,7 @@ function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}):
 
   log(`[PAILot] created new session "${name}" (${sessionId.slice(0, 8)}...)`);
   sendTo(ws, { type: "session_switched", name, sessionId });
-  handleSessionsCommand(ws);
+  await handleSessionsCommand(ws);
 }
 
 async function handleCreateFromProject(ws: WebSocket, projectName: string): Promise<void> {
@@ -860,7 +860,7 @@ async function handleCreateFromProject(ws: WebSocket, projectName: string): Prom
 
     if (hybridManager) {
       hybridManager.registerVisualSession(displayName, "", itermSessionId);
-      const sessions = hybridManager.listSessions();
+      const sessions = await hybridManager.listAsync();
       const idx = sessions.findIndex(s => s.backendSessionId === itermSessionId);
       if (idx >= 0) {
         hybridManager.switchToIndex(idx + 1);
@@ -870,7 +870,7 @@ async function handleCreateFromProject(ws: WebSocket, projectName: string): Prom
 
     log(`[PAILot] launched PAI project "${projectName}" (${itermSessionId.slice(0, 8)}...)`);
     sendTo(ws, { type: "session_switched", name: displayName, sessionId: itermSessionId });
-    handleSessionsCommand(ws);
+    await handleSessionsCommand(ws);
   } catch (err) {
     log(`[PAILot] project launch failed: ${err}`);
     sendTo(ws, { type: "error", message: `Failed to launch project: ${err instanceof Error ? err.message : String(err)}` });
@@ -912,7 +912,7 @@ async function handleNavCommand(ws: WebSocket, args: Record<string, unknown>): P
   // Map key names to actions
   // sendKeystrokeToSession takes ASCII code: 13=enter, 9=tab, 27=escape
   // sendEscapeSequenceToSession takes ANSI direction char: A=up, B=down, C=right, D=left
-  const keyMap: Record<string, () => void> = {
+  const keyMap: Record<string, () => Promise<unknown>> = {
     // Arrow keys (descriptive names)
     up: () => sendEscapeSequenceToSession(targetSession, "A"),
     down: () => sendEscapeSequenceToSession(targetSession, "B"),
@@ -930,22 +930,22 @@ async function handleNavCommand(ws: WebSocket, args: Record<string, unknown>): P
     Tab: () => sendKeystrokeToSession(targetSession, 9),
     escape: () => sendKeystrokeToSession(targetSession, 27),
     Escape: () => sendKeystrokeToSession(targetSession, 27),
-    "ctrl-c": () => {
+    "ctrl-c": async () => {
       // Send Ctrl+C (ETX, ASCII 3)
-      runItermJxa(withSessionJxa(targetSession, `          aSession.write({ text: String.fromCharCode(3), newline: false });\n          return "ok";`));
+      await runItermJxa(withSessionJxa(targetSession, `          aSession.write({ text: String.fromCharCode(3), newline: false });\n          return "ok";`));
     },
-    "ctrl+c": () => {
-      runItermJxa(withSessionJxa(targetSession, `          aSession.write({ text: String.fromCharCode(3), newline: false });\n          return "ok";`));
+    "ctrl+c": async () => {
+      await runItermJxa(withSessionJxa(targetSession, `          aSession.write({ text: String.fromCharCode(3), newline: false });\n          return "ok";`));
     },
   };
 
   const action = keyMap[key];
   if (action) {
-    action();
+    await action();
   } else {
     // Send each character individually (vi keys like "dd" need separate keystrokes)
     for (const ch of key) {
-      pasteTextIntoSession(targetSession, ch);
+      await pasteTextIntoSession(targetSession, ch);
     }
   }
   log(`[PAILot] nav: sent ${key} to session ${targetSession.slice(0, 8)}...`);
@@ -1150,7 +1150,7 @@ export async function transcribeAndRoute(
  * Start the WebSocket gateway.
  * @param onMessage — the same handleMessage(text, timestamp) used by the transport
  */
-export function startWsGateway(onMessage: (text: string, timestamp: number) => void | Promise<void>): void {
+export async function startWsGateway(onMessage: (text: string, timestamp: number) => void | Promise<void>): Promise<void> {
   wss = new WebSocketServer({ port: WS_PORT });
 
   // Server-side ping: keep connections alive and detect dead iOS clients.
@@ -1174,9 +1174,10 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
     // Pre-populate hybrid manager with live iTerm sessions so messages
     // can be tagged with sessionId even before a PAILot client connects.
     if (hybridManager) {
+      void (async () => {
       try {
-        const liveSnapshots = enrichedSnapshots();
-        const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+        const liveSnapshots = await enrichedSnapshots();
+        const knownIds = new Set((await hybridManager.listAsync()).map(s => s.backendSessionId));
         const seenTabs = new Set<string>();
         for (const snap of liveSnapshots) {
           if (!isClaudeRelated(snap)) continue;
@@ -1188,19 +1189,20 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
           }
         }
         // Also set the active session based on current iTerm focus
-        const focusedId = runItermJxa(`  try { return app.currentWindow().currentTab().currentSession().id(); } catch (e) { return ""; }`)?.trim() ?? "";
+        const focusedId = (await runItermJxa(`  try { return app.currentWindow().currentTab().currentSession().id(); } catch (e) { return ""; }`))?.trim() ?? "";
         if (focusedId) {
-          const sessions = hybridManager.listSessions();
+          const sessions = await hybridManager.listAsync();
           const idx = sessions.findIndex(s => s.backendSessionId === focusedId);
           if (idx >= 0) {
             hybridManager.switchToIndex(idx + 1);
             setActiveItermSessionId(focusedId);
           }
         }
-        log(`Pre-registered ${hybridManager.listSessions().length} session(s) from live iTerm`);
+        log(`Pre-registered ${(await hybridManager.listAsync()).length} session(s) from live iTerm`);
       } catch (err) {
         log(`Failed to pre-register sessions: ${err}`);
       }
+      })();
     }
   });
 
@@ -1216,7 +1218,7 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
       clientLastActive.set(ws, Date.now());
     });
 
-    ws.on("message", (raw) => {
+    ws.on("message", async (raw) => {
       clientLastActive.set(ws, Date.now());
       try {
         const rawStr = raw.toString();
@@ -1238,29 +1240,29 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
 
           switch (command) {
             case "sessions":
-              handleSessionsCommand(ws);
+              await handleSessionsCommand(ws);
               return;
             case "sync":
-              handleSyncCommand(ws, args);
+              await handleSyncCommand(ws, args);
               return;
             case "catch_up":
               handleCatchUp(ws, args);
               return;
             case "switch":
-              handleSwitchCommand(ws, args);
+              await handleSwitchCommand(ws, args);
               return;
             case "rename":
-              handleRenameCommand(ws, args);
+              await handleRenameCommand(ws, args);
               return;
             case "refresh":
               // Force a fresh enumeration + prune + re-push (closed tabs drop here).
-              handleSessionsCommand(ws, { fresh: true });
+              await handleSessionsCommand(ws, { fresh: true });
               return;
             case "remove":
-              handleRemoveCommand(ws, args);
+              await handleRemoveCommand(ws, args);
               return;
             case "create":
-              handleCreateCommand(ws, args);
+              await handleCreateCommand(ws, args);
               return;
             case "projects":
               handleProjectsCommand(ws);
@@ -1291,18 +1293,18 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
         // Extract the session ID that PAILot says this message belongs to.
         // This is the iTerm session ID the user was viewing when they typed/spoke.
         // We use it for routing instead of guessing from activeItermSessionId.
-        const pailotSessionId = typeof msg.sessionId === "string" ? liveSession(msg.sessionId) : undefined;
+        const pailotSessionId = typeof msg.sessionId === "string" ? await liveSession(msg.sessionId) : undefined;
 
         // Validate against the live session list. A stale id (e.g. a Claude Code
         // session was restarted and got a new id) would otherwise silently fall
         // back to the active session and the message would land in the wrong tab.
         // Refuse to route, push a fresh session list, and tell the user.
         if (pailotSessionId && hybridManager) {
-          const known = hybridManager.listSessions().some(s => s.backendSessionId === pailotSessionId);
+          const known = (await hybridManager.listAsync()).some(s => s.backendSessionId === pailotSessionId);
           if (!known) {
             log(`[PAILot] Rejecting message — sessionId=${pailotSessionId.slice(0, 8)} is stale (no matching session). Refreshing client list.`);
             mqttPublishControl({ type: "session_not_found", sessionId: pailotSessionId });
-            handleMqttCommand("sessions");
+            await handleMqttCommand("sessions");
             mqttPublishText(pailotSessionId, "⚠️ That session no longer exists on the host. Pick a session from the refreshed list and resend.");
             return;
           }
@@ -1321,7 +1323,7 @@ export function startWsGateway(onMessage: (text: string, timestamp: number) => v
           if (pailotSessionId !== activeItermSessionId) {
             setActiveItermSessionId(pailotSessionId);
             if (hybridManager) {
-              const sessions = hybridManager.listSessions();
+              const sessions = await hybridManager.listAsync();
               const idx = sessions.findIndex(s => s.backendSessionId === pailotSessionId);
               if (idx >= 0) hybridManager.switchToIndex(idx + 1);
             }
@@ -1467,8 +1469,8 @@ function resolveSessionIdRaw(sessionId?: string): string | undefined {
   return hybridManager?.activeSession?.backendSessionId || undefined;
 }
 
-export function broadcastText(text: string, sessionId?: string, direct?: boolean): void {
-  const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
+export async function broadcastText(text: string, sessionId?: string, direct?: boolean): Promise<void> {
+  const resolvedSession = await liveSession(sessionId || resolveSessionId(sessionId));
   if (resolvedSession) lastOutboundSessionId = resolvedSession;
   const traceId = randomUUID().slice(0, 8);
   const contentPreview = text.replace(/\s+/g, " ").trim().slice(0, 80);
@@ -1509,7 +1511,7 @@ export function broadcastText(text: string, sessionId?: string, direct?: boolean
         if (match) sessionName = match.name;
       } else {
         // Fallback: scan iTerm tabs for the session name
-        const snaps = enrichedSnapshots();
+        const snaps = await enrichedSnapshots();
         const snap = snaps.find(s => s.id.startsWith(resolvedSession) || resolvedSession.startsWith(s.id));
         if (snap) sessionName = snap.paiName ?? snap.tabTitle ?? snap.name;
       }
@@ -1531,7 +1533,7 @@ export async function broadcastVoice(
   direct?: boolean,
   chunkMeta?: { groupId: string; chunkIndex: number; totalChunks: number },
 ): Promise<void> {
-  const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
+  const resolvedSession = await liveSession(sessionId || resolveSessionId(sessionId));
   if (resolvedSession) lastOutboundSessionId = resolvedSession;
   const traceId = randomUUID().slice(0, 8);
   const contentPreview = transcript.replace(/\s+/g, " ").trim().slice(0, 80);
@@ -1595,7 +1597,7 @@ export async function broadcastVoice(
         const match = hybridManager.knownSessions().find(s => s.backendSessionId.startsWith(resolvedSession) || resolvedSession.startsWith(s.backendSessionId));
         if (match) voiceSessionName = match.name;
       } else {
-        const snaps = enrichedSnapshots();
+        const snaps = await enrichedSnapshots();
         const snap = snaps.find(s => s.id.startsWith(resolvedSession) || resolvedSession.startsWith(s.id));
         if (snap) voiceSessionName = snap.paiName ?? snap.tabTitle ?? snap.name;
       }
@@ -1609,8 +1611,8 @@ export async function broadcastVoice(
  * Broadcast a screenshot/image to all connected PAILot clients.
  * @param sessionId — iTerm session ID of the originating Claude session
  */
-export function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean, mimeType?: string): void {
-  const resolvedSession = liveSession(sessionId || resolveSessionId(sessionId));
+export async function broadcastImage(imageBuffer: Buffer, caption?: string, sessionId?: string, direct?: boolean, mimeType?: string): Promise<void> {
+  const resolvedSession = await liveSession(sessionId || resolveSessionId(sessionId));
   if (resolvedSession) lastOutboundSessionId = resolvedSession;
   const imgBase64 = imageBuffer.toString("base64");
   broadcast({
@@ -1677,7 +1679,7 @@ export function stopWsGateway(): void {
  * Handle a command from MQTT (no WebSocket needed).
  * Replicates the WS command dispatcher for MQTT-only clients.
  */
-export function handleMqttCommand(command: string, args: Record<string, unknown> = {}): void {
+export async function handleMqttCommand(command: string, args: Record<string, unknown> = {}): Promise<void> {
   if (!hybridManager) {
     log(`[MQTT] command ${command} — no hybridManager`);
     return;
@@ -1687,12 +1689,12 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
     case "refresh":
     case "sessions": {
       // Prune dead sessions and publish current list via MQTT
-      const liveSnapshots = enrichedSnapshots();
+      const liveSnapshots = await enrichedSnapshots();
       const liveIds = listedLiveIds(liveSnapshots);
       if (liveSnapshots.length > 0) {
         hybridManager.pruneDeadVisualSessions(liveIds);
       }
-      const knownIds = new Set(hybridManager.listSessions().map(s => s.backendSessionId));
+      const knownIds = new Set(await (await hybridManager.listAsync()).map(s => s.backendSessionId));
       const seenTabs = new Set<string>();
       for (const snap of liveSnapshots) {
         if (!isClaudeRelated(snap)) continue;
@@ -1702,12 +1704,12 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         if (!knownIds.has(snap.id)) {
           hybridManager.registerVisualSession(displayName, "", snap.id);
         } else {
-          const existing = hybridManager.listSessions().find(s => s.backendSessionId === snap.id);
+          const existing = (await hybridManager.listAsync()).find(s => s.backendSessionId === snap.id);
           if (existing && existing.name !== displayName) existing.name = displayName;
         }
       }
       const active = hybridManager.activeSession;
-      const sessions = hybridManager.listSessions().map((s, i) => ({
+      const sessions = await (await hybridManager.listAsync()).map((s, i) => ({
         index: i + 1,
         name: s.name,
         type: "claude" as const,
@@ -1722,7 +1724,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       // Sync is sessions + set active from client preference
       const clientActiveId = args.activeSessionId as string | undefined;
       if (clientActiveId) {
-        const sessions = hybridManager.listSessions();
+        const sessions = await hybridManager.listAsync();
         const idx = sessions.findIndex(s => s.backendSessionId === clientActiveId);
         if (idx >= 0) {
           hybridManager.switchToIndex(idx + 1);
@@ -1730,17 +1732,17 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
           setLastRoutedSessionId(clientActiveId);
         }
       }
-      handleMqttCommand("sessions");
+      await handleMqttCommand("sessions");
       break;
     }
     case "switch": {
-      const sessionId = liveSession(args.sessionId as string | undefined);
+      const sessionId = await liveSession(args.sessionId as string | undefined);
       const sessionIndex = args.index as number | undefined;
       let targetIndex: number | undefined;
       if (sessionIndex) {
         targetIndex = sessionIndex;
       } else if (sessionId) {
-        const sessions = hybridManager.listSessions();
+        const sessions = await hybridManager.listAsync();
         const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
         if (idx >= 0) targetIndex = idx + 1;
       }
@@ -1751,12 +1753,12 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         }
         setLastRoutedSessionId(session?.backendSessionId ?? "");
         mqttPublishControl({ type: "session_switched", sessionId: session?.backendSessionId, name: session?.name });
-        handleMqttCommand("sessions");
+        await handleMqttCommand("sessions");
       }
       break;
     }
     case "screenshot": {
-      const ssSessionId = liveSession(args.sessionId as string | undefined);
+      const ssSessionId = await liveSession(args.sessionId as string | undefined);
       log(`[MQTT] screenshot command: requested session=${ssSessionId?.slice(0, 8) ?? "none"}`);
       if (ssSessionId) {
         setActiveItermSessionId(ssSessionId);
@@ -1774,36 +1776,36 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       break;
     }
     case "rename": {
-      const sessionId = liveSession(args.sessionId as string | undefined);
+      const sessionId = await liveSession(args.sessionId as string | undefined);
       const name = args.name as string | undefined;
       if (sessionId && name) {
         // Persist so the rename survives re-enumeration: enrichedSnapshots reads
         // paiName from ~/.aibroker/session-names.json and it wins over the tab
         // title — without this the name reverts on the next sessions refresh.
         // A refused claim (name held by a live session) changes nothing.
-        if (!setPersistentSessionName(sessionId, name).ok) {
+        if (!(await setPersistentSessionName(sessionId, name)).ok) {
           mqttPublishControl({ type: "error", message: `Name "${name}" is held by another live session — nothing was changed.` });
           break;
         }
-        const sessions = hybridManager.listSessions();
+        const sessions = await hybridManager.listAsync();
         const session = sessions.find(s => s.backendSessionId === sessionId);
         if (session) {
           session.name = name;
           if (session.kind === "visual") {
-            setItermSessionVar(sessionId, name);
+            await setItermSessionVar(sessionId, name);
             setItermTabName(sessionId, name);
-            setItermBadge(sessionId, name);
+            await setItermBadge(sessionId, name);
           }
         }
         mqttPublishControl({ type: "session_renamed", sessionId, name });
-        handleMqttCommand("sessions");
+        await handleMqttCommand("sessions");
       }
       break;
     }
     case "remove": {
-      const sessionId = liveSession(args.sessionId as string | undefined);
+      const sessionId = await liveSession(args.sessionId as string | undefined);
       if (sessionId) {
-        const sessions = hybridManager.listSessions();
+        const sessions = await hybridManager.listAsync();
         const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
         if (idx >= 0) {
           const target = sessions[idx];
@@ -1812,17 +1814,17 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
           // close the iTerm tab so a re-enumeration can't resurrect it. Refresh
           // the list only AFTER the tab is gone — an immediate refresh re-adds the
           // still-open tab (the "it reappears" bug).
-          if (sid) typeIntoSession(sid, "/exit");
+          if (sid) await typeIntoSession(sid, "/exit");
           hybridManager.removeByIndex(idx + 1);
-          setTimeout(() => {
-            try { if (sid) killSession(sid); } catch (e) { log(`[MQTT] killSession failed: ${e}`); }
+          setTimeout(async () => {
+            try { if (sid) await killSession(sid); } catch (e) { log(`[MQTT] killSession failed: ${e}`); }
             // The kill just happened; the memoized enumeration (up to
             // SNAPSHOT_TTL_MS old) can predate it and would resurrect the tab.
             invalidateSnapshotCache();
-            setTimeout(() => handleMqttCommand("sessions"), 600);
+            setTimeout(() => { void handleMqttCommand("sessions"); }, 600);
           }, 2000);
         } else {
-          handleMqttCommand("sessions");
+          await handleMqttCommand("sessions");
         }
       }
       break;
@@ -1836,7 +1838,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
           try {
             const { itermSessionId } = await launchPaiProject(projectName);
             hybridManager!.registerVisualSession(projectDisplay, "", itermSessionId);
-            const list = hybridManager!.listSessions();
+            const list = await hybridManager!.listAsync();
             const pidx = list.findIndex(s => s.backendSessionId === itermSessionId);
             if (pidx >= 0) {
               hybridManager!.switchToIndex(pidx + 1);
@@ -1846,11 +1848,11 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
             // A launch may not steal a live session's name: a refused claim
             // leaves the binding where it is and says so — the new tab still
             // runs, it just does not own the name.
-            if (!setPersistentSessionName(itermSessionId, projectDisplay).ok) {
+            if (!(await setPersistentSessionName(itermSessionId, projectDisplay)).ok) {
               mqttPublishControl({ type: "error", message: `Name "${projectDisplay}" is held by another live session — launched, but not renamed.` });
             }
             mqttPublishControl({ type: "session_switched", name: projectDisplay, sessionId: itermSessionId });
-            handleMqttCommand("sessions");
+            await handleMqttCommand("sessions");
           } catch (err) {
             log(`[MQTT] project launch failed: ${err}`);
             mqttPublishControl({ type: "error", message: `Failed to launch project: ${err instanceof Error ? err.message : String(err)}` });
@@ -1858,31 +1860,31 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
         })();
         break;
       }
-      if (createThrottled()) { handleMqttCommand("sessions"); break; }
+      if (createThrottled()) { await handleMqttCommand("sessions"); break; }
       const path = args.path as string | undefined;
       const requestedName = typeof args.name === "string" ? args.name.trim() : "";
       const fallbackName = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
       const command = claudeLaunchCommand(path ?? "~", requestedName || fallbackName);
-      const sessionId = createClaudeSession(command);
+      const sessionId = await createClaudeSession(command);
       if (!sessionId) { log("[MQTT] create: failed to create session"); break; }
       // Same guard as the WS create: a reused live tab keeps its chosen name.
       const name = requestedName || autoTabName(sessionId, fallbackName);
-      setItermSessionVar(sessionId, name);
+      await setItermSessionVar(sessionId, name);
       setItermTabName(sessionId, name);
-      setItermBadge(sessionId, name);
+      await setItermBadge(sessionId, name);
       hybridManager.registerVisualSession(name, "", sessionId);
-      const sessions = hybridManager.listSessions();
+      const sessions = await hybridManager.listAsync();
       const idx = sessions.findIndex(s => s.backendSessionId === sessionId);
       if (idx >= 0) {
         hybridManager.switchToIndex(idx + 1);
         setActiveItermSessionId(sessionId);
         setLastRoutedSessionId(sessionId);
       }
-      if (!setPersistentSessionName(sessionId, name).ok) {
+      if (!(await setPersistentSessionName(sessionId, name)).ok) {
         mqttPublishControl({ type: "error", message: `Name "${name}" is held by another live session — launched, but not renamed.` });
       }
       mqttPublishControl({ type: "session_switched", name, sessionId });
-      handleMqttCommand("sessions");
+      await handleMqttCommand("sessions");
       break;
     }
     case "rehome": {
@@ -1892,32 +1894,32 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       // iTerm tab — the session id is unchanged, so the app keeps following it.
       const rid = args.sessionId as string | undefined;
       const rpath = args.path as string | undefined;
-      if (!rid || !rpath) { handleMqttCommand("sessions"); break; }
+      if (!rid || !rpath) { await handleMqttCommand("sessions"); break; }
       // Re-home default name: autoTabName keeps a chosen name over the
       // path-basename guess — re-homing re-topics a session, it does not
       // unname it.
       const rname = (typeof args.name === "string" && args.name.trim())
         ? args.name.trim()
         : autoTabName(rid, rpath.split("/").filter(Boolean).pop() ?? "Session");
-      typeIntoSession(rid, "/exit");
+      await typeIntoSession(rid, "/exit");
       // Wait for /exit to fully finalize (tab back at a shell prompt) before
       // relaunching, so the end-session work isn't cut short. Short initial delay
       // lets /exit register, then poll atPrompt.
-      setTimeout(() => whenAtShellPrompt(rid, () => {
-        typeIntoSession(rid, claudeLaunchCommand(rpath, rname));
-        setItermSessionVar(rid, rname);
+      setTimeout(() => { void whenAtShellPrompt(rid, async () => {
+        await typeIntoSession(rid, claudeLaunchCommand(rpath, rname));
+        await setItermSessionVar(rid, rname);
         setItermTabName(rid, rname);
-        setItermBadge(rid, rname);
-        const s = hybridManager!.listSessions().find(x => x.backendSessionId === rid);
+        await setItermBadge(rid, rname);
+        const s = (await hybridManager!.listAsync()).find(x => x.backendSessionId === rid);
         if (s) s.name = rname;
-        if (!setPersistentSessionName(rid, rname).ok) {
+        if (!(await setPersistentSessionName(rid, rname)).ok) {
           mqttPublishControl({ type: "error", message: `Name "${rname}" is held by another live session — re-homed, but the name stays with its holder.` });
         }
         setActiveItermSessionId(rid);
         setLastRoutedSessionId(rid);
         mqttPublishControl({ type: "session_switched", name: rname, sessionId: rid });
-        handleMqttCommand("sessions");
-      }), 1200);
+        await handleMqttCommand("sessions");
+      }); }, 1200);
       break;
     }
     case "projects": {
@@ -1979,7 +1981,7 @@ export function handleMqttCommand(command: string, args: Record<string, unknown>
       });
       for (const r of replays) mqttPublishReplay(r);
 
-      handleMqttCommand("sessions");
+      await handleMqttCommand("sessions");
       break;
     }
     default:

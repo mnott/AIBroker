@@ -5,7 +5,7 @@
  * Does NOT import any transport send functions — callers handle message delivery.
  */
 
-import { execSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { basename } from "node:path";
 
 import {
@@ -43,14 +43,14 @@ import { saveSessionRegistry, getAllPersistentSessionNames, lookupPersistentName
 
 // ── Session Variable Helpers ──
 
-function setItermSessionProperty(itermSessionId: string, body: string): void {
+async function setItermSessionProperty(itermSessionId: string, body: string): Promise<void> {
   if (!itermInPlay()) return;
-  runItermJxa(withSessionJxa(itermSessionId, `          ${body}\n          return "ok";`), 5_000);
+  await runItermJxa(withSessionJxa(itermSessionId, `          ${body}\n          return "ok";`), 5_000);
 }
 
-export function setItermSessionVar(itermSessionId: string, name: string): void {
+export async function setItermSessionVar(itermSessionId: string, name: string): Promise<void> {
   const value = JSON.stringify(name.replace(/[\n\r]/g, " "));
-  setItermSessionProperty(itermSessionId, `aSession.setVariable({ named: "user.paiName", to: ${value} });`);
+  await setItermSessionProperty(itermSessionId, `aSession.setVariable({ named: "user.paiName", to: ${value} });`);
 }
 
 export function setItermTabName(itermSessionId: string, name: string): void {
@@ -64,20 +64,29 @@ export function setItermTabName(itermSessionId: string, name: string): void {
   );
 }
 
-export function setItermBadge(itermSessionId: string, text: string): void {
+export async function setItermBadge(itermSessionId: string, text: string): Promise<void> {
   if (!itermInPlay()) return;
   // Write badge escape sequence to the session's tty device.
   // Must go to terminal output stream (not stdin via "write text").
   try {
-    const tty = (runItermJxa(
+    const tty = ((await runItermJxa(
       withSessionJxa(itermSessionId, `          return aSession.tty();`),
       5_000,
-    ) ?? "").trim();
+    )) ?? "").trim();
     if (!tty || !tty.startsWith("/dev/ttys")) return;
     const b64 = Buffer.from(text).toString("base64");
-    execSync(`printf '\\033]1337;SetBadgeFormat=${b64}\\007' > ${tty}`, {
-      timeout: 3000,
-      shell: "/bin/bash",
+    // Awaited child instead of execSync (which blocked the event loop up to 3 s
+    // per badge). Same command as before — bash's printf builtin redirected to
+    // the tty — but the payload and path travel as ARGV, never interpolated
+    // into shell syntax. The tty is validated above to ^/dev/ttys[A-Za-z0-9]+$;
+    // the base64 alphabet carries no shell characters.
+    await new Promise<void>((resolve) => {
+      execFile(
+        "/bin/bash",
+        ["-c", 'tty=$1; shift; printf \'\\033]1337;SetBadgeFormat=%s\\007\' "$@" > "$tty"', "bash", tty, b64],
+        { timeout: 3_000 },
+        () => resolve(),
+      );
     });
   } catch {
     // silently ignore — badge is cosmetic
@@ -91,10 +100,10 @@ export function setItermBadge(itermSessionId: string, text: string): void {
  * needs in order to fall back to relaunching, rather than reporting a dead
  * session as an unexplained failure.
  */
-export function revealItermSession(itermSessionId: string): boolean {
+export async function revealItermSession(itermSessionId: string): Promise<boolean> {
   if (!itermInPlay()) return false;
   try {
-    const result = runItermJxa(withSessionJxa(
+    const result = await runItermJxa(withSessionJxa(
       itermSessionId,
       `          aWindow.select(); aTab.select(); aSession.select(); app.activate();\n          return "ok";`,
       '"no"',
@@ -105,9 +114,9 @@ export function revealItermSession(itermSessionId: string): boolean {
   }
 }
 
-export function getItermSessionVar(itermSessionId: string): string | null {
+export async function getItermSessionVar(itermSessionId: string): Promise<string | null> {
   if (!itermInPlay()) return null;
-  const result = runItermJxa(withSessionJxa(
+  const result = await runItermJxa(withSessionJxa(
     itermSessionId,
     `          try { return aSession.variable({ named: "user.paiName" }) || ""; } catch (e) { return ""; }`,
   ), 5_000);
@@ -125,7 +134,7 @@ export function getItermSessionVar(itermSessionId: string): string | null {
  * `claude attach` pane now serving it (killed and reattached keeps its name),
  * unless that pane already has a name of its own. Returns how many moved.
  */
-export function moveStaleNamesToAttachPanes(sessions: SessionSnapshot[]): number {
+export async function moveStaleNamesToAttachPanes(sessions: SessionSnapshot[]): Promise<number> {
   const live = new Set(sessions.map((s) => s.id));
   let moved = 0;
   for (const [id, name] of Object.entries(getAllPersistentSessionNames())) {
@@ -133,7 +142,7 @@ export function moveStaleNamesToAttachPanes(sessions: SessionSnapshot[]): number
     const target = liveSessionFor(id, sessions);
     if (target === id || lookupPersistentName(getAllPersistentSessionNames(), target)) continue;
     removePersistentSessionName(id);
-    if (!setPersistentSessionName(target, name).ok) continue;
+    if (!(await setPersistentSessionName(target, name)).ok) continue;
     log(`Name authority: moved "${name}" from dead pane ${id.slice(0, 8)} to attach pane ${target.slice(0, 8)}`);
     moved += 1;
   }
@@ -152,23 +161,23 @@ export function moveStaleNamesToAttachPanes(sessions: SessionSnapshot[]): number
  * them; the production defaults are exactly what the rename handler uses.
  * Returns the count actually re-pinned — 0 means every surface already agrees.
  */
-export function reassertPersistentTitles(
+export async function reassertPersistentTitles(
   deps: {
     sessions?: SessionSnapshot[];
-    setTabName?: (id: string, name: string) => void;
-    setSessionVar?: (id: string, name: string) => void;
-    setBadge?: (id: string, name: string) => void;
-    setPaneTitle?: (id: string, name: string) => boolean;
-    viewerFor?: (paneId: string) => string | null;
+    setTabName?: (id: string, name: string) => void | Promise<void>;
+    setSessionVar?: (id: string, name: string) => void | Promise<void>;
+    setBadge?: (id: string, name: string) => void | Promise<void>;
+    setPaneTitle?: (id: string, name: string) => boolean | Promise<boolean>;
+    viewerFor?: (paneId: string) => string | null | Promise<string | null>;
   } = {},
-): number {
+): Promise<number> {
   const setTabName = deps.setTabName ?? setItermTabName;
   const setSessionVar = deps.setSessionVar ?? setItermSessionVar;
   const setBadge = deps.setBadge ?? setItermBadge;
   const setPaneTitle = deps.setPaneTitle ?? setSessionTitle;
   const viewerFor = deps.viewerFor ?? itermViewerSessionId;
-  const sessions = deps.sessions ?? snapshotAllTransports();
-  moveStaleNamesToAttachPanes(sessions);
+  const sessions = deps.sessions ?? (await snapshotAllTransports());
+  await moveStaleNamesToAttachPanes(sessions);
 
   const names = getAllPersistentSessionNames();
   let repinned = 0;
@@ -181,17 +190,17 @@ export function reassertPersistentTitles(
     if (s.aibrokerId) {
       // tmux-hosted: the pane title, plus — if an iTerm tab is viewing it —
       // that tab, exactly the surfaces the rename handler touches.
-      setPaneTitle(s.id, chosen);
-      const viewer = viewerFor(s.id);
+      await setPaneTitle(s.id, chosen);
+      const viewer = await viewerFor(s.id);
       if (viewer) {
-        setSessionVar(viewer, chosen);
-        setTabName(viewer, chosen);
-        setBadge(viewer, chosen);
+        await setSessionVar(viewer, chosen);
+        await setTabName(viewer, chosen);
+        await setBadge(viewer, chosen);
       }
     } else {
-      setSessionVar(s.id, chosen);
-      setTabName(s.id, chosen);
-      setBadge(s.id, chosen);
+      await setSessionVar(s.id, chosen);
+      await setTabName(s.id, chosen);
+      await setBadge(s.id, chosen);
     }
     log(`Name authority: re-pinned "${chosen}" over tab title "${title}" (session ${s.id.slice(0, 8)})`);
     repinned += 1;
@@ -211,10 +220,10 @@ export function autoTabName(sessionId: string, fallback: string): string {
 
 // ── Session Resolution ──
 
-export function findItermSessionForTermId(
+export async function findItermSessionForTermId(
   termSessionId: string,
   itermSessionIdHint?: string,
-): string | null {
+): Promise<string | null> {
   if (itermSessionIdHint) {
     return stripItermPrefix(itermSessionIdHint) ?? itermSessionIdHint;
   }
@@ -229,9 +238,10 @@ export function findItermSessionForTermId(
   });
   return found;`;
 
-  const result = runItermJxa(script);
+  const result = await runItermJxa(script);
   return (result && result.length > 0) ? result : null;
 }
+
 
 // ── Session Listing ──
 
@@ -240,8 +250,8 @@ export function isListed(s: { workerPane?: boolean }): boolean {
   return !s.workerPane;
 }
 
-export function listClaudeSessions(): Array<{ id: string; name: string }> {
-  const sessions = snapshotAllSessions().filter(isListed);
+export async function listClaudeSessions(): Promise<Array<{ id: string; name: string }>> {
+  const sessions = (await snapshotAllSessions()).filter(isListed);
   const persistentNames = getAllPersistentSessionNames();
   return sessions
     .filter((s) => s.name.toLowerCase().includes("claude") || lookupPersistentName(persistentNames, s.id, s.aibrokerId))
@@ -252,15 +262,15 @@ export function listClaudeSessions(): Array<{ id: string; name: string }> {
  * Build a full session list with type classification and PAI name resolution.
  * Returns the data used by /s command.
  */
-export function getSessionList(): Array<{
+export async function getSessionList(): Promise<Array<{
   id: string;
   name: string;
   path: string;
   type: "claude" | "terminal";
   paiName: string | null;
   atPrompt: boolean;
-}> {
-  const snapshots = snapshotAllSessions();
+}>> {
+  const snapshots = await snapshotAllSessions();
   const persistentNames = getAllPersistentSessionNames();
 
   // Update TTY cache
@@ -384,18 +394,18 @@ function rejectIfBusy(result: string | null, label: string): string | null {
   return result;
 }
 
-export function createClaudeSession(command = "claude"): string | null {
+export async function createClaudeSession(command = "claude"): Promise<string | null> {
   try {
-    return rejectIfBusy(_internal.runItermJxa(openSessionScript(command)) ?? null, "createClaudeSession");
+    return rejectIfBusy((await _internal.runItermJxa(openSessionScript(command))) ?? null, "createClaudeSession");
   } catch (err) {
     log("Failed to create session:", String(err));
     return null;
   }
 }
 
-export function createTerminalTab(command?: string): string | null {
+export async function createTerminalTab(command?: string): Promise<string | null> {
   try {
-    return rejectIfBusy(_internal.runItermJxa(openSessionScript(command ?? "")) ?? null, "createTerminalTab");
+    return rejectIfBusy((await _internal.runItermJxa(openSessionScript(command ?? ""))) ?? null, "createTerminalTab");
   } catch (err) {
     log("Failed to create terminal tab:", String(err));
     return null;
@@ -405,14 +415,14 @@ export function createTerminalTab(command?: string): string | null {
 // ── Session Lifecycle ──
 
 export async function restartSession(itermSessionId: string, command = "claude"): Promise<void> {
-  sendKeystrokeToSession(itermSessionId, 3); // Ctrl+C
+  await sendKeystrokeToSession(itermSessionId, 3); // Ctrl+C
   await new Promise((r) => setTimeout(r, 500));
   // Uses the RAW core primitive, not the guarded facade, deliberately:
   // addressing a shell is the whole point here — Ctrl+C has just dropped this
   // tab out of Claude so the launch command can be typed into it.
-  typeIntoSession(itermSessionId, command);
+  await typeIntoSession(itermSessionId, command);
 }
 
-export function killSession(itermSessionId: string): void {
-  runItermJxa(withSessionJxa(itermSessionId, `          aSession.close();\n          return "ok";`));
+export async function killSession(itermSessionId: string): Promise<void> {
+  await runItermJxa(withSessionJxa(itermSessionId, `          aSession.close();\n          return "ok";`));
 }

@@ -41,70 +41,70 @@ const entry = (over = {}) => ({
   shift: { until: UNTIL, workers: 1, visual: false, startedAt: NOW - 3_600_000, plain: true }, ...over,
 }) as import("../src/daemon/manage.js").ManagedSession;
 
-test("marker absent before until, empty input: re-arm now with the reason", () => {
+test("marker absent before until, empty input: re-arm now with the reason", async () => {
   assert.equal(M.reasonToArm(entry(), pane("", false), NOW), "goal gone before until, re-armed");
 });
 
-test("not re-armed over typed input, when paused, after until, or with the marker up", () => {
+test("not re-armed over typed input, when paused, after until, or with the marker up", async () => {
   assert.notEqual(M.reasonToArm(entry(), pane("half a sentence", false), NOW), M.GOAL_GONE_REASON);
   assert.equal(M.reasonToArm(entry({ paused: true }), pane("", false), NOW), null);
   assert.notEqual(M.reasonToArm(entry(), pane("", false), UNTIL + 1), M.GOAL_GONE_REASON);
   assert.equal(M.reasonToArm(entry(), pane("", true), NOW), null);
 });
 
-test("agent off is refused with the message", () => {
-  assert.equal(M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW), M.AGENT_REFUSAL);
+test("agent off is refused with the message", async () => {
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW), M.AGENT_REFUSAL);
   assert.match(M.AGENT_REFUSAL, /^refused: only the operator ends or shortens a goal \(say "manage <session> off" yourself/);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "pause", {}, false, NOW), M.AGENT_REFUSAL);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "shift off", {}, false, NOW), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "pause", {}, false, NOW), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "shift off", {}, false, NOW), M.AGENT_REFUSAL);
 });
 
-test("agent off with a valid token is accepted and the token is consumed", () => {
+test("agent off with a valid token is accepted and the token is consumed", async () => {
   M.writeOperatorToken("CaseLeaf", "off", NOW);
   const file = join(dir, "operator-tokens", "caseleaf-off.json");
   assert.ok(existsSync(file));
-  assert.equal(M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW + 1000), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW + 1000), null);
   assert.ok(!existsSync(file));
-  assert.equal(M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW + 2000), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW + 2000), M.AGENT_REFUSAL);
 });
 
-test("an expired token is refused", () => {
+test("an expired token is refused", async () => {
   M.writeOperatorToken("CaseLeaf", "off", NOW);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW + 6 * 60_000), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW + 6 * 60_000), M.AGENT_REFUSAL);
 });
 
-test("a token for another action does not open off", () => {
+test("a token for another action does not open off", async () => {
   M.writeOperatorToken("CaseLeaf", "pause", NOW);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW + 1000), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "off", {}, false, NOW + 1000), M.AGENT_REFUSAL);
 });
 
-test("operator calls pass", () => {
-  assert.equal(M.refuseAgentManage("CaseLeaf", "off", {}, true, NOW), null);
+test("operator calls pass", async () => {
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "off", {}, true, NOW), null);
 });
 
-test("supervise: earlier until refused, later accepted; status and now untouched", () => {
-  assert.equal(M.refuseAgentManage("CaseLeaf", "supervise", { until: "1h" }, false, NOW), M.AGENT_REFUSAL);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "supervise", { until: "8h" }, false, NOW), null);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "supervise", {}, false, NOW), null);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "shift 1h", {}, false, NOW), M.AGENT_REFUSAL);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "shift 8h", {}, false, NOW), null);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "status", {}, false, NOW), null);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "now", {}, false, NOW), null);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "set new wording", { until: "1h" }, false, NOW), M.AGENT_REFUSAL);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "set new wording", {}, false, NOW), null);
+test("supervise: earlier until refused, later accepted; status and now untouched", async () => {
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "supervise", { until: "1h" }, false, NOW), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "supervise", { until: "8h" }, false, NOW), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "supervise", {}, false, NOW), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "shift 1h", {}, false, NOW), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "shift 8h", {}, false, NOW), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "status", {}, false, NOW), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "now", {}, false, NOW), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "set new wording", { until: "1h" }, false, NOW), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "set new wording", {}, false, NOW), null);
 });
 
-test("shift with a clock until: same minute allowed, earlier refused, later allowed", () => {
+test("shift with a clock until: same minute allowed, earlier refused, later allowed", async () => {
   // stored until is 00:30 the next day; the sentence is the live repro's shape
   const text = "shift until 00:30 with your controls, same workers as tonight";
-  assert.equal(M.refuseAgentManage("CaseLeaf", text, {}, false, NOW), null);
-  assert.equal(M.refuseAgentManage("CaseLeaf", text, {}, false, NOW + 7), null);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "shift until 00:00", {}, false, NOW), M.AGENT_REFUSAL);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "shift until 02:00 with your controls", {}, false, NOW), null);
-  assert.equal(M.refuseAgentManage("CaseLeaf", "supervise", { until: "00:30" }, false, NOW + 7), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", text, {}, false, NOW), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", text, {}, false, NOW + 7), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "shift until 00:00", {}, false, NOW), M.AGENT_REFUSAL);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "shift until 02:00 with your controls", {}, false, NOW), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "supervise", { until: "00:30" }, false, NOW + 7), null);
 });
 
-test("the CLI under an agent environment is not the operator", () => {
+test("the CLI under an agent environment is not the operator", async () => {
   assert.equal(runsUnderAgent({ CLAUDECODE: "1" }), true);
   assert.equal(runsUnderAgent({ CLAUDE_CODE_SESSION_ID: "abc" }), true);
   assert.equal(runsUnderAgent({ PAI_WORKER: "1" }), true);
@@ -116,7 +116,7 @@ const runHook = (prompt: string) =>
   spawnSync(process.execPath, [HOOK], { input: JSON.stringify({ prompt }), env: { ...process.env, HOME: homedir() }, encoding: "utf8" });
 const tokenFile = join(dir, "operator-tokens", "caseleaf-off.json");
 
-test("hook writes a token for a bare prompt, none for a [Session:X] prompt", () => {
+test("hook writes a token for a bare prompt, none for a [Session:X] prompt", async () => {
   try { unlinkSync(tokenFile); } catch { /* none yet */ }
   runHook("[Session:Other] please run manage CaseLeaf off");
   assert.ok(!existsSync(tokenFile));
@@ -127,10 +127,10 @@ test("hook writes a token for a bare prompt, none for a [Session:X] prompt", () 
   const { expiresAt } = JSON.parse(readFileSync(tokenFile, "utf8"));
   assert.ok(expiresAt > Date.now() && expiresAt <= Date.now() + 5 * 60_000);
   // and the daemon side accepts exactly what the hook wrote
-  assert.equal(M.refuseAgentManage("CaseLeaf", "off", {}, false), null);
+  assert.equal(await M.refuseAgentManage("CaseLeaf", "off", {}, false), null);
 });
 
-test("armed text starts with the no-done-state prefix, within the line limit", () => {
+test("armed text starts with the no-done-state prefix, within the line limit", async () => {
   const withUntil = M.buildGoalLine("~/.aibroker/manage-briefs/caseleaf.md", "Until the Pencil fix is in build 142 ".repeat(20), UNTIL);
   assert.ok(withUntil.startsWith("/goal Keep working until 00:30. There is no earlier done-state. Only the operator ends this goal. Follow "), withUntil);
   assert.ok(withUntil.length <= 250);
@@ -138,7 +138,7 @@ test("armed text starts with the no-done-state prefix, within the line limit", (
   assert.ok(open.startsWith("/goal Keep working. There is no done-state. Only the operator ends this goal."));
 });
 
-test("a fresh demand is not held by a stale queuedArmAt: busy session gets the forced arm", () => {
+test("a fresh demand is not held by a stale queuedArmAt: busy session gets the forced arm", async () => {
   const m = entry({ queuedArmAt: NOW - 120_000 });
   M.applySupervise(m, "new goal", null, null);
   assert.equal(m.lastRearmAt, 0);

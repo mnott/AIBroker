@@ -803,7 +803,7 @@ export function saveState(s: State): void {
   } catch (e) {
     log(`[manage] could not save state — ${(e as Error).message}`);
   }
-  for (const m of Object.values(s)) mirrorToRepo(m);
+  for (const m of Object.values(s)) void mirrorToRepo(m);
 }
 
 /**
@@ -825,14 +825,14 @@ export function saveState(s: State): void {
  * agent to open the repository, possibly on another machine, possibly weeks
  * later. It should not need this program to make sense of what it finds.
  */
-function mirrorToRepo(m: ManagedSession): void {
+async function mirrorToRepo(m: ManagedSession): Promise<void> {
   try {
     // Resolve the pane NOW rather than trusting one recorded at creation.
     // A field captured once is a field that is absent on every record made
     // before it existed and wrong for any session that has since moved — and
     // both of those fail silently, which is how a mirror stops mirroring
     // without anybody noticing.
-    const tty = m.tty ?? snapshotTty(m.sessionId);
+    const tty = m.tty ?? await snapshotTty(m.sessionId);
     const proc = tty ? processReading(tty) : { isSession: false, pid: null };
     if (!proc.pid) return;
     const live = repoRootFor(proc.pid, proc.uuid);
@@ -1286,8 +1286,8 @@ export function inputLineDecision(input: {
 }
 
 /** This session's context in thousands of tokens, from its own transcript. */
-function contextK(m: ManagedSession): number | null {
-  const tty = m.tty ?? snapshotTty(m.sessionId);
+async function contextK(m: ManagedSession): Promise<number | null> {
+  const tty = m.tty ?? (await snapshotTty(m.sessionId));
   const pid = tty ? processReading(tty).pid : null;
   return pid ? transcriptReading(pid).contextK : null;
 }
@@ -1446,8 +1446,8 @@ function handoverChanged(m: ManagedSession): boolean {
 }
 
 /** The pane device for a session, captured once at start. */
-function snapshotTty(sessionId: string): string | undefined {
-  return discoverLiveSessions().find((s) => s.id === sessionId)?.tty;
+async function snapshotTty(sessionId: string): Promise<string | undefined> {
+  return (await discoverLiveSessions()).find((s) => s.id === sessionId)?.tty;
 }
 
 /** The checkout a process is sitting in, or null if it is not in one. */
@@ -1458,8 +1458,8 @@ function snapshotTty(sessionId: string): string | undefined {
  * checkout is unknown gets no mirror at all, which is better than a mirror
  * written somewhere plausible.
  */
-function repoRootForSession(sessionId: string): string | undefined {
-  const tty = snapshotTty(sessionId);
+async function repoRootForSession(sessionId: string): Promise<string | undefined> {
+  const tty = await snapshotTty(sessionId);
   if (!tty) return undefined;
   const proc = processReading(tty);
   if (!proc.pid) return undefined;
@@ -1643,20 +1643,21 @@ function reportKey(m: ManagedSession, live: { id: string; aibrokerId?: string | 
  * One report row per managed session, de-duplicated by stable session identity:
  * three records viewing one live session produce ONE row.
  */
-export function reportLines(
+export async function reportLines(
   managed: ManagedSession[],
   armingsSince: Map<string, number>,
   now: number,
-  kOf: (m: ManagedSession) => number | null = contextK,
-  live: { id: string; aibrokerId?: string | null; attachUuid?: string }[] = discoverLiveSessions(),
-): string[] {
+  kOf: (m: ManagedSession) => number | null | Promise<number | null> = contextK,
+  live?: { id: string; aibrokerId?: string | null; attachUuid?: string }[],
+): Promise<string[]> {
+  live ??= await discoverLiveSessions();
   const mins = Math.round(REPORT_EVERY_MS / 60_000);
-  const rows = managed
+  const rows = await Promise.all(managed
     .filter((m) => !m.paused)
-    .map((m) => {
+    .map(async (m) => {
       const armings = armingsSince.get(m.sessionId) ?? 0;
       armingsSince.set(m.sessionId, 0);
-      const k = kOf(m);
+      const k = await kOf(m);
       const quietFor = Math.round((now - m.lastChangeAt) / 60_000);
       const doing = quietFor >= 2 ? `quiet for ${quietFor} min` : "working";
       const last = m.history.at(-1);
@@ -1666,7 +1667,7 @@ export function reportLines(
         `, ${armings} arming${armings === 1 ? "" : "s"} in ${mins} min` +
         (last ? `\n  last: ${last.what.slice(0, 110)}` : "");
       return { key: reportKey(m, live), row };
-    });
+    }));
   return dedupeReportRows(rows);
 }
 
@@ -1682,8 +1683,8 @@ export function reportLines(
  * produced only on an explicit ask: `manage status` / the MCP status call.
  * The tick no longer sends anything.
  */
-export function managerReportText(managed: ManagedSession[] = Object.values(state), now = Date.now()): string {
-  const lines = reportLines(managed, armingsSinceReport, now);
+export async function managerReportText(managed: ManagedSession[] = Object.values(state), now = Date.now()): Promise<string> {
+  const lines = await reportLines(managed, armingsSinceReport, now);
   if (lines.length === 0) return "no sessions are being managed";
   return `Manager report\n${lines.join("\n")}`;
 }
@@ -1694,8 +1695,8 @@ export function managerReportText(managed: ManagedSession[] = Object.values(stat
  * The hook knows the working directory and the terminal session; a person
  * knows the name. Both have to land on the same record.
  */
-export function resolveSession(idOrName: string): { sessionId: string; name: string } | null {
-  const live = discoverLiveSessions();
+export async function resolveSession(idOrName: string): Promise<{ sessionId: string; name: string } | null> {
+  const live = await discoverLiveSessions();
   // The terminal's own id may arrive as "w3t1p0:UUID"; the pane is the UUID.
   const id = idOrName.includes(":") ? (idOrName.split(":").pop() ?? idOrName) : idOrName;
   const byId = live.find((s) => s.id === id || s.aibrokerId === id);
@@ -2207,8 +2208,8 @@ function fmtAge(ms: number): string {
   return s < 90 ? `${s}s` : `${Math.round(s / 60)} min`;
 }
 
-function liveReading(sessionId: string, idleSec: number, m?: ManagedSession): string {
-  const snap = discoverLiveSessions().find((s) => s.id === sessionId);
+async function liveReading(sessionId: string, idleSec: number, m?: ManagedSession): Promise<string> {
+  const snap = (await discoverLiveSessions()).find((s) => s.id === sessionId);
   const proc = snap?.tty ? processReading(snap.tty) : { isSession: false, pid: null };
 
   if (!proc.isSession) {
@@ -2260,7 +2261,7 @@ function liveReading(sessionId: string, idleSec: number, m?: ManagedSession): st
     out.push(`  a session is running, but its transcript could not be read — falling back to the screen`);
   }
 
-  const content = readPane(sessionId);
+  const content = await readPane(sessionId);
   if (GOAL_ACTIVE.test(content)) {
     out.push(`  goal marker present on screen (a proxy — it lingers after a goal is met)`);
   }
@@ -2708,16 +2709,16 @@ function consumeToken(sessions: string[], action: string, now: number): boolean 
  * ponytail: a process that writes the daemon socket directly can still claim
  * `operator`; the socket is local-user trust, tighten with a peer credential.
  */
-export function refuseAgentManage(
+export async function refuseAgentManage(
   sessionIdOrName: string,
   rawArg: string,
   opts: { until?: string },
   operator: boolean,
   now = Date.now(),
-): string | null {
+): Promise<string | null> {
   if (operator) return null;
   const arg = rawArg.trim().toLowerCase();
-  const resolved = resolveSession(sessionIdOrName);
+  const resolved = await resolveSession(sessionIdOrName);
   const cur = resolved ? state[resolved.sessionId]?.shift?.until : undefined;
   const names = [sessionIdOrName, resolved?.name ?? ""];
 
@@ -2846,16 +2847,16 @@ const hhmm = (t: number) => {
 };
 
 /** One block for every managed session: name, goal, until, next due, context, last handover, state. */
-export function statusLines(
+export async function statusLines(
   sessions: ManagedSession[],
   now: number,
-  kOf: (m: ManagedSession) => number | null = () => null,
-): string[] {
+  kOf: (m: ManagedSession) => number | null | Promise<number | null> = () => null,
+): Promise<string[]> {
   if (sessions.length === 0) return ["no sessions are being managed"];
-  return sessions.map((m) => {
+  return Promise.all(sessions.map(async (m) => {
     const goal = oneLine(m.objective);
     const due = nextDueAt(m);
-    const k = kOf(m);
+    const k = await kOf(m);
     const pct = k !== null ? Math.round((k / (m.contextWindowK ?? 1000)) * 100) : null;
     const state = m.paused ? "paused" : m.shift ? (m.shift.plain ? "supervised" : "shift") : "on";
     return [
@@ -2867,7 +2868,7 @@ export function statusLines(
       `handover: ${m.handoverDoneAt ? hhmm(m.handoverDoneAt) : "-"}`,
       state,
     ].join(" | ");
-  });
+  }));
 }
 
 /**
@@ -3112,9 +3113,9 @@ async function readPaneAsync(sessionId: string, opts: { fresh?: boolean } = {}):
   }
 }
 
-function readPane(sessionId: string, opts: { fresh?: boolean } = {}): string {
+async function readPane(sessionId: string, opts: { fresh?: boolean } = {}): Promise<string> {
   try {
-    return readSessionContent(sessionId, 60, opts)?.content ?? "";
+    return (await readSessionContent(sessionId, 60, opts))?.content ?? "";
   } catch {
     return "";
   }
@@ -3305,7 +3306,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   if (onLine) {
     note(m, `arm replaces the input line: clearing "${onLine.slice(0, 60)}" (${onLine.length} chars) before typing (${reason})`);
     const clear = await clearLineUntilEmpty({
-      send: () => sendControlU(m.sessionId),
+      send: async () => { await sendControlU(m.sessionId); },
       read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
       sleep,
     });
@@ -3330,7 +3331,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   if (onLineNow) {
     note(m, `arm: ${onLineNow.length} chars on the line just before typing — clearing again before the paste`);
     const secondClear = await clearLineUntilEmpty({
-      send: () => sendControlU(m.sessionId),
+      send: async () => { await sendControlU(m.sessionId); },
       read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
       sleep,
     });
@@ -3364,9 +3365,9 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   //      busy session (the goal text below queues harmlessly behind it) —
   //      it is specifically the escape sequence that is not safe there.
   if (armIdle && needsVimEscape(preTypePane)) {
-    escapeInputMode(m.sessionId);
+    await escapeInputMode(m.sessionId);
   }
-  if (!pasteTextIntoSession(m.sessionId, text)) {
+  if (!await pasteTextIntoSession(m.sessionId, text)) {
     note(m, `could not type into the session (${reason}) — will retry`);
     return "failed";
   }
@@ -3375,7 +3376,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
     sleep,
   });
   if (!typedLineMatches(echoedLine, text)) {
-    sendControlU(m.sessionId);
+    await sendControlU(m.sessionId);
     await sleep(300);
     const left = promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "";
     note(
@@ -3384,7 +3385,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
     );
     return "failed";
   }
-  sendEnterKey(m.sessionId);
+  await sendEnterKey(m.sessionId);
 
   // Typed is not sent, and sent is not received.
   const landed = await confirmArmed(text, {
@@ -4024,7 +4025,7 @@ async function tick(now = Date.now()): Promise<void> {
       m.noScreen = !wasOff;
       if (m.noScreen) delete m.screenSince;
       else m.screenSince = now;
-      typeIntoSession(
+      await typeIntoSession(
         m.sessionId,
         m.noScreen
           ? "The time you had the screen for is up — my controls. The operator may be back at the machine, so stop screen and pointer work now, write down how far you got and what still needs checking on screen, and carry on with everything that does not need it."
@@ -4091,7 +4092,7 @@ async function tick(now = Date.now()): Promise<void> {
          */
         logOnly(m, "handover written — leaving the session to compact on its own rather than clearing it");
         m.handoverDoneAt = now;
-        m.handoverDoneK = contextK(m) ?? undefined;
+        m.handoverDoneK = (await contextK(m)) ?? undefined;
         delete m.handoverAskedAt;
         delete m.handoverWas;
         delete m.handoverAskedPath;
@@ -4126,10 +4127,10 @@ async function tick(now = Date.now()): Promise<void> {
             continue;
           }
           logOnly(m, "handover written — asking it to clear");
-          typeIntoSession(m.sessionId, "/clear");
+          await typeIntoSession(m.sessionId, "/clear");
           m.clearTypedAt = now;
           m.clearPendingSince = now;
-          m.contextAtClear = contextK(m) ?? undefined;
+          m.contextAtClear = (await contextK(m)) ?? undefined;
           dirty = true;
           continue;
         }
@@ -4166,7 +4167,7 @@ async function tick(now = Date.now()): Promise<void> {
          * decides, and the number is reported beside it because it is useful
          * to read, not because it is being trusted.
          */
-        const nowK = contextK(m);
+        const nowK = await contextK(m);
         const fell = m.contextAtClear !== undefined && nowK !== null && nowK < m.contextAtClear / 2;
         if (CLEARED_BANNER.test(content) && !QUEUED_INPUT.test(content)) {
           logOnly(
@@ -4273,7 +4274,7 @@ async function tick(now = Date.now()): Promise<void> {
         // is a first request.
         const topUp = m.handoverDoneAt !== undefined && (decision.reason === "refresh" || decision.reason.startsWith("warm-up — work"));
         const urgent = decision.reason === "immediate";
-        typeIntoSession(
+        await typeIntoSession(
           m.sessionId,
           (urgent
             ? `URGENT — write your handover NOW. You are at ${used}k tokens and compaction is imminent; there is no time left to keep working first. `
@@ -4454,7 +4455,7 @@ async function tick(now = Date.now()): Promise<void> {
     }
     if (!reason && stopped && !m.paused && !over && now - (m.lastNudgeAt ?? 0) >= STOP_NUDGE_COOLDOWN_MS) {
       // Marker still up but the turn ended on nothing: nudge now, not at the lapse timer.
-      typeIntoSession(m.sessionId, NUDGE_TEXT);
+      await typeIntoSession(m.sessionId, NUDGE_TEXT);
       m.lastNudgeAt = now;
       note(m, `${STOPPED_REASON.replace("re-arming", "nudged to continue")}`);
       dirty = true;
@@ -4463,7 +4464,7 @@ async function tick(now = Date.now()): Promise<void> {
     if (!reason) {
       // Idle at an empty prompt past the `every` interval: a short nudge, not the full goal.
       if (nudgeDue(m, content, now)) {
-        typeIntoSession(m.sessionId, NUDGE_TEXT);
+        await typeIntoSession(m.sessionId, NUDGE_TEXT);
         m.lastNudgeAt = now;
         note(m, `idle ${m.nudgeEveryMin}+ min at an empty prompt — nudged to continue`);
         dirty = true;
@@ -4539,8 +4540,8 @@ export async function runTickForTest(now: number, entry: ManagedSession): Promis
  * transcript's "not running" reading, which the tick has. Guarded on a
  * reliable enumeration: a failed osascript must not empty the machine.
  */
-function dropGoneOnLoad(): void {
-  const live = discoverLiveSessions();
+async function dropGoneOnLoad(): Promise<void> {
+  const live = await discoverLiveSessions();
   if (!wasLastEnumerationReliable()) return;
   let dropped = 0;
   for (const m of Object.values(state)) {
@@ -4571,7 +4572,7 @@ export function renameManagedOwner(oldName: string, newName: string, dryRun: boo
 export function startManagerLoop(): void {
   if (timer) return;
   state = loadState();
-  dropGoneOnLoad();
+  void dropGoneOnLoad();
   const n = Object.keys(state).length;
   if (n) log(`[manage] resuming ${n} managed session${n > 1 ? "s" : ""}`);
   let skipLogged = false;
@@ -4632,7 +4633,7 @@ export async function handleManage(
   // single-session resolution, since "all" names no session. This is the
   // operator's ASK for the manager report: the only place it is ever produced.
   if (sessionIdOrName.trim().toLowerCase() === "all" && (!arg || arg.toLowerCase() === "status")) {
-    return { ok: true, message: managerReportText(Object.values(state), Date.now()) };
+    return { ok: true, message: await managerReportText(Object.values(state), Date.now()) };
   }
 
   /**
@@ -4655,7 +4656,7 @@ export async function handleManage(
     }
   }
 
-  const resolved = resolveSession(sessionIdOrName);
+  const resolved = await resolveSession(sessionIdOrName);
   if (!resolved) return { ok: false, message: `no live session matches "${sessionIdOrName}"` };
 
   const { sessionId, name } = resolved;
@@ -4683,7 +4684,7 @@ export async function handleManage(
     return {
       ok: true,
       managed: true,
-      message: `${name} is supervised${until !== null ? ` until ${hhmm(until)}` : ""}${m.nudgeEveryMin ? `, nudged after ${m.nudgeEveryMin} min idle` : ""}.${goal ? "\n  arm pending, next tick (not typed yet; typed at once when idle, queued behind the running turn when busy)." : ""}\n  ${statusLines([m], Date.now(), contextK)[0]}`,
+      message: `${name} is supervised${until !== null ? ` until ${hhmm(until)}` : ""}${m.nudgeEveryMin ? `, nudged after ${m.nudgeEveryMin} min idle` : ""}.${goal ? "\n  arm pending, next tick (not typed yet; typed at once when idle, queued behind the running turn when busy)." : ""}\n  ${(await statusLines([m], Date.now(), contextK))[0]}`,
     };
   }
 
@@ -4935,7 +4936,7 @@ export async function handleManage(
         `managing ${name}${existing.paused ? " (paused)" : ""}\n` +
         `objective: ${existing.objective}\n` +
         `\nright now:\n` +
-        liveReading(sessionId, idle, existing) +
+        (await liveReading(sessionId, idle, existing)) +
         // Who holds the screen belongs in the live reading, not in the
         // manager's own record: it is a fact about the machine right now, and
         // it is the one a watcher cannot get any other way.
@@ -5087,10 +5088,10 @@ export async function handleManage(
         "Write into your notes exactly how far you got and what still needs verifying on screen, in enough detail that somebody can resume it cold — that record is the only thing being asked of the work you are abandoning. " +
         "Then KEEP WORKING on everything that does not need the screen: reading code, diagnosing, writing, tests, notes. There is plenty of that. " +
         "Do not stop and do not wait. The screen comes back to you when you are told the controls are yours again.";
-      typeIntoSession(sessionId, msg);
+      await typeIntoSession(sessionId, msg);
       note(existing, "hands off — screen work stopped, non-visual work continues");
     } else {
-      typeIntoSession(sessionId, "your controls. The screen is yours again — you may resume visual work where your notes left it.");
+      await typeIntoSession(sessionId, "your controls. The screen is yours again — you may resume visual work where your notes left it.");
       note(existing, "hands on — screen work permitted again");
     }
     saveState(state);
@@ -5151,7 +5152,7 @@ export async function handleManage(
      * input line trades a certain wrong file for a possible retyped sentence.
      */
     if (previous && previous !== path) {
-      typeIntoSession(
+      await typeIntoSession(
         sessionId,
         `Your handover file has moved: write it to ${resolved} from now on, not ${resolveHandoverPath(previous)}. ` +
           (existsSync(resolved)
@@ -5239,7 +5240,7 @@ export async function handleManage(
    */
   if (word === "clear-line") {
     const clear = await clearLineUntilEmpty({
-      send: () => sendControlU(sessionId),
+      send: async () => { await sendControlU(sessionId); },
       read: async () => promptUnsentText(await readPaneAsync(sessionId, { fresh: true })) ?? "",
       sleep,
     });
@@ -5278,7 +5279,7 @@ export async function handleManage(
      * but idle session. Only a title that names no session (see isClaudePane)
      * is a shell to refuse.
      */
-    const probe = readSessionContent(sessionId, 5);
+    const probe = await readSessionContent(sessionId, 5);
     if (probe?.atPrompt && !isClaudePane(probe.name)) {
       return {
         ok: false,
@@ -5302,12 +5303,12 @@ export async function handleManage(
       // gone, and 0 arms on the very next tick.
       lastRearmAt: 0,
       lastChangeAt: Date.now(),
-      lastHash: hash(readPane(sessionId)),
-      tty: snapshotTty(sessionId),
+      lastHash: hash(await readPane(sessionId)),
+      tty: await snapshotTty(sessionId),
       paused: false,
       // Pinned here so every later write goes to the checkout this session was
       // started in, whatever the pane does afterwards.
-      repoRoot: repoRootForSession(sessionId),
+      repoRoot: await repoRootForSession(sessionId),
       startedAt: Date.now(),
     };
     state[sessionId] = m;

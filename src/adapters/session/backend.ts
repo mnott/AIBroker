@@ -41,7 +41,7 @@ export class SessionBackend implements Backend {
       return undefined;
     }
 
-    const ok = typeIntoSession(targetItermId, message);
+    const ok = await typeIntoSession(targetItermId, message);
     if (!ok) {
       log(`SessionBackend: failed to type into session ${targetItermId}`);
     }

@@ -6,10 +6,11 @@
  * hub logic drive tmux (headless / Linux / SSH) or, later, a pty-owned process,
  * without the rest of the daemon knowing which host it's talking to.
  *
- * Methods are SYNCHRONOUS on purpose: the daemon's existing iTerm path already
- * blocks on `spawnSync` osascript, and the call sites (snapshot enumeration,
- * message delivery) are written synchronously across the codebase. Keeping the
- * same shape makes the iTerm→transport swap a drop-in with no async refactor.
+ * Methods are ASYNC: the iTerm path runs osascript as an awaited child (a sync
+ * `spawnSync` there froze the daemon's whole event loop for ~30 s at a time when
+ * iTerm wedged — 2026-11-17 — stalling IPC, MQTT keep-alives and the mailbox),
+ * so no host call may block. tmux implements the same shape with awaited
+ * children; both stay responsive while the other host hangs.
  *
  * Zero transport-specific imports here — implementations live in sibling files.
  */
@@ -77,24 +78,24 @@ export interface SendOptions {
 export interface SessionTransport {
   readonly kind: TransportKind;
   /** Cheap probe: is this host present/usable right now? */
-  isAvailable(): boolean;
+  isAvailable(): Promise<boolean>;
   /** Enumerate all sessions this transport can see. */
-  listSessions(): ManagedSession[];
+  listSessions(): Promise<ManagedSession[]>;
   /**
    * Inject text into a session. On tmux this is `send-keys -l` then a SEPARATE `Enter`
    * (the one-command-text / one-command-enter rule), with verify+retry because bare
    * combined sends are unreliable for Claude Code.
    */
-  sendText(id: string, text: string, opts?: SendOptions): boolean;
+  sendText(id: string, text: string, opts?: SendOptions): Promise<boolean>;
   /** Read what the session is currently showing. `lines` includes scrollback when >visible. */
-  capture(id: string, lines?: number): string | null;
+  capture(id: string, lines?: number): Promise<string | null>;
   /** True when a foreground program is running (coarse: shell vs program). */
-  isBusy(id: string): boolean;
+  isBusy(id: string): Promise<boolean>;
   /** Set the session's title (used for the sticky paiName display). */
-  setTitle(id: string, title: string): boolean;
+  setTitle(id: string, title: string): Promise<boolean>;
   /**
    * Open a new Claude Code session in `opts.dir`. Returns null when the host
    * refused. iTerm implements it with the tab launcher `sessions restore` used.
    */
-  launch(opts: LaunchOptions): LaunchResult | null;
+  launch(opts: LaunchOptions): Promise<LaunchResult | null>;
 }

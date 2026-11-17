@@ -109,7 +109,7 @@ const hub = new WatcherClient(DAEMON_SOCKET);
 
 let _resolvedSessionId: string | undefined;
 
-function detectSessionId(): string | undefined {
+async function detectSessionId(): Promise<string | undefined> {
   // 1. Try ITERM_SESSION_ID from env (works if shell exports it)
   const envId = process.env.ITERM_SESSION_ID?.split(":")[1];
   if (envId) return envId;
@@ -135,12 +135,12 @@ function detectSessionId(): string | undefined {
 
     // 3. Ask iTerm which session owns this TTY
     // Use multiple -e flags since osascript doesn't handle \n in single -e strings
-    const result = runItermJxa(`  var tty = ${JSON.stringify(tty)};
+    const result = (await runItermJxa(`  var tty = ${JSON.stringify(tty)};
   var found = "";
   eachSession(function (s) {
     if (!found && s.tty() === tty) found = s.id();
   });
-  return found;`, 3_000)?.trim();
+  return found;`, 3_000))?.trim();
     return result || undefined;
   } catch {
     return undefined;
@@ -154,7 +154,7 @@ function detectSessionId(): string | undefined {
 // 1. ITERM_SESSION_ID env var (set by iTerm per tab)
 // 2. AIBP registration with hub (hub resolves identity)
 // 3. TTY detection (legacy — fragile but works on macOS)
-_resolvedSessionId = process.env.TMUX_PANE ?? process.env.ITERM_SESSION_ID?.split(":")[1] ?? detectSessionId();
+_resolvedSessionId = process.env.TMUX_PANE ?? process.env.ITERM_SESSION_ID?.split(":")[1] ?? await detectSessionId();
 
 async function registerWithAibp(): Promise<void> {
   // A worker child process inherits ITERM_SESSION_ID/TMUX_PANE from the pane

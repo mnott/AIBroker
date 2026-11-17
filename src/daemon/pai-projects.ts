@@ -520,7 +520,7 @@ export async function launchResolvedPaiProject(
   );
 
   // Open new iTerm2 tab and run the command
-  const itermSessionId = createClaudeSession(command);
+  const itermSessionId = await createClaudeSession(command);
   if (!itermSessionId) {
     throw new Error(`Failed to create iTerm2 tab for project "${name}" (iTerm would not open one, or the new tab was not at a shell prompt and was closed untouched)`);
   }
