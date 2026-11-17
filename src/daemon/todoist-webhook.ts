@@ -70,7 +70,7 @@ async function deliverA2A(session: string, text: string): Promise<{ delivered: b
     const { getAllPersistentSessionNames, lookupPersistentName } = await import("../core/persistence.js");
     const { depositToSessionMailbox } = await import("../core/state.js");
 
-    const snapshots = snapshotAllSessions();
+    const snapshots = await snapshotAllSessions();
     const names = getAllPersistentSessionNames();
     const candidates = snapshots.map((s) => ({ id: s.id, name: lookupPersistentName(names, s.id, s.aibrokerId) ?? s.name }));
     // A name can be answered by a stale shell tab next to its live holder —

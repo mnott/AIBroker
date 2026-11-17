@@ -129,7 +129,7 @@ export interface DispatchOptions {
  */
 export interface DispatchDeps {
   resolve: (name: string) => Promise<PaiProject | undefined>;
-  sessions: () => { id: string; name: string; paiName: string | null; isClaude?: boolean }[];
+  sessions: () => { id: string; name: string; paiName: string | null; isClaude?: boolean }[] | Promise<{ id: string; name: string; paiName: string | null; isClaude?: boolean }[]>;
   /**
    * Did `sessions()` actually enumerate, or fall back to `[]` after a failed
    * osascript call? An empty array means two different things and only this
@@ -151,7 +151,7 @@ export interface DispatchDeps {
    */
   todoistFetch?: typeof fetch;
   /** Read a session's screen, to confirm Claude still owns the tty. */
-  capture: (sessionId: string) => string | null;
+  capture: (sessionId: string) => string | null | Promise<string | null>;
   /** Wait between launch attempts; injectable so the retry is testable without real seconds. */
   sleep?: (ms: number) => Promise<void>;
   /** Clock for the shared budget; injectable so budget maths is testable. */
@@ -201,14 +201,14 @@ export {
  * same-name hits, a measured-Claude one first, and the caller works down the
  * list until a session answers.
  */
-export function findSessionsForProject(
+export async function findSessionsForProject(
   project: PaiProject,
   sessions: { id: string; name: string; paiName: string | null; isClaude?: boolean }[],
-): { id: string; label: string }[] {
+): Promise<{ id: string; label: string }[]> {
   // Exact and separator-folded only — never substring. A project called `sl`
   // would otherwise match any session whose title contains those letters, and
   // here a wrong match does not spawn, it delivers work to the wrong session.
-  return matchAllSessions(
+  return (await matchAllSessions(
     [project.displayName, project.name, project.slug, ...project.names],
     sessions,
     {
@@ -217,20 +217,20 @@ export function findSessionsForProject(
       // tie broken by enumeration order, which is the old single-hit behavior.
       prefer: (s) => (s.isClaude === true ? 2 : s.isClaude === false ? 0 : 1),
     },
-  ).map((h) => ({ id: h.session.id, label: h.label }));
+  )).map((h) => ({ id: h.session.id, label: h.label }));
 }
 
 /** The single best session for `project` — see findSessionsForProject. */
-export function findSessionForProject(
+export async function findSessionForProject(
   project: PaiProject,
   sessions: { id: string; name: string; paiName: string | null; isClaude?: boolean }[],
-): { id: string; label: string } | null {
-  return findSessionsForProject(project, sessions)[0] ?? null;
+): Promise<{ id: string; label: string } | null> {
+  return (await findSessionsForProject(project, sessions))[0] ?? null;
 }
 
 /** Enumerate live sessions with their persistent (PAI) names resolved. */
-function liveSessions(): { id: string; name: string; paiName: string | null; isClaude?: boolean }[] {
-  const snaps = snapshotAllSessions();
+async function liveSessions(): Promise<{ id: string; name: string; paiName: string | null; isClaude?: boolean }[]> {
+  const snaps = await snapshotAllSessions();
   const persistent = getAllPersistentSessionNames();
   return snaps.map((s) => ({
     id: s.id,
@@ -270,7 +270,7 @@ export async function waitForReady(
   const deadline = io.now() + timeoutMs;
   while (io.now() < deadline) {
     await io.sleep(READY_POLL_MS);
-    const frame = io.capture(sessionId);
+    const frame = await io.capture(sessionId);
     if (frame === null) continue;
     if (isClaudeReady(frame) && isInputBoxEmpty(frame)) return true;
   }
@@ -297,7 +297,7 @@ export async function submitAndConfirm(
   io: TerminalIO = realIO,
   retries = 3,
 ): Promise<AckResult> {
-  if (io.capture(sessionId) === null) return "unreadable";
+  if (await io.capture(sessionId) === null) return "unreadable";
 
   // A short distinctive slice: long bodies wrap and get truncated on screen.
   const needle = flatten(body.split("\n").find((l) => l.trim().length > 0) ?? body).slice(0, 48);
@@ -317,7 +317,7 @@ export async function submitAndConfirm(
     const deadline = Math.min(overallDeadline, io.now() + perAttempt);
     while (io.now() < deadline) {
       await io.sleep(500);
-      const frame = io.capture(sessionId);
+      const frame = await io.capture(sessionId);
       if (frame === null) continue;
       if (hasBeenSubmitted(frame, needle)) return "ok";
     }
@@ -388,10 +388,10 @@ export async function dispatch(
   // called "PAI" / "Home" is idle and waiting. Match the name against the
   // running sessions (case- and separator-insensitively) before any verdict
   // that would launch or give up.
-  const ownerHits = matchAllSessions([projectName], deps.sessions(), {
+  const ownerHits = (await matchAllSessions([projectName], await deps.sessions(), {
     kinds: ["exact", "normalised"],
     prefer: (s) => (s.isClaude === true ? 2 : s.isClaude === false ? 0 : 1),
-  }).map((h) => ({ id: h.session.id, label: h.label }));
+  })).map((h) => ({ id: h.session.id, label: h.label }));
   if (!project && ownerHits.length === 0) {
     if (curatedRegistryEmpty()) {
       return {
@@ -423,7 +423,7 @@ export async function dispatch(
   const body = `${opts.prefix ?? TASK_PREFIX} ${message}`;
 
   // ── already running? ──
-  const candidates = [...(project ? findSessionsForProject(project, deps.sessions()) : [])];
+  const candidates = [...(project ? await findSessionsForProject(project, await deps.sessions()) : [])];
   for (const h of ownerHits) if (!candidates.some((c) => c.id === h.id)) candidates.push(h);
   const existing = candidates[0] ?? null;
   if (existing) {
@@ -451,7 +451,7 @@ export async function dispatch(
     let ready: { id: string; label: string } | null = null;
     let sawShell: { id: string; label: string } | null = null;
     for (const c of candidates) {
-      const frame = deps.capture(c.id);
+      const frame = await deps.capture(c.id);
       if (frame === null) continue; // unreadable: not evidence either way
       if (isClaudeReady(frame)) { ready = c; break; }
       sawShell ??= c;

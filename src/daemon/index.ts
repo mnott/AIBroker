@@ -12,6 +12,7 @@ import { writePrivate } from "../core/private-file.js";
 import { terminalPluginId } from "../transport/policy.js";
 import { randomUUID } from "node:crypto";
 import { setLogPrefix, log } from "../core/log.js";
+import { startLagMonitor } from "../core/event-loop-lag.js";
 import { extForMime } from "../core/mime.js";
 import { discoverLiveSessions, isClaudeRelated } from "../core/session-discovery.js";
 import { loadEnvFile } from "../core/env.js";
@@ -97,6 +98,9 @@ export async function startDaemon(options?: {
   socketPath?: string;
 }): Promise<void> {
   setLogPrefix("aibroker");
+  // Witness for a blocked event loop: logs "event loop blocked N ms" when the
+  // worst timer gap exceeds 1 s (the 2026-11-17 freeze left no trace of its stalls).
+  startLagMonitor();
   const appDir = options?.appDir ?? join(homedir(), ".aibroker");
   const socketPath = options?.socketPath ?? DAEMON_SOCKET_PATH;
 
@@ -537,7 +541,7 @@ export async function startDaemon(options?: {
     }
 
     // Text/voice/image from app — route through AIBP bridge (same as WS path)
-    let routeSession = liveSession(sessionId || undefined);
+    let routeSession = await liveSession(sessionId || undefined);
     if (!routeSession) {
       log(`[MQTT→Hub] no sessionId in inbound ${type} message — dropping`);
       return;

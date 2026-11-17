@@ -85,18 +85,18 @@ export async function readSessionContentAsync(
   const fetchLines = Math.max(lines, MIN_CACHE_LINES);
   const result = routeToTmux(sessionId)
     ? await readTmuxContent(sessionId, fetchLines)
-    : parseItermContent(sessionId, await _internal.runItermJxaAsync(itermReadScript(sessionId, fetchLines)));
+    : parseItermContent(sessionId, await _internal.runItermJxa(itermReadScript(sessionId, fetchLines)));
   cache.set(sessionId, { at: Date.now(), lines: fetchLines, result });
   return result ? sliceToLines(result, lines) : null;
 }
 
 /** tmux path: `capture-pane -p -J -S -<lines>` through the transport, no AppleScript. */
 async function readTmuxContent(sessionId: string, lines: number): Promise<SessionContent | null> {
-  const raw = timeCall("session-content:read", () => captureSession(sessionId, lines));
+  const raw = await timeCall("session-content:read", () => captureSession(sessionId, lines));
   if (raw === null) return null;
   // capture-pane pads the visible area with blank rows; they are not content.
   const content = raw.replace(/\s+$/, "");
-  const snap = snapshotAllSessions().find((s) => s.id === sessionId);
+  const snap = (await snapshotAllSessions()).find((s) => s.id === sessionId);
   return {
     sessionId,
     name: snap?.name ?? sessionId,
@@ -111,7 +111,7 @@ async function readSessionContentUncached(sessionId: string, lines: number): Pro
   if (routeToTmux(sessionId)) return await readTmuxContent(sessionId, lines);
   // _internal indirection, as in core.ts's own enumeration, so tests can
   // replace the osascript call without mocking node:child_process.
-  return parseItermContent(sessionId, timeCall("session-content:read", () => _internal.runItermJxa(itermReadScript(sessionId, lines))));
+  return parseItermContent(sessionId, await timeCall("session-content:read", () => _internal.runItermJxa(itermReadScript(sessionId, lines))));
 }
 
 /** JXA: contents, name, atPrompt for one session; the tail is cut inside osascript so only `lines` cross the pipe. */

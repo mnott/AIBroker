@@ -118,8 +118,15 @@ function spawnOsascriptAsync(args: string[], script: string, timeoutMs: number):
     const err: Buffer[] = [];
     let timedOut = false;
     let settled = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, timeoutMs);
-    const done = (status: number | null, signal: string | null, error?: Error) => {
+    // On timeout: SIGKILL and answer NOW. Waiting for "close" would hang on a child
+    // (or grandchild) still holding the stdio pipes open - the very wedge guarded against.
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      child.stdout.destroy(); child.stderr.destroy();
+      done(null, "SIGKILL");
+    }, timeoutMs);
+    const done = (status: number | null, signal: string | null, error?: Error): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -301,7 +308,7 @@ export const runItermJxaAsync = runItermJxa;
  * transport wrapper, enumeration) read through this object rather than
  * importing the function directly.
  */
-export const _internal = { runAppleScript, runItermJxa, runItermJxaAsync, snapshotAllSessions };
+export const _internal = { runAppleScript, runItermJxa, snapshotAllSessions };
 
 export function stripItermPrefix(id: string | undefined): string | undefined {
   if (!id) return id;
@@ -695,7 +702,7 @@ async function snapshotAllSessionsUncached(): Promise<SessionSnapshot[]> {
   // 4.05s and every enumeration returned empty, killing all session features
   // at once. Budget generously — this is a correctness floor, not a latency
   // target, and a slow answer beats a confidently wrong empty one.
-  const result = await withEnumRetryAsync(() => _internal.runItermJxaAsync(ENUM_SCRIPT, 30_000));
+  const result = await withEnumRetryAsync(() => _internal.runItermJxa(ENUM_SCRIPT, 30_000));
   if (!result) {
     lastSnapshotOk = false;
     onEnumFailure(Date.now());

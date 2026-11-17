@@ -401,8 +401,8 @@ export type AckResult = "ok" | "no-ack" | "no-settle" | "unreadable";
 
 /** Injected so the ack state machine can be tested against a simulated terminal. */
 export interface SessionProbe {
-  capture: (id: string) => string | null;
-  send: (id: string, text: string) => void;
+  capture: (id: string) => string | null | Promise<string | null>;
+  send: (id: string, text: string) => void | Promise<void>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   onRetry?: (attempt: number, of: number) => void;
@@ -441,18 +441,18 @@ export async function sendVerified(
   opts: { timeoutMs: number; retries: number },
   probe: SessionProbe,
 ): Promise<AckResult> {
-  const before = probe.capture(sessionId);
+  const before = await probe.capture(sessionId);
   if (before === null) return "unreadable";
 
   let acked = false;
   for (let attempt = 1; attempt <= opts.retries && !acked; attempt++) {
-    probe.send(sessionId, message);
+    await probe.send(sessionId, message);
 
     const seen = new Set<string>([hash(before)]);
     const ackDeadline = probe.now() + Math.min(8000, opts.timeoutMs);
     while (probe.now() < ackDeadline) {
       await probe.sleep(POLL_MS);
-      const frame = probe.capture(sessionId);
+      const frame = await probe.capture(sessionId);
       if (frame !== null) seen.add(hash(frame));
       // seen includes the pre-send frame, so N transitions == N+1 members.
       if (seen.size > ACK_TRANSITIONS) { acked = true; break; }
@@ -463,11 +463,11 @@ export async function sendVerified(
 
   // Wait for the reply to finish rather than for any particular string.
   const settleDeadline = probe.now() + opts.timeoutMs;
-  let last = hash(probe.capture(sessionId) ?? "");
+  let last = hash((await probe.capture(sessionId)) ?? "");
   let still = 0;
   while (probe.now() < settleDeadline) {
     await probe.sleep(POLL_MS);
-    const cur = hash(probe.capture(sessionId) ?? "");
+    const cur = hash((await probe.capture(sessionId)) ?? "");
     if (cur === last) {
       if (++still >= SETTLE_TICKS) return "ok";
     } else {

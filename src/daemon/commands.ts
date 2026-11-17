@@ -113,7 +113,7 @@ export function createHubCommandHandler(): (
   // ── Session resolution ──
 
   async function ensureActiveSession(): Promise<string> {
-    const allSessions = getSessionList();
+    const allSessions = await getSessionList();
     const allSessionIds = new Set(allSessions.map((s) => s.id));
 
     for (const [sid, entry] of sessionRegistry) {
@@ -191,7 +191,7 @@ export function createHubCommandHandler(): (
       }
 
       // Refresh TTY cache and retry
-      const fresh = snapshotAllSessions();
+      const fresh = await snapshotAllSessions();
       updateSessionTtyCache(fresh);
       const freshTty = sessionTtyCache.get(resolvedId);
       if (freshTty) {
@@ -250,14 +250,14 @@ export function createHubCommandHandler(): (
 
     log(`${activeItermSessionId ? `Session ${activeItermSessionId} is not running Claude.` : "No cached session."} Searching for another...`);
 
-    const found = findClaudeSession();
+    const found = await findClaudeSession();
     if (found && await isClaudeRunningInSession(found)) {
       setActiveItermSessionId(found);
       if (await typeIntoSession(found, text)) return true;
     }
 
     log("No running Claude session found. Starting new one...");
-    const created = createClaudeSession();
+    const created = await createClaudeSession();
     if (created) {
       setActiveItermSessionId(created);
       if (await typeIntoSession(created, text)) return true;
@@ -269,8 +269,8 @@ export function createHubCommandHandler(): (
 
   // ── Terminal tab handling ──
 
-  function handleTerminal(command: string | null): void {
-    const newId = createTerminalTab(command ?? undefined);
+  async function handleTerminal(command: string | null): Promise<void> {
+    const newId = await createTerminalTab(command ?? undefined);
     if (newId) {
       managedSessions.set(newId, { name: command ?? "terminal", createdAt: Date.now() });
       setActiveItermSessionId(newId);
@@ -322,11 +322,11 @@ export function createHubCommandHandler(): (
     return p;
   }
 
-  function handleRelocate(targetPath: string): string | null {
+  async function handleRelocate(targetPath: string): Promise<string | null> {
     const command = `claude --dangerously-skip-permissions`;
     // Quoted: this reaches a shell, and a path with a space in it is ordinary.
     const quoted = `'${targetPath.replace(/'/g, "'\\''")}'`;
-    const newId = createClaudeSession(`cd ${quoted} && ${command}`);
+    const newId = await createClaudeSession(`cd ${quoted} && ${command}`);
     return newId;
   }
 
@@ -402,7 +402,7 @@ export function createHubCommandHandler(): (
         return;
       }
       {
-        const newSessionId = handleRelocate(targetPath);
+        const newSessionId = await handleRelocate(targetPath);
         if (newSessionId) {
           const name = basename(targetPath);
           if (hybridManager) {
@@ -420,7 +420,7 @@ export function createHubCommandHandler(): (
     if (trimmedText === "/sessions" || trimmedText === "/s") {
       if (hybridManager) {
         // Prune dead visual sessions before listing
-        const liveSnapshots = snapshotAllSessions();
+        const liveSnapshots = await snapshotAllSessions();
         const liveIds = listedLiveIds(liveSnapshots);
         hybridManager.pruneDeadVisualSessions(liveIds);
         const list = await hybridManager.formatSessionList();
@@ -429,7 +429,7 @@ export function createHubCommandHandler(): (
       }
 
       await ensureActiveSession();
-      const allSessions = cachedSessionList ?? getSessionList();
+      const allSessions = cachedSessionList ?? await getSessionList();
       if (allSessions.length === 0 && sessionRegistry.size === 0) {
         ctx.reply("No sessions found.").catch(() => {});
         return;
@@ -488,7 +488,7 @@ export function createHubCommandHandler(): (
         return;
       }
       const chosen = sessions[num - 1];
-      const focusResult = runItermJxa(withSessionJxa(
+      const focusResult = await runItermJxa(withSessionJxa(
         chosen.id,
         `          aSession.select();\n          return "focused";`,
         '"not_found"',
@@ -529,12 +529,12 @@ export function createHubCommandHandler(): (
 
     // --- /t [command] — open a raw terminal tab ---
     if (trimmedText === "/t" || trimmedText === "/terminal") {
-      handleTerminal(null);
+      await handleTerminal(null);
       return;
     }
     const terminalMatch = trimmedText.match(/^\/(?:t|terminal)\s+(.+)$/);
     if (terminalMatch) {
-      handleTerminal(terminalMatch[1].trim());
+      await handleTerminal(terminalMatch[1].trim());
       return;
     }
 
@@ -728,7 +728,7 @@ export function createHubCommandHandler(): (
     const restartMatch = trimmedText.match(/^\/(?:restart|r)\s+(\d+)$/);
     if (restartMatch) {
       const num = parseInt(restartMatch[1], 10);
-      const sessions = getSessionList();
+      const sessions = await getSessionList();
       if (sessions.length === 0) {
         ctx.reply("No sessions found.").catch(() => {});
         return;
@@ -760,7 +760,7 @@ export function createHubCommandHandler(): (
           return;
         }
         if (session.kind === "visual") {
-          const itermSessions = getSessionList();
+          const itermSessions = await getSessionList();
           const target = itermSessions.find(s => s.id === session.backendSessionId);
           if (target) {
             handleEndSessionVisual(target).catch((err) => log(`/e: error — ${err}`));
@@ -772,7 +772,7 @@ export function createHubCommandHandler(): (
         return;
       }
 
-      const sessions = getSessionList();
+      const sessions = await getSessionList();
       if (sessions.length === 0) {
         ctx.reply("No sessions found.").catch(() => {});
         return;
@@ -799,7 +799,7 @@ export function createHubCommandHandler(): (
       switch (sub) {
         case "status": {
           // Combined overview: sessions + plugins + adapters
-          const snapshots = snapshotAllSessions();
+          const snapshots = await snapshotAllSessions();
           const lines: string[] = ["*AIBP Status*", ""];
 
           // Sessions
@@ -1073,6 +1073,6 @@ export function createHubCommandHandler(): (
     }
 
     // Visual session — deliver to iTerm2
-    deliverMessage(textToDeliver, ctx.sessionId);
+    await deliverMessage(textToDeliver, ctx.sessionId);
   };
 }

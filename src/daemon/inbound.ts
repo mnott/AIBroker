@@ -852,7 +852,7 @@ async function attemptMessageDelivery(route: InboundRoute, body: string): Promis
   const { getAllPersistentSessionNames, lookupPersistentName } = await import("../core/persistence.js");
   const { depositToSessionMailbox } = await import("../core/state.js");
 
-  const snapshots = snapshotAllSessions();
+  const snapshots = await snapshotAllSessions();
   const names = getAllPersistentSessionNames();
   const candidates = snapshots.map((s) => ({
     id: s.id,

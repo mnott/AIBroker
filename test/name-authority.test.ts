@@ -120,11 +120,11 @@ function recordingWrites() {
   };
 }
 
-test("re-assert re-pins a diverged title, ignores benign decoration and unnamed sessions", () => {
+test("re-assert re-pins a diverged title, ignores benign decoration and unnamed sessions", async () => {
   setPersistentSessionName("na-a", "TaskBus");
   setPersistentSessionName("na-b", "Inbox");
   const { wrote, deps } = recordingWrites();
-  const repinned = reassertPersistentTitles({
+  const repinned = await reassertPersistentTitles({
     ...deps,
     sessions: [
       snapOf("na-a", "TaskBus-smooth-fiddle"), // auto-titled over the chosen name → re-pin
@@ -136,10 +136,10 @@ test("re-assert re-pins a diverged title, ignores benign decoration and unnamed 
   assert.deepEqual(wrote, ["var:na-a:TaskBus", "tab:na-a:TaskBus", "badge:na-a:TaskBus"]);
 });
 
-test("re-assert on a tmux-hosted pane retitles the pane and its iTerm viewer tab", () => {
+test("re-assert on a tmux-hosted pane retitles the pane and its iTerm viewer tab", async () => {
   setPersistentSessionName("na-tmux", "CaseNotes");
   const { wrote, deps } = recordingWrites();
-  const repinned = reassertPersistentTitles({
+  const repinned = await reassertPersistentTitles({
     ...deps,
     sessions: [snapOf("na-tmux", "CaseNotes-smooth-fiddle", "aid-1")],
   });
@@ -154,7 +154,7 @@ test("re-assert on a tmux-hosted pane retitles the pane and its iTerm viewer tab
 
 // ── auto paths may not displace a chosen name ──────────────────────────────
 
-test("an auto-generated name yields to a chosen one, and generates when there is none", () => {
+test("an auto-generated name yields to a chosen one, and generates when there is none", async () => {
   setPersistentSessionName("na-chosen", "ChosenName");
   assert.equal(autoTabName("na-chosen", "path-basename"), "ChosenName");
   assert.equal(autoTabName("na-never-named", "path-basename"), "path-basename");

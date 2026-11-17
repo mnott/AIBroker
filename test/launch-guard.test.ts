@@ -28,30 +28,30 @@ function stubAppleScript(result: string | null) {
   return () => { _internal.runItermJxa = original; };
 }
 
-test("createClaudeSession refuses a target that was not at a shell prompt", () => {
+test("createClaudeSession refuses a target that was not at a shell prompt", async () => {
   const restore = stubAppleScript("busy:F5EBF70A-16EC-4F83-AE79-3670AB764C9B");
   try {
-    const id = createClaudeSession("claude --name x");
+    const id = await createClaudeSession("claude --name x");
     assert.equal(id, null, "must not report success for a write it refused to make");
   } finally {
     restore();
   }
 });
 
-test("createClaudeSession returns the session id on a genuine fresh tab", () => {
+test("createClaudeSession returns the session id on a genuine fresh tab", async () => {
   const restore = stubAppleScript("F5EBF70A-16EC-4F83-AE79-3670AB764C9B");
   try {
-    const id = createClaudeSession("claude --name x");
+    const id = await createClaudeSession("claude --name x");
     assert.equal(id, "F5EBF70A-16EC-4F83-AE79-3670AB764C9B");
   } finally {
     restore();
   }
 });
 
-test("createTerminalTab refuses a busy target the same way", () => {
+test("createTerminalTab refuses a busy target the same way", async () => {
   const restore = stubAppleScript("busy:S1");
   try {
-    assert.equal(createTerminalTab("echo hi"), null);
+    assert.equal(await createTerminalTab("echo hi"), null);
   } finally {
     restore();
   }

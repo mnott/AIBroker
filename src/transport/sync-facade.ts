@@ -138,18 +138,18 @@ async function enumerateTransports(opts: { fresh?: boolean }, now: number): Prom
     const tmuxSessions = allowTmux ? await tmuxTransport.listSessions() : [];
     const itermSessions: SessionSnapshot[] = allowIterm ? await iterm.snapshotAllSessions(opts) : [];
     const viewers = allowIterm && tmuxSessions.length ? await tmuxTransport.attachedClientTtysAsync() : new Set<string>();
-    const rows = mergeTransports(itermSessions, tmuxSessions, () => viewers);
+    const rows = await mergeTransports(itermSessions, tmuxSessions, () => viewers);
     if (wasLastEnumerationReliable()) merged = { rows, at: Date.now(), epoch: iterm.snapshotCacheEpoch() };
     return rows;
   })().finally(() => { transportsInFlight = null; });
   return transportsInFlight;
 }
 
-function mergeTransports(
+async function mergeTransports(
   iterm: SessionSnapshot[],
   tmuxSessions: ManagedSession[],
   viewerTtysOf: () => Set<string>,
-): SessionSnapshot[] {
+): Promise<SessionSnapshot[]> {
   let itermSessions = iterm;
   if (allowIterm && tmuxSessions.length) {
     // De-dup nesting: an iTerm/Terminal tab running `tmux attach` is just a

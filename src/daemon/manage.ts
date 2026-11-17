@@ -832,7 +832,7 @@ async function mirrorToRepo(m: ManagedSession): Promise<void> {
     // before it existed and wrong for any session that has since moved — and
     // both of those fail silently, which is how a mirror stops mirroring
     // without anybody noticing.
-    const tty = m.tty ?? snapshotTty(m.sessionId);
+    const tty = m.tty ?? await snapshotTty(m.sessionId);
     const proc = tty ? processReading(tty) : { isSession: false, pid: null };
     if (!proc.pid) return;
     const live = repoRootFor(proc.pid, proc.uuid);
@@ -1643,17 +1643,18 @@ function reportKey(m: ManagedSession, live: { id: string; aibrokerId?: string | 
  * One report row per managed session, de-duplicated by stable session identity:
  * three records viewing one live session produce ONE row.
  */
-export function reportLines(
+export async function reportLines(
   managed: ManagedSession[],
   armingsSince: Map<string, number>,
   now: number,
   kOf: (m: ManagedSession) => number | null | Promise<number | null> = contextK,
   live?: { id: string; aibrokerId?: string | null; attachUuid?: string }[],
 ): Promise<string[]> {
+  live ??= await discoverLiveSessions();
   const mins = Math.round(REPORT_EVERY_MS / 60_000);
-  const rows = managed
+  const rows = await Promise.all(managed
     .filter((m) => !m.paused)
-    .map((m) => {
+    .map(async (m) => {
       const armings = armingsSince.get(m.sessionId) ?? 0;
       armingsSince.set(m.sessionId, 0);
       const k = await kOf(m);
@@ -1666,7 +1667,7 @@ export function reportLines(
         `, ${armings} arming${armings === 1 ? "" : "s"} in ${mins} min` +
         (last ? `\n  last: ${last.what.slice(0, 110)}` : "");
       return { key: reportKey(m, live), row };
-    });
+    }));
   return dedupeReportRows(rows);
 }
 
@@ -1682,8 +1683,8 @@ export function reportLines(
  * produced only on an explicit ask: `manage status` / the MCP status call.
  * The tick no longer sends anything.
  */
-export function managerReportText(managed: ManagedSession[] = Object.values(state), now = Date.now()): string {
-  const lines = reportLines(managed, armingsSinceReport, now);
+export async function managerReportText(managed: ManagedSession[] = Object.values(state), now = Date.now()): Promise<string> {
+  const lines = await reportLines(managed, armingsSinceReport, now);
   if (lines.length === 0) return "no sessions are being managed";
   return `Manager report\n${lines.join("\n")}`;
 }
@@ -2714,7 +2715,7 @@ export async function refuseAgentManage(
   opts: { until?: string },
   operator: boolean,
   now = Date.now(),
-): string | null {
+): Promise<string | null> {
   if (operator) return null;
   const arg = rawArg.trim().toLowerCase();
   const resolved = await resolveSession(sessionIdOrName);
@@ -2846,16 +2847,16 @@ const hhmm = (t: number) => {
 };
 
 /** One block for every managed session: name, goal, until, next due, context, last handover, state. */
-export function statusLines(
+export async function statusLines(
   sessions: ManagedSession[],
   now: number,
-  kOf: (m: ManagedSession) => number | null = () => null,
-): string[] {
+  kOf: (m: ManagedSession) => number | null | Promise<number | null> = () => null,
+): Promise<string[]> {
   if (sessions.length === 0) return ["no sessions are being managed"];
-  return sessions.map((m) => {
+  return Promise.all(sessions.map(async (m) => {
     const goal = oneLine(m.objective);
     const due = nextDueAt(m);
-    const k = kOf(m);
+    const k = await kOf(m);
     const pct = k !== null ? Math.round((k / (m.contextWindowK ?? 1000)) * 100) : null;
     const state = m.paused ? "paused" : m.shift ? (m.shift.plain ? "supervised" : "shift") : "on";
     return [
@@ -2867,7 +2868,7 @@ export function statusLines(
       `handover: ${m.handoverDoneAt ? hhmm(m.handoverDoneAt) : "-"}`,
       state,
     ].join(" | ");
-  });
+  }));
 }
 
 /**
@@ -3390,7 +3391,7 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   const landed = await confirmArmed(text, {
     readPane: () => readPaneAsync(m.sessionId, { fresh: true }),
     sleep,
-    clearInput: () => await sendControlU(m.sessionId),
+    clearInput: () => sendControlU(m.sessionId),
   });
   if (landed) {
     m.lastRearmAt = Date.now();
@@ -4166,7 +4167,7 @@ async function tick(now = Date.now()): Promise<void> {
          * decides, and the number is reported beside it because it is useful
          * to read, not because it is being trusted.
          */
-        const nowK = contextK(m);
+        const nowK = await contextK(m);
         const fell = m.contextAtClear !== undefined && nowK !== null && nowK < m.contextAtClear / 2;
         if (CLEARED_BANNER.test(content) && !QUEUED_INPUT.test(content)) {
           logOnly(
@@ -4632,7 +4633,7 @@ export async function handleManage(
   // single-session resolution, since "all" names no session. This is the
   // operator's ASK for the manager report: the only place it is ever produced.
   if (sessionIdOrName.trim().toLowerCase() === "all" && (!arg || arg.toLowerCase() === "status")) {
-    return { ok: true, message: managerReportText(Object.values(state), Date.now()) };
+    return { ok: true, message: await managerReportText(Object.values(state), Date.now()) };
   }
 
   /**
@@ -4683,7 +4684,7 @@ export async function handleManage(
     return {
       ok: true,
       managed: true,
-      message: `${name} is supervised${until !== null ? ` until ${hhmm(until)}` : ""}${m.nudgeEveryMin ? `, nudged after ${m.nudgeEveryMin} min idle` : ""}.${goal ? "\n  arm pending, next tick (not typed yet; typed at once when idle, queued behind the running turn when busy)." : ""}\n  ${statusLines([m], Date.now(), contextK)[0]}`,
+      message: `${name} is supervised${until !== null ? ` until ${hhmm(until)}` : ""}${m.nudgeEveryMin ? `, nudged after ${m.nudgeEveryMin} min idle` : ""}.${goal ? "\n  arm pending, next tick (not typed yet; typed at once when idle, queued behind the running turn when busy)." : ""}\n  ${(await statusLines([m], Date.now(), contextK))[0]}`,
     };
   }
 
@@ -5278,7 +5279,7 @@ export async function handleManage(
      * but idle session. Only a title that names no session (see isClaudePane)
      * is a shell to refuse.
      */
-    const probe = readSessionContent(sessionId, 5);
+    const probe = await readSessionContent(sessionId, 5);
     if (probe?.atPrompt && !isClaudePane(probe.name)) {
       return {
         ok: false,

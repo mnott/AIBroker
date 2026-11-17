@@ -23,8 +23,8 @@ export {
 
 /** Terminal access, injectable so the screen heuristics can be tested on real frames. */
 export interface TerminalIO {
-  capture: (id: string) => string | null;
-  send: (id: string, text: string) => void;
+  capture: (id: string) => string | null | Promise<string | null>;
+  send: (id: string, text: string) => void | Promise<void>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
 }

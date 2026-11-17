@@ -72,7 +72,7 @@ export interface AskOptions {
 
 export interface AskDeps {
   resolve: (name: string) => Promise<PaiProject | undefined>;
-  sessions: () => LiveSession[];
+  sessions: () => LiveSession[] | Promise<LiveSession[]>;
   io: TerminalIO;
 }
 
@@ -84,9 +84,9 @@ const SETTLE_TICKS = 4;
 const POLL_MS = 500;
 
 /** Enumerate live sessions with persistent names resolved. */
-function liveSessions(): LiveSession[] {
+async function liveSessions(): Promise<LiveSession[]> {
   const persistent = getAllPersistentSessionNames();
-  return snapshotAllSessions().map((s) => ({
+  return (await snapshotAllSessions()).map((s) => ({
     id: s.id,
     name: s.name,
     paiName: lookupPersistentName(persistent, s.id, s.aibrokerId),
@@ -157,10 +157,10 @@ export function extractReply(frame: string, question: string): string {
 
 /** True when two samples of the screen differ — the session is producing output. */
 async function isWorking(id: string, io: TerminalIO): Promise<boolean> {
-  const a = io.capture(id);
+  const a = await io.capture(id);
   if (a === null) return false;
   await io.sleep(LIVENESS_SAMPLE_MS);
-  const b = io.capture(id);
+  const b = await io.capture(id);
   if (b === null) return false;
   return a !== b;
 }
@@ -188,7 +188,7 @@ export async function ask(
   }
 
   const label = project.displayName || project.name;
-  const existing = findSessionForProject(project, deps.sessions());
+  const existing = await findSessionForProject(project, await deps.sessions());
   if (!existing) {
     // Deliberately not launched: a probe must never create what it is probing.
     return { replied: false, session: "", state: "absent", reason: "session not running" };
@@ -206,7 +206,7 @@ export async function ask(
     };
   }
 
-  const frame = deps.io.capture(existing.id);
+  const frame = await deps.io.capture(existing.id);
   if (frame === null) {
     return { replied: false, session: existing.label, state: "silent", reason: "session terminal could not be read" };
   }
@@ -227,7 +227,7 @@ export async function ask(
   const submitDeadline = deps.io.now() + Math.min(10_000, timeoutMs);
   while (deps.io.now() < submitDeadline) {
     await deps.io.sleep(POLL_MS);
-    const f = deps.io.capture(existing.id);
+    const f = await deps.io.capture(existing.id);
     if (f !== null && hasBeenSubmitted(f, needle)) { submitted = true; break; }
   }
   if (!submitted) {
@@ -240,11 +240,11 @@ export async function ask(
   }
 
   // Answer complete when the screen stops changing.
-  let last = deps.io.capture(existing.id) ?? "";
+  let last = await deps.io.capture(existing.id) ?? "";
   let quiet = 0;
   while (left() > 0) {
     await deps.io.sleep(POLL_MS);
-    const cur = deps.io.capture(existing.id);
+    const cur = await deps.io.capture(existing.id);
     if (cur === null) continue;
     if (cur === last) {
       if (++quiet >= SETTLE_TICKS) {

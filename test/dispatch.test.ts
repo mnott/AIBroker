@@ -504,34 +504,34 @@ test("delivery to an already-live session respects the budget too", async () => 
 
 // ── session matching (PAI's bite #1) ────────────────────────────────────────
 
-test("session matching is case-insensitive", () => {
+test("session matching is case-insensitive", async () => {
   const p = project({ displayName: "Whazaa", names: ["whazaa"] });
   for (const label of ["whazaa", "WHAZAA", "Whazaa", "WhAzAa"]) {
-    assert.ok(findSessionForProject(p, live(label)), `should match "${label}"`);
+    assert.ok(await findSessionForProject(p, live(label)), `should match "${label}"`);
   }
 });
 
-test("any curated alias matches, not just the display name", () => {
+test("any curated alias matches, not just the display name", async () => {
   const p = project({ displayName: "BirnPartners", names: ["birnpartners", "birn"] });
-  assert.ok(findSessionForProject(p, live("birn")));
-  assert.ok(findSessionForProject(p, live("BirnPartners")));
+  assert.ok(await findSessionForProject(p, live("birn")));
+  assert.ok(await findSessionForProject(p, live("BirnPartners")));
 });
 
-test("an unrelated session is not matched", () => {
+test("an unrelated session is not matched", async () => {
   const p = project({ displayName: "Whazaa", names: ["whazaa"] });
-  assert.equal(findSessionForProject(p, live("Telex")), null);
+  assert.equal(await findSessionForProject(p, live("Telex")), null);
 });
 
-test("a substring is not a match", () => {
+test("a substring is not a match", async () => {
   // "Task Bus 2" must not satisfy a dispatch aimed at "Task Bus".
   const p = project({ displayName: "Task Bus", names: ["task-bus"] });
-  assert.equal(findSessionForProject(p, live("Task Bus 2")), null);
+  assert.equal(await findSessionForProject(p, live("Task Bus 2")), null);
 });
 
-test("the persistent PAI name wins over the raw session name", () => {
+test("the persistent PAI name wins over the raw session name", async () => {
   const p = project({ displayName: "Whazaa", names: ["whazaa"] });
   const sessions = [{ id: "S1", name: "node", paiName: "Whazaa" }];
-  assert.equal(findSessionForProject(p, sessions)?.id, "S1");
+  assert.equal((await findSessionForProject(p, sessions))?.id, "S1");
 });
 
 // ── separators are not significant ──────────────────────────────────────────
@@ -542,34 +542,34 @@ test("the persistent PAI name wins over the raw session name", () => {
 // fresh tab opened in the right directory with none of the context, which looks
 // like success from every angle except the one that matters.
 
-test("a hyphenated alias matches a human-named session", () => {
+test("a hyphenated alias matches a human-named session", async () => {
   const project = {
     name: "task-bus", names: ["task-bus"],
     slug: "09-voice-notes", displayName: "09 - Voice Notes",
   } as unknown as Parameters<typeof findSessionForProject>[0];
 
-  const found = findSessionForProject(project, [
+  const found = await findSessionForProject(project, [
     { id: "s-1", name: "✳ Task Bus (node)", paiName: "Task Bus" },
   ]);
   assert.equal(found?.id, "s-1");
 });
 
-test("underscores and doubled spaces fold the same way", () => {
+test("underscores and doubled spaces fold the same way", async () => {
   const project = {
     name: "task_bus", names: ["task_bus"], slug: "x", displayName: "x",
   } as unknown as Parameters<typeof findSessionForProject>[0];
 
-  assert.equal(findSessionForProject(project, [
+  assert.equal((await findSessionForProject(project, [
     { id: "s-2", name: "t", paiName: "Task  Bus" },
-  ])?.id, "s-2");
+  ]))?.id, "s-2");
 });
 
-test("folding separators does not make different projects collide", () => {
+test("folding separators does not make different projects collide", async () => {
   const project = {
     name: "voice-notes", names: ["voice-notes"], slug: "x", displayName: "x",
   } as unknown as Parameters<typeof findSessionForProject>[0];
 
-  assert.equal(findSessionForProject(project, [
+  assert.equal(await findSessionForProject(project, [
     { id: "s-3", name: "t", paiName: "Task Bus" },
   ]), null);
 });
