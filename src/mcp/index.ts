@@ -894,7 +894,7 @@ server.tool(
   },
   async ({ broadcastId }) => {
     try {
-      const r = (await hub.call_raw("broadcast_status", { broadcastId })) as any;
+      const r = (await hub.call_raw("broadcast_rollcall", { broadcastId })) as any;
       const counts = new Map<string, number>();
       for (const row of r.rows) counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
       const lines = r.rows.map((row: any) => `${row.status.padEnd(12)} ${row.name}${row.reason ? ` — ${row.reason}` : ""}`);

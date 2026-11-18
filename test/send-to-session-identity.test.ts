@@ -84,6 +84,7 @@ async function dropFacadeMemo() {
   const facade = await import("../src/transport/sync-facade.js");
   facade.invalidateSnapshotMemoForTests();
   coreImport.invalidateSnapshotCache();
+  coreImport._resetEnumBackoffForTest(); // a failed-enumeration test leaves a 60s back-off that would starve the next fixture
 }
 
 function req(fields: Partial<IpcRequest>): IpcRequest {
@@ -459,10 +460,10 @@ test("broadcast handler ask round-trip: reply recorded, status shows ok/hold vs 
     const rep2 = (await handlers.get("broadcast_reply")!(req({ itermSessionId: "bc-bystander-pane", params: { broadcastId: b.result.id, answer: "hold", reason: "mid-deploy" } }))) as any;
     assert.equal(rep2.ok, true);
 
-    const st = (await handlers.get("broadcast_status")!(req({ params: { broadcastId: b.result.id } }))) as any;
+    const st = (await handlers.get("broadcast_rollcall")!(req({ params: { broadcastId: b.result.id } }))) as any;
     assert.equal(st.ok, true);
     // Deadline not yet passed: the answered ones read their answers.
-    const byName = new Map<string, string>(st.result.rows.map((row: any) => [row.name, row.status]));
+    const byName = new Map<string, string>(st.result.rows.map((row: any) => [row.sessionId, row.status]));
     assert.equal(byName.get("bc-answerer-pane"), "ok");
     assert.equal(byName.get("bc-bystander-pane"), "hold");
 
@@ -470,7 +471,7 @@ test("broadcast handler ask round-trip: reply recorded, status shows ok/hold vs 
     const b2 = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: "restart in 5", ask: true, deadline: 1, defaultOk: true } }))) as any;
     recordBroadcastReply(b2.result.id, BC_ANSWERER, "bc-answerer-pane", "ok", undefined);
     const late2 = getBroadcastStatus(b2.result.id, Date.now() + 10_000)!;
-    const by2 = new Map<string, string>(late2.rows.map((row) => [row.name, row.status]));
+    const by2 = new Map<string, string>(late2.rows.map((row) => [row.sessionId, row.status]));
     assert.equal(by2.get("bc-answerer-pane"), "ok");
     assert.equal(by2.get("bc-bystander-pane"), "no-objection");
 
@@ -478,5 +479,5 @@ test("broadcast handler ask round-trip: reply recorded, status shows ok/hold vs 
     const b3 = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: "restart in 5", ask: true, deadline: 1 } }))) as any;
     recordBroadcastReply(b3.result.id, BC_ANSWERER, "bc-answerer-pane", "ok", undefined);
     const late3 = getBroadcastStatus(b3.result.id, Date.now() + 10_000)!;
-    assert.equal(new Map(late3.rows.map((row) => [row.name, row.status])).get("bc-bystander-pane"), "silent");
+    assert.equal(new Map(late3.rows.map((row) => [row.sessionId, row.status])).get("bc-bystander-pane"), "silent");
 }));

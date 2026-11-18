@@ -1673,7 +1673,7 @@ export function registerCoreHandlers(
    * (only with defaultOk). Any session may read it; every broadcast is
    * ledgered anyway.
    */
-  server.on("broadcast_status", async (req) => {
+  server.on("broadcast_rollcall", async (req) => {
     const { broadcastId } = req.params as { broadcastId?: string };
     if (!broadcastId) return { ok: false, error: "broadcastId is required" };
     let s;

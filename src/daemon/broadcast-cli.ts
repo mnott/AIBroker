@@ -75,7 +75,7 @@ export async function broadcast(args: string[], deps: {
     if (!id) { deps.out("Usage: aibroker broadcast status <id>"); return 1; }
     let r: Record<string, unknown>;
     try {
-      r = await deps.call("broadcast_status", { broadcastId: id });
+      r = await deps.call("broadcast_rollcall", { broadcastId: id });
     } catch (err) {
       console.error(`broadcast status failed: ${err instanceof Error ? err.message : String(err)}`);
       return 1;
