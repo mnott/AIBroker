@@ -45,6 +45,10 @@ let lastGoodSnapshots: LiveSession[] = [];
  */
 /** Async: the enumeration's children are awaited, never spawnSync'd. */
 export async function discoverLiveSessions(opts: { fresh?: boolean } = {}): Promise<LiveSession[]> {
+  // `fresh` bypasses every layer's memo down to the enumeration itself; the
+  // last-good replay below must not resurrect a PREVIOUS stub's rows for a
+  // caller that explicitly asked for a fresh look.
+  if (opts.fresh) lastGoodSnapshots = [];
   return withPersistentNames(await snapshotAllSessions(opts));
 }
 

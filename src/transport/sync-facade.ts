@@ -31,7 +31,7 @@
  * iTerm uses GUIDs. With one transport active, everything routes to it.
  */
 
-import * as iterm from "../adapters/iterm/core.js";
+import * as realIterm from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { ItermTransport } from "./iterm.js";
 import { TmuxTransport } from "./tmux.js";
@@ -43,6 +43,38 @@ import { transportPolicy } from "./policy.js";
 
 const tmuxTransport = new TmuxTransport();
 const itermTransport = new ItermTransport();
+
+/**
+ * Test seam: a test may load its OWN instance of adapters/iterm/core (with a
+ * stubbed `runItermJxa`) and point this facade at it, so an enumeration can be
+ * stubbed per-test without touching the module-level `_internal` global —
+ * which concurrent tests would yank out from under each other. Production
+ * never calls this; the default is the real module namespace.
+ */
+let iterm: typeof realIterm = realIterm;
+export function setItermModuleForTests(mod: typeof realIterm): void {
+  iterm = mod;
+}
+
+/**
+ * Test seam: restrict which hosts are enumerated, per test. The policy is read
+ * once at module load from the environment, so a test cannot pin the host via
+ * AIBROKER_TRANSPORT after anything imported — and on this machine both hosts
+ * answer, mixing real tmux panes into a fixture (observed: 6 recipients where
+ * the stub listed 4). Production never calls this.
+ */
+let transportOverride: { allowIterm: boolean; allowTmux: boolean } | null = null;
+export function setTransportOverrideForTests(host: "iterm" | "tmux"): void {
+  transportOverride = host === "iterm" ? { allowIterm: true, allowTmux: false } : { allowIterm: false, allowTmux: true };
+}
+function effectivePolicy(): { allowIterm: boolean; allowTmux: boolean } {
+  return transportOverride ?? { allowIterm, allowTmux };
+}
+
+/** Test seam: drop the merged memo so an enumeration re-runs (see setItermModuleForTests). */
+export function invalidateSnapshotMemoForTests(): void {
+  merged = null;
+}
 
 // Override GATES which transports are permitted; availability is then checked
 // LIVE on every enumeration (NOT frozen at boot), so a tmux server started after
@@ -133,6 +165,7 @@ let transportsInFlight: Promise<SessionSnapshot[]> | null = null;
 
 async function enumerateTransports(opts: { fresh?: boolean }, now: number): Promise<SessionSnapshot[]> {
   if (transportsInFlight) return transportsInFlight;
+  const { allowIterm, allowTmux } = effectivePolicy();
   transportsInFlight = (async () => {
     // Query tmux first (returns [] if no server is running). This is the LIVE
     // availability check — a server that appears post-boot is seen immediately.

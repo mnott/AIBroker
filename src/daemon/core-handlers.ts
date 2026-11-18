@@ -54,6 +54,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { addRoute, findRoute, noteOwnWrite } from "./inbound.js";
+import { broadcastRecipients, createBroadcast, recordBroadcastReply, getBroadcastStatus, parseDeadlineSec } from "./broadcast-core.js";
 import { issueWriteCredential, botIgnoreRule, routeIgnoresAccount } from "./forge-credential.js";
 import { issueOp, whoAmI, READ_VERBS, WRITE_VERBS, type IssueVerb } from "./forge-issues.js";
 import { funnelHostname } from "./funnel-watchdog.js";
@@ -336,8 +337,16 @@ export function registerCoreHandlers(
    * the caller had just read, and a target index taken from the list hit a
    * different tab (live 2026-10-26).
    */
+  /**
+   * `fresh:true` is load-bearing for tests: a stubbed enumeration must never
+   * be answered from a previous caller's memo — with the 3 s snapshot cache a
+   * second test's stub was silently ignored and the FIRST fixture answered.
+   * Production cost: at most one extra enumeration per handler call (the
+   * single-flight in adapters/iterm/core.ts keeps concurrent callers sharing
+   * it), against a correctness floor — "the list you got is the list that is".
+   */
   async function listedSessions(): Promise<SessionSnapshot[]> {
-    return (await discoverLiveSessions()).filter((s) => !s.workerPane);
+    return (await discoverLiveSessions({ fresh: true })).filter((s) => !s.workerPane);
   }
 
   /** The display name `sessions` shows for a row — the name a target must match. */
@@ -1579,6 +1588,100 @@ export function registerCoreHandlers(
           : `${reason}. `,
       },
     };
+  });
+
+  /**
+   * broadcast — one session shouting out to every OTHER live Claude session.
+   *
+   * Mailbox-only by construction: the message is deposited into each
+   * recipient's mailbox (the same path send_to_session uses with mailboxOnly)
+   * and NOTHING is typed into any terminal, so a shout about restarting the
+   * daemon cannot land in whatever anyone is mid-way through typing. Shell
+   * tabs are skipped — they would execute the message, not read it. The sender
+   * never receives its own shout.
+   *
+   * With ask:true the text carries a broadcast id and invites a short answer;
+   * answers arrive via broadcast_reply below (into the ledger AND the sender's
+   * mailbox), and broadcast_status rolls them up: ok, hold+reason, or no
+   * answer. Silence is only "no objection" when the sender passed defaultOk —
+   * otherwise it stays "silent", because quiet people have not agreed.
+   */
+  server.on("broadcast", async (req) => {
+    const { message, ask = false, deadline, defaultOk = false } = req.params as { message?: string; ask?: boolean; deadline?: string | number; defaultOk?: boolean };
+    if (!message) return { ok: false, error: "message is required" };
+    let deadlineSec: number | undefined;
+    if (deadline !== undefined) {
+      const parsed = parseDeadlineSec(deadline);
+      if (parsed === null) return { ok: false, error: `--deadline takes seconds or a duration like 2m/90s/1h, got "${deadline}"` };
+      deadlineSec = parsed;
+    }
+
+    const snapshots = await listedSessions();
+    const senderId = await callerSelfId(req, snapshots);
+    const senderLabel = resolveSenderLabel(req, snapshots);
+    // Measured Claude first (the process table). The per-id re-measure is only
+    // right for a TARGETED send — broadcast enumerates everything, and asking
+    // "is a claude on this pane's tty" per row runs `ps` once per tab, which
+    // the enumeration already did in one pass. When the table could not be read
+    // at all, isClaude is undefined for every row and broadcastRecipients
+    // falls back to the title heuristic — the same rule send_to_session uses.
+    const recipients = broadcastRecipients(snapshots, senderId);
+    const skippedShells = snapshots.filter((s) => s.isClaude === false).length;
+
+    const rec = createBroadcast({
+      senderId: senderId ?? senderLabel, senderName: senderLabel, message, ask, deadlineSec, defaultOk, recipients,
+    });
+    for (const r of recipients) {
+      const eventId = audit({
+        action: "broadcast", actor: `session:${senderLabel}`, target: r.name,
+        outcome: "queued", body: message, reason: "broadcast — mailbox only, nothing typed", meta: { broadcastId: rec.id, ask },
+      });
+      noteInbound(r.name, eventId);
+    }
+    audit({
+      action: "broadcast", actor: `session:${senderLabel}`, target: "all-sessions",
+      outcome: "delivered", body: message, reason: `${recipients.length} recipient(s), ${skippedShells} shell tab(s) skipped`, meta: { broadcastId: rec.id, ask, deadlineSec, defaultOk },
+    });
+    return { ok: true, result: { id: rec.id, ask, deliveredTo: recipients.length, skippedShells } };
+  });
+
+  /**
+   * broadcast_reply — answer someone's ask. The caller's own pane identifies
+   * the answerer; only a session that actually received that broadcast may
+   * answer it. Recorded in the ledger and pushed into the sender's mailbox.
+   */
+  server.on("broadcast_reply", async (req) => {
+    const { broadcastId, answer, reason } = req.params as { broadcastId?: string; answer?: string; reason?: string };
+    if (!broadcastId) return { ok: false, error: "broadcastId is required" };
+    if (answer !== "ok" && answer !== "hold") return { ok: false, error: 'answer must be "ok" or "hold"' };
+    const snapshots = await listedSessions();
+    const sessionId = await callerSelfId(req, snapshots);
+    if (!sessionId) return { ok: false, error: "could not identify your session — run this from inside the session that received the broadcast" };
+    const name = resolveSenderLabel(req, snapshots);
+    const r = recordBroadcastReply(broadcastId, sessionId, name, answer, reason?.trim() || undefined);
+    if (!r.ok) {
+      audit({ action: "broadcast_reply", actor: `session:${name}`, target: broadcastId, outcome: "refused", reason: r.error });
+      return { ok: false, error: r.error };
+    }
+    audit({ action: "broadcast_reply", actor: `session:${name}`, target: broadcastId, outcome: "delivered", body: `${answer}${reason ? ` — ${reason}` : ""}`, meta: { broadcastId, answer } });
+    return { ok: true, result: { ok: true, id: broadcastId, answeredBy: name, answer } };
+  });
+
+  /**
+   * broadcast_status — the sender's roll-call for one ask: per recipient ok,
+   * hold+reason, pending (deadline not reached), silent, or no-objection
+   * (only with defaultOk). Any session may read it; every broadcast is
+   * ledgered anyway.
+   */
+  server.on("broadcast_status", async (req) => {
+    const { broadcastId } = req.params as { broadcastId?: string };
+    if (!broadcastId) return { ok: false, error: "broadcastId is required" };
+    let s;
+    try { s = getBroadcastStatus(broadcastId); } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    if (!s) return { ok: false, error: `no broadcast with id "${broadcastId}"` };
+    return { ok: true, result: { ...s } };
   });
 
   /**

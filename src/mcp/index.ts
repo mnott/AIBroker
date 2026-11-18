@@ -235,6 +235,7 @@ const server = new McpServer(
       "| `[PAILot]` | PAILot text | `pailot_send` |",
       "| `[PAILot:voice]` | PAILot voice | `pailot_tts` |",
       "| `[Session:NAME]` | another Claude session | `aibroker_send_to_session` |",
+      "| `[Broadcast:NAME]` | a shout to all sessions | answer with `aibroker_broadcast_reply` only when it asks (reply id is in the message), otherwise read and carry on — never block on it |",
       "| `[Keepalive]` | cache beat | no reply, no tools, answer with at most one word |",
       "| `[Task]` | task-bus work order | act, see Task rules below |",
       "| `[Task:comment]` | follow-up on a Task | act, see Task rules below |",
@@ -845,6 +846,63 @@ server.tool(
       if (r.delivered) return ok(`Delivered to session "${name}" — typed pointer observed submitted.`);
       if (r.queued) return ok(`Queued for session "${name}" — ${r.note ?? "not confirmed delivered; it is in the mailbox."}`);
       return ok(`Sent to session "${name}", but not confirmed and not queued — ${r.note ?? "no mailbox fallback (noReply)."}`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_broadcast",
+  "Shout a message to EVERY other live Claude session at once — e.g. \"I need the screen controls for ~5 min, ok?\" or \"about to restart the daemon\". Delivery is mailbox-only: nothing is typed into anyone's terminal and shell tabs are skipped, so it is safe to send while others are busy. The message arrives prefixed [Broadcast:<you>]. With ask:true it carries a broadcast id and invites a short answer; collect answers with aibroker_broadcast_status — an unanswered ask reads 'pending' until the deadline, then 'silent' unless defaultOk:true (only that flag turns silence into \"no objection\").",
+  {
+    message: z.string().min(1).describe("The broadcast text. Do NOT add a [Broadcast:...] prefix — the hub prepends it."),
+    ask: z.boolean().optional().describe("Ask every recipient for a short ok/hold answer, addressed by the returned broadcast id."),
+    deadlineSec: z.number().int().min(1).max(86400).optional().describe("Seconds to wait for answers (default 300). Only affects how status() labels silence."),
+    defaultOk: z.boolean().optional().describe("After the deadline, count no answer as \"no objection\" instead of \"silent\". Use deliberately: quiet sessions have not agreed."),
+  },
+  async ({ message, ask, deadlineSec, defaultOk }) => {
+    try {
+      const r = (await hub.call_raw("broadcast", {
+        message, ...(ask ? { ask: true } : {}), ...(deadlineSec !== undefined ? { deadline: deadlineSec } : {}), ...(defaultOk ? { defaultOk: true } : {}),
+      })) as any;
+      const line = `Broadcast ${r.id} to ${r.deliveredTo} session(s)${r.skippedShells ? `, ${r.skippedShells} shell tab(s) skipped` : ""}.`;
+      return ok(ask ? `${line}\nAnswers asked — collect with aibroker_broadcast_status({broadcastId:"${r.id}"}). Recipients answer with aibroker_broadcast_reply.` : line);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_broadcast_reply",
+  "Answer a broadcast that asked (a message prefixed [Broadcast:NAME] carrying a reply id). ok = you agree / no problem; hold = you object, with the short reason. Your answer goes to the sender's mailbox and into the roll-call they read with aibroker_broadcast_status. Only sessions that received that broadcast can answer it.",
+  {
+    broadcastId: z.string().min(1).describe("The id in the [Broadcast:...] message's reply line."),
+    answer: z.enum(["ok", "hold"]).describe("ok = fine; hold = objection."),
+    reason: z.string().optional().describe("Short reason, required in spirit for hold (e.g. \"mid-deploy, 10 min\")."),
+  },
+  async ({ broadcastId, answer, reason }) => {
+    try {
+      const r = (await hub.call_raw("broadcast_reply", { broadcastId, answer, ...(reason ? { reason } : {}) })) as any;
+      return ok(`Answered ${answer} on broadcast ${broadcastId}.`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_broadcast_status",
+  "The roll-call for a broadcast you sent: one row per recipient — ok, hold (+reason), pending (deadline not reached), silent (no answer; not agreement), or no-objection (only when the broadcast was sent with defaultOk). Reads the ledger, so it works across daemon restarts.",
+  {
+    broadcastId: z.string().min(1).describe("The id aibroker_broadcast returned."),
+  },
+  async ({ broadcastId }) => {
+    try {
+      const r = (await hub.call_raw("broadcast_status", { broadcastId })) as any;
+      const counts = new Map<string, number>();
+      for (const row of r.rows) counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
+      const lines = r.rows.map((row: any) => `${row.status.padEnd(12)} ${row.name}${row.reason ? ` — ${row.reason}` : ""}`);
+      return ok([
+        `broadcast ${r.id} from ${r.senderName}: ${r.message}`,
+        r.ask ? [...counts].map(([k, n]) => `${n} ${k}`).join(", ") + (r.defaultOk ? " (silence defaults to no objection)" : "") : "(no answers asked)",
+        ...lines,
+      ].join("\n"));
     } catch (e) { return err(e); }
   },
 );
