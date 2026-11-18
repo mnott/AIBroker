@@ -355,6 +355,14 @@ export async function startDaemon(options?: {
     .then(({ startMailIngress }) => startMailIngress())
     .catch((err) => log(`mail-ingress: failed to start — ${err instanceof Error ? err.message : String(err)}`));
 
+  // Self-restart on a new build. `pai worker merge` rebuilds dist but has no
+  // restart hook for this daemon, so a merged fix stayed dead code for two days
+  // (2026-11-18: a mail-ingress fix merged 11-16 was still not live). Watching
+  // the entry file's build id closes that; launchd starts the new build.
+  import("./dist-watch.js")
+    .then(({ startDistWatch }) => startDistWatch())
+    .catch((err) => log(`dist-watch: failed to start — ${err instanceof Error ? err.message : String(err)}`));
+
   // Keep the Todoist token valid here, in the daemon, because the daemon is the
   // one process that is always up. Every other holder of this responsibility is
   // occasional: a CLI invocation, an MCP shim loaded once per session, a reply
