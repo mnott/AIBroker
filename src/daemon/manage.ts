@@ -796,6 +796,92 @@ export function loadState(): State {
   return {};
 }
 
+// ── dormant watchers: a goal outlives the terminal that carried it ───────────
+
+const DORMANT_FILE = join(homedir(), ".aibroker", "managers-dormant.json");
+
+/** A shelved watcher is forgotten after this long when its goal has no `until`. */
+const DORMANT_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * Does this record carry a goal worth keeping across a lost terminal? A goal is
+ * the operator's; losing the pane (daemon restart, reboot — the pane id changes
+ * with it) must not lose the goal. Only a goal still inside its `until` (or one
+ * without an `until`, bounded by DORMANT_MAX_AGE_MS) is kept.
+ */
+export function carriesGoal(m: ManagedSession, now: number): boolean {
+  if (!m.objective?.trim()) return false;
+  if (m.shift && now >= m.shift.until) return false;
+  return true;
+}
+
+/** Records waiting for their session to be seen again, keyed by the id they had. */
+export function loadDormant(file = DORMANT_FILE): State {
+  try {
+    if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8")) as State;
+  } catch (e) {
+    log(`[manage] dormant watchers unreadable, starting empty — ${(e as Error).message}`);
+  }
+  return {};
+}
+
+export function saveDormant(d: State, file = DORMANT_FILE): void {
+  try {
+    writeFileSync(file, JSON.stringify(d, null, 2));
+  } catch (e) {
+    log(`[manage] could not save dormant watchers — ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Shelve a record that is being dropped because its pane is gone, if it carries
+ * a goal. Returns whether it was shelved. The record is kept as it was — goal,
+ * until, every, last handover — and never edited.
+ */
+export function shelveDormant(d: State, m: ManagedSession, now: number): boolean {
+  if (!carriesGoal(m, now)) return false;
+  for (const k of Object.keys(d)) if (d[k].name === m.name) delete d[k];
+  d[m.sessionId] = { ...m };
+  delete d[m.sessionId].unreadableSince;
+  return true;
+}
+
+/**
+ * Re-attach shelved watchers to live sessions: by the old terminal id when it is
+ * back, else by session name (exact, case-insensitive). Moves the record into
+ * `active` under the live id with the clocks restarted, so the first tick does
+ * not read a reboot's downtime as the session having been quiet. Expired
+ * records are discarded. Returns the names re-attached. The goal, until and
+ * every are carried over untouched: this never extends or alters a goal.
+ */
+export function restoreDormant(
+  active: State,
+  dormant: State,
+  live: { id: string; aibrokerId?: string | null; paiName?: string | null; name?: string | null }[],
+  now: number,
+): string[] {
+  const restored: string[] = [];
+  for (const [key, m] of Object.entries(dormant)) {
+    if (!carriesGoal(m, now) || now - (m.lastChangeAt || m.startedAt || 0) > DORMANT_MAX_AGE_MS && !m.shift) {
+      delete dormant[key];
+      continue;
+    }
+    const want = m.name.toLowerCase();
+    const hit =
+      live.find((s) => s.id === m.sessionId || (s.aibrokerId && s.aibrokerId === m.sessionId)) ??
+      live.find((s) => (s.paiName ?? "").toLowerCase() === want);
+    if (!hit) continue;
+    const taken = Object.values(active).some((a) => a.sessionId === hit.id || a.name.toLowerCase() === want);
+    delete dormant[key];
+    if (taken) continue;
+    active[hit.id] = { ...m, sessionId: hit.id, lastChangeAt: now, lastHash: "" };
+    delete active[hit.id].unreadableSince;
+    delete active[hit.id].tty;
+    restored.push(m.name);
+  }
+  return restored;
+}
+
 /** The saving half of the pair arm-self reuses; see loadState. */
 export function saveState(s: State): void {
   try {
@@ -1482,6 +1568,7 @@ function repoRootFor(pid: string, uuid?: string): string | null {
 }
 
 let state: State = loadState();
+let dormant: State = loadDormant();
 let timer: NodeJS.Timeout | null = null;
 
 function hash(s: string): string {
@@ -3702,6 +3789,11 @@ async function tick(now = Date.now()): Promise<void> {
   // The live enumeration, once per tick: the drop rule needs it, and the
   // per-session readings below reuse it rather than re-enumerating.
   const liveSnaps = reliable ? await discoverLiveSessionsAsync() : [];
+  if (reliable) {
+    const before = Object.keys(state).length;
+    reattachDormant(liveSnaps, now);
+    if (Object.keys(state).length !== before) dirty = true;
+  }
 
   /**
    * A record whose terminal is gone, or whose Claude process is gone, stops
@@ -3728,6 +3820,10 @@ async function tick(now = Date.now()): Promise<void> {
           ? `its pane has been unreadable for ${Math.round((now - (m.unreadableSince ?? now)) / 60_000)} min`
           : `quiet and not running for ${minutesSince(m.lastChangeAt, now)}`;
     log(`[manage] dropped ${m.name} from management — ${why}; not reporting a session that is not there`);
+    if (verdict.reason !== "quiet-limit" && shelveDormant(dormant, m, now)) {
+      saveDormant(dormant);
+      log(`[manage] ${m.name} carries a goal — kept dormant, re-attached when the session is seen again`);
+    }
     delete state[m.sessionId];
     // The retry memories die with the record: nothing may keep typing, or
     // promising to retry, at a session that has been dropped.
@@ -4254,39 +4350,17 @@ async function tick(now = Date.now()): Promise<void> {
         m.handoverAskedPath = askedPath;
         m.handoverWas = askedPath ? fileFingerprint(askedPath) : undefined;
 
-        // A dated handover starts empty each day, and an empty one is worse
-        // than none: it reads as authoritative and says nothing. So the
-        // instruction carries the rule for that case rather than assuming the
-        // session will think of it at the moment it is running out of room.
-        const carry = askedPath && !existsSync(askedPath)
-          ? `That file does not exist yet — start it by carrying forward from the most recent handover beside it whatever still matters, especially anything written nowhere else. `
-          : "";
-        const whereClause = askedPath
-          ? `Update ${askedPath}. ${carry}`
-          : target.description
-            ? `Update ${target.description}. `
-            : `Write it to your project's handover file (its ## Continue section, or wherever this project's convention keeps that) — nothing was set or found automatically, so use your own judgement about where that lives here. `;
-
-        // Wording follows the band: IMMEDIATE has no time to spare and says
-        // so; REFRESH and a work-triggered WARM-UP both mean the session has
-        // already written one and this is about the work SINCE, not a repeat
-        // it can satisfy by confirming the file is still there; anything else
-        // is a first request.
         const topUp = m.handoverDoneAt !== undefined && (decision.reason === "refresh" || decision.reason.startsWith("warm-up — work"));
-        const urgent = decision.reason === "immediate";
         await typeIntoSession(
           m.sessionId,
-          (urgent
-            ? `URGENT — write your handover NOW. You are at ${used}k tokens and compaction is imminent; there is no time left to keep working first. `
-            : topUp
-              ? `Bring your handover up to date — you are at ${used}k tokens${grownBy !== null ? `, ${grownBy}k of work since you last wrote it` : ""}, and the terminal will compact before long. Everything you have learned in that stretch is currently written nowhere but this context, which is the part compaction takes. `
-              : `Write your handover now — you are at ${used}k tokens and the terminal will compact before long. `) +
-            whereClause +
-            `Three things: where the current item stands, what you would do next and why, ` +
-            `and — the irreplaceable part — anything you know that is written nowhere else. Commit it. ` +
-            (m.clearAfterHandover
-              ? `You will be cleared once that file has changed on disk, and not before.`
-              : `Then carry straight on with the work; you are not being cleared. And keep that file current as you go — anything you work out after writing it is at risk until it is on disk.`),
+          buildHandoverInstruction({
+            kind: decision.reason === "immediate" ? "urgent" : topUp ? "top-up" : "first",
+            usedK: used,
+            grownByK: grownBy,
+            askedPath,
+            description: target.description,
+            clearAfter: !!m.clearAfterHandover,
+          }),
         );
         logOnly(
           m,
@@ -4548,11 +4622,123 @@ async function dropGoneOnLoad(): Promise<void> {
     const paneExists = live.some((s) => s.id === m.sessionId || (s.aibrokerId && s.aibrokerId === m.sessionId));
     if (!paneExists) {
       log(`[manage] dropped ${m.name} from management — its terminal no longer exists; not reporting a session that is not there`);
+      if (shelveDormant(dormant, m, Date.now())) {
+        saveDormant(dormant);
+        log(`[manage] ${m.name} carries a goal — kept dormant, re-attached when the session is seen again`);
+      }
       delete state[m.sessionId];
       dropped++;
     }
   }
   if (dropped) saveState(state);
+  reattachDormant(live, Date.now());
+}
+
+/**
+ * The handover instruction typed into a session — one text for both callers:
+ * the watcher before a compaction and `aibroker handover` / `/handover` now.
+ *
+ * A dated handover starts empty each day, and an empty one is worse than none:
+ * it reads as authoritative and says nothing. So the instruction carries the
+ * rule for that case rather than assuming the session will think of it.
+ * Wording follows `kind`: urgent has no time to spare; top-up is about the work
+ * SINCE the last one; first is a plain request; now is the operator's ask with
+ * no context figure, and also covers what a post-compact self needs (open
+ * workers and specs, decisions, lessons).
+ */
+export function buildHandoverInstruction(i: {
+  kind: "urgent" | "top-up" | "first" | "now";
+  usedK?: number | null;
+  grownByK?: number | null;
+  askedPath?: string | null;
+  description?: string | null;
+  clearAfter?: boolean;
+  exists?: (p: string) => boolean;
+}): string {
+  const exists = i.exists ?? existsSync;
+  const carry = i.askedPath && !exists(i.askedPath)
+    ? `That file does not exist yet — start it by carrying forward from the most recent handover beside it whatever still matters, especially anything written nowhere else. `
+    : "";
+  const whereClause = i.askedPath
+    ? `Update ${i.askedPath}. ${carry}`
+    : i.description
+      ? `Update ${i.description}. `
+      : `Write it to your project's handover file (its ## Continue section, or wherever this project's convention keeps that) — nothing was set or found automatically, so use your own judgement about where that lives here. `;
+  const used = i.usedK ?? "?";
+  const lead =
+    i.kind === "urgent"
+      ? `URGENT — write your handover NOW. You are at ${used}k tokens and compaction is imminent; there is no time left to keep working first. `
+      : i.kind === "top-up"
+        ? `Bring your handover up to date — you are at ${used}k tokens${i.grownByK != null ? `, ${i.grownByK}k of work since you last wrote it` : ""}, and the terminal will compact before long. Everything you have learned in that stretch is currently written nowhere but this context, which is the part compaction takes. `
+        : i.kind === "now"
+          ? `Write your handover now, for your post-compact self — the operator asked for it. `
+          : `Write your handover now — you are at ${used}k tokens and the terminal will compact before long. `;
+  const scope = i.kind === "now"
+    ? `Cover: the TODO.md Continue section, the session note, open workers and specs, decisions made and lessons learned. `
+    : "";
+  return (
+    lead +
+    whereClause +
+    scope +
+    `Three things: where the current item stands, what you would do next and why, ` +
+    `and — the irreplaceable part — anything you know that is written nowhere else. Commit it. ` +
+    (i.clearAfter
+      ? `You will be cleared once that file has changed on disk, and not before.`
+      : `Then carry straight on with the work; you are not being cleared. And keep that file current as you go — anything you work out after writing it is at risk until it is on disk.`)
+  );
+}
+
+/**
+ * Handover now, on the operator's word: type the handover instruction into the
+ * named session (the caller's own by default, resolved by the CLI). Works with
+ * or without a goal or a watcher. Does not touch the watcher's handover clocks.
+ */
+export async function handoverNow(
+  sessionIdOrName: string,
+  deps: {
+    type?: (id: string, text: string) => unknown;
+    cwdOf?: (sessionId: string) => Promise<string | null>;
+  } = {},
+): Promise<ManageResult> {
+  const resolved = await resolveSession(sessionIdOrName);
+  if (!resolved) return { ok: false, message: `no live session matches "${sessionIdOrName}"` };
+  const m = state[resolved.sessionId];
+  const cwd = deps.cwdOf ? await deps.cwdOf(resolved.sessionId) : await sessionCwdFor(resolved.sessionId);
+  const target = pickHandoverTarget({
+    handoverFile: m?.handoverFile,
+    sinkDescription: projectSinkDescription(cwd),
+    defaultPath: defaultHandoverTarget(cwd, cwd ? existsSync(join(cwd, "Notes")) : false),
+  });
+  const text = buildHandoverInstruction({ kind: "now", askedPath: target.path, description: target.description, clearAfter: !!m?.clearAfterHandover });
+  await (deps.type ?? typeIntoSession)(resolved.sessionId, text);
+  if (m) {
+    m.handoverDoneAt = Date.now();
+    saveState(state);
+  }
+  return { ok: true, message: `handover requested from ${resolved.name}${target.path ? ` — target ${target.path}` : ""}` };
+}
+
+async function sessionCwdFor(sessionId: string): Promise<string | null> {
+  try {
+    const snap = (await discoverLiveSessionsAsync()).find((s) => s.id === sessionId);
+    const proc = snap?.tty ? await processReadingAsync(snap.tty) : null;
+    if (!proc?.pid) return null;
+    await primeProcessCwd(proc.pid);
+    return sessionProjectCwd(proc.pid, proc.uuid ?? snap?.attachUuid);
+  } catch {
+    return null;
+  }
+}
+
+/** Bring shelved watchers back onto sessions that are live again; persists both sides. */
+function reattachDormant(live: Parameters<typeof restoreDormant>[2], now: number): void {
+  if (!Object.keys(dormant).length) return;
+  const names = restoreDormant(state, dormant, live, now);
+  saveDormant(dormant);
+  if (names.length) {
+    saveState(state);
+    for (const n of names) log(`[manage] ${n} — watcher restored with its goal after the session was seen again`);
+  }
 }
 
 /**
@@ -4690,6 +4876,10 @@ export async function handleManage(
 
   const existing = state[sessionId];
   const word = arg.toLowerCase();
+
+  // handover-now — the operator's ask: the same instruction the watcher sends
+  // before a compact, typed now. Needs no goal and no watcher.
+  if (word === "handover-now") return handoverNow(sessionId);
 
   // help — the grammar, from the thing that implements it.
   //

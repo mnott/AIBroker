@@ -474,6 +474,28 @@ switch (command) {
   }
 
   /**
+   * handover — ask a session to write its handover now, for its post-compact
+   * self. The same instruction the watcher sends before a compact; works with
+   * or without a goal. Default target: the session that types it.
+   */
+  case "handover": {
+    const session = args[1] ?? (process.env.ITERM_SESSION_ID ?? "").split(":").pop() ?? "";
+    if (!session || session.startsWith("-")) {
+      console.log("usage: aibroker handover [session]   (the session may be omitted when run inside one)");
+      process.exit(session.startsWith("-") ? 0 : 1);
+    }
+    const client = new WatcherClient(DAEMON_SOCKET_PATH);
+    try {
+      const raw = (await client.call_raw("manage", { session, arg: "handover-now", operator: !runsUnderAgent(process.env) })) as { message?: string };
+      console.log(raw?.message ?? "(no answer)");
+    } catch (e) {
+      console.error(`handover failed: ${(e as Error).message}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
+
+  /**
    * arm-self — a session arms its own goal, in one command with no arguments.
    *
    * Watched sessions coming out of a compact kept having to re-derive how to

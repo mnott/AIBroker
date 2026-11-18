@@ -11,6 +11,7 @@
     "README.md",
     "LICENSE",
     "hooks",
+    "skills",
     "docker",
     "!docker/**/node_modules/**",
     "!docker/**/dist/**",

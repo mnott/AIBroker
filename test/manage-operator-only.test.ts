@@ -145,3 +145,40 @@ test("a fresh demand is not held by a stale queuedArmAt: busy session gets the f
   assert.equal(m.queuedArmAt, undefined);
   assert.equal(M.busyGoalGoneReason(m, pane("", true), NOW, true), M.GOAL_FORCED_BUSY_REASON);
 });
+
+test("dormant watcher is shelved on a lost pane and restored by name after a restart", () => {
+  const dormant: Record<string, import("../src/daemon/manage.js").ManagedSession> = {};
+  const m = entry({ every: undefined, handoverDoneAt: NOW - 1000 });
+  assert.equal(M.shelveDormant(dormant, m, NOW), true);
+  assert.equal(M.shelveDormant({}, entry({ objective: "" }), NOW), false);
+  assert.equal(M.shelveDormant({}, entry(), UNTIL + 1), false, "an ended goal is not kept");
+  const active: Record<string, import("../src/daemon/manage.js").ManagedSession> = {};
+  const NEW = "11111111-0000-0000-0000-000000000000";
+  assert.deepEqual(M.restoreDormant(active, dormant, [{ id: "other", paiName: "Elsewhere" }], NOW), []);
+  assert.deepEqual(M.restoreDormant(active, dormant, [{ id: NEW, paiName: "caseleaf" }], NOW), ["CaseLeaf"]);
+  assert.equal(active[NEW].sessionId, NEW);
+  assert.equal(active[NEW].objective, "x");
+  assert.equal(active[NEW].shift?.until, UNTIL, "goal and until untouched");
+  assert.equal(active[NEW].handoverDoneAt, NOW - 1000, "last handover kept");
+  assert.equal(Object.keys(dormant).length, 0);
+});
+
+test("a goal with no watcher gets one when the session is seen; an expired goal does not", () => {
+  const dormant = { old: entry({ sessionId: "old" }) };
+  const active: Record<string, import("../src/daemon/manage.js").ManagedSession> = {};
+  assert.deepEqual(M.restoreDormant(active, dormant, [{ id: "n1", paiName: "CaseLeaf" }], UNTIL + 1), []);
+  assert.equal(Object.keys(active).length, 0);
+  assert.equal(Object.keys(dormant).length, 0, "expired record discarded");
+});
+
+test("handover command types the handover instruction into the right session", async () => {
+  const typed: [string, string][] = [];
+  const r = await M.handoverNow("CaseLeaf", { type: (id, t) => typed.push([id, t]), cwdOf: async () => null });
+  assert.equal(r.ok, true);
+  assert.equal(typed.length, 1);
+  assert.equal(typed[0][0], SID);
+  assert.match(typed[0][1], /^Write your handover now, for your post-compact self/);
+  assert.match(typed[0][1], /TODO\.md Continue section, the session note, open workers and specs, decisions made and lessons/);
+  const none = await M.handoverNow("NoSuchSession", { type: () => assert.fail("must not type"), cwdOf: async () => null });
+  assert.equal(none.ok, false);
+});

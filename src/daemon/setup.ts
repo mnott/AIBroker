@@ -420,6 +420,23 @@ function hooksEdit(a: Act, remove: boolean): void {
   for (const h of updated) a.say(`  ${a.dryRun ? "would update" : "updated"}: ${h}`);
 }
 
+// ── skills ────────────────────────────────────────────────────────────────
+
+/** Skills shipped in skills/<name>/SKILL.md, installed to ~/.claude/skills/<name>/. */
+const SKILLS = ["handover"];
+
+function skillsInstall(a: Act): void {
+  for (const name of SKILLS) {
+    const src = join(a.s.pkgRoot, "skills", name, "SKILL.md");
+    const dest = join(a.s.home, ".claude", "skills", name, "SKILL.md");
+    const body = readIf(src);
+    if (body === null) { a.say(`  skill ${name}: ${src} missing; skipped`); continue; }
+    if (readIf(dest) === body) { a.say(`  skill ${name}: already installed`); continue; }
+    a.write(dest, body);
+    a.done(`  skill ${name}: installed to ${dest}`);
+  }
+}
+
 // ── env file ──────────────────────────────────────────────────────────────
 
 function envFile(a: Act): void {
@@ -445,6 +462,7 @@ export function setup(s: Sys, opts: Opts, say: Say = console.log): number {
   }
   if (opts.mcp) { say("mcp:"); mcpAdd(a); }
   if (opts.hooks) { say("hooks:"); hooksEdit(a, false); }
+  if (opts.hooks) { say("skills:"); skillsInstall(a); }
   say(a.fails ? `setup finished with ${a.fails} failure(s)` : "setup done. Next: aibroker doctor");
   return a.fails;
 }
