@@ -11,11 +11,14 @@
  *
  * With --ask the message carries a broadcast id and invites a short answer;
  * recipients reply with `broadcast reply <id> ok|hold "<reason>"` (or the MCP
- * tool), which lands in the SENDER's mailbox as well as the ledger. The sender
- * asks `broadcast status <id>` for the roll-call: per session ok, hold+reason,
- * or no answer. Silence is not agreement by itself — an unanswered ask reads
- * "silent" unless the sender passed --default-ok, in which case it counts as
- * "no objection"; a deadline that has not passed yet says "pending".
+ * tool), which lands in the LEDGER — durably, like the watchers — and the
+ * sender is notified with ONE summary line into their mailbox when every
+ * recipient has answered or the deadline passes (never one message per
+ * reply). The sender asks `broadcast status <id>` for the roll-call: per
+ * session ok, hold+reason, or no answer. Silence is not agreement by itself —
+ * an unanswered ask reads "silent" unless the sender passed --default-ok, in
+ * which case it counts as "no objection"; a deadline that has not passed yet
+ * says "pending".
  *
  * The store is one JSON file under the state dir (broadcasts.json): every
  * broadcast and every reply is ledgered there durably, and `audit()` records
@@ -55,6 +58,12 @@ export interface BroadcastRecord {
   createdAt: number;
   recipients: BroadcastRecipient[];
   replies: BroadcastReply[];
+  /**
+   * The sender's mailbox was told once — the single summary line (all answered
+   * or deadline passed). Written with the ledger, so a daemon restart cannot
+   * re-notify. Absent = never notified.
+   */
+  notifiedAt?: number;
 }
 
 export interface BroadcastReply {
@@ -85,6 +94,8 @@ export interface BroadcastStatus {
   deadlineAt?: number;
   deadlinePassed: boolean;
   rows: BroadcastStatusRow[];
+  /** The ledger record behind this read — for callers that act on it (summary). */
+  record: BroadcastRecord;
 }
 
 // ── The message a recipient sees ──
@@ -107,6 +118,60 @@ export function composeBroadcastText(senderName: string, message: string, ask?: 
 /** The line the SENDER's mailbox gets when someone answers their ask. */
 export function composeReplyText(broadcastId: string, name: string, answer: "ok" | "hold", reason?: string): string {
   return `[Broadcast-reply:${broadcastId}] ${name}: ${answer}${reason ? ` — ${reason}` : ""}`;
+}
+
+/**
+ * The ONE summary line the sender's mailbox gets for an ask — at most once,
+ * when every recipient has answered or the deadline passes. Not one message
+ * per reply: five "ok" lines are five interruptions that say nothing a single
+ * roll-up does not say better.
+ */
+export function composeSummaryText(b: BroadcastRecord, now: number): string {
+  const rows = statusRows(b, now);
+  // Counted from the rows, not b.replies: a reply can come from a session no
+  // longer in the recipient list — the roll-call is what the sender reads.
+  const answered = rows.filter((r) => r.status === "ok" || r.status === "hold").length;
+  const why = answered >= b.recipients.length ? "all answered" : "deadline passed";
+  const counts = new Map<string, number>();
+  for (const row of rows) counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
+  const tally = [...counts].map(([k, n]) => `${n} ${k}`).join(", ");
+  const lines = rows
+    .filter((r) => r.status === "hold" || r.status === "silent")
+    .map((r) => `\n  ${r.status}: ${r.name}${r.reason ? ` — ${r.reason}` : ""}`);
+  return `[Broadcast-summary:${b.id}] ${answered}/${b.recipients.length} answered (${why}): ${tally}${lines.join("")}. Roll-call: aibroker broadcast status ${b.id}`;
+}
+
+/**
+ * The moment this ask's summary is due, if it is due and not yet sent:
+ * every recipient answered, or the deadline passed. `undefined` means nothing
+ * to report (or already reported) — so callers can fire it after any event
+ * (a reply lands, a status is read) without tracking timers.
+ */
+export function summaryDueAt(b: BroadcastRecord, now: number): number | undefined {
+  if (!b.ask || b.notifiedAt !== undefined) return undefined;
+  const allAnswered = b.recipients.length > 0 && b.replies.length >= b.recipients.length;
+  const deadlinePassed = b.deadlineAt !== undefined && now >= b.deadlineAt;
+  return allAnswered || deadlinePassed ? now : undefined;
+}
+
+/**
+ * Deposit the summary once, durably. The ledger write goes FIRST: a sender
+ * who was notified must never be re-notified by a later call (a crash between
+ * the two would otherwise spam), while a missed notification is recoverable —
+ * the next reply or status read fires it again.
+ */
+export function notifyBroadcastSummary(b: BroadcastRecord, now: number = Date.now()): boolean {
+  const due = summaryDueAt(b, now);
+  if (due === undefined) return false;
+  const map = loadLedger();
+  const cur = map.get(b.id) ?? b;
+  if (cur.notifiedAt !== undefined) return false;
+  cur.notifiedAt = due;
+  saveLedger(map);
+  Object.assign(b, cur);
+  const keys = [cur.senderId, ...cur.senderId.split("|")];
+  for (const k of new Set(keys)) depositToSessionMailbox(k, cur.senderName, composeSummaryText(cur, due));
+  return true;
 }
 
 // ── Fan-out decision (pure) ──
@@ -315,7 +380,9 @@ export function createBroadcast(input: CreateBroadcastInput, now: number = Date.
 }
 
 /**
- * Record one answer: into the ledger and into the sender's mailbox.
+ * Record one answer: into the ledger only. The sender is NOT messaged per
+ * reply — `notifyBroadcastSummary` sends them one summary line when all have
+ * answered or the deadline passes, and `status` reads the ledger meanwhile.
  * Refuses an unknown id or a recipient who never received the broadcast — a
  * reply to a made-up id must not fabricate a roll-call row.
  */
@@ -339,10 +406,6 @@ export function recordBroadcastReply(
   b.replies.push({ sessionId, name, answer, ...(reason ? { reason } : {}), at: now });
   pruneLedger(map, now);
   saveLedger(map);
-  // The sender's mailbox key is their pane id; a broadcast FROM an attach-view
-  // pair was deposited under `pane|uuid`, so try both forms of the sender.
-  const keys = [b.senderId, ...b.senderId.split("|")];
-  for (const k of new Set(keys)) depositToSessionMailbox(k, name, composeReplyText(id, name, answer, reason));
   return { ok: true, record: b };
 }
 
@@ -359,7 +422,17 @@ export function getBroadcastStatus(id: string, now: number = Date.now()): Broadc
     ...(b.deadlineAt !== undefined ? { deadlineAt: b.deadlineAt } : {}),
     deadlinePassed: b.deadlineAt !== undefined && now >= b.deadlineAt,
     rows: statusRows(b, now),
+    // The live record too: a handler that must act on it (fire the summary)
+    // gets the object without loading the ledger a second time.
+    record: b,
   };
+}
+
+/** One row per recipient with its answer — the pieces of a status read. */
+export function broadcastRollcall(id: string, now: number = Date.now()): { record: BroadcastRecord; rows: BroadcastStatusRow[] } | null {
+  const b = loadLedger().get(id);
+  if (!b) return null;
+  return { record: b, rows: statusRows(b, now) };
 }
 
 /** Test seam: point the ledger at a scratch dir and clear the read cache. */

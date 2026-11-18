@@ -266,7 +266,8 @@ test("beat: --heartbeat 0 prints nothing while waiting", async () => {
 // an unanswered recipient reads "silent" — or "no-objection" ONLY when the
 // sender passed defaultOk: silence is not agreement unless it was declared so.
 
-const { broadcastRecipients, createBroadcast, recordBroadcastReply, getBroadcastStatus, statusFor, parseDeadlineSec, _resetLedgerCache } = await import("../src/daemon/broadcast-core.js");
+const { broadcastRecipients, createBroadcast, recordBroadcastReply, getBroadcastStatus, statusFor, parseDeadlineSec, notifyBroadcastSummary, summaryDueAt, composeSummaryText, _resetLedgerCache } = await import("../src/daemon/broadcast-core.js");
+const { broadcast: broadcastCli } = await import("../src/daemon/broadcast-cli.js");
 
 process.env.AIBROKER_STATE_DIR = join(scratch, ".aibroker"); // the ledger file lives here too
 
@@ -382,7 +383,7 @@ test("broadcast deadline parsing: 2m / 90s / bare seconds / nonsense", () => {
   assert.equal(parseDeadlineSec("soon"), null);
 });
 
-test("broadcast ledger round-trip: create, reply into the sender's mailbox, roll-call; unknown id refused", () => {
+test("broadcast ledger round-trip: create, reply into the ledger, roll-call; unknown id refused", () => {
   _resetLedgerCache();
   // A deadline in the real future: `pending` must not depend on a fake clock —
   // getBroadcastStatus reads Date.now(), so a fixed epoch is always "passed".
@@ -394,7 +395,9 @@ test("broadcast ledger round-trip: create, reply into the sender's mailbox, roll
 
   const r = recordBroadcastReply(rec.id, BC_ANSWERER, "Answerer", "hold", "mid-deploy");
   assert.equal(r.ok, true, JSON.stringify(r));
-  assert.match(drainSessionMailbox(BC_SENDER)[0].content, new RegExp(`\\[Broadcast-reply:${rec.id}\\] Answerer: hold — mid-deploy`));
+  // A reply is ledgered, not messaged: the sender gets ONE summary when all
+  // answered — here that fires on the notify call, not per reply.
+  assert.deepEqual(drainSessionMailbox(BC_SENDER), [], "no mailbox message per reply");
 
   assert.equal(getBroadcastStatus(rec.id)!.rows[0].status, "hold");
   const after = getBroadcastStatus(rec.id, Date.now() + 200_000)!;
@@ -446,12 +449,16 @@ test("broadcast handler ask round-trip: reply recorded, status shows ok/hold vs 
   const handlers = registerAndCapture();
     const b = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: SHOUT, ask: true, deadline: "2m" } }))) as any;
     assert.equal(b.result.ask, true);
+    // The delivery report names its recipients — the CLI prints this list.
+    assert.deepEqual(b.result.recipients.map((r: any) => r.sessionId).sort(), [BC_ANSWERER, "bc-bystander-pane"]);
     // The ask carries its id and the exact reply command.
     assert.match(drainSessionMailbox(BC_ANSWERER)[0].content, new RegExp(`broadcast reply ${b.result.id} ok\\|hold`));
 
     const rep = (await handlers.get("broadcast_reply")!(req({ itermSessionId: BC_ANSWERER, params: { broadcastId: b.result.id, answer: "ok" } }))) as any;
     assert.equal(rep.ok, true, JSON.stringify(rep));
-    assert.match(drainSessionMailbox(BC_SENDER)[0].content, new RegExp(`\\[Broadcast-reply:${b.result.id}\\] bc-answerer-pane: ok`));
+    // Not the last answer outstanding → no summary yet, and never one message
+    // per reply. The sender's mailbox stays quiet until all answered/deadline.
+    assert.deepEqual(drainSessionMailbox(BC_SENDER), []);
 
     // A stranger that never received it may not answer.
     const bogus = (await handlers.get("broadcast_reply")!(req({ itermSessionId: "bc-shell-tab", params: { broadcastId: b.result.id, answer: "ok" } }))) as any;
@@ -460,24 +467,188 @@ test("broadcast handler ask round-trip: reply recorded, status shows ok/hold vs 
     const rep2 = (await handlers.get("broadcast_reply")!(req({ itermSessionId: "bc-bystander-pane", params: { broadcastId: b.result.id, answer: "hold", reason: "mid-deploy" } }))) as any;
     assert.equal(rep2.ok, true);
 
+    // The last answer outstanding landed → the handler fires ONE summary into
+    // the sender's mailbox (not one message per reply).
+    const summaries = drainSessionMailbox(BC_SENDER);
+    assert.equal(summaries.length, 1, `exactly one summary line, got ${summaries.length}`);
+    assert.match(summaries[0].content, new RegExp(`\\[Broadcast-summary:${b.result.id}\\] 2/2 answered \\(all answered\\)`));
+
     const st = (await handlers.get("broadcast_rollcall")!(req({ params: { broadcastId: b.result.id } }))) as any;
     assert.equal(st.ok, true);
     // Deadline not yet passed: the answered ones read their answers.
     const byName = new Map<string, string>(st.result.rows.map((row: any) => [row.sessionId, row.status]));
     assert.equal(byName.get("bc-answerer-pane"), "ok");
     assert.equal(byName.get("bc-bystander-pane"), "hold");
+    // The summary fired once; a later status read must not re-notify.
+    drainSessionMailbox(BC_SENDER);
+    await handlers.get("broadcast_rollcall")!(req({ params: { broadcastId: b.result.id } }));
+    assert.deepEqual(drainSessionMailbox(BC_SENDER), [], "the summary is sent at most once");
 
     // A default-ok broadcast whose deadline has passed: silence is no objection.
     const b2 = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: "restart in 5", ask: true, deadline: 1, defaultOk: true } }))) as any;
-    recordBroadcastReply(b2.result.id, BC_ANSWERER, "bc-answerer-pane", "ok", undefined);
+    // The reply handler itself fires the summary once the roll-call is
+    // complete — and that is what this asserts, through the real handler.
+    // Answered BY the answerer (a stranger's id would be refused). NOTE: in
+    // THIS fixture the sender resolves to "unknown-session" (the bare req()),
+    // not BC_SENDER — so the summary lands under the sender's own key, which
+    // is exactly what notifyBroadcastSummary deposits to (senderId + its parts).
+    const rep_b2 = (await handlers.get("broadcast_reply")!(req({ itermSessionId: BC_ANSWERER, params: { broadcastId: b2.result.id, answer: "ok" } }))) as any;
+    assert.equal(rep_b2.ok, true);
+    // One of two answered is nothing to report yet — the sender's mailbox (the
+    // sender's recorded pane key) stays empty.
+    assert.deepEqual(drainSessionMailbox(BC_SENDER), [], "no summary before all answered");
+
+    // The SECOND answer completes the roll-call: the handler fires the ONE
+    // summary line into the sender's mailbox then, and only then.
+    const rep_b2b = (await handlers.get("broadcast_reply")!(req({ itermSessionId: "bc-bystander-pane", params: { broadcastId: b2.result.id, answer: "ok" } }))) as any;
+    assert.equal(rep_b2b.ok, true);
+    const s2 = drainSessionMailbox(BC_SENDER);
+    assert.equal(s2.length, 1, `one summary for the completed ask, got ${s2.length}`);
+    assert.match(s2[0].content, new RegExp(`\\[Broadcast-summary:${b2.result.id}\\] 2/2 answered \\(all answered\\): 2 ok`));
     const late2 = getBroadcastStatus(b2.result.id, Date.now() + 10_000)!;
     const by2 = new Map<string, string>(late2.rows.map((row) => [row.sessionId, row.status]));
     assert.equal(by2.get("bc-answerer-pane"), "ok");
-    assert.equal(by2.get("bc-bystander-pane"), "no-objection");
+    // The second answer completed the roll-call before the deadline — both
+    // read their answers; defaultOk only labels silence.
+    assert.equal(by2.get("bc-bystander-pane"), "ok");
+
+    // A default-ok ask whose deadline passes UNANSWERED reads no-objection:
+    // b3 below covers that (its bystander never answers).
 
     // Same clock WITHOUT defaultOk: the unanswered one is silent.
     const b3 = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: "restart in 5", ask: true, deadline: 1 } }))) as any;
     recordBroadcastReply(b3.result.id, BC_ANSWERER, "bc-answerer-pane", "ok", undefined);
+    drainSessionMailbox(BC_SENDER); // b3's summary (all answered) — not what this asserts
     const late3 = getBroadcastStatus(b3.result.id, Date.now() + 10_000)!;
     assert.equal(new Map(late3.rows.map((row) => [row.sessionId, row.status])).get("bc-bystander-pane"), "silent");
+
+    // A shout with nobody to reach is refused WITH a reason — never a silent
+    // "delivered to 0". The fixture: only the sender's own pane remains (the
+    // answerer and bystander are gone, the shell is never asked).
+    await privateStub([[BC_SENDER, "claude (node)", "/dev/ttys901", "◑ Sender (claude)", "", ""]]);
+    const alone = await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: "anyone there?" } }));
+    assert.equal(alone.ok, false);
+    assert.match((alone as any).error, /no other live Claude session/);
 }));
+
+// ── the summary line: one per ask, at all-answered or the deadline ─────────
+
+test("broadcast summary: not before all answered; one line when all answered; never twice", () => {
+  _resetLedgerCache();
+  const rec = createBroadcast({
+    senderId: BC_SENDER, senderName: "Sender", message: "restart window?", ask: true, deadlineSec: 120, defaultOk: false,
+    recipients: [{ sessionId: "bc-sum-a", name: "A" }, { sessionId: "bc-sum-b", name: "B" }],
+  });
+  drainSessionMailbox("bc-sum-a"); drainSessionMailbox("bc-sum-b");
+
+  recordBroadcastReply(rec.id, "bc-sum-a", "A", "ok", undefined);
+  assert.equal(summaryDueAt(getBroadcastStatus(rec.id)!.record, Date.now()), undefined, "one of two answered is nothing to report");
+  assert.deepEqual(drainSessionMailbox(BC_SENDER), []);
+
+  recordBroadcastReply(rec.id, "bc-sum-b", "B", "hold", "mid-deploy");
+  const b = getBroadcastStatus(rec.id)!.record;
+  assert.equal(summaryDueAt(b, Date.now()) !== undefined, true);
+  assert.equal(notifyBroadcastSummary(b), true);
+  const m = drainSessionMailbox(BC_SENDER);
+  assert.equal(m.length, 1);
+  assert.match(m[0].content, /\[Broadcast-summary:/);
+  assert.match(m[0].content, /2\/2 answered \(all answered\): 1 ok, 1 hold/);
+  assert.match(m[0].content, /hold: B — mid-deploy/);
+  assert.equal(notifyBroadcastSummary(getBroadcastStatus(rec.id)!.record), false, "at most once");
+  assert.deepEqual(drainSessionMailbox(BC_SENDER), []);
+});
+
+test("broadcast summary at the deadline: silence reports as silent/no-objection; durable across a restart", () => {
+  _resetLedgerCache();
+  const rec = createBroadcast({
+    senderId: BC_SENDER, senderName: "Sender", message: "freeze soon?", ask: true, deadlineSec: 60, defaultOk: false,
+    recipients: [{ sessionId: "bc-sum-c", name: "C" }],
+  });
+  drainSessionMailbox("bc-sum-c");
+  const late = Date.now() + 120_000;
+  assert.equal(summaryDueAt(getBroadcastStatus(rec.id)!.record, late) !== undefined, true);
+  assert.equal(notifyBroadcastSummary(getBroadcastStatus(rec.id)!.record, late), true);
+  const m = drainSessionMailbox(BC_SENDER);
+  // Nothing answered → "0/1", the tally reads silent.
+  assert.match(m[0].content, /0\/1 answered \(deadline passed\): 1 silent/);
+
+  // The notified flag is in the ledger file: a fresh read (daemon restart)
+  // must not re-notify.
+  _resetLedgerCache();
+  assert.equal(notifyBroadcastSummary(getBroadcastStatus(rec.id)!.record, late + 1000), false);
+  assert.deepEqual(drainSessionMailbox(BC_SENDER), []);
+
+  // defaultOk flips the wording of silence in the summary too.
+  const rec2 = createBroadcast({
+    senderId: BC_SENDER, senderName: "Sender", message: "ok to restart?", ask: true, deadlineSec: 60, defaultOk: true,
+    recipients: [{ sessionId: "bc-sum-d", name: "D" }],
+  });
+  drainSessionMailbox("bc-sum-d");
+  assert.match(composeSummaryText(getBroadcastStatus(rec2.id)!.record, late), /1 no-objection/);
+});
+
+// ── the CLI's own words: id + recipients + delivered; ledger-backed status ──
+
+test("broadcast CLI: prints the id, every recipient and 'delivered to N'; a refusal names its reason", async () => {
+  const lines: string[] = [];
+  const errs: string[] = [];
+  const origError = console.error;
+  console.error = (l: unknown) => errs.push(String(l));
+  try {
+    const code = await broadcastCli(["hello", "--ask", "--deadline", "10m"], {
+      call: async (method, params) => {
+        assert.equal(method, "broadcast");
+        assert.equal(params.deadline, "10m");
+        return { id: "abc23", deliveredTo: 2, skippedShells: 1, recipients: [{ sessionId: "p1", name: "One" }, { sessionId: "p2", name: "Two" }] };
+      },
+      readStdin: async () => "",
+      out: (l) => lines.push(l),
+    });
+    assert.equal(code, 0);
+    assert.match(lines[0], /^Broadcast abc23 delivered to 2 session\(s\), 1 shell tab\(s\) skipped\./);
+    assert.deepEqual(lines.slice(1, 3), ["  → One", "  → Two"]);
+    assert.match(lines[3], /deadline 10m.*broadcast status abc23/);
+
+    // A refusal arrives as a thrown error carrying the reason (client
+    // contract). Fresh `lines` — a refusal must add no delivery line.
+    lines.length = 0;
+    const refused = await broadcastCli(["hello"], {
+      call: async () => { throw new Error("nothing was sent — no other live Claude session to reach"); },
+      readStdin: async () => "", out: (l) => lines.push(l),
+    });
+    assert.equal(refused, 1);
+    assert.match(errs.at(-1)!, /refused: nothing was sent/);
+    assert.deepEqual(lines, [], "a refusal prints no delivery line");
+  } finally { console.error = origError; }
+});
+
+test("broadcast CLI status: survives a daemon that cannot answer the roll-call — reads the durable ledger", async () => {
+  _resetLedgerCache();
+  const rec = createBroadcast({
+    senderId: BC_SENDER, senderName: "Sender", message: "old daemon test", ask: true, deadlineSec: 60, defaultOk: false,
+    recipients: [{ sessionId: "bc-cli-a", name: "A" }, { sessionId: "bc-cli-b", name: "B" }],
+  });
+  drainSessionMailbox("bc-cli-a"); drainSessionMailbox("bc-cli-b");
+  recordBroadcastReply(rec.id, "bc-cli-a", "A", "ok", undefined);
+
+  const lines: string[] = [];
+  // The old-daemon fault (live 2026-11-18): the call throws — status must
+  // still roll up from broadcasts.json on disk.
+  const code = await broadcastCli(["status", rec.id], {
+    call: async () => { throw new Error("Unknown method: broadcast_rollcall"); },
+    readStdin: async () => "", out: (l) => lines.push(l),
+  });
+  assert.equal(code, 0);
+  assert.match(lines[0], new RegExp(`broadcast ${rec.id} from Sender: old daemon test`));
+  assert.match(lines[0], /deadline .*T.*Z/);
+  assert.match(lines[1], /1 ok, 1 pending/);
+  assert.match(lines.join("\n"), /ok\s+A\n\s*pending\s+B/);
+
+  // An id the ledger does not know stays an error — the fallback must not
+  // invent a roll-call.
+  const missing = await broadcastCli(["status", "zzzzz"], {
+    call: async () => { throw new Error("Unknown method"); },
+    readStdin: async () => "", out: () => {},
+  });
+  assert.equal(missing, 1);
+});

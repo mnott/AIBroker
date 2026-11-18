@@ -54,7 +54,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { addRoute, findRoute, noteOwnWrite } from "./inbound.js";
-import { broadcastRecipients, createBroadcast, recordBroadcastReply, getBroadcastStatus, parseDeadlineSec } from "./broadcast-core.js";
+import { broadcastRecipients, createBroadcast, recordBroadcastReply, getBroadcastStatus, notifyBroadcastSummary, parseDeadlineSec } from "./broadcast-core.js";
 import { issueWriteCredential, botIgnoreRule, routeIgnoresAccount } from "./forge-credential.js";
 import { issueOp, whoAmI, READ_VERBS, WRITE_VERBS, type IssueVerb } from "./forge-issues.js";
 import { funnelHostname } from "./funnel-watchdog.js";
@@ -1631,6 +1631,15 @@ export function registerCoreHandlers(
     const rec = createBroadcast({
       senderId: senderId ?? senderLabel, senderName: senderLabel, message, ask, deadlineSec, defaultOk, recipients,
     });
+    // A shout with nobody to hear it is a refusal, not a success: the CLI must
+    // say so (with the reason) instead of printing "delivered to 0".
+    if (recipients.length === 0) {
+      audit({
+        action: "broadcast", actor: `session:${senderLabel}`, target: "all-sessions",
+        outcome: "refused", body: message, reason: `${skippedShells} shell tab(s) skipped, no other live Claude session`, meta: { ask, deadlineSec, defaultOk },
+      });
+      return { ok: false, error: `nothing was sent — no other live Claude session to reach${skippedShells ? ` (${skippedShells} shell tab(s) are never asked)` : ""}` };
+    }
     for (const r of recipients) {
       const eventId = audit({
         action: "broadcast", actor: `session:${senderLabel}`, target: r.name,
@@ -1642,7 +1651,9 @@ export function registerCoreHandlers(
       action: "broadcast", actor: `session:${senderLabel}`, target: "all-sessions",
       outcome: "delivered", body: message, reason: `${recipients.length} recipient(s), ${skippedShells} shell tab(s) skipped`, meta: { broadcastId: rec.id, ask, deadlineSec, defaultOk },
     });
-    return { ok: true, result: { id: rec.id, ask, deliveredTo: recipients.length, skippedShells } };
+    // The recipient list rides home so the CLI can print exactly who got it —
+    // "delivered to N" without names is not a delivery report.
+    return { ok: true, result: { id: rec.id, ask, deliveredTo: recipients.length, skippedShells, recipients } };
   });
 
   /**
@@ -1664,6 +1675,12 @@ export function registerCoreHandlers(
       return { ok: false, error: r.error };
     }
     audit({ action: "broadcast_reply", actor: `session:${name}`, target: broadcastId, outcome: "delivered", body: `${answer}${reason ? ` — ${reason}` : ""}`, meta: { broadcastId, answer } });
+    // The sender gets ONE summary line when the roll-call is complete or the
+    // deadline passes — never one mailbox message per reply. Idempotent and
+    // durable (the ledger records that it was sent), so a restart cannot
+    // re-notify; if this call is not the last one, a later reply or status
+    // read fires it instead.
+    notifyBroadcastSummary(r.record);
     return { ok: true, result: { ok: true, id: broadcastId, answeredBy: name, answer } };
   });
 
@@ -1681,7 +1698,11 @@ export function registerCoreHandlers(
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
     if (!s) return { ok: false, error: `no broadcast with id "${broadcastId}"` };
-    return { ok: true, result: { ...s } };
+    // A status read doubles as the deadline's check: if the ask completed or
+    // ran out while nobody looked, this is where the summary goes out.
+    notifyBroadcastSummary(s.record);
+    const { record: _record, ...publicStatus } = s;
+    return { ok: true, result: { ...publicStatus } };
   });
 
   /**
