@@ -230,15 +230,17 @@ test("host[:port] parsing: defaults, explicit port, invalid port, smtp TLS mode"
 });
 
 // --- auto-launch of the owner session ---------------------------------------
-import { __resetLaunchState } from "../src/daemon/mail-ingress.js";
+import { __resetLaunchState, __resetAlertState } from "../src/daemon/mail-ingress.js";
 
 async function mailWith(mid: string): Promise<Buffer> {
   return signed(msg().replace("<m1@example.org>", `<${mid}@example.org>`));
 }
 const NO_SESSION = { ok: false, detail: 'no live session matches owner "Site Owner"' };
+const SHELL_TAB = { ok: false, detail: 'session "Site Owner" is at a shell prompt, not a Claude prompt' };
 
 function harness(deliverResults: { ok: boolean; detail: string }[], dispatchImpl?: () => Promise<{ outcome: string; reason: string }>) {
   __resetLaunchState();
+  __resetAlertState();
   const calls = { dispatch: [] as { project: string; message: string; prefix: string; sessionName: string; launchRetryDelayMs?: number }[], deliver: 0, notify: [] as string[] };
   let clock = 1_000_000;
   const deps = {
@@ -318,11 +320,109 @@ test("auto-launch: failure -> deferred, relaunch only after 10 minutes", async (
   assert.equal(h.calls.notify.length, 0);
 });
 
-test("auto-launch: shell prompt (not absence) never launches", async () => {
+test("auto-launch: shell prompt (not absence) never goes through dispatch", async () => {
   const h = harness([{ ok: false, detail: 'session "x" is at a shell prompt, not a Claude prompt' }]);
   const r = await handleMessage(mb, await mailWith("al6"), BOX, id, goodResolver, h.deps);
   assert.equal(r.action, "deferred");
   assert.equal(h.calls.dispatch.length, 0);
+});
+
+// --- owner tab exists as a plain shell ---------------------------------------
+// 2026-11-18 morning: change-request mail for an owner whose iTerm tab existed
+// but ran no Claude deferred every 5 minutes for two hours — the absence path
+// (dispatch) was never taken, and nothing else started the session either.
+
+function shellHarness(o: { launchFails?: string; afterLaunch?: { ok: boolean; detail: string }[] }) {
+  __resetLaunchState();
+  __resetAlertState();
+  const calls = { launchInTab: [] as { project: string; message: string; sessionName: string }[], deliver: 0, notify: [] as string[], dispatch: 0 };
+  // First call sees the shell. After a successful launch the tab runs Claude,
+  // so delivery succeeds unless the test configures otherwise.
+  const after = o.afterLaunch ?? { ok: true, detail: "delivered" };
+  let launched = false;
+  let postLaunch = 0;
+  const deps = {
+    deliver: async () => {
+      if (calls.deliver++ === 0) return SHELL_TAB; // the tab was a shell before anything ran
+      if (!launched) return SHELL_TAB; // launch failed: still a shell
+      const r = Array.isArray(after) ? after[Math.min(postLaunch, after.length - 1)] : after;
+      postLaunch++;
+      return r;
+    },
+    dispatch: async () => { calls.dispatch++; return { outcome: "spawned", reason: "" }; },
+    launchInTab: async (project: string, message: string, sessionName: string) => {
+      calls.launchInTab.push({ project, message, sessionName });
+      if (o.launchFails) throw new Error(o.launchFails);
+      launched = true;
+    },
+    notify: (t: string) => { calls.notify.push(t); },
+    now: () => 1_000_000,
+  };
+  return { calls, deps };
+}
+
+test("shell tab: mail starts Claude in the owner's project and delivers there", async () => {
+  const h = shellHarness({});
+  const r = await handleMessage({ ...mb, project: "example-project" }, await mailWith("sh1"), BOX, id, goodResolver, h.deps);
+  assert.equal(r.action, "accepted");
+  assert.equal(h.calls.launchInTab.length, 1);
+  assert.equal(h.calls.launchInTab[0].project, "example-project");
+  assert.equal(h.calls.launchInTab[0].sessionName, "Site Owner");
+  assert.match(h.calls.launchInTab[0].message, /^\[Mail:site\] change request received/);
+  assert.equal(h.calls.dispatch, 0); // dispatch refuses a shell tab; this path bypasses it
+  assert.deepEqual(h.calls.notify, ["Started Claude in the Site Owner tab for mail change"]);
+});
+
+test("shell tab: launch failure -> deferred with exactly one operator alert, not silent", async () => {
+  const h = shellHarness({ launchFails: "iTerm would not open a tab" });
+  const m = await mailWith("sh2");
+  assert.equal((await handleMessage(mb, m, BOX, id, goodResolver, h.deps)).action, "deferred");
+  // The deferred mail is retried forever (every poll); the alert must not be.
+  assert.equal((await handleMessage(mb, m, BOX, id, goodResolver, h.deps)).action, "deferred");
+  assert.equal(h.calls.launchInTab.length, 2);
+  assert.equal(h.calls.notify.length, 1);
+  assert.match(h.calls.notify[0], /Site Owner could not start its session: iTerm would not open a tab/);
+});
+
+test("shell tab: Claude started but the mail cannot be deposited -> one alert naming why", async () => {
+  const h = shellHarness({ afterLaunch: [{ ok: false, detail: "session vanished mid-launch" }] });
+  const r = await handleMessage(mb, await mailWith("sh3"), BOX, id, goodResolver, h.deps);
+  assert.equal(r.action, "deferred");
+  assert.equal(h.calls.notify.length, 1);
+  assert.match(h.calls.notify[0], /Claude was started but the mail could not be delivered \(session vanished mid-launch\)/);
+});
+
+test("batch: owner at a shell tab -> Claude started once with the first mail as work order", async () => {
+  __resetLaunchState();
+  __resetAlertState();
+  let live = false; // stays false in this harness: delivery is asserted via the work order
+  const calls = { launchInTab: [] as string[], delivered: [] as string[], notify: [] as string[] };
+  const deps = {
+    deliver: async (_m: MailboxConfig, body: string) => {
+      // A deposit that is the work order itself (a re-delivery after a failed
+      // start) must not count as a mailbox delivery of its own.
+      if (body.startsWith("[work order]")) return { ok: true, detail: "delivered" };
+      if (!live) return SHELL_TAB;
+      calls.delivered.push(body);
+      return { ok: true, detail: "delivered" };
+    },
+    dispatch: async () => ({ outcome: "spawned", reason: "" }),
+    launchInTab: async (_p: string, message: string) => {
+      calls.launchInTab.push(message);
+      live = true;
+      // The launched session reads the order as its first prompt — it is NOT a
+      // mailbox delivery, so nothing here pushes it into `delivered`.
+    },
+    notify: (t: string) => { calls.notify.push(t); },
+    now: () => 1_000_000,
+  };
+  const raws = await Promise.all([{ uid: 7, mid: "sb1" }, { uid: 8, mid: "sb2" }].map(async (i) => ({ uid: i.uid, raw: await mailWith(i.mid) })));
+  const results: [number, string][] = [];
+  await handleBatch(mb, raws, BOX, id, goodResolver, deps, (uid, r) => { results.push([uid, r.action]); });
+  assert.equal(calls.launchInTab.length, 1);
+  assert.match(calls.launchInTab[0], /sb2@example\.org/); // work order names the queued rest
+  assert.deepEqual(midsOf(calls.delivered), ["sb1", "sb2"]);
+  assert.deepEqual(results, [[7, "accepted"], [8, "accepted"]]);
 });
 
 // --- catch-up batch ----------------------------------------------------------

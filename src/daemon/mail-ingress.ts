@@ -76,15 +76,24 @@ async function saveAttachments(messageId: string, p: Parsed): Promise<string[]> 
 
 type DeliverFn = (mb: MailboxConfig, body: string) => Promise<{ ok: boolean; detail: string }>;
 type LaunchFn = (project: string, message: string, opts: { prefix: string; sessionName: string; launchRetryDelayMs?: number }) => Promise<{ outcome: string; reason: string }>;
+type FindTabFn = (owner: string) => Promise<{ id: string; name: string } | undefined>;
+type TabClaudeFn = (id: string) => Promise<boolean>;
+type LaunchTabFn = (project: string, message: string, sessionName: string) => Promise<void>;
 
 export interface IngressDeps {
   deliver?: DeliverFn;
   dispatch?: LaunchFn;
   notify?: (text: string) => void;
   now?: () => number;
+  /** For tests: the live-tab lookups and the in-tab launch behind seams. */
+  findTab?: FindTabFn;
+  tabRunsClaude?: TabClaudeFn;
+  launchInTab?: LaunchTabFn;
 }
 
 const LAUNCH_RETRY_MS = 10 * 60_000;
+/** The refusal of `attemptMessageDelivery` when the owner's tab is a bare shell. */
+const SHELL_PROMPT = /is at a shell prompt, not a Claude prompt/;
 /**
  * Tab creation is transiently flaky: the first manual launch of an owner has
  * failed with "iTerm would not open one, or the new tab was not at a shell
@@ -113,6 +122,84 @@ async function realDispatch(project: string, message: string, opts: { prefix: st
 async function realNotify(text: string): Promise<void> {
   const { broadcastText } = await import("../adapters/pailot/gateway.js");
   await broadcastText(text);
+}
+
+/** The session tab matching the owner name, if one exists at all (shell included). */
+async function findOwnerTab(owner: string): Promise<{ id: string; name: string } | undefined> {
+  const { snapshotAllSessions } = await import("../transport/sync-facade.js");
+  const { matchSession } = await import("../core/session-match.js");
+  const snapshots = await snapshotAllSessions();
+  const hit = await matchSession([owner], snapshots.map((s) => ({ id: s.id, name: s.name })));
+  return hit ? { id: hit.session.id, name: hit.session.name } : undefined;
+}
+
+/** True when the pane at that tab is running Claude rather than a bare shell. */
+async function tabRunsClaude(id: string): Promise<boolean> {
+  const { isClaudeSession } = await import("../transport/sync-facade.js");
+  return isClaudeSession(id);
+}
+
+/**
+ * Open a tab in the owner's project directory and start Claude there with the
+ * mail as its first prompt — `launchResolvedPaiProject` does exactly that, but
+ * it resolves by name and a display-name owner ("MDF - Webseiten") has no
+ * curated alias, so the resolution goes through the PAI registry directly.
+ */
+async function realLaunchInProject(projectName: string, message: string, sessionName: string): Promise<void> {
+  const { findPaiProject, launchResolvedPaiProject } = await import("./pai-projects.js");
+  const project = await findPaiProject(projectName);
+  if (!project) throw new Error(`PAI project "${projectName}" not found`);
+  const order = message.replace(/[\r\n]+/g, " ").replace(/'/g, "").trim();
+  await launchResolvedPaiProject(project, { initialPrompt: order, sessionName });
+}
+
+/**
+ * One operator alert per owner and failure reason. A deferred mail is retried
+ * every five minutes forever until it lands; an alert that fired per retry
+ * would be spam, and one that never fires is the silent failure this replaces.
+ */
+const alerted = new Map<string, string>();
+/** For tests. */
+export function __resetAlertState(): void { alerted.clear(); }
+
+async function alertOperator(deps: IngressDeps, key: string, text: string): Promise<void> {
+  if (alerted.get(key) === text) return;
+  alerted.set(key, text);
+  try { await (deps.notify ?? realNotify)(text); } catch { /* best effort */ }
+}
+
+/**
+ * Start Claude in the owner's existing tab and hand it the mail as its first
+ * prompt. The dispatch path cannot do this: a same-name session that is a bare
+ * shell makes dispatch refuse ("no longer running Claude — nothing was sent")
+ * rather than launch, so on 2026-11-18 morning a change-request mail sat UNSEEN
+ * for two hours while the owner's tab existed at a shell prompt. Claude is
+ * started in the project directory (never typed into the existing shell pane:
+ * that is the deliberate refusal in inbound.ts, and it stays true); once Claude
+ * is up there, delivery goes through the normal mailbox path.
+ */
+async function startClaudeInOwnerTab(
+  mb: MailboxConfig, body: string, subject: string, deps: IngressDeps, deliver: DeliverFn,
+): Promise<"launched" | "failed"> {
+  const key = mb.owner.toLowerCase();
+  const project = mb.project || mb.owner;
+  try {
+    await (deps.launchInTab ?? realLaunchInProject)(project, body, mb.owner);
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    log(`mail-ingress: ${mb.name} start of Claude for the shell tab of ${mb.owner} failed: ${why}`);
+    await alertOperator(deps, key, `Mail for ${mb.owner} could not start its session: ${why}. Mail stays unread until it is handled.`);
+    return "failed";
+  }
+  // The tab belongs to Claude now; give the mail to it like any live session.
+  const r = await deliver(mb, body);
+  if (!r.ok) {
+    log(`mail-ingress: ${mb.name} started Claude for ${mb.owner} but deposit failed: ${r.detail}`);
+    await alertOperator(deps, key, `Mail for ${mb.owner}: Claude was started but the mail could not be delivered (${r.detail}). Mail stays unread until it is handled.`);
+    return "failed";
+  }
+  try { await (deps.notify ?? realNotify)(`Started Claude in the ${mb.owner} tab for mail ${subject}`); } catch { /* best effort */ }
+  return "launched";
 }
 
 /**
@@ -213,10 +300,15 @@ export async function handleMessage(
   const pr = x.prep;
   const deliver = deps.deliver ?? deliverToOwner;
   let r = await deliver(mb, pr.text);
-  if (!r.ok && mb.autoLaunch !== false && r.detail.startsWith("no live session")) {
-    const l = await launchOwner(mb, pr.text, pr.subject, deps);
-    if (l === "launched") r = { ok: true, detail: `started ${mb.owner} with the mail as work order` };
-    else if (l === "wait") r = await deliver(mb, pr.text);
+  if (!r.ok && mb.autoLaunch !== false) {
+    if (r.detail.startsWith("no live session")) {
+      const l = await launchOwner(mb, pr.text, pr.subject, deps);
+      if (l === "launched") r = { ok: true, detail: `started ${mb.owner} with the mail as work order` };
+      else if (l === "wait") r = await deliver(mb, pr.text);
+    } else if (SHELL_PROMPT.test(r.detail)) {
+      const l = await startClaudeInOwnerTab(mb, pr.text, pr.subject, deps, deliver);
+      if (l === "launched") r = { ok: true, detail: `started Claude in the ${mb.owner} tab with the mail as work order` };
+    }
   }
   return r.ok ? accepted(mb, pr, r.detail) : deferredOutcome(mb, pr, r.detail);
 }
@@ -245,18 +337,25 @@ export async function handleBatch(
   let delivered = 0;
   let launched = false;
   let launchTried = false;
+  let shellLaunchTried = false;
   for (let i = 0; i < queue.length; i++) {
     const { uid, pr } = queue[i];
     let r = await deliver(mb, pr.text);
-    if (!r.ok && !launchTried && mb.autoLaunch !== false && r.detail.startsWith("no live session")) {
-      launchTried = true;
+    if (!r.ok && mb.autoLaunch !== false) {
       const rest = queue.slice(i + 1).map((q) => q.pr.messageId);
       const order = rest.length
         ? `${pr.text}\n---\nQueued after this request, delivered next as separate [Mail:${mb.name}] messages in arrival order: ${rest.join(" ")}`
         : pr.text;
-      const l = await launchOwner(mb, order, pr.subject, deps, { notify: queue.length === 1 });
-      if (l === "launched") { launched = true; r = { ok: true, detail: `started ${mb.owner} with the mail as work order` }; }
-      else if (l === "wait") r = await deliver(mb, pr.text);
+      if (!launchTried && r.detail.startsWith("no live session")) {
+        launchTried = true;
+        const l = await launchOwner(mb, order, pr.subject, deps, { notify: queue.length === 1 });
+        if (l === "launched") { launched = true; r = { ok: true, detail: `started ${mb.owner} with the mail as work order` }; }
+        else if (l === "wait") r = await deliver(mb, pr.text);
+      } else if (!shellLaunchTried && SHELL_PROMPT.test(r.detail)) {
+        shellLaunchTried = true;
+        const l = await startClaudeInOwnerTab(mb, order, pr.subject, deps, deliver);
+        if (l === "launched") { launched = true; r = { ok: true, detail: `started Claude in the ${mb.owner} tab with the mail as work order` }; }
+      }
     }
     const out = r.ok ? accepted(mb, pr, r.detail) : deferredOutcome(mb, pr, r.detail);
     if (r.ok) delivered++;
