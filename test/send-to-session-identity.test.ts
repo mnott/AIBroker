@@ -33,7 +33,11 @@ process.env.HOME = scratch;
 mkdirSync(join(scratch, ".aibroker"), { recursive: true });
 
 const { registerCoreHandlers, callerItermId, resolveSenderLabel } = await import("../src/daemon/core-handlers.js");
-const { _internal, invalidateSnapshotCache } = await import("../src/adapters/iterm/core.js");
+// `live bindings`: the module namespace is passed through, so a rebinding of
+// wasLastSnapshotReliable below reaches core.ts's own internal call sites.
+const coreImport: typeof import("../src/adapters/iterm/core.js") & { live?: true } = await import("../src/adapters/iterm/core.js");
+const _internal = coreImport._internal;
+const invalidateSnapshotCache = coreImport.invalidateSnapshotCache;
 const { setAppDir, setPersistentSessionName } = await import("../src/core/persistence.js");
 const { drainSessionMailbox } = await import("../src/core/state.js");
 import type { IpcRequest } from "../src/types/ipc.js";
@@ -55,13 +59,41 @@ const APPLESCRIPT_ONE_LIVE_SESSION = [
   "session-live-1", "claude (node)", "/dev/ttys001", "◑ Generic session content (claude)",
 ].join("\t");
 
+/**
+ * The JXA slot is ONE module-level function shared by every stubbed test in
+ * this file (the A-tests below swap it and restore at a fixed moment), so all
+ * of them run under this mutex: only one holds the slot at a time. (Without
+ * it, install/restore interleaved and whichever restore landed last put the
+ * REAL osascript back mid-test — observed: deliveredTo 0.) Declared before the
+ * first test() call because node starts tests as they are registered.
+ */
+let stubChain: Promise<unknown> = Promise.resolve();
+function withStubLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = stubChain.then(fn);
+  stubChain = run.catch(() => {}); // a failure must not poison the next holder
+  return run;
+}
+
+/**
+ * The facade's merged memo answers from memory for STALE_LIMIT_MS, and its
+ * epoch only moves when core's cache is invalidated — dropping the memo alone
+ * would leave an old (real-machine) row set answering. Invalidation makes the
+ * next call re-enumerate instead of serving the stale rows.
+ */
+async function dropFacadeMemo() {
+  const facade = await import("../src/transport/sync-facade.js");
+  facade.invalidateSnapshotMemoForTests();
+  coreImport.invalidateSnapshotCache();
+  coreImport._resetEnumBackoffForTest(); // a failed-enumeration test leaves a 60s back-off that would starve the next fixture
+}
+
 function req(fields: Partial<IpcRequest>): IpcRequest {
   return { id: "r1", sessionId: "unknown-session", method: "send_to_session", params: {}, ...fields } as IpcRequest;
 }
 
 // ── A: a failed enumeration must retry, then queue — never "not found" ─────
 
-test("A: an unreliable/empty enumeration retries and then queues by the persisted name, not \"not found\"", async () => {
+test("A: an unreliable/empty enumeration retries and then queues by the persisted name, not \"not found\"", () => withStubLock(async () => {
   setPersistentSessionName("session-live-1", "AIBroker");
   invalidateSnapshotCache();
   const original = _internal.runItermJxa;
@@ -83,10 +115,11 @@ test("A: an unreliable/empty enumeration retries and then queues by the persiste
   } finally {
     _internal.runItermJxa = original;
     invalidateSnapshotCache();
+    await dropFacadeMemo(); // a stubbed run must not sit in the facade memo for later tests
   }
-});
+}));
 
-test("A: a RELIABLE enumeration that genuinely has no match still reports \"not found\"", async () => {
+test("A: a RELIABLE enumeration that genuinely has no match still reports \"not found\"", () => withStubLock(async () => {
   // The fix must not paper over a real absence — only an unreliable answer.
   invalidateSnapshotCache();
   const original = _internal.runItermJxa;
@@ -100,8 +133,9 @@ test("A: a RELIABLE enumeration that genuinely has no match still reports \"not 
   } finally {
     _internal.runItermJxa = original;
     invalidateSnapshotCache();
+    await dropFacadeMemo(); // ditto
   }
-});
+}));
 
 // ── B: sender label is the persistent name, never the raw dynamic title ────
 //
@@ -221,3 +255,229 @@ test("beat: --heartbeat 0 prints nothing while waiting", async () => {
   assert.equal(await mailboxWait(["--timeout", "5000", "--heartbeat", "0"], c.deps), 2);
   assert.deepEqual(c.out, []);
 });
+
+// ── broadcast: fan-out to all live claude sessions, answers, roll-call ───────
+//
+// `aibroker broadcast` shouts a message into the mailbox of every live Claude
+// session except the sender (mailbox-only — nothing typed anywhere, so no part
+// of this needs a real terminal; the JXA stub answers `sessions` only). Shell
+// tabs are skipped: they would execute the shout, not read it. With --ask a
+// reply is recorded and lands in the sender's mailbox, and after the deadline
+// an unanswered recipient reads "silent" — or "no-objection" ONLY when the
+// sender passed defaultOk: silence is not agreement unless it was declared so.
+
+const { broadcastRecipients, createBroadcast, recordBroadcastReply, getBroadcastStatus, statusFor, parseDeadlineSec, _resetLedgerCache } = await import("../src/daemon/broadcast-core.js");
+
+process.env.AIBROKER_STATE_DIR = join(scratch, ".aibroker"); // the ledger file lives here too
+
+/**
+ * A per-test enumeration stub, run under withStubLock — the module-level JXA
+ * slot is shared state and tests run concurrently, so a swapped-in global gets
+ * yanked out from under a running test (observed: deliveredTo 0).
+ *
+ * Rows are tab-separated JXA fields (id, name, tty, tabTitle, workerPane,
+ * path). `isClaude` comes from the process table keyed on the tty: a non-empty
+ * table marks these PRIVATE ttys false (measured wins over any heuristic), so
+ * this stub answers "" for it — an empty ps output leaves isClaude undefined
+ * and the documented title fallback decides ("(node)" is a session, "-zsh" at
+ * prompt is a shell).
+ */
+async function privateStub(rows: string[][]) {
+  const coreMod = await import("../src/adapters/iterm/core.js");
+  // The stub answers EVERY enumeration call in the test, whatever script is
+  // passed (the A-tests' bare stubs do the same): keying on the script text
+  // made a changed enum script fall through to the REAL osascript — which
+  // enumerates this machine's real tabs and starves the fixture (deliveredTo 0).
+  coreMod._internal.runItermJxa = () => (rows.length ? rows.map((r) => r.join("\t")).join("\n") : ""); // no rows = "iTerm answered nothing" → marker fires
+  // The process table is read by runCaptureAsync (execFile), NOT the JXA stub,
+  // and a direct call inside the module cannot be swapped from outside — so it
+  // goes through _internal, like every other JXA primitive does for exactly
+  // this reason. An empty `ps` output means "table unreadable" → isClaude
+  // undefined → the title heuristic decides. A real ps on this machine would
+  // mark our private ttys measured-shells and starve the fan-out to zero.
+  coreMod._internal.runPsTtys = () => Promise.resolve("");
+  const facade = await import("../src/transport/sync-facade.js");
+  facade.setTransportOverrideForTests("iterm"); // the tmux host's panes are not our fixture
+  await dropFacadeMemo(); // never answer from another enumeration's memo (see dropFacadeMemo)
+  return coreMod;
+}
+
+/**
+ * The enumeration's own caches (adapters/iterm memo, discovery's last-good
+ * replay) sit BELOW core-handlers' listedSessions, so one test could be
+ * answered from another's rows. Every layer gets a bypass: listedSessions asks
+ * `fresh` (discovery drops its replay on it), the facade memo is dropped in
+ * privateStub, and an EMPTY stub answer marks the enumeration unreliable —
+ * which is what stops the core memo caching those rows at all. The marker is
+ * consumed by exactly one enumeration call (the test's first).
+ */
+const origRunItermJxa = _internal.runItermJxa;
+_internal.runItermJxa = (script?: string, timeoutMs?: number) => {
+  const r = origRunItermJxa(script, timeoutMs);
+  if (r === "") _internal.markEnumUnreliableForTests(); // empty stub: iTerm answered nothing — do not cache/replay it
+  return r;
+};
+
+const BC_SENDER = "bc-sender-pane";
+const BC_ANSWERER = "bc-answerer-pane";
+const SHOUT = "I need the screen controls (clickr) for ~5 min, ok?";
+
+function baseRows(): string[][] {
+  return [
+    [BC_SENDER, "claude (node)", "/dev/ttys901", "◑ Sender (claude)", "", ""],
+    [BC_ANSWERER, "claude (node)", "/dev/ttys902", "◑ Answerer (claude)", "", ""],
+    ["bc-bystander-pane", "claude (node)", "/dev/ttys903", "◑ Bystander (claude)", "", ""],
+    // Named like a leftover shell tab, but NOT at a prompt — the heuristic that
+    // reads "something is running here" first. A row AT a prompt with this
+    // title would be a shell (the `sessions` list's own kind rule).
+    ["bc-shell-tab", "node /x/watcher.js", "/dev/ttys904", "leftover shell", "", ""],
+  ];
+}
+
+test("broadcast recipients: live claude sessions only, sender excluded, shells never asked", () => {
+  const ids = broadcastRecipients([
+    { id: BC_SENDER, paiName: "Sender", isClaude: true },
+    { id: BC_ANSWERER, paiName: "Answerer", isClaude: true },
+    { id: "bc-shell-tab", paiName: null, tabTitle: "leftover shell", name: "-zsh", atPrompt: true, isClaude: false },
+    // Unmeasured (isClaude undefined): the title heuristic decides.
+    { id: "bc-unmeasured-claude", paiName: null, tabTitle: "◑ Work (claude)", name: "claude (node)", atPrompt: false },
+    { id: "bc-unmeasured-shell", paiName: null, tabTitle: "leftover shell", name: "-zsh", atPrompt: true },
+  ], BC_SENDER).map((r) => r.sessionId);
+  assert.ok(ids.includes(BC_ANSWERER));
+  assert.ok(ids.includes("bc-unmeasured-claude"));
+  assert.ok(!ids.includes(BC_SENDER), "the sender never receives its own shout");
+  assert.ok(!ids.includes("bc-shell-tab"), "a shell would execute the message, not read it");
+  assert.ok(!ids.includes("bc-unmeasured-shell"));
+});
+
+function bcRecord(over: Partial<import("../src/daemon/broadcast-core.js").BroadcastRecord> = {}): import("../src/daemon/broadcast-core.js").BroadcastRecord {
+  return {
+    id: "abc234", senderId: BC_SENDER, senderName: "Sender", message: SHOUT, ask: true,
+    deadlineAt: 1000, defaultOk: false, createdAt: 0,
+    recipients: [{ sessionId: BC_ANSWERER, name: "Answerer" }], replies: [], ...over,
+  };
+}
+
+test("broadcast status after the deadline: silence is silent without --default-ok…", () => {
+  const b = bcRecord();
+  assert.equal(statusFor(b, b.recipients[0], 2000).status, "silent");
+});
+
+test("broadcast status after the deadline: …no-objection only WITH --default-ok; before it, pending; a reply wins", () => {
+  const d = bcRecord({ defaultOk: true });
+  assert.equal(statusFor(d, d.recipients[0], 2000).status, "no-objection");
+  const b = bcRecord();
+  assert.equal(statusFor(b, b.recipients[0], 500).status, "pending");
+  b.replies.push({ sessionId: BC_ANSWERER, name: "Answerer", answer: "hold", reason: "mid-deploy", at: 600 });
+  const row = statusFor(b, b.recipients[0], 2000);
+  assert.equal(row.status, "hold");
+  assert.equal(row.reason, "mid-deploy");
+});
+
+test("broadcast deadline parsing: 2m / 90s / bare seconds / nonsense", () => {
+  assert.equal(parseDeadlineSec("2m"), 120);
+  assert.equal(parseDeadlineSec("90s"), 90);
+  assert.equal(parseDeadlineSec(45), 45);
+  assert.equal(parseDeadlineSec("1h"), 3600);
+  assert.equal(parseDeadlineSec("soon"), null);
+});
+
+test("broadcast ledger round-trip: create, reply into the sender's mailbox, roll-call; unknown id refused", () => {
+  _resetLedgerCache();
+  // A deadline in the real future: `pending` must not depend on a fake clock —
+  // getBroadcastStatus reads Date.now(), so a fixed epoch is always "passed".
+  const rec = createBroadcast({
+    senderId: BC_SENDER, senderName: "Sender", message: SHOUT, ask: true, deadlineSec: 120, defaultOk: false,
+    recipients: [{ sessionId: BC_ANSWERER, name: "Answerer" }],
+  });
+  assert.match(drainSessionMailbox(BC_ANSWERER)[0].content, new RegExp(`\\[Broadcast:Sender\\] ${SHOUT.replace(/[()~.?]/g, "\\$&")}`));
+
+  const r = recordBroadcastReply(rec.id, BC_ANSWERER, "Answerer", "hold", "mid-deploy");
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.match(drainSessionMailbox(BC_SENDER)[0].content, new RegExp(`\\[Broadcast-reply:${rec.id}\\] Answerer: hold — mid-deploy`));
+
+  assert.equal(getBroadcastStatus(rec.id)!.rows[0].status, "hold");
+  const after = getBroadcastStatus(rec.id, Date.now() + 200_000)!;
+  assert.equal(after.deadlinePassed, true);
+  // The one who answered still reads hold — the deadline only labels silence.
+  assert.equal(after.rows[0].status, "hold");
+
+  const unknown = recordBroadcastReply("nosuchid", BC_ANSWERER, "Answerer", "ok", undefined);
+  assert.equal(unknown.ok, false);
+
+  // An unanswered ask whose deadline has NOT passed reads pending.
+  const rec2 = createBroadcast({ senderId: BC_SENDER, senderName: "Sender", message: "quick one", ask: true, deadlineSec: 120, defaultOk: false, recipients: [{ sessionId: "bc-quiet-pane", name: "Quiet" }] });
+  drainSessionMailbox("bc-quiet-pane");
+  assert.equal(getBroadcastStatus(rec2.id)!.rows[0].status, "pending");
+});
+
+test("broadcast ledger survives a fresh read (daemon restart): status still rolls up", () => {
+  _resetLedgerCache();
+  const rec = createBroadcast({ senderId: BC_SENDER, senderName: "Sender", message: "freeze workers soon", ask: false, defaultOk: false, recipients: [{ sessionId: BC_ANSWERER, name: "Answerer" }] });
+  drainSessionMailbox(BC_ANSWERER);
+  _resetLedgerCache();
+  const s = getBroadcastStatus(rec.id)!;
+  assert.equal(s.message, "freeze workers soon");
+  assert.equal(s.rows[0].status, "silent", "a non-ask has nothing to roll up but silence");
+});
+
+test("broadcast handler fan-out: every live claude session except the sender, shells skipped", () => withStubLock(async () => {
+  _resetLedgerCache();
+  await privateStub(baseRows());
+  const handlers = registerAndCapture();
+    const r = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: SHOUT } }))) as any;
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.result.deliveredTo, 2, "answerer + bystander, not the sender and not the shell");
+
+    const forAnswerer = drainSessionMailbox(BC_ANSWERER);
+    assert.equal(forAnswerer.length, 1);
+    assert.match(forAnswerer[0].content, /^\[Broadcast:bc-sender-pane\] /);
+    assert.match(drainSessionMailbox("bc-bystander-pane")[0].content, /^\[Broadcast:bc-sender-pane\] /);
+    assert.deepEqual(drainSessionMailbox("bc-shell-tab"), [], "nothing is ever deposited into a shell");
+    assert.deepEqual(drainSessionMailbox(BC_SENDER), [], "the sender does not receive its own shout");
+
+    // Ledgered: the broadcast id resolves to its roll-call.
+    assert.equal(getBroadcastStatus(r.result.id)!.rows.length, 2);
+}));
+
+test("broadcast handler ask round-trip: reply recorded, status shows ok/hold vs silent after the deadline", () => withStubLock(async () => {
+  _resetLedgerCache();
+  await privateStub(baseRows());
+  const handlers = registerAndCapture();
+    const b = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: SHOUT, ask: true, deadline: "2m" } }))) as any;
+    assert.equal(b.result.ask, true);
+    // The ask carries its id and the exact reply command.
+    assert.match(drainSessionMailbox(BC_ANSWERER)[0].content, new RegExp(`broadcast reply ${b.result.id} ok\\|hold`));
+
+    const rep = (await handlers.get("broadcast_reply")!(req({ itermSessionId: BC_ANSWERER, params: { broadcastId: b.result.id, answer: "ok" } }))) as any;
+    assert.equal(rep.ok, true, JSON.stringify(rep));
+    assert.match(drainSessionMailbox(BC_SENDER)[0].content, new RegExp(`\\[Broadcast-reply:${b.result.id}\\] bc-answerer-pane: ok`));
+
+    // A stranger that never received it may not answer.
+    const bogus = (await handlers.get("broadcast_reply")!(req({ itermSessionId: "bc-shell-tab", params: { broadcastId: b.result.id, answer: "ok" } }))) as any;
+    assert.equal(bogus.ok, false);
+
+    const rep2 = (await handlers.get("broadcast_reply")!(req({ itermSessionId: "bc-bystander-pane", params: { broadcastId: b.result.id, answer: "hold", reason: "mid-deploy" } }))) as any;
+    assert.equal(rep2.ok, true);
+
+    const st = (await handlers.get("broadcast_rollcall")!(req({ params: { broadcastId: b.result.id } }))) as any;
+    assert.equal(st.ok, true);
+    // Deadline not yet passed: the answered ones read their answers.
+    const byName = new Map<string, string>(st.result.rows.map((row: any) => [row.sessionId, row.status]));
+    assert.equal(byName.get("bc-answerer-pane"), "ok");
+    assert.equal(byName.get("bc-bystander-pane"), "hold");
+
+    // A default-ok broadcast whose deadline has passed: silence is no objection.
+    const b2 = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: "restart in 5", ask: true, deadline: 1, defaultOk: true } }))) as any;
+    recordBroadcastReply(b2.result.id, BC_ANSWERER, "bc-answerer-pane", "ok", undefined);
+    const late2 = getBroadcastStatus(b2.result.id, Date.now() + 10_000)!;
+    const by2 = new Map<string, string>(late2.rows.map((row) => [row.sessionId, row.status]));
+    assert.equal(by2.get("bc-answerer-pane"), "ok");
+    assert.equal(by2.get("bc-bystander-pane"), "no-objection");
+
+    // Same clock WITHOUT defaultOk: the unanswered one is silent.
+    const b3 = (await handlers.get("broadcast")!(req({ itermSessionId: BC_SENDER, params: { message: "restart in 5", ask: true, deadline: 1 } }))) as any;
+    recordBroadcastReply(b3.result.id, BC_ANSWERER, "bc-answerer-pane", "ok", undefined);
+    const late3 = getBroadcastStatus(b3.result.id, Date.now() + 10_000)!;
+    assert.equal(new Map(late3.rows.map((row) => [row.sessionId, row.status])).get("bc-bystander-pane"), "silent");
+}));

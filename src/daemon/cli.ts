@@ -45,6 +45,7 @@ function printCommandList(): void {
   console.log("  stop | restart     Stop or restart the daemon (service, IPC shutdown, or daemon.pid)");
   console.log("  launch <dir|proj>  Open a Claude session there [--name N]: tmux window or iTerm tab");
   console.log("  send <name> <text> Type a message into a session, by name");
+  console.log("  broadcast <text>   Shout to every other live Claude session (--ask [--deadline 2m] [--default-ok]); reply/status subcommands");
   console.log("  mail send          Guarded reply from a mail-ingress mailbox (--mailbox --to --subject --body-file [--in-reply-to])");
   console.log("  mailbox wait       Block until this session's mailbox has a message (background wake-up; --timeout <s>, --heartbeat <s>, exit 2 on timeout)");
   console.log("  ping               Quick heartbeat check");
@@ -108,6 +109,16 @@ if (helpRequested && command !== undefined && command !== "help" && command !== 
       "Open a Claude session (tmux window / iTerm tab). Attaches when it is already running.",
     ],
     send: ["Usage: aibroker send <name> <text>", "", "Type a message into a session, by name."],
+    broadcast: [
+      "Usage: aibroker broadcast \"<text>\" [--ask] [--deadline <2m|90s|1h>] [--default-ok]",
+      "       aibroker broadcast reply <id> ok|hold [\"<short reason>\"]",
+      "       aibroker broadcast status <id>",
+      "",
+      "Delivers the message to the mailbox of every live Claude session except",
+      "the sender (nothing is typed into any terminal; shell tabs are skipped),",
+      "prefixed [Broadcast:<sender>]. --ask invites short answers; after the",
+      "deadline an unanswered ask reads 'silent' unless --default-ok was passed.",
+    ],
     setup: ["Usage: aibroker setup [--no-service --no-mcp --no-hooks --dry-run --force]", "", "Install service, MCP entry, hooks, env."],
     doctor: ["Usage: aibroker doctor", "", "Check the install; non-zero exit on a required failure."],
     uninstall: ["Usage: aibroker uninstall [--purge]", "", "Remove what setup added; --purge also deletes ~/.aibroker."],
@@ -340,6 +351,12 @@ switch (command) {
     break;
   }
 
+  case "broadcast": {
+    const { runBroadcast } = await import("./broadcast-cli.js");
+    await runBroadcast(rest);
+    break;
+  }
+
   case "mail": {
     const { runMail } = await import("./mail-cli.js");
     await runMail(rest);
@@ -569,6 +586,6 @@ switch (command) {
 
   default:
     console.error(`Unknown command: ${command}`);
-    console.error("Usage: aibroker [start|status|stop|restart|launch|send|ping|setup|doctor|uninstall|create-adapter|ota|sessions|dispatch|ask|audit|inbound|issue|agentish|help]");
+    console.error("Usage: aibroker [start|status|stop|restart|launch|send|broadcast|ping|setup|doctor|uninstall|create-adapter|ota|sessions|dispatch|ask|audit|inbound|issue|agentish|help]");
     process.exit(1);
 }

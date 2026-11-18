@@ -308,7 +308,20 @@ export const runItermJxaAsync = runItermJxa;
  * transport wrapper, enumeration) read through this object rather than
  * importing the function directly.
  */
-export const _internal = { runAppleScript, runItermJxa, snapshotAllSessions };
+export const _internal = {
+  runAppleScript,
+  runItermJxa,
+  snapshotAllSessions,
+  /** The one `ps` pass behind isClaude — swappable for tests (see ttysRunningClaude). */
+  runPsTtys: (): Promise<string | null> => runCaptureAsync("ps", ["-ao", "tty=,pid=,command="], 10_000),
+  /**
+   * Test seam: an EMPTY stub answer means "iTerm did not answer", and the
+   * reliability flag must say so — otherwise those rows get cached and replayed
+   * as truth to the next caller (live in tests: one test's fixture answered
+   * another's). Production writes this flag only from a real osascript failure.
+   */
+  markEnumUnreliableForTests: (): void => { lastSnapshotOk = false; },
+};
 
 export function stripItermPrefix(id: string | undefined): string | undefined {
   if (!id) return id;
@@ -558,7 +571,11 @@ export function parseItermPath(raw: string | undefined): string | null {
  */
 /** ttysRunningClaude — async; a sync `ps` here would block the event loop. */
 async function ttysRunningClaude(pids?: Map<string, string>): Promise<Map<string, string | undefined>> {
-  const out = await runCaptureAsync("ps", ["-ao", "tty=,pid=,command="], 10_000);
+  // Through _internal, like every other external primitive: a direct call
+  // cannot be swapped from outside, and a test must be able to make the
+  // process table unreadable (empty output → isClaude undefined → the title
+  // heuristic) without marking its fixture ttys measured-shells.
+  const out = await _internal.runPsTtys();
   return out ? parseClaudeTtys(out, pids) : new Map();
 }
 
