@@ -1549,7 +1549,10 @@ export function registerCoreHandlers(
       noteInbound(resolvedName ?? target, eventId);
       return {
         ok: true,
-        result: { sent: true, delivered: true, queued: shouldDeposit, sessionId: itermSessionId, name: resolvedName },
+        result: {
+          sent: true, delivered: true, queued: shouldDeposit, sessionId: itermSessionId, name: resolvedName,
+          ...(guarded.typed && guarded.how ? { note: guarded.how } : {}),
+        },
       };
     }
 

@@ -85,3 +85,19 @@ the same fault at a smaller scale.
 - [channels.md](./channels.md) — delivery modes and why `task` is often safer
 - [audit.md](./audit.md) — every deposit, delivery and refusal is recorded
 - [sessions.md](./sessions.md) — how a name resolves to a session
+
+## Typing into a held input line (`pointerGuard`)
+
+The typed pointer follows the mailbox deposit. If the target's input line holds
+text, `~/.aibroker/config.json` decides (`"pointerGuard"`):
+
+- `"send"` (default, operator decision 2026-11-18): type the pointer and submit
+  anyway. A held line that is itself an earlier pointer (`[Session:…]`,
+  `[Keepalive]`, `[Task…]`, `[Inbound:…]`, `[a2a]`, `[PAILot]`) is cleared with
+  ctrl-U first. The `aibroker_send_to_session` result `note` says what happened:
+  `cleared stale pointer, typed` or `typed over unsent text`.
+- `"hold"`: the earlier behaviour. Nothing is typed into held text; the message
+  stays in the mailbox and the pointer is retried every 20 s for up to an hour.
+
+An unreadable pane is never typed into, in either mode. The mailbox holds every
+message, so nothing is lost.
