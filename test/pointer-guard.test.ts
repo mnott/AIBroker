@@ -5,12 +5,12 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
-  typeWhenInputEmpty, resetPointerGuard, GIVEUP_MS, RETRY_MS, heldReason, UNREADABLE_REASON, type GuardDeps,
+  typeWhenInputEmpty, resetPointerGuard, GIVEUP_MS, RETRY_MS, heldReason, UNREADABLE_REASON, type GuardDeps, type PointerGuardMode,
 } from "../src/daemon/pointer-guard.js";
 
 const BOX = (typed: string) => `output\n${"─".repeat(40)}\n❯ ${typed}\n${"─".repeat(40)}\n`;
 
-function fake(pane: () => string | null, mailbox: () => number) {
+function fake(pane: () => string | null, mailbox: () => number, mode: PointerGuardMode = "hold") {
   let t = 0;
   const timers: Array<{ fn: () => void; at: number; live: boolean }> = [];
   const typed: string[] = [];
@@ -18,6 +18,8 @@ function fake(pane: () => string | null, mailbox: () => number) {
   const deps: GuardDeps = {
     read: async () => pane(),
     type: async (_id, text) => { typed.push(text); return "ok"; },
+    clear: async () => { typed.push("<clear>"); },
+    mode: () => mode,
     mailboxSize: mailbox,
     now: () => t,
     sleep: async () => {},
@@ -111,4 +113,34 @@ test("held reason carries the detected text; held then empty audits delivered-la
   assert.equal(f.audits[0].outcome, "delivered-late");
   assert.equal(f.audits[0].action, "send");
   assert.equal(f.audits[0].target, "S7");
+});
+
+test("send mode: stale pointer is cleared, new pointer typed", async () => {
+  const f = fake(() => BOX("[Session:pai-cli] worker 1 888 C: old"), () => 1, "send");
+  const r = await typeWhenInputEmpty("S8", "[Session:A] hi", {}, f.deps);
+  assert.deepEqual(r, { typed: true, ack: "ok", how: "cleared stale pointer, typed" });
+  assert.deepEqual(f.typed, ["<clear>", "[Session:A] hi"]);
+});
+
+test("send mode: other held text is typed over", async () => {
+  const f = fake(() => BOX("half a sentence"), () => 1, "send");
+  const r = await typeWhenInputEmpty("S9", "[Session:A] hi", {}, f.deps);
+  assert.deepEqual(r, { typed: true, ack: "ok", how: "typed over unsent text" });
+  assert.deepEqual(f.typed, ["[Session:A] hi"]);
+});
+
+test("hold mode: stale pointer and other text are not typed", async () => {
+  for (const t of ["[Keepalive] x", "half"]) {
+    const f = fake(() => BOX(t), () => 1, "hold");
+    const r = await typeWhenInputEmpty(`H-${t}`, "p", {}, f.deps);
+    assert.equal(r.typed, false);
+    assert.deepEqual(f.typed, []);
+  }
+});
+
+test("send mode: unreadable pane is not typed", async () => {
+  const f = fake(() => null, () => 1, "send");
+  const r = await typeWhenInputEmpty("S10", "p", {}, f.deps);
+  assert.deepEqual(r, { typed: false, reason: UNREADABLE_REASON });
+  assert.deepEqual(f.typed, []);
 });
