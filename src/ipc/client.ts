@@ -319,8 +319,18 @@ export class WatcherClient {
           return;
         }
 
+        // The wire contract (IpcResponse): `ok` is the transport status and
+        // the refusal reason rides in `error`. A caller that tests `result.ok`
+        // instead reads a perfectly successful call as "refused" whenever the
+        // payload itself carries no ok field — which is exactly how a
+        // delivered broadcast printed "refused" (live 2026-11-18: id d4zy5,
+        // all five recipients answered, the CLI still refused). Surface the
+        // refusal as an error HERE so every caller gets one honest failure
+        // path instead of a silent misread.
         if (!response.ok) {
           finish(new Error(response.error ?? "IPC call failed"));
+        } else if (response.result && response.result.ok === false) {
+          finish(new Error(typeof response.result.error === "string" ? response.result.error : "daemon refused the call"));
         } else {
           finish(null, response.result ?? {});
         }

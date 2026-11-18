@@ -864,7 +864,7 @@ server.tool(
       const r = (await hub.call_raw("broadcast", {
         message, ...(ask ? { ask: true } : {}), ...(deadlineSec !== undefined ? { deadline: deadlineSec } : {}), ...(defaultOk ? { defaultOk: true } : {}),
       })) as any;
-      const line = `Broadcast ${r.id} to ${r.deliveredTo} session(s)${r.skippedShells ? `, ${r.skippedShells} shell tab(s) skipped` : ""}.`;
+      const line = `Broadcast ${r.id} delivered to ${r.deliveredTo} session(s)${r.skippedShells ? `, ${r.skippedShells} shell tab(s) skipped` : ""}.\n${(r.recipients ?? []).map((s: any) => `→ ${s.name}`).join("\n")}`;
       return ok(ask ? `${line}\nAnswers asked — collect with aibroker_broadcast_status({broadcastId:"${r.id}"}). Recipients answer with aibroker_broadcast_reply.` : line);
     } catch (e) { return err(e); }
   },
@@ -899,7 +899,7 @@ server.tool(
       for (const row of r.rows) counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
       const lines = r.rows.map((row: any) => `${row.status.padEnd(12)} ${row.name}${row.reason ? ` — ${row.reason}` : ""}`);
       return ok([
-        `broadcast ${r.id} from ${r.senderName}: ${r.message}`,
+        `broadcast ${r.id} from ${r.senderName}: ${r.message}${r.deadlineAt ? `\ndeadline ${new Date(r.deadlineAt).toISOString()}${r.deadlinePassed ? " (passed)" : ""}` : ""}`,
         r.ask ? [...counts].map(([k, n]) => `${n} ${k}`).join(", ") + (r.defaultOk ? " (silence defaults to no objection)" : "") : "(no answers asked)",
         ...lines,
       ].join("\n"));
