@@ -21,7 +21,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, openSync, closeSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { log } from "../core/log.js";
@@ -31,8 +31,11 @@ const STATE_DIR = join(homedir(), ".aibroker");
 // AIBROKER_HOME redirects the whole state directory. Without it a scratch run
 // that forgot to redirect HOME would read — and on a refresh, overwrite — the
 // real account's token file.
-const TOKEN_FILE = join(process.env.AIBROKER_HOME ?? STATE_DIR, "todoist-oauth.json");
-const PENDING_FILE = join(process.env.AIBROKER_HOME ?? STATE_DIR, "todoist-oauth-pending.json");
+const STATE_ROOT = process.env.AIBROKER_HOME ?? STATE_DIR;
+const TOKEN_FILE = join(STATE_ROOT, "todoist-oauth.json");
+const PENDING_FILE = join(STATE_ROOT, "todoist-oauth-pending.json");
+/** Cross-process refresh lock: see `withRefreshLock`. */
+const REFRESH_LOCK_FILE = join(STATE_ROOT, "todoist-oauth-refresh.lock");
 
 /** Anything Todoist hands back on a successful exchange, plus when we got it. */
 export interface StoredToken {
@@ -345,12 +348,78 @@ export async function refreshAccessToken(
  * `refreshAccessToken()` directly is not one owner.
  *
  * So: one refresh at a time, and everyone else waits for its result — every
- * caller, including the forced refresh on a 401.
+ * caller, including the forced refresh on a 401. And since 2026-11-19 that
+ * "one" spans processes: the promise below plus the lock file in
+ * `withRefreshLock`, because the keeper's process and a session's MCP process
+ * are not the same guard.
  */
 let refreshing: Promise<StoredToken> | undefined;
 
+/** A refresh is seconds of HTTP. A lock older than this has no live holder. */
+const REFRESH_LOCK_STALE_MS = 30_000;
+/** How long a waiter blocks for the holder before giving up on it. */
+const REFRESH_LOCK_WAIT_MS = 15_000;
+const REFRESH_LOCK_POLL_MS = 50;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /**
- * One refresh at a time for the whole process.
+ * Run `fn` holding a machine-wide refresh lock.
+ *
+ * The in-process single-flight below cannot span processes: every Claude
+ * session runs its own MCP server, and the daemon is another process, so N
+ * processes can each hold the same stored refresh token and present it at
+ * once. Todoist reads the second use as reuse and revokes the whole grant —
+ * the 2026-10-26 outage and the 2026-11-19 morning (audit: `invalid_grant …
+ * reuse detected; tokens … revoked`, all from out-of-process callers). The one
+ * owner of "may I refresh?" therefore has to live on disk, not in a promise.
+ *
+ * O_EXCL create is the atomic test-and-set every POSIX offers; the file holds
+ * pid + timestamp so a crashed holder's lock ages out instead of wedging
+ * refresh forever. The holder removes it in `finally`; a stale one is deleted
+ * and contendred for again. Waiters re-read the token on disk — if the holder
+ * already refreshed, that IS their result and they never present the token.
+ */
+async function withRefreshLock<T>(fn: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + REFRESH_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      mkdirSync(dirname(REFRESH_LOCK_FILE), { recursive: true });
+      const fd = openSync(REFRESH_LOCK_FILE, "wx", 0o600);
+      writeFileSync(fd, `${process.pid} ${Date.now()}\n`);
+      closeSync(fd);
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      let age = Infinity;
+      try {
+        age = Date.now() - statSync(REFRESH_LOCK_FILE).mtimeMs;
+      } catch {
+        continue; // vanished between EEXIST and stat — contend again
+      }
+      if (age > REFRESH_LOCK_STALE_MS) {
+        // A crashed holder. Remove and re-contend; a rival may win first, and
+        // the loop handles that.
+        try { rmSync(REFRESH_LOCK_FILE, { force: true }); } catch { /* race, loop */ }
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("todoist refresh lock held by another process — not presenting the rotating token");
+      }
+      await sleep(REFRESH_LOCK_POLL_MS);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    try { unlinkSync(REFRESH_LOCK_FILE); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * One refresh at a time for the whole machine.
  *
  * `force` refreshes even a token whose stated expiry is still in the future —
  * a 401 says the token is invalid NOW and the stored expiry cannot be trusted.
@@ -370,13 +439,23 @@ async function refreshOnce(
   }
   try {
     if (!refreshing) {
-      // Re-read inside the guard: a refresh that completed while we were
-      // deciding has already written a fresh token to disk, and refreshing the
-      // one we loaded a moment ago would spend a token that is already spent.
+      // The in-process flight covers this process's callers at once; the lock
+      // file covers every other process on the machine. Re-read inside both:
+      // a refresh that completed while we were deciding — here or elsewhere —
+      // has already written a fresh token to disk, and refreshing the one we
+      // loaded a moment ago would spend a token that is already spent.
       refreshing = (async () => {
         const current = loadToken() ?? t;
         if (!force && !isExpired(current)) return current;
-        return refreshAccessToken(clientId, clientSecret, current, fetchImpl);
+        return withRefreshLock(async () => {
+          const fresh = loadToken();
+          // Another process refreshed while we queued for the lock: its token
+          // is on disk, present it — never the spent one in `current`. A
+          // forced caller (holding a 401) still refreshes: the server has
+          // just said the stored token is invalid.
+          if (fresh && !force && !isExpired(fresh)) return fresh;
+          return refreshAccessToken(clientId, clientSecret, fresh ?? current, fetchImpl);
+        });
       })().finally(() => { refreshing = undefined; });
     }
     return await refreshing;

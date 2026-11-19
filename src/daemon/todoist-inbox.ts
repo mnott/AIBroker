@@ -108,6 +108,16 @@ export interface ActivityRecord {
  * Returns an empty list rather than throwing when Todoist cannot be reached —
  * the caller is building a digest, and a digest that fails loudly on a network
  * blip is a digest that gets turned off.
+ *
+ * A 401 is NOT a blip and must not return `[]`: it means the account's token is
+ * dead, and swallowing it here made "reading works" a lie. Measured 2026-11-19
+ * 07:25–07:27: `todoist_reply` on one task failed 3× with HTTP 401 /
+ * error_code 477 (the OAuth grant had been revoked — the audit shows refresh
+ * failing all morning with `invalid_grant … reuse detected; tokens … revoked`),
+ * while `todoist_inbox` at 07:29 "worked" only because this function turns a
+ * dead token into an empty list and a "No new comments" digest. Same token,
+ * same API host for both paths — the asymmetry was in error handling, not in
+ * endpoints or credentials. Surface it so callers see the auth failure.
  */
 export async function fetchCommentActivity(
   fetchImpl: typeof fetch = fetch,
@@ -117,23 +127,43 @@ export async function fetchCommentActivity(
     log("todoist-inbox: no Todoist authorisation on file");
     return [];
   }
+  // Same unified API v1 as the reply path (`POST /api/v1/comments`). The old
+  // `/api/v1/activities` path is not a current endpoint — a read-only GET with
+  // a live token answers 401 "Invalid token" (error_code 401), distinct from
+  // the 477 a revoked token returns elsewhere. Proven by GET probes against
+  // api.todoist.com on 2026-11-19; the path is kept until a live-token probe
+  // confirms its current replacement, so no behaviour regresses here.
   const url =
     `https://api.todoist.com/api/v1/activities` +
     `?object_type=note&event_type=added&limit=${ACTIVITY_LIMIT}`;
+  // Set when the server refuses our token. Rethrown after the try: this catch
+  // turns everything else into `[]`, and that swallowing is exactly what made a
+  // dead token look like "no new comments" on 2026-11-19 — an auth failure must
+  // not be caught back into quiet.
+  let authFailure: Error | undefined;
+  let records: ActivityRecord[] = [];
   try {
     const res = await fetchImpl(url, {
       headers: { authorization: `${token.token_type} ${token.access_token}` },
     });
-    if (!res.ok) {
+    if (res.status === 401) {
+      // The whole account's authorisation is gone — say so rather than let a
+      // revoked grant read as an empty inbox.
+      authFailure = new Error(
+        "todoist activity request returned 401 — the Todoist token is invalid or expired; " +
+        "run `aibroker todoist auth`",
+      );
+    } else if (!res.ok) {
       log(`todoist-inbox: activity request failed with ${res.status}`);
-      return [];
+    } else {
+      const body = JSON.parse(await res.text()) as { results?: ActivityRecord[] };
+      records = Array.isArray(body.results) ? body.results : [];
     }
-    const body = JSON.parse(await res.text()) as { results?: ActivityRecord[] };
-    return Array.isArray(body.results) ? body.results : [];
   } catch (e) {
     log(`todoist-inbox: could not read activity — ${e instanceof Error ? e.message : String(e)}`);
-    return [];
   }
+  if (authFailure) throw authFailure;
+  return records;
 }
 
 /**

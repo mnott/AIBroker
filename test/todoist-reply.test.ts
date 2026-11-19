@@ -20,6 +20,7 @@ mkdirSync(join(scratch, ".aibroker"), { recursive: true });
 
 const { AGENT_MARK, route } = await import("../src/daemon/todoist-webhook.js");
 const { replyToTask } = await import("../src/daemon/todoist-reply.js");
+const { fetchCommentActivity } = await import("../src/daemon/todoist-inbox.js");
 const { saveToken } = await import("../src/daemon/todoist-oauth.js");
 import type { WebhookConfig, TodoistEvent } from "../src/daemon/todoist-webhook.js";
 
@@ -43,6 +44,110 @@ test("the agent mark is applied by the writer, not trusted to the caller", async
   assert.equal(seen.payload.task_id, "task-1");
   assert.equal(seen.url, "https://api.todoist.com/api/v1/comments");
   assert.equal(seen.auth, "Bearer tok");
+});
+
+// ── the request itself: same token, same API as the reader ─────────────────
+//
+// 2026-11-19 07:25–07:27: todoist_reply failed 3× with 401 / error_code 477 on
+// one task while todoist_inbox "worked" minutes later. The hunt went to endpoint
+// and token-source differences (REST v2 vs Sync v9, a project-scoped or shared
+// token, a stale base URL). There are none: both paths take the account's OAuth
+// token from getAccessToken() and hit api.todoist.com/api/v1. This pins that so
+// the next 477 is read as what it is — a dead grant — not as an endpoint bug.
+
+test("the reply request carries the stored OAuth token to the unified v1 API", async () => {
+  // The auth header must come from the SAME file the reader uses: a token
+  // written here and read there is the only credential either path may present.
+  const { loadToken } = await import("../src/daemon/todoist-oauth.js");
+  saveToken({ access_token: "acct-token", token_type: "Bearer", obtained_at: new Date().toISOString() });
+  const { impl, seen } = captureFetch();
+  await replyToTask("task-7", "answer", impl);
+  assert.equal(seen.url, "https://api.todoist.com/api/v1/comments");
+  assert.equal(seen.auth, `Bearer ${loadToken()!.access_token}`);
+  assert.deepEqual(seen.payload, { task_id: "task-7", content: `${AGENT_MARK} answer` });
+});
+
+test("a 401 on the comment is a dead grant, not an endpoint problem", async () => {
+  // With no refresh path there is nothing to retry; the error must name the
+  // token and the remedy rather than leave "comment failed with 401" to be
+  // read as an endpoint or credential mismatch.
+  process.env.TODOIST_CLIENT_ID = "";
+  process.env.TODOIST_CLIENT_SECRET = "";
+  saveToken({ access_token: "revoked", token_type: "Bearer", obtained_at: new Date().toISOString() });
+  const impl = (async () =>
+    new Response(JSON.stringify({ error_code: 477 }), { status: 401 })) as unknown as typeof fetch;
+  await assert.rejects(
+    () => replyToTask("task-8", "hi", impl),
+    /invalid or expired .* cannot be refreshed \(no refresh token on file\).*aibroker todoist auth/,
+  );
+});
+
+// ── the reader must fail like the writer ────────────────────────────────────
+//
+// The other half of the 2026-11-19 incident: `todoist_inbox` "worked" at 07:29
+// while the reply path 401'd, because fetchCommentActivity swallowed the dead
+// token's 401 into an empty list — a revoked grant reading as "no new
+// comments". Both paths take the same stored OAuth token to the same unified
+// v1 host; the asymmetry was only in error handling.
+
+test("the activity read uses the same unified v1 host and stored token", async () => {
+  let url = "", auth = "";
+  const impl = (async (u: string | URL | Request, init?: RequestInit) => {
+    url = String(u);
+    auth = (init?.headers as Record<string, string>)?.authorization ?? "";
+    return new Response(JSON.stringify({ results: [] }), { status: 200 });
+  }) as unknown as typeof fetch;
+  await fetchCommentActivity(impl);
+  assert.match(url, /^https:\/\/api\.todoist\.com\/api\/v1\/activities\?/);
+  assert.equal(auth, "Bearer revoked"); // the token on file — same source as the reply's
+});
+
+test("a 401 from the activity read surfaces — it is not an empty inbox", async () => {
+  // Same single-flight refresh as every path: getAccessToken() tries to renew,
+  // the revoked grant refuses (no credentials on file here), and what reaches
+  // the API is still a 401 — which must now surface, not become [].
+  process.env.TODOIST_CLIENT_ID = "";
+  process.env.TODOIST_CLIENT_SECRET = "";
+  const impl = (async () =>
+    new Response(JSON.stringify({ error_code: 477 }), { status: 401 })) as unknown as typeof fetch;
+  await assert.rejects(
+    () => fetchCommentActivity(impl),
+    /401.*invalid or expired.*aibroker todoist auth/,
+  );
+});
+
+test("a transient failure on the activity read still returns an empty list", async () => {
+  // The digest must survive a blip; only the auth failure is loud.
+  const impl = (async () => new Response("nope", { status: 503 })) as unknown as typeof fetch;
+  assert.deepEqual(await fetchCommentActivity(impl), []);
+});
+
+test("a 401 with a refresh token is refreshed and retried once", async () => {
+  process.env.TODOIST_CLIENT_ID = "cid";
+  process.env.TODOIST_CLIENT_SECRET = "secret";
+  saveToken({
+    access_token: "stale", token_type: "Bearer", obtained_at: new Date().toISOString(),
+    refresh_token: "r1", expires_at: new Date(Date.now() + 3600_000).toISOString(),
+  });
+  let calls = 0;
+  const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls++;
+    if (String(url).includes("/oauth/access_token")) {
+      return new Response(JSON.stringify({
+        access_token: "fresh", token_type: "Bearer", expires_in: 3600, refresh_token: "r2",
+      }), { status: 200 });
+    }
+    const auth = (init?.headers as Record<string, string>)?.authorization ?? "";
+    if (auth.includes("stale")) {
+      return new Response(JSON.stringify({ error_code: 477 }), { status: 401 });
+    }
+    return new Response(JSON.stringify({ id: "c-9" }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const r = await replyToTask("task-9", "late answer", impl);
+  assert.equal(r.commentId, "c-9");
+  // stale comment, refresh, retried comment — and no third attempt.
+  assert.equal(calls, 3);
 });
 
 test("an already-marked reply is not marked twice", async () => {

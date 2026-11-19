@@ -251,3 +251,55 @@ test("a failed refresh returns the old token rather than inventing a failure", a
   const fake = (async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
   assert.equal((await getAccessToken(fake))?.access_token, "old");
 });
+
+// ── the refresh lock is machine-wide ────────────────────────────────────────
+//
+// The single-flight promise guards ONE process. Every Claude session runs its
+// own MCP server and the daemon is another, so two processes could present the
+// same rotating refresh token at once — which Todoist answers by revoking the
+// whole grant ("reuse detected", the 2026-10-26 and 2026-11-19 outages). The
+// lock file beside the token store is what makes "one refresh" true across
+// processes. Two module instances loaded under different URLs share nothing
+// but the token dir — exactly two processes, one machine.
+
+const SHARED = mkdtempSync(join(tmpdir(), "aibroker-oauth-shared-"));
+// AIBROKER_HOME is read at module scope, so it must be set BEFORE the two
+// instances below resolve their token paths. Nothing imported earlier ever
+// consults it again, so this cannot move any other suite's state.
+process.env.AIBROKER_HOME = SHARED;
+const procA = await import(`../src/daemon/todoist-oauth.ts?proc=a#${SHARED}`);
+const procB = await import(`../src/daemon/todoist-oauth.ts?proc=b#${SHARED}`);
+
+/** Both "processes" start from the same on-disk token, refresh token r1. */
+function expiredPair(): void {
+  writeFileSync(join(SHARED, "todoist-oauth.json"), JSON.stringify({
+    access_token: "old", token_type: "Bearer", obtained_at: new Date().toISOString(),
+    refresh_token: "r1", expires_at: new Date(Date.now() - 1000).toISOString(),
+  }), "utf-8");
+}
+
+test("two processes sharing a token dir issue exactly one refresh request", async () => {
+  cleanup();
+  process.env.TODOIST_CLIENT_ID = "cid";
+  process.env.TODOIST_CLIENT_SECRET = "secret";
+  expiredPair();
+  let refreshCalls = 0;
+  const fake = (async () => {
+    refreshCalls++;
+    await new Promise((r) => setTimeout(r, 50)); // widen the race window
+    return new Response(JSON.stringify({
+      access_token: `new${refreshCalls}`, token_type: "Bearer",
+      expires_in: 3600, refresh_token: "r2",
+    }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const [a, b] = await Promise.all([procA.getAccessToken(fake), procB.getAccessToken(fake)]);
+  assert.equal(refreshCalls, 1, "the loser must read the winner's token from disk, never present r1 again");
+  assert.equal(a?.access_token, "new1");
+  assert.equal(b?.access_token, "new1", "both callers converge on the one rotated token");
+});
+
+test("the refresh lock is removed after a successful refresh", () => {
+  assert.equal(existsSync(join(SHARED, "todoist-oauth-refresh.lock")), false,
+    "a leftover lock would wedge every later refresh until it aged out");
+});

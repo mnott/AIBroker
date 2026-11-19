@@ -6,8 +6,8 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | --- | --- | --- |
 | test/inbound-signature.test.ts | b | webhook signature verification on the inbound route (8eac204) |
 | test/todoist-webhook.test.ts | a,b | Todoist webhook HMAC check, claim and dispatch (d4675f0, 31065f5, 285e6f9) |
-| test/todoist-oauth.test.ts | a,b | OAuth token handling and state check (d7c0475) |
-| test/todoist-reply.test.ts | a | reply writes with the account credentials, no webhook echo loop (2ab8556, 3a1a46a) |
+| test/todoist-oauth.test.ts | a,b | OAuth token handling and state check (d7c0475); cross-process refresh lock — two processes, one rotation (2026-11-19 reuse-detected revocations) |
+| test/todoist-reply.test.ts | a | reply writes with the account credentials, no webhook echo loop (2ab8556, 3a1a46a); reply and activity read share one token + unified v1 API, a 401 surfaces as a dead grant not an empty inbox (2026-11-19 477 incident) |
 | test/inbound-echo.test.ts | a | a session never receives its own issue write back through the route (dfe2825) |
 | test/a2a-schema.test.ts | c | A2A message/task schema other agents depend on |
 | test/a2a-server.test.ts | c | A2A server endpoints and agent card, the wire peers call |

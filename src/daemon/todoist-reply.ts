@@ -86,6 +86,7 @@ export async function replyToTask(
   taskId: string,
   text: string,
   fetchImpl: typeof fetch = fetch,
+  attempt = 1,
 ): Promise<ReplyResult> {
   const token = await getAccessToken();
   if (!token) {
@@ -93,6 +94,10 @@ export async function replyToTask(
   }
   const body = text.trimStart().startsWith(AGENT_MARK) ? text : `${AGENT_MARK} ${text}`;
 
+  // Same unified API v1 and the same OAuth token as every other path — reads
+  // included. There is no second credential here, and a comment endpoint that
+  // answers 401 error_code 477 therefore never means "the writer's token is a
+  // different one": it means the account's grant is invalid or revoked.
   const res = await fetchImpl("https://api.todoist.com/api/v1/comments", {
     method: "POST",
     headers: {
@@ -103,6 +108,25 @@ export async function replyToTask(
   });
 
   const raw = await res.text();
+  if (res.status === 401) {
+    // getAccessToken() already tried what it could — a token the server still
+    // refuses after that is a dead grant, and reading "comment failed with
+    // 401" sent two debugging sessions hunting for an endpoint or token-source
+    // difference that did not exist (2026-11-19: three 477s on todoist_reply
+    // while the audit showed refresh failing all morning with `invalid_grant
+    // … reuse detected; tokens … revoked`). Name the cause and the remedy.
+    const { forceRefreshAccessToken, loadToken } = await import("./todoist-oauth.js");
+    const current = loadToken();
+    const refreshed = await forceRefreshAccessToken(fetchImpl);
+    // One retry only, same rule as setTaskLabel: a second 401 is the dead
+    // grant speaking, and looping on it just hammers a revoked client.
+    if (refreshed && attempt === 1) return replyToTask(taskId, text, fetchImpl, 2);
+    throw new Error(
+      `comment failed with 401 — the Todoist token is invalid or expired and ` +
+      `${current?.refresh_token ? "could not be refreshed" : "cannot be refreshed (no refresh token on file)"}. ` +
+      "Run `aibroker todoist auth`.",
+    );
+  }
   if (!res.ok) throw new Error(`comment failed with ${res.status}: ${raw.slice(0, 200)}`);
 
   let parsed: { id?: string };
