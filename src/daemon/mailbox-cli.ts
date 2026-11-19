@@ -109,14 +109,17 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
       // pass with no new message, hard-capped at SETTLE_CAP_S from the first
       // arrival; the timeout deadline still wins over the window.
       if (settleS > 0) {
-        const first = deps.now();
-        const capAt = first + SETTLE_CAP_S * 1000;
+        const capAt = deps.now() + SETTLE_CAP_S * 1000;
+        // The quiet window closes settleS after the LAST arrival — not after
+        // "now", which would slide it forward on every pass and never close
+        // before the cap.
+        let lastArrival = deps.now();
         let lastCount = messages.length;
         for (;;) {
           const nowMs = deps.now();
-          // sleep to the earlier of: settleS after this moment (the quiet
-          // window), the hard cap, and the timeout deadline.
-          const wakeAt = Math.min(nowMs + settleS * 1000, capAt, deadline);
+          // sleep to the earlier of: the quiet window closing (settleS after
+          // the last arrival), the hard cap, and the timeout deadline.
+          const wakeAt = Math.min(lastArrival + settleS * 1000, capAt, deadline);
           if (!(wakeAt > nowMs)) break;
           await deps.sleep(Math.min(POLL_MS, wakeAt - nowMs));
           const more = await peekReal(session, deps);
@@ -124,6 +127,7 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
             messages.length = 0;
             messages.push(...more);
             lastCount = more.length;
+            lastArrival = deps.now(); // a new arrival restarts the quiet window
           }
         }
       }

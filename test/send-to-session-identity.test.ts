@@ -271,8 +271,9 @@ test("settle: a burst of 3 messages 2 s apart returns once, after the settle win
   assert.equal(await mailboxWait(["--heartbeat", "0", "--timeout", "3600", "--settle", "5"], c.deps), 0);
   assert.equal(c.out.length, 3); // one wake, all three lines together
   assert.deepEqual(c.out.map((l) => l.split(" | ")[0]), ["a1", "a2", "a3"]);
-  // last arrival at t=4 s (peek 3), quiet for a full 5 s window -> t=9 s.
-  assert.equal(c.slept, 9_000);
+  // m3 first seen at t=4 s (peek 3), quiet for a full 5 s window -> t=9 s; the
+  // last sleep is clamped to the wake moment, so slept = 8 s.
+  assert.equal(c.slept, 8_000);
 });
 
 test("settle: a single message returns after the settle window, not at the arrival", async () => {
