@@ -225,6 +225,8 @@ function fakeClock(peeks: Array<Array<{ from: string; content: string; kind?: st
   let n = 0;
   return {
     out,
+    /** Total milliseconds slept — how long the wait took on the fake clock. */
+    get slept() { return t - 1_700_000_000_000; },
     deps: {
       peek: async () => peeks[Math.min(n++, peeks.length - 1)],
       sleep: async (ms: number) => { t += ms; },
@@ -254,6 +256,59 @@ test("beat: --heartbeat 0 prints nothing while waiting", async () => {
   const c = fakeClock([[beat]]);
   assert.equal(await mailboxWait(["--timeout", "5000", "--heartbeat", "0"], c.deps), 2);
   assert.deepEqual(c.out, []);
+});
+
+// ── --settle: a burst wakes the session once ─────────────────────────────────
+const m1 = { from: "a1", content: "one" };
+const m2 = { from: "a2", content: "two" };
+const m3 = { from: "a3", content: "three" };
+
+test("settle: a burst of 3 messages 2 s apart returns once, after the settle window", async () => {
+  // arrival per peek index; peek 0 is empty (arrival at t=1 s), then one new
+  // message every 2 s for three, then quiet.
+  const arrivals = [[], [m1], [m1, m2], [m1, m2, m3], [m1, m2, m3]];
+  const c = fakeClock(arrivals);
+  assert.equal(await mailboxWait(["--heartbeat", "0", "--timeout", "3600", "--settle", "5"], c.deps), 0);
+  assert.equal(c.out.length, 3); // one wake, all three lines together
+  assert.deepEqual(c.out.map((l) => l.split(" | ")[0]), ["a1", "a2", "a3"]);
+  // m3 first seen at t=4 s (peek 3), quiet for a full 5 s window -> t=9 s; the
+  // last sleep is clamped to the wake moment, so slept = 8 s.
+  assert.equal(c.slept, 8_000);
+});
+
+test("settle: a single message returns after the settle window, not at the arrival", async () => {
+  const c = fakeClock([[], [m1]]);
+  assert.equal(await mailboxWait(["--heartbeat", "0", "--timeout", "3600", "--settle", "5"], c.deps), 0);
+  assert.equal(c.out.length, 1);
+  // first arrival at t=1 s (peek 1), then a full quiet window -> t=6 s.
+  assert.equal(c.slept, 6_000);
+});
+
+test("settle: the cap holds under a steady trickle — one wake within 60 s of the first arrival", async () => {
+  // one new message every poll (1 s), forever: the window never goes quiet, so
+  // the hard cap from the first arrival must end the collection.
+  const arrivals: Array<Array<{ from: string; content: string; kind?: string }>> = [];
+  for (let i = 0; i <= 65; i++) arrivals.push(Array.from({ length: i + 1 }, (_, j) => ({ from: `f${j}`, content: `msg${j}` })));
+  const c = fakeClock(arrivals);
+  assert.equal(await mailboxWait(["--heartbeat", "0", "--timeout", "3600", "--settle", "20"], c.deps), 0);
+  // first arrival at t=1 s, cap 60 s -> return by t=61 s, with everything the
+  // peeks saw up to then delivered together (the trickle keeps coming; nothing
+  // is dropped — aibroker_receive still reads them all).
+  assert.ok(c.slept <= 61_000, `slept ${c.slept}`);
+  assert.equal(c.out.length, c.slept / 1000 + 1); // one message per second slept
+});
+
+test("settle: --settle 0 returns at the first message (old behaviour)", async () => {
+  const c = fakeClock([[], [m1], [m1, m2]]);
+  assert.equal(await mailboxWait(["--heartbeat", "0", "--settle", "0"], c.deps), 0);
+  assert.equal(c.out.length, 1); // only the first message, no window
+  assert.equal(c.slept, 1_000);
+});
+
+test("settle: default is on (20 s) — a burst settles into one wake without the flag", async () => {
+  const c = fakeClock([[], [m1], [m1, m2]]);
+  assert.equal(await mailboxWait(["--heartbeat", "0"], c.deps), 0);
+  assert.equal(c.out.length, 2); // m2 landed during the default window and is delivered together
 });
 
 // ── broadcast: fan-out to all live claude sessions, answers, roll-call ───────

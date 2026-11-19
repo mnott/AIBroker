@@ -101,7 +101,7 @@ if (helpRequested && command !== undefined && command !== "help" && command !== 
     status: ["Usage: aibroker status", "", "Show daemon status and adapter health."],
     stop: ["Usage: aibroker stop", "", "Stop the daemon: active service, then IPC shutdown, then daemon.pid."],
     restart: ["Usage: aibroker restart", "", "Restart the daemon: the service restarts its own unit; otherwise stop, then start detached."],
-    mailbox: ["Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] | waiters>", "", "Block until this session's mailbox has an unshown message; print one line per message, exit 0 (2 on timeout). Does not consume."],
+    mailbox: ["Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] [--heartbeat <s>] [--settle <s>] | waiters>", "", "Block until this session's mailbox has an unshown message; print one line per message, exit 0 (2 on timeout). Does not consume.", "--settle <s> (default 20, env AIBROKER_MAILBOX_SETTLE_S; 0 = old behaviour): after the first message arrives, keep waiting until no new message has landed for s seconds — at most 60 s from the first arrival — then deliver them together, so a burst wakes the session once."],
     ping: ["Usage: aibroker ping", "", "Quick heartbeat check."],
     launch: [
       "Usage: aibroker launch <dir|pai-project> [--name N]",

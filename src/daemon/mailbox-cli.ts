@@ -1,5 +1,5 @@
 /**
- * daemon/mailbox-cli.ts — `aibroker mailbox wait [--session <id>] [--timeout <s>]`.
+ * daemon/mailbox-cli.ts — `aibroker mailbox wait [--session <id>] [--timeout <s>] [--settle <s>]`.
  *
  * Blocks until this session's mailbox holds a message it has not been shown,
  * prints one summary line per message and exits 0; exits 2 on timeout with
@@ -7,6 +7,12 @@
  * the harness notifies the idle session, which then reads the mailbox
  * (aibroker_receive). This is how machine ingress wakes a session without
  * typing into its input line (ingress.ts).
+ *
+ * --settle <s> (default 20, env AIBROKER_MAILBOX_SETTLE_S; 0 = old behaviour):
+ * after the first message arrives, keep waiting until no new message has landed
+ * for s seconds — at most 60 s from the first arrival — then print them all at
+ * once, so a burst of notices wakes the session once instead of once per
+ * message. Nothing is dropped or delayed beyond the cap.
  *
  * Beat entries (kind "beat", the cache keepalive) never wake it. While waiting
  * it prints one "waiting since HH:MM" line per --heartbeat seconds (default 1200,
@@ -30,6 +36,14 @@ export interface MailboxDeps {
 }
 
 const HEARTBEAT_DEFAULT_S = 1200;
+const SETTLE_DEFAULT_S = 20;
+/** Hard cap on the settle window, measured from the first arrival. */
+const SETTLE_CAP_S = 60;
+
+function envSettleDefault(): number {
+  const v = Number(process.env.AIBROKER_MAILBOX_SETTLE_S);
+  return Number.isFinite(v) && v >= 0 ? v : SETTLE_DEFAULT_S;
+}
 
 function hhmm(ms: number): string {
   return new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -43,6 +57,11 @@ function kindOf(content: string): string {
   return tag ? tag[1] : "text";
 }
 
+/** Unshown non-beat messages; a daemon that is down or restarting is not an arrival. */
+async function peekReal(session: string | undefined, deps: MailboxDeps): Promise<Pending[]> {
+  return (await deps.peek(session).catch(() => [] as Pending[])).filter((m) => m.kind !== "beat");
+}
+
 export function summarise(m: Pending): string {
   // eslint-disable-next-line no-control-regex
   const flat = m.content.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
@@ -54,17 +73,23 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
   let session: string | undefined;
   let timeoutS: number | undefined;
   let heartbeatS = HEARTBEAT_DEFAULT_S;
+  let settleS = envSettleDefault();
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--session") session = args[++i];
     else if (args[i] === "--timeout") timeoutS = Number(args[++i]);
     else if (args[i] === "--heartbeat") heartbeatS = Number(args[++i]);
+    else if (args[i] === "--settle") settleS = Number(args[++i]);
     else {
-      console.error("Usage: aibroker mailbox wait [--session <id>] [--timeout <s>] [--heartbeat <s>]");
+      console.error("Usage: aibroker mailbox wait [--session <id>] [--timeout <s>] [--heartbeat <s>] [--settle <s>]");
       return 1;
     }
   }
   if (timeoutS !== undefined && !(timeoutS >= 0)) {
     console.error("--timeout takes a number of seconds");
+    return 1;
+  }
+  if (!(settleS >= 0)) {
+    console.error("--settle takes a number of seconds (0 = return at the first arrival)");
     return 1;
   }
   if (!(heartbeatS >= 0)) {
@@ -78,8 +103,34 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
     // A daemon that is down or restarting is not an arrival and not a failure:
     // keep waiting, the mailbox is read again once it answers.
     // Cache beats are not a wake-up: the prompt hook still shows them.
-    const messages = (await deps.peek(session).catch(() => [] as Pending[])).filter((m) => m.kind !== "beat");
+    const messages = await peekReal(session, deps);
     if (messages.length) {
+      // --settle: one wake covers a burst. Keep collecting until settleS seconds
+      // pass with no new message, hard-capped at SETTLE_CAP_S from the first
+      // arrival; the timeout deadline still wins over the window.
+      if (settleS > 0) {
+        const capAt = deps.now() + SETTLE_CAP_S * 1000;
+        // The quiet window closes settleS after the LAST arrival — not after
+        // "now", which would slide it forward on every pass and never close
+        // before the cap.
+        let lastArrival = deps.now();
+        let lastCount = messages.length;
+        for (;;) {
+          const nowMs = deps.now();
+          // sleep to the earlier of: the quiet window closing (settleS after
+          // the last arrival), the hard cap, and the timeout deadline.
+          const wakeAt = Math.min(lastArrival + settleS * 1000, capAt, deadline);
+          if (!(wakeAt > nowMs)) break;
+          await deps.sleep(Math.min(POLL_MS, wakeAt - nowMs));
+          const more = await peekReal(session, deps);
+          if (more.length > lastCount) {
+            messages.length = 0;
+            messages.push(...more);
+            lastCount = more.length;
+            lastArrival = deps.now(); // a new arrival restarts the quiet window
+          }
+        }
+      }
       for (const m of messages) deps.out(summarise(m));
       return 0;
     }
@@ -100,7 +151,7 @@ export async function runMailbox(args: string[]): Promise<void> {
     process.exit(0);
   }
   if (verb !== "wait") {
-    console.error("Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] [--heartbeat <s>] | waiters>");
+    console.error("Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] [--heartbeat <s>] [--settle <s>] | waiters>");
     process.exit(1);
   }
   const client = new WatcherClient(DAEMON_SOCKET_PATH);
