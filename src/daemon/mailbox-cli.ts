@@ -39,6 +39,17 @@ export interface MailboxDeps {
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   out: (line: string) => void;
+  /**
+   * Checked at the top of every loop turn and every settle poll. A stopped
+   * waiter returns immediately instead of sleeping forever — SIGTERM/SIGINT, a
+   * lost session, or a test that wants its follow loop to end.
+   */
+  stopped?: () => boolean;
+}
+
+/** `stopped()` is truthy (a missing hook never stops anything). */
+function isStopped(deps: MailboxDeps): boolean {
+  return deps.stopped?.() === true;
 }
 
 const HEARTBEAT_DEFAULT_S = 1200;
@@ -125,6 +136,7 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
     });
   };
   for (;;) {
+    if (isStopped(deps)) return 0;
     // A daemon that is down or restarting is not an arrival and not a failure:
     // keep waiting, the mailbox is read again once it answers.
     // Cache beats are not a wake-up: the prompt hook still shows them.
@@ -143,6 +155,7 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
         let lastArrival = deps.now();
         let lastCount = messages.length;
         for (;;) {
+          if (isStopped(deps)) break;
           const nowMs = deps.now();
           // sleep to the earlier of: the quiet window closing (settleS after
           // the last arrival), the hard cap, and the timeout deadline.
@@ -194,8 +207,8 @@ export async function runMailbox(args: string[]): Promise<void> {
   const client = new WatcherClient(DAEMON_SOCKET_PATH);
   let aborted = false;
   let fatalReason: string | undefined;
-  process.on("SIGTERM", () => { aborted = true; process.exit(0); });
-  process.on("SIGINT", () => { aborted = true; process.exit(0); });
+  process.on("SIGTERM", () => { aborted = true; });
+  process.on("SIGINT", () => { aborted = true; });
   const code = await mailboxWait(rest, {
     peek: async (session) => {
       if (aborted) throw new Error("wait aborted");
@@ -213,6 +226,7 @@ export async function runMailbox(args: string[]): Promise<void> {
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     now: () => Date.now(),
     out: (l) => console.log(l),
+    stopped: () => aborted,
   });
   if (fatalReason) {
     console.error(`mailbox wait: session lost — ${fatalReason}`);

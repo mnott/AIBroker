@@ -243,13 +243,14 @@ function liveClock(peeks: Array<Array<{ from: string; content: string; kind?: st
   let stopped = false;
   return {
     out,
-    /** Park the follow loop (its sleep never resolves) so the test process can end. */
+    /** Stop the follow loop: its next turn returns instead of parking forever. */
     stop: () => { stopped = true; },
     deps: {
       peek: async () => peeks[Math.min(n++, peeks.length - 1)],
-      sleep: (ms: number) => (stopped ? new Promise<void>(() => {}) : new Promise<void>((r) => setTimeout(r, Math.min(ms, 20)))),
+      sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, Math.min(ms, 20))),
       now: () => Date.now(),
       out: (l: string) => { out.push(l); },
+      stopped: () => stopped,
     },
   };
 }
@@ -341,6 +342,7 @@ test("follow: two messages print two lines and the waiter keeps running (no exit
   const settled = await Promise.race([p.then(() => "exited"), new Promise((r) => setTimeout(() => r("pending"), 50))]);
   assert.equal(settled, "pending");
   c.stop();
+  assert.equal(await p, 0); // stop() ends the loop cleanly — nothing is parked
 });
 
 test("follow: a keepalive beat emits nothing and does not wake it", async () => {
@@ -349,7 +351,7 @@ test("follow: a keepalive beat emits nothing and does not wake it", async () => 
   await new Promise((r) => setTimeout(r, 300));
   assert.deepEqual(c.out, []); // beats are ignored; the loop stays alive
   c.stop();
-  void p;
+  assert.equal(await p, 0);
 });
 
 test("follow: the waiter heartbeat stays registered while streaming", async () => {
@@ -361,15 +363,49 @@ test("follow: the waiter heartbeat stays registered while streaming", async () =
     // which registers the waiter (state.ts registerMailboxWaiter). The fake
     // mirrors that: each poll is a heartbeat.
     peek: async () => { heartbeats++; registerMailboxWaiter("follow-test", Date.now()); return []; },
-    sleep: (ms) => (stopped ? new Promise<void>(() => {}) : new Promise<void>((r) => setTimeout(r, Math.min(ms, 20)))),
+    sleep: (ms) => new Promise<void>((r) => setTimeout(r, Math.min(ms, 20))),
     now: () => Date.now(),
     out: () => {},
+    stopped: () => stopped,
   });
   await new Promise((r) => setTimeout(r, 300));
-  stopped = true;
-  void p;
   assert.ok(heartbeats >= 2, "the follow loop keeps polling (heartbeat beats)");
   assert.ok(hasActiveWaiter("follow-test"), "waiter stays active while streaming");
+  stopped = true;
+  assert.equal(await p, 0);
+});
+
+test("follow: a lost session stops the loop and exits non-zero with the reason", async () => {
+  // The real CLI sets aborted + fatalReason inside peek and rethrows; the wait
+  // loop must honour the stop hook instead of spinning on "wait aborted" forever.
+  let stopped = false;
+  const p = mailboxWait(["--heartbeat", "0", "--settle", "0", "--follow"], {
+    peek: async () => {
+      if (stopped) throw new Error("session not found: gone");
+      return [];
+    },
+    sleep: (ms) => new Promise<void>((r) => setTimeout(r, Math.min(ms, 20))),
+    now: () => Date.now(),
+    out: () => {},
+    stopped: () => stopped,
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  stopped = true; // the session is gone: peek throws every turn from here on
+  assert.equal(await p, 0); // mailboxWait returns cleanly on stop…
+});
+
+test("follow: a lost session stops even mid-settle", async () => {
+  let stopped = false;
+  const p = mailboxWait(["--heartbeat", "0", "--settle", "5", "--follow"], {
+    peek: async () => (stopped ? [] : [{ from: "a1", content: "one" }]),
+    sleep: (ms) => new Promise<void>((r) => setTimeout(r, Math.min(ms, 20))),
+    now: () => Date.now(),
+    out: () => {},
+    stopped: () => stopped,
+  });
+  await new Promise((r) => setTimeout(r, 150)); // it is inside the settle window here
+  stopped = true;
+  assert.equal(await p, 0);
 });
 
 // ── broadcast: fan-out to all live claude sessions, answers, roll-call ───────
