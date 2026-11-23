@@ -426,3 +426,21 @@ test("a failure with no retry_after is not retried", async () => {
   await assert.rejects(() => setTaskLabel("t-hard", "pai-running", true, impl), /403/);
   assert.equal(calls, 1);
 });
+
+test("a mirrored reply is filed once: the mirror entry gets no duplicate comment", async () => {
+  process.env.TODOIST_MIRROR_PROJECT = "mirror-p";
+  const { mirrorComment } = await import("../src/daemon/todoist-mirror.js");
+  const calls: { method: string; url: string }[] = [];
+  const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url);
+    calls.push({ method: init?.method ?? "GET", url: u });
+    const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200 });
+    if (u.includes("/sections")) return json({ results: [{ id: "s1", name: "Unfiled" }] });
+    if (u.includes("/tasks/orig")) return json({ id: "orig", content: "Origin", project_id: "p1", url: "https://app.todoist.com/app/task/orig" });
+    if (u.includes("/projects")) return json({ results: [] });
+    return json({ id: "new-1" });
+  }) as unknown as typeof fetch;
+  await mirrorComment({ taskId: "orig", commentId: "c1", text: "x".repeat(400) }, impl);
+  delete process.env.TODOIST_MIRROR_PROJECT;
+  assert.equal(calls.filter((c) => c.method === "POST" && c.url.includes("/comments")).length, 0);
+});

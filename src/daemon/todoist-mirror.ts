@@ -477,18 +477,10 @@ async function fileOne(
     );
     if (!id) return false;
 
-    // Full text as the first comment. Failing here leaves the entry in place
-    // with its excerpt and link — degraded, but not lost, and the link still
-    // reaches the real conversation.
-    if (flat.length > excerpt.length) {
-      // MARKED, and that is not cosmetic. `mirrorBack` carries any unmarked
-      // comment on a mirror entry to the source task — that is the whole point
-      // of it. This comment IS the source task's comment, already; carrying it
-      // back would post a verbatim duplicate onto the conversation it came
-      // from. Observed on 2026-08-03: the split landed, and the copy bounced
-      // straight back as a second identical reply.
-      await addComment(id, `${AGENT_MARK} ${comment.text}`, fetchImpl);
-    }
+    // No second copy of the reply. The full text already exists as the comment
+    // on the origin task; a verbatim 🤖 comment here showed up in PAILot as the
+    // same reply twice (2026-11-23, tasks 6j4VWpWf5qm6hFCh / 6j4VX6CMq8w7qrq6).
+    // The entry carries an excerpt and the link to the origin task instead.
     return true;
   } catch (e) {
     log(`todoist-mirror: file failed — ${e instanceof Error ? e.message : String(e)}`);
