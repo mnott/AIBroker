@@ -107,11 +107,30 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
   const started = deps.now();
   let nextBeat = heartbeatS > 0 ? started + heartbeatS * 1000 : Infinity;
   const deadline = timeoutS === undefined ? Infinity : deps.now() + timeoutS * 1000;
+  // --follow: peek never consumes, so remember what was already printed
+  // (multiset of from|content; consumed messages drop out of it).
+  const counts = (all: Pending[]): Map<string, number> => {
+    const c = new Map<string, number>();
+    for (const m of all) { const k = `${m.from}\u0000${m.content}`; c.set(k, (c.get(k) ?? 0) + 1); }
+    return c;
+  };
+  let printed = new Map<string, number>();
+  const unprinted = (all: Pending[]): Pending[] => {
+    const seen = new Map<string, number>();
+    return all.filter((m) => {
+      const k = `${m.from}\u0000${m.content}`;
+      const n = (seen.get(k) ?? 0) + 1;
+      seen.set(k, n);
+      return n > (printed.get(k) ?? 0);
+    });
+  };
   for (;;) {
     // A daemon that is down or restarting is not an arrival and not a failure:
     // keep waiting, the mailbox is read again once it answers.
     // Cache beats are not a wake-up: the prompt hook still shows them.
-    const messages = await peekReal(session, deps);
+    let all = await peekReal(session, deps);
+    if (follow) printed = new Map([...printed].filter(([k]) => counts(all).has(k)));
+    const messages = follow ? unprinted(all) : all;
     if (messages.length) {
       // --settle: one wake covers a burst. Keep collecting until settleS seconds
       // pass with no new message, hard-capped at SETTLE_CAP_S from the first
@@ -130,7 +149,9 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
           const wakeAt = Math.min(lastArrival + settleS * 1000, capAt, deadline);
           if (!(wakeAt > nowMs)) break;
           await deps.sleep(Math.min(POLL_MS, wakeAt - nowMs));
-          const more = await peekReal(session, deps);
+          const latestAll = await peekReal(session, deps);
+          if (follow) all = latestAll;
+          const more = follow ? unprinted(latestAll) : latestAll;
           if (more.length > lastCount) {
             messages.length = 0;
             messages.push(...more);
@@ -143,6 +164,8 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
         // --follow: stream, never exit. Print the burst and keep going — each
         // line is a Monitor notification, so no per-message restart churn.
         for (const m of messages) deps.out(summarise(m));
+        printed = counts(all);
+        await deps.sleep(POLL_MS);
         continue;
       }
       for (const m of messages) deps.out(summarise(m));
