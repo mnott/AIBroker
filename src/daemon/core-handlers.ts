@@ -145,9 +145,16 @@ export function sendToSessionDelivery(
 ): { typed: string; deposit: boolean } {
   // Never the body: noReply only drops the reply demand, not the mailbox. A
   // typed full message lands in whatever the operator is writing.
-  // A noReply message is a cache beat: labelled [Keepalive], not [Session:..],
-  // so the session does not try to reply to the (non-existent) sender.
-  if (noReply) return { typed: beatPointer(messagePreview(message)), deposit: true };
+  //
+  // A noReply message is a machine notice (worker escalation, keepalive). Per
+  // the routing rules only the operator's own channels may type into the input
+  // line, so a beat is NEVER typed: it is deposited to the mailbox as
+  // kind=beat and delivered by the session's prompt hook, like every other
+  // machine message. Live fault 2026-11-23 14:47: an escalation notice was
+  // typed as "[Keepalive] …" and landed mid-sentence in what the operator was
+  // writing. If a content-free cache-warming beat is ever wanted again it must
+  // be injected only when the input line is provably empty, and carry no text.
+  if (noReply) return { typed: "", deposit: true };
   return { typed: mailboxPointer(senderLabel, messagePreview(message)), deposit: true };
 }
 
@@ -1478,8 +1485,8 @@ export function registerCoreHandlers(
 
     // Only the operator's own channels type into the input line; machine
     // ingress is mailbox-only once a waiter can wake the session (ingress.ts).
-    // A beat is always typed: it exists to cause a turn (warm the cache), and the waiter ignores it.
-    const mailboxOnly = !noReply && (mailboxOnlyParam || deliveryFor(source, hasActiveWaiter(mailboxKeys(itermSessionId, claudeSessionOfId(itermSessionId)))) === "mailboxOnly");
+    // A beat (noReply) is a machine notice: always mailbox-only, never typed.
+    const mailboxOnly = noReply || (mailboxOnlyParam || deliveryFor(source, hasActiveWaiter(mailboxKeys(itermSessionId, claudeSessionOfId(itermSessionId)))) === "mailboxOnly");
 
     // What gets typed and whether it goes to the mailbox — see
     // sendToSessionDelivery() for why noReply skips both.

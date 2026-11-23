@@ -211,8 +211,8 @@ const { depositToSessionMailbox, peekSessionMailbox } = await import("../src/cor
 
 test("beat: noReply is labelled [Keepalive], not [Session:..], and marked kind=beat in the mailbox", () => {
   const d = sendToSessionDelivery("keepalive", "pai-cli", true);
-  assert.match(d.typed, /^\[Keepalive\] /);
-  assert.ok(!d.typed.includes("[Session:"));
+  assert.equal(d.typed, "", "a beat is never typed");
+  assert.ok(!d.typed.includes("[Keepalive]"));
   assert.equal(d.deposit, true);
   assert.match(sendToSessionDelivery("hi", "pai-cli", false).typed, /^\[Session:pai-cli\]/);
   depositToSessionMailbox("beat-box", "pai-cli", "keepalive", "beat");
