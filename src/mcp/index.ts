@@ -257,7 +257,7 @@ const server = new McpServer(
       "- **bold**/*italic* only in `whatsapp_send`/`telegram_send`; no headers or code blocks there.",
       "- No markdown/asterisks in `_tts` calls — TTS reads them literally.",
       "- If a prefixed task takes more than a few seconds, send a brief ack first via the matching `_tts`/`_send` tool. Never leave the client silent.",
-      "- `[Session:NAME]`: reply via `aibroker_send_to_session(target=NAME, message=YOUR_RESPONSE)`, not the terminal — the sender waits on `aibroker_receive`. Don't add a `[Session:...]` prefix yourself; the hub does.",
+      "- `[Session:NAME]`: reply via `aibroker_send_to_session(target=NAME, message=YOUR_RESPONSE)`, not the terminal (a Claude Code peer marked native in `aibroker_sessions` can be reached with SendMessage using its Claude name; on SendMessage error use aibroker_send_to_session) — the sender waits on `aibroker_receive`. Don't add a `[Session:...]` prefix yourself; the hub does.",
       "- Routing switches per message automatically, no manual toggle.",
       "- Only the operator's own channels (Telex, Whazaa, PAILot) are typed into your input line. Machine ingress (Todoist, forge/GitHub events, worker alerts, other sessions) is stored in your mailbox and nothing is typed. Run `aibroker mailbox wait --follow` under the Monitor tool with the maximum timeout — each new message prints one line as a notification, so there is no restart per message; re-arm it when the monitor expires (fallback for harnesses without Monitor: keep exactly ONE plain `aibroker mailbox wait` in the background via `run_in_background` and re-start it after every exit). When a notification arrives, read the mailbox (`aibroker_receive`) and act.",
       "",
@@ -302,7 +302,7 @@ server.tool("aibroker_adapters", "List registered adapters", {}, async () => {
   } catch (e) { return err(e); }
 });
 
-server.tool("aibroker_sessions", "List Claude sessions managed by the hub", {}, async () => {
+server.tool("aibroker_sessions", "List Claude sessions managed by the hub. Each row has kind, sessionKind (\"claude-code\"|\"shell\"), claudeSessionId and native. native:true marks a Claude Code peer you can reach with SendMessage using its Claude name; on a SendMessage error use aibroker_send_to_session (mailbox).", {}, async () => {
   try {
     const r = await hub.call_raw("sessions", {});
     return ok(JSON.stringify(r, null, 2));
@@ -833,15 +833,16 @@ server.tool(
 
 server.tool(
   "aibroker_send_to_session",
-  "Send a message to another iTerm2 session by depositing it into that session's AIBP mailbox and typing a one-line pointer into its terminal (the full body is never typed — the target's own UserPromptSubmit hook drains the mailbox and shows it once; typing the full body too would show it twice). The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can also read it directly via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message. The result distinguishes `delivered: true` (the target was observed taking the typed pointer) from `delivered: false, queued: true` (typed but unconfirmed — the target is probably mid-task; the message is in its mailbox regardless). Do not read ok:true as \"they have seen it\". Text to another Claude session is Agentish v2 (AG2); only text to the operator and to git is prose. `aibroker agentish spec` prints the format.",
+  "Send a message to another iTerm2 session by depositing it into that session's AIBP mailbox and typing a one-line pointer into its terminal (the full body is never typed — the target's own UserPromptSubmit hook drains the mailbox and shows it once; typing the full body too would show it twice). The target can be a session index (e.g. '2'), a session name substring, or an iTerm2 session UUID. The receiving session can also read it directly via aibroker_receive. NOTE: The [Session:SENDER] prefix is auto-prepended by the hub — do NOT include it in the message. The result distinguishes `delivered: true` (the target was observed taking the typed pointer) from `delivered: false, queued: true` (typed but unconfirmed — the target is probably mid-task; the message is in its mailbox regardless). Do not read ok:true as \"they have seen it\". Text to another Claude session is Agentish v2 (AG2); only text to the operator and to git is prose. `aibroker agentish spec` prints the format. A Claude Code peer marked native in aibroker_sessions can be reached with SendMessage using its Claude name; on SendMessage error use this tool.",
   {
     target: z.string().min(1).describe("Session to send to: index (1-based), name substring, or iTerm2 session UUID"),
     message: z.string().min(1).describe("The raw message content. Do NOT include a [Session:...] prefix — the hub auto-prepends [Session:SENDER_NAME] for routing."),
+    mode: z.enum(["auto", "mailbox"]).optional().describe("auto (default) = mailbox delivery as always; mailbox = explicit mailbox. A target marked native in aibroker_sessions can instead be reached with SendMessage; use this tool when SendMessage errors."),
     mailboxOnly: z.boolean().optional().describe("Store the message in the target's mailbox and type NOTHING into its terminal; it is delivered at the target's next prompt. Default false."),
   },
-  async ({ target, message, mailboxOnly }) => {
+  async ({ target, message, mode, mailboxOnly }) => {
     try {
-      const r = await hub.call_raw("send_to_session", { target, message, ...(mailboxOnly ? { mailboxOnly: true } : {}) }) as any;
+      const r = await hub.call_raw("send_to_session", { target, message, ...(mode ? { mode } : {}), ...(mailboxOnly ? { mailboxOnly: true } : {}) }) as any;
       const name = r.name ?? target;
       if (r.delivered) return ok(`Delivered to session "${name}" — typed pointer observed submitted.`);
       if (r.queued) return ok(`Queued for session "${name}" — ${r.note ?? "not confirmed delivered; it is in the mailbox."}`);
