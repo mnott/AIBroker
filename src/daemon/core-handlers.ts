@@ -42,7 +42,8 @@ import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
 import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { sameClaudeSession } from "../core/claude-attach.js";
-import { resolveSelfSessionId } from "./pai-session-map.js";
+import { resolveSelfSessionId, readPaiSessionMap, paneSuffix } from "./pai-session-map.js";
+import { readClaudeRegistry, isNativePeer } from "../core/native-peers.js";
 import { matchSession, matchAllSessions, resolveCallerSession, cwdMatches, displayName, labelOf, selfSendError } from "../core/session-match.js";
 import { audit, noteInbound } from "./audit.js";
 import type { IpcRequest } from "../types/ipc.js";
@@ -368,8 +369,24 @@ export function registerCoreHandlers(
     // (nothing populates the internal registry)" — described the defect and
     // routed around it; the registry now populates itself.
     const snapshots = await listedSessions();
+    // Path A of the hybrid messaging design: report only, deliver as before.
+    const registry = readClaudeRegistry();
+    const paiMap = readPaiSessionMap() ?? {};
+    const claudeIdOf = (s: SessionSnapshot): string | undefined => {
+      const uid = paneSuffix(s.id);
+      let best: { id: string; ts: number } | undefined;
+      for (const [id, e] of Object.entries(paiMap)) {
+        if (e?.uid !== uid) continue;
+        const ts = typeof e.ts === "number" ? e.ts : 0;
+        if (!best || ts > best.ts) best = { id, ts };
+      }
+      if (best) return best.id;
+      return s.attachUuid && registry?.find((r) => sameClaudeSession(r.sessionId, s.attachUuid!))?.sessionId || s.attachUuid;
+    };
     const sessions = snapshots.map((s, i) => {
       const paiName = s.paiName;
+      const isClaude = s.isClaude ?? (Boolean(paiName) || !s.atPrompt);
+      const claudeSessionId = isClaude ? claudeIdOf(s) : undefined;
       return {
         index: i + 1,
         sessionId: s.id,
@@ -385,7 +402,12 @@ export function registerCoreHandlers(
         // Measured first, guessed only when there is no measurement: a pane
         // running the launcher is titled like a node process and is not a
         // session, which is how the picker came to list itself.
-        kind: (s.isClaude ?? (Boolean(paiName) || !s.atPrompt)) ? "claude" : "shell",
+        kind: isClaude ? "claude" : "shell",
+        // "claude-code" | "shell" (kind above keeps its older "claude" spelling).
+        sessionKind: isClaude ? "claude-code" : "shell",
+        claudeSessionId: claudeSessionId ?? null,
+        // true = reach it with SendMessage by its Claude name; unknown reads true.
+        native: isClaude && isNativePeer(claudeSessionId, { registry }),
         active: s.id === activeItermSessionId,
       };
     });
@@ -1219,7 +1241,9 @@ export function registerCoreHandlers(
    * other message (mailbox + idle-only pointer); see sendToSessionDelivery().
    */
   server.on("send_to_session", async (req) => {
-    const { target: targetParam, message, noReply = false, mailboxOnly: mailboxOnlyParam = false, source = "session" } = req.params as { target?: string; message?: string; noReply?: boolean; mailboxOnly?: boolean; source?: string };
+    const { target: targetParam, message, noReply = false, mailboxOnly: mailboxOnlyParam = false, source = "session", mode = "auto" } = req.params as { target?: string; message?: string; noReply?: boolean; mailboxOnly?: boolean; source?: string; mode?: string };
+    // auto and mailbox are the same delivery today; the field is the stable seam for native paths.
+    if (mode !== "auto" && mode !== "mailbox") return { ok: false, error: 'mode must be "auto" or "mailbox"' };
     if (!targetParam) return { ok: false, error: "target is required" };
     if (!message) return { ok: false, error: "message is required" };
     const target = targetParam;

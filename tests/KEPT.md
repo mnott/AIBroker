@@ -34,3 +34,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/mail-ingress.test.ts | b | mail ingress sender gate (allowlist + topmost Authentication-Results, spoofed lower header ignored) and unconditional send rules (allowlist, accepted in-reply-to for non-self, operatorCc always Cc) pin an operator-approved security exception |
 | test/inbound-held.test.ts | a | webhook events held for coalescing survive a daemon restart, delivered once (live loss 2026-11-08) |
 | test/sync-facade-refresh.test.ts | a | transport facade background refresh recursed into snapshotAllSessions: RangeError on every status (this fix) |
+| test/native-peers.test.ts | a | native peer detection from registry dir, path A of #28 |
