@@ -47,7 +47,7 @@ function printCommandList(): void {
   console.log("  send <name> <text> Type a message into a session, by name");
   console.log("  broadcast <text>   Shout to every other live Claude session (--ask [--deadline 2m] [--default-ok]); reply/status subcommands");
   console.log("  mail send          Guarded reply from a mail-ingress mailbox (--mailbox --to --subject --body-file [--in-reply-to])");
-  console.log("  mailbox wait       Block until this session's mailbox has a message (background wake-up; --timeout <s>, --heartbeat <s>, exit 2 on timeout)");
+  console.log("  mailbox wait       Block until this session's mailbox has a message (background wake-up; --timeout <s>, --heartbeat <s>, exit 2 on timeout; --follow streams one line per message and never exits — run it under the Monitor tool)");
   console.log("  ping               Quick heartbeat check");
   console.log("  setup              Install service, MCP entry, hooks, env (--no-service --no-mcp --no-hooks --dry-run --force)");
   console.log("  doctor             Check the install; non-zero exit on a required failure");
