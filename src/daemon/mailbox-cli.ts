@@ -18,6 +18,12 @@
  * it prints one "waiting since HH:MM" line per --heartbeat seconds (default 1200,
  * 0 = off) so the harness sees output. It only peeks. Nothing is consumed or marked shown, so aibroker_receive and
  * the UserPromptSubmit hook still deliver every message.
+ *
+ * --follow: never exit on a message — print one line per new unshown message
+ * (same format, same --settle burst grouping) and keep running. Intended for
+ * Claude Code's Monitor tool, where each stdout line becomes a notification;
+ * no restart per message. Exits only on SIGTERM/SIGINT, a lost session, or a
+ * fatal daemon error (a final line says why, exit non-zero).
  */
 import { WatcherClient } from "../ipc/client.js";
 import { DAEMON_SOCKET_PATH } from "./index.js";
@@ -33,6 +39,17 @@ export interface MailboxDeps {
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   out: (line: string) => void;
+  /**
+   * Checked at the top of every loop turn and every settle poll. A stopped
+   * waiter returns immediately instead of sleeping forever — SIGTERM/SIGINT, a
+   * lost session, or a test that wants its follow loop to end.
+   */
+  stopped?: () => boolean;
+}
+
+/** `stopped()` is truthy (a missing hook never stops anything). */
+function isStopped(deps: MailboxDeps): boolean {
+  return deps.stopped?.() === true;
 }
 
 const HEARTBEAT_DEFAULT_S = 1200;
@@ -74,13 +91,15 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
   let timeoutS: number | undefined;
   let heartbeatS = HEARTBEAT_DEFAULT_S;
   let settleS = envSettleDefault();
+  let follow = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--session") session = args[++i];
     else if (args[i] === "--timeout") timeoutS = Number(args[++i]);
     else if (args[i] === "--heartbeat") heartbeatS = Number(args[++i]);
     else if (args[i] === "--settle") settleS = Number(args[++i]);
+    else if (args[i] === "--follow") follow = true;
     else {
-      console.error("Usage: aibroker mailbox wait [--session <id>] [--timeout <s>] [--heartbeat <s>] [--settle <s>]");
+      console.error("Usage: aibroker mailbox wait [--session <id>] [--timeout <s>] [--heartbeat <s>] [--settle <s>] [--follow]");
       return 1;
     }
   }
@@ -99,11 +118,31 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
   const started = deps.now();
   let nextBeat = heartbeatS > 0 ? started + heartbeatS * 1000 : Infinity;
   const deadline = timeoutS === undefined ? Infinity : deps.now() + timeoutS * 1000;
+  // --follow: peek never consumes, so remember what was already printed
+  // (multiset of from|content; consumed messages drop out of it).
+  const counts = (all: Pending[]): Map<string, number> => {
+    const c = new Map<string, number>();
+    for (const m of all) { const k = `${m.from}\u0000${m.content}`; c.set(k, (c.get(k) ?? 0) + 1); }
+    return c;
+  };
+  let printed = new Map<string, number>();
+  const unprinted = (all: Pending[]): Pending[] => {
+    const seen = new Map<string, number>();
+    return all.filter((m) => {
+      const k = `${m.from}\u0000${m.content}`;
+      const n = (seen.get(k) ?? 0) + 1;
+      seen.set(k, n);
+      return n > (printed.get(k) ?? 0);
+    });
+  };
   for (;;) {
+    if (isStopped(deps)) return 0;
     // A daemon that is down or restarting is not an arrival and not a failure:
     // keep waiting, the mailbox is read again once it answers.
     // Cache beats are not a wake-up: the prompt hook still shows them.
-    const messages = await peekReal(session, deps);
+    let all = await peekReal(session, deps);
+    if (follow) printed = new Map([...printed].filter(([k]) => counts(all).has(k)));
+    const messages = follow ? unprinted(all) : all;
     if (messages.length) {
       // --settle: one wake covers a burst. Keep collecting until settleS seconds
       // pass with no new message, hard-capped at SETTLE_CAP_S from the first
@@ -116,13 +155,16 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
         let lastArrival = deps.now();
         let lastCount = messages.length;
         for (;;) {
+          if (isStopped(deps)) break;
           const nowMs = deps.now();
           // sleep to the earlier of: the quiet window closing (settleS after
           // the last arrival), the hard cap, and the timeout deadline.
           const wakeAt = Math.min(lastArrival + settleS * 1000, capAt, deadline);
           if (!(wakeAt > nowMs)) break;
           await deps.sleep(Math.min(POLL_MS, wakeAt - nowMs));
-          const more = await peekReal(session, deps);
+          const latestAll = await peekReal(session, deps);
+          if (follow) all = latestAll;
+          const more = follow ? unprinted(latestAll) : latestAll;
           if (more.length > lastCount) {
             messages.length = 0;
             messages.push(...more);
@@ -131,15 +173,23 @@ export async function mailboxWait(args: string[], deps: MailboxDeps): Promise<nu
           }
         }
       }
+      if (follow) {
+        // --follow: stream, never exit. Print the burst and keep going — each
+        // line is a Monitor notification, so no per-message restart churn.
+        for (const m of messages) deps.out(summarise(m));
+        printed = counts(all);
+        await deps.sleep(POLL_MS);
+        continue;
+      }
       for (const m of messages) deps.out(summarise(m));
       return 0;
     }
-    if (deps.now() >= deadline) return 2;
+    if (!follow && deps.now() >= deadline) return 2;
     if (deps.now() >= nextBeat) {
       deps.out(`waiting since ${hhmm(started)}`);
       nextBeat = deps.now() + heartbeatS * 1000;
     }
-    await deps.sleep(Math.min(POLL_MS, Math.max(0, deadline - deps.now())));
+    await deps.sleep(follow ? POLL_MS : Math.min(POLL_MS, Math.max(0, deadline - deps.now())));
   }
 }
 
@@ -155,14 +205,32 @@ export async function runMailbox(args: string[]): Promise<void> {
     process.exit(1);
   }
   const client = new WatcherClient(DAEMON_SOCKET_PATH);
+  let aborted = false;
+  let fatalReason: string | undefined;
+  process.on("SIGTERM", () => { aborted = true; });
+  process.on("SIGINT", () => { aborted = true; });
   const code = await mailboxWait(rest, {
     peek: async (session) => {
-      const r = (await client.call_raw("session_mailbox_peek", { waiter: true, ...(session ? { sessionId: session } : {}) })) as { messages?: Pending[] };
-      return r.messages ?? [];
+      if (aborted) throw new Error("wait aborted");
+      try {
+        const r = (await client.call_raw("session_mailbox_peek", { waiter: true, ...(session ? { sessionId: session } : {}) })) as { messages?: Pending[] };
+        return r.messages ?? [];
+      } catch (err) {
+        if (!aborted && err instanceof Error && /session not found|unknown session/i.test(err.message)) {
+          fatalReason = err.message;
+          aborted = true;
+        }
+        throw err;
+      }
     },
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     now: () => Date.now(),
     out: (l) => console.log(l),
+    stopped: () => aborted,
   });
+  if (fatalReason) {
+    console.error(`mailbox wait: session lost — ${fatalReason}`);
+    process.exit(1);
+  }
   process.exit(code);
 }
