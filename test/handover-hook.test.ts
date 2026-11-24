@@ -11,7 +11,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handoverDue, measuredCompactForProject, writeHandoverMarker, handoverMarkerPath } from "../src/daemon/manage.js";
+import { handoverDue, measuredCompactForProject, effectiveCompactK, bandOf, writeHandoverMarker, handoverMarkerPath } from "../src/daemon/manage.js";
 
 const HOOK = join(import.meta.dirname, "..", "hooks", "handover-due.mjs");
 
@@ -60,4 +60,31 @@ test("trigger estimate takes the project minimum over other sessions' transcript
   writeFileSync(join(dir, "b.jsonl"), ev(905_000, "2026-11-20T10:00:00Z"));
   writeFileSync(join(dir, "mine.jsonl"), "{}\n");
   assert.equal(measuredCompactForProject(join(dir, "mine.jsonl"))?.k, 905);
+});
+
+function projFiles(others: Record<string, { model: string; pre: number }>, mineModel = "m-big") {
+  const dir = mkdtempSync(join(tmpdir(), "proj-"));
+  const asst = (model: string) => JSON.stringify({ type: "assistant", message: { model } }) + "\n";
+  const ev = (pre: number) =>
+    JSON.stringify({ type: "system", subtype: "compact_boundary", timestamp: "2026-11-24T10:00:00Z", compactMetadata: { trigger: "auto", preTokens: pre } }) + "\n";
+  for (const [n, o] of Object.entries(others)) writeFileSync(join(dir, `${n}.jsonl`), asst(o.model) + ev(o.pre));
+  writeFileSync(join(dir, "mine.jsonl"), asst(mineModel));
+  return join(dir, "mine.jsonl");
+}
+
+test("a smaller-window session's 259k compaction does not pull this session's trigger down", () => {
+  const mine = projFiles({ small: { model: "m-small", pre: 259_000 }, samemodel: { model: "m-big", pre: 259_000 } });
+  const m = measuredCompactForProject(mine, 1000);
+  assert.equal(m, undefined);
+  const k = effectiveCompactK({ windowK: 1000, overridePct: 95, measuredK: m?.k });
+  assert.equal(k, 950);
+  assert.equal(bandOf(676, k, 50), "below");
+});
+
+test("same-model same-window project measurement is used", () => {
+  const mine = projFiles({ a: { model: "m-big", pre: 931_000 }, b: { model: "m-small", pre: 259_000 } });
+  const m = measuredCompactForProject(mine, 1000);
+  assert.equal(m?.k, 931);
+  assert.equal(m?.source, "project");
+  assert.equal(effectiveCompactK({ windowK: 1000, overridePct: 95, measuredK: m?.k }), 931);
 });
