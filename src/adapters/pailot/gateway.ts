@@ -66,7 +66,7 @@ import { sendPush as apnsSendPush } from "../../apns/client.js";
 import { readAttachment, withNote, type AttachmentRef, getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
 import { getAllPersistentSessionNames, getPersistentSessionName, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
-import { discoverLiveSessions, isClaudeRelated, listedLiveIds } from "../../core/session-discovery.js";
+import { discoverLiveSessions, isClaudeRelated, listedLiveIds, resumableSessionsForDir } from "../../core/session-discovery.js";
 import { resolveLaunchDir } from "../../core/launch-dir.js";
 
 /**
@@ -88,6 +88,13 @@ interface WsSession {
   kind: "api" | "visual";
   isActive: boolean;
   id: string;
+  /**
+   * A session that is not open in a tab but can be resumed there (its recorded
+   * project directory matches a directory the client searched). The tray renders
+   * these as resumable rows; without them a folder search offers only a fresh
+   * launch and hides the earlier session that already worked there.
+   */
+  resumable?: boolean;
 }
 
 // --- State ---
@@ -600,6 +607,30 @@ async function handleSessionsCommand(ws: WebSocket, opts: { fresh?: boolean } = 
     isActive: active ? s.id === active.id : false,
     id: s.backendSessionId,
   }));
+
+  // Offer earlier sessions that can be RESUMED in the directory the client is
+  // looking at, not just a fresh launch of it. A session recorded in a
+  // directory but not open in a tab is listed as resumable so the tray shows
+  // the operator's existing session for that folder (live 2026-11-24: a search
+  // of "~" offered only a new "Home", hiding the Home session that already
+  // existed). Home is deliberately not a PAI project, but that must not hide
+  // the sessions recorded in it — the persistent store is the record, not the
+  // project registry.
+  const liveIds = listedLiveIds(liveSnapshots);
+  for (const snap of liveSnapshots) {
+    if (!snap.cwd) continue;
+    for (const r of resumableSessionsForDir(snap.cwd, liveIds)) {
+      sessions.push({
+        index: sessions.length + 1,
+        name: r.name,
+        type: "claude" as const,
+        kind: "visual",
+        isActive: false,
+        id: r.id,
+        resumable: true,
+      });
+    }
+  }
 
   const payload = JSON.stringify({ type: "sessions", sessions });
   if (ws.readyState === WebSocket.OPEN) {

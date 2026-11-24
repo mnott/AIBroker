@@ -35,3 +35,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/inbound-held.test.ts | a | webhook events held for coalescing survive a daemon restart, delivered once (live loss 2026-11-08) |
 | test/sync-facade-refresh.test.ts | a | transport facade background refresh recursed into snapshotAllSessions: RangeError on every status (this fix) |
 | test/native-peers.test.ts | a | native peer detection from registry dir, path A of #28 |
+| test/pailot-home-launch.test.ts | a | PAILot home launch failed: literal '~' was single-quoted so the shell never expanded it (live 2026-11-24); pins tilde expansion in both launch builders and the nonexistent-dir refusal |

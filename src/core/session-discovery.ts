@@ -26,7 +26,8 @@
  */
 
 import { snapshotAllSessions, snapshotAllSessionsAsync, wasLastEnumerationReliable as wasLastSnapshotReliable } from "../transport/sync-facade.js";
-import { getAllPersistentSessionNames, lookupPersistentName } from "./persistence.js";
+import { getAllPersistentSessionNames, lookupPersistentName, getSessionProjects } from "./persistence.js";
+import { expandTilde } from "./launch-dir.js";
 
 export type LiveSession = Awaited<ReturnType<typeof snapshotAllSessions>>[0];
 
@@ -100,6 +101,36 @@ export function isClaudeRelated(snap: LiveSession): boolean {
   if (name.includes("claude")) return true;
   if (!snap.atPrompt) return true;
   return false;
+}
+
+/**
+ * Sessions that can be resumed in `dir` — the ones a folder search must offer.
+ *
+ * A search for a directory used to offer only the directory itself, never the
+ * earlier session that already worked there: the operator searched "~", got a
+ * fresh "Home" launch, and their existing Home session stayed hidden. The
+ * persistent name store is the durable record of every session ever named, and
+ * its sibling projects file records where each was named, so a search can list
+ * resumable earlier sessions for ANY directory — including the home directory,
+ * which is deliberately not treated as a PAI project but must not hide the
+ * sessions that live in it.
+ *
+ * `dir` arrives from PAILot as a literal "~" (see core/launch-dir): it is
+ * expanded before matching, so a home search matches the recorded home cwd.
+ * Matching is exact after expansion — a parent directory is not a match, and
+ * guessing would resume the wrong session.
+ */
+export function resumableSessionsForDir(dir: string, liveIds: Set<string>): Array<{ id: string; name: string }> {
+  const target = expandTilde(dir);
+  const names = getAllPersistentSessionNames();
+  const projects = getSessionProjects();
+  const out: Array<{ id: string; name: string }> = [];
+  for (const [id, name] of Object.entries(names)) {
+    if (projects[id] !== target) continue;
+    if (liveIds.has(id)) continue; // already on the tray as a live row
+    out.push({ id, name });
+  }
+  return out;
 }
 
 /**
