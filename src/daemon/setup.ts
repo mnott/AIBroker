@@ -122,6 +122,21 @@ export function mergeHooks(settings: Json, s: Sys): { settings: Json; added: str
   const added: string[] = [];
   const present: string[] = [];
   const updated: string[] = [];
+  // Collapse repeats of our own hook file within one event (a second install or
+  // a hand-merge left two): one hook, one run per event.
+  for (const h of HOOK_PLAN) {
+    let seen = false;
+    for (const g of (next.hooks[h.event] ?? []) as HookGroup[]) {
+      if (!g.hooks) continue;
+      g.hooks = g.hooks.filter((c) => {
+        if (!c.command || !isHookFile(c.command, h.file)) return true;
+        if (seen) { updated.push(`${h.event} ${h.file} (duplicate removed)`); return false; }
+        seen = true;
+        return true;
+      });
+    }
+    if (next.hooks[h.event]) next.hooks[h.event] = (next.hooks[h.event] as HookGroup[]).filter((g) => !g.hooks || g.hooks.length);
+  }
   for (const h of HOOK_PLAN) {
     const label = `${h.event}${h.matcher ? `[${h.matcher}]` : ""} ${h.file}`;
     if (hasHookFile(next, h.event, h.file)) {
