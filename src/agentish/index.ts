@@ -281,8 +281,13 @@ export function check(msg: string, earlier: string[] = []): AgentishCheckResult 
     if (fields.res === "+") {
       const gatePassed = fields.gate === "+";
       const hasProof = (fields.prove ?? "").trim().length > 0;
-      const testsPassed = test.trim().split(/\s+/).filter(Boolean).every((tk) => outcomeOf(tk) === "+");
-      if (!gatePassed || !hasProof || !testsPassed) fail("E_R_UNPROVEN", "r=+ without proof", fieldLine.res);
+      const entries = test.trim().split(/\s+/).filter(Boolean);
+      const failed = entries.find((tk) => outcomeOf(tk) !== "+");
+      if (failed) {
+        fail("E_R_UNPROVEN", `r=+ but test ${nameOf(failed)} failed; use r=~ or r=- or fix the test`, fieldLine.res);
+      } else if (!gatePassed || !hasProof) {
+        fail("E_R_UNPROVEN", "r=+ without proof", fieldLine.res);
+      }
     }
     // Anything short of a clean pass, or a named worst-remaining issue, owes
     // a reason — otherwise "~" and "-" read exactly like "didn't get to it".
