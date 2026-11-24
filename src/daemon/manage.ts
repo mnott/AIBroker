@@ -516,6 +516,20 @@ export interface ManagedSession {
   /** When a handover was asked for, so a silent session can be given up on. */
   handoverAskedAt?: number;
   /**
+   * The last handover the hook delivered for this session — its marker's
+   * fingerprint and the time it landed. The hook path is un-gated by design
+   * (a busy session is never idle), so without this clock a session that
+   * writes its handover in response to one ask is asked again on the next
+   * tick: live 2026-11-24, asked at 676k, written 20s later, asked again.
+   * `handoverDoneAt` cannot serve — it is only ever set by a typed ask's
+   * read-back, which a busy session never confirms.
+   */
+  hookAskedAt?: number;
+  /** The target file a hook ask named, so its landing is watched like a typed ask's. */
+  hookAskedPath?: string;
+  /** What that file looked like when the hook asked, so "changed" is measured not claimed. */
+  hookWas?: string;
+  /**
    * When this session's pane last could not be read at all. Set by the tick's
    * drop rule; cleared the moment a read succeeds. A pane unreadable past
    * DROP_UNREADABLE_MS is a gone terminal, and management ends with it.
@@ -4046,8 +4060,14 @@ async function tick(now = Date.now()): Promise<void> {
       idleMs: tickIdleMs,
       now,
     });
-    // Same decision with the idle gate lifted: what the hook can deliver
-    // regardless of whether the session is ever idle.
+    /**
+     * Same decision with the idle gate lifted: what the hook can deliver
+     * regardless of whether the session is ever idle. The re-ask rules stay
+     * in — a hook ask is an ask exactly like a typed one, so the gap floor and
+     * the new-work floor apply to it too. Lifting only `idleMs` used to let a
+     * busy session be asked again seconds after its handover landed (live
+     * 2026-11-24: asked at 676k, handover written, asked again 20s later).
+     */
     const tickHookDecision = handoverDue({
       contextK: tickUsed ?? undefined,
       effectiveK: tickCompaction.effectiveK,
@@ -4475,6 +4495,40 @@ async function tick(now = Date.now()): Promise<void> {
     // preferred target; an unnamed session still gets asked, at a sane
     // default (see defaultHandoverTarget) or, failing that, with no path at
     // all rather than not asking.
+    /**
+     * A hook-delivered handover that landed: record it on the hook's own
+     * clock and clear the pending ask, so the next tick cannot re-ask a
+     * session that just wrote its handover down.
+     */
+    if (m.hookAskedAt && m.hookAskedPath) {
+      const hookWrote = fileFingerprint(m.hookAskedPath) !== (m.hookWas ?? "");
+      if (hookWrote) {
+        log(`[manage] ${m.name} handover written via hook (${m.hookAskedPath} changed)`);
+        try { unlinkSync(handoverMarkerPath(m.sessionId)); } catch { /* consumed already */ }
+        m.handoverDoneAt = now;
+        m.handoverDoneK = (await contextK(m)) ?? undefined;
+        delete m.hookAskedAt;
+        delete m.hookWas;
+        delete m.hookAskedPath;
+        delete m.handoverAskedAt;
+        delete m.handoverWas;
+        delete m.handoverAskedPath;
+        dirty = true;
+      } else if (now - m.hookAskedAt > HANDOVER_GRACE_MS) {
+        // The hook asked and nothing was written: give up on it the same way
+        // a typed ask is given up on, so the clock stops counting forever.
+        alert(m, "asked for a handover via hook and did not get one — NOT clearing, the session keeps its context");
+        try { unlinkSync(handoverMarkerPath(m.sessionId)); } catch { /* consumed already */ }
+        delete m.hookAskedAt;
+        delete m.hookWas;
+        delete m.hookAskedPath;
+        delete m.handoverAskedAt;
+        delete m.handoverWas;
+        delete m.handoverAskedPath;
+        dirty = true;
+      }
+    }
+
     if (!m.paused && !m.handoverAskedAt && !m.clearPendingSince) {
       // Reuses the pid/context/decision already resolved once above, for
       // every managed session, so the diagnostic log and the actual ask are
@@ -4498,6 +4552,17 @@ async function tick(now = Date.now()): Promise<void> {
         m.handoverWas = askedPath ? fileFingerprint(askedPath) : undefined;
 
         if (viaHook) {
+          /**
+           * THE HOOK PATH KEEPS ITS OWN CLOCK.
+           *
+           * `handoverDoneAt` is only ever set by a typed ask's read-back, and
+           * a busy session never confirms one — so the hook path had no clock
+           * of its own and was asked again seconds after the handover it just
+           * delivered (live 2026-11-24: asked at 676k, written, asked again at
+           * 685k twenty seconds later). This records the ask and watches the
+           * same target file the typed path watches; when it changes, the handover
+           * landed and the gap/new-work rules below hold the next ask off.
+           */
           writeHandoverMarker(m.sessionId, {
             contextK: used ?? 0,
             triggerK: Math.round(tickCompaction.effectiveK),
@@ -4505,6 +4570,9 @@ async function tick(now = Date.now()): Promise<void> {
             path: askedPath ?? null,
             askedAt: now,
           });
+          m.hookAskedAt = now;
+          m.hookAskedPath = askedPath;
+          m.hookWas = askedPath ? fileFingerprint(askedPath) : undefined;
           log(
             `[manage] ${m.name} handover asked via hook at ${used}k (band ${bandOf(used ?? 0, tickCompaction.effectiveK, resolvedMarginK(m))}) ` +
               `target=${askedPath ?? "Notes/TODO.md ## Continue"} reason=${tickHookDecision.reason}`,
@@ -4590,6 +4658,38 @@ async function tick(now = Date.now()): Promise<void> {
     // Goal gone — or a forced arm (now / supervise with a new goal, asked by a
     // session that is itself mid-turn) — mid-turn: queue the arm behind the
     // turn instead of waiting for an idle tick.
+    /**
+     * THE FIRST ARM AFTER A SET_GOAL IS NOT HELD BY THE IDLE GATE.
+     *
+     * `set_goal`/`supervise` set `lastRearmAt = 0`, the "arm now" sentinel, and
+     * the contract says the `/goal` line is typed even mid-turn — Claude Code
+     * queues a submitted line and runs it at the next turn boundary. But the
+     * idle gate below only ever let an arm through when the pane went quiet,
+     * so a session that never goes quiet was never armed: live 2026-11-24, a
+     * goal set at 21:45:06 sat "arm pending" for three minutes and the operator
+     * had to type `/goal` by hand. A forced arm is exactly the case the queue
+     * path exists for; `busyGoalGoneReason` already handles it once `working`
+     * is true, but a session that looks idle-but-not-yet-armed falls through
+     * the gate below too. So: any forced arm whose read-back sees an empty
+     * input line goes out now, idle or not — only never over unsent text, which
+     * `arm()` itself enforces via promptUnsentText.
+     */
+    const forcedArm = m.lastRearmAt === 0 && !m.paused && !shiftOver(m, now) && promptUnsentText(content) === null;
+    if (forcedArm) {
+      const queued = await tryExclusive(arming, m.sessionId, () => arm(m, FORCED_ARM_REASON));
+      if (queued === undefined || queued === "untyped") {
+        // Nothing went out this tick; the sentinel survives and the next tick tries again.
+        note(m, `${FORCED_ARM_REASON} — could not type it this tick, will retry`);
+      } else {
+        m.lastRearmAt = now;
+        delete m.queuedArmAt;
+        if (queued === "failed") note(m, `${FORCED_ARM_REASON} — typed mid-turn, not confirmed yet; it queues behind the turn`);
+        else note(m, `${FORCED_ARM_REASON} — armed`);
+      }
+      dirty = true;
+      continue;
+    }
+
     const queuedReason = busyGoalGoneReason(m, content, now, working && !paneLooksIdle(content, now - m.lastChangeAt));
     if (queuedReason && now - m.lastRearmAt >= REARM_COOLDOWN_MS) {
       // Pending whether or not the read-back saw it land: a queued line is invisible until the turn ends.
