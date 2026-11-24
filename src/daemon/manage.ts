@@ -1049,6 +1049,25 @@ export function bandOf(usedK: number, effectiveK: number, marginK: number): "bel
 }
 
 /**
+ * The per-session "handover due" marker the handover-due hook reads. A goal
+ * session is never idle long enough for the typed ask, so a due band is
+ * delivered as hook context instead: no typing, no idle gate.
+ */
+export function handoverMarkerDir(): string {
+  return process.env.AIBROKER_HANDOVER_DIR ?? join(homedir(), ".aibroker", "handover-due");
+}
+export function handoverMarkerPath(sessionKey: string): string {
+  return join(handoverMarkerDir(), `${sessionKey.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
+}
+export function writeHandoverMarker(
+  sessionKey: string,
+  marker: { contextK: number; triggerK: number; target: string; path: string | null; askedAt: number },
+): void {
+  mkdirSync(handoverMarkerDir(), { recursive: true });
+  writeFileSync(handoverMarkerPath(sessionKey), JSON.stringify(marker));
+}
+
+/**
  * Whether a handover is due — the pure decision, extracted so it is testable
  * without a pane, a process table, or a transcript file.
  *
@@ -2250,6 +2269,39 @@ export function measuredCompactForTranscript(file: string): ReturnType<typeof me
 }
 
 /**
+ * The lowest measured auto-compaction point across the project's transcripts
+ * (every <sessionId>.jsonl beside `file`), not only this session's. A session's
+ * own history is often one event or none, and one measured too high (931k real
+ * against a 950k estimate) leaves every band above the real wall. Cheap
+ * failure direction is low, so the minimum wins; each file is mtime-cached.
+ * The 40 newest files bound the work.
+ */
+export function measuredCompactForProject(file: string): ReturnType<typeof measuredCompactK> {
+  const dir = dirname(file);
+  let files: string[] = [];
+  try {
+    files = readdirSync(dir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => join(dir, f))
+      .map((f) => ({ f, t: (() => { try { return statSync(f).mtimeMs; } catch { return 0; } })() }))
+      .sort((a, b) => b.t - a.t)
+      .slice(0, 40)
+      .map((x) => x.f);
+  } catch { /* directory gone */ }
+  if (!files.includes(file)) files.push(file);
+  let best: ReturnType<typeof measuredCompactK>;
+  const all: { at: string; preTokens: number }[] = [];
+  for (const f of files) {
+    const r = measuredCompactForTranscript(f);
+    if (!r) continue;
+    all.push(...r.events);
+    if (!best || r.k < best.k) best = r;
+  }
+  if (!best) return undefined;
+  return { k: best.k, events: all.sort((a, b) => a.preTokens - b.preTokens).slice(0, 3) };
+}
+
+/**
  * The compaction point to plan a session's handover around, and a one-line
  * account of where that number came from — printed in `status` and in the
  * per-tick log line, because a number nobody can trace back to a source is a
@@ -2257,7 +2309,7 @@ export function measuredCompactForTranscript(file: string): ReturnType<typeof me
  */
 function compactionReading(m: ManagedSession, pid: string | null, file: string | null | undefined): { effectiveK: number; label: string } {
   const windowK = m.contextWindowK ?? 1000;
-  const measured = file ? measuredCompactForTranscript(file) : undefined;
+  const measured = file ? measuredCompactForProject(file) : undefined;
   const override = readOverridePct(pid);
   const effectiveK = effectiveCompactK({ windowK, overridePct: override?.pct, measuredK: measured?.k });
 
@@ -2268,7 +2320,7 @@ function compactionReading(m: ManagedSession, pid: string | null, file: string |
     label = `${src}; measured ${measured.k.toLocaleString("en-US")}k is stale-high and ignored`;
   } else if (measured) {
     const vals = measured.events.map((e) => e.preTokens.toLocaleString("en-US")).join(" / ");
-    label = `measured: min of ${measured.events.length} event${measured.events.length > 1 ? "s" : ""} ${vals} in this session`;
+    label = `measured: min of ${measured.events.length} event${measured.events.length > 1 ? "s" : ""} ${vals} across this project's transcripts`;
   } else if (override) {
     label = `${override.source} override=${override.pct}`;
   } else {
@@ -3929,6 +3981,17 @@ async function tick(now = Date.now()): Promise<void> {
       idleMs: tickIdleMs,
       now,
     });
+    // Same decision with the idle gate lifted: what the hook can deliver
+    // regardless of whether the session is ever idle.
+    const tickHookDecision = handoverDue({
+      contextK: tickUsed ?? undefined,
+      effectiveK: tickCompaction.effectiveK,
+      marginK: resolvedMarginK(m),
+      lastAskAt: m.handoverDoneAt,
+      handoverDoneK: m.handoverDoneK,
+      idleMs: Number.MAX_SAFE_INTEGER,
+      now,
+    });
     {
       const prevLog = lastContextLog.get(m.sessionId);
       const kMoved = tickUsed !== null && (prevLog?.k === undefined || Math.abs(tickUsed - prevLog.k) >= 10);
@@ -4186,6 +4249,8 @@ async function tick(now = Date.now()): Promise<void> {
          * to disk. So the valuable half runs and the dangerous half does not,
          * unless somebody asks for it by name.
          */
+        log(`[manage] ${m.name} handover written (${m.handoverAskedPath ?? "project TODO Continue section"} changed)`);
+        try { unlinkSync(handoverMarkerPath(m.sessionId)); } catch { /* already consumed */ }
         logOnly(m, "handover written — leaving the session to compact on its own rather than clearing it");
         m.handoverDoneAt = now;
         m.handoverDoneK = (await contextK(m)) ?? undefined;
@@ -4308,6 +4373,7 @@ async function tick(now = Date.now()): Promise<void> {
       }
       if (now - m.handoverAskedAt > HANDOVER_GRACE_MS) {
         alert(m, "asked for a handover and did not get one — NOT clearing, the session keeps its context");
+        try { unlinkSync(handoverMarkerPath(m.sessionId)); } catch { /* consumed already */ }
         delete m.handoverAskedAt;
         delete m.handoverWas;
         dirty = true;
@@ -4335,9 +4401,10 @@ async function tick(now = Date.now()): Promise<void> {
       // never able to disagree about what was seen this tick.
       const used = tickUsed;
       const decision = tickHandoverDecision;
+      const viaHook = !decision.due && tickHookDecision.due;
       const grownBy = used !== null && m.handoverDoneK !== undefined ? used - m.handoverDoneK : null;
 
-      if (decision.due) {
+      if (decision.due || viaHook) {
         const notesDirExists = tickCwd ? existsSync(join(tickCwd, "Notes")) : false;
         const target = pickHandoverTarget({
           handoverFile: m.handoverFile,
@@ -4350,6 +4417,22 @@ async function tick(now = Date.now()): Promise<void> {
         m.handoverAskedPath = askedPath;
         m.handoverWas = askedPath ? fileFingerprint(askedPath) : undefined;
 
+        if (viaHook) {
+          writeHandoverMarker(m.sessionId, {
+            contextK: used ?? 0,
+            triggerK: Math.round(tickCompaction.effectiveK),
+            target: askedPath ?? target.description ?? "the project's Notes/TODO.md ## Continue section",
+            path: askedPath ?? null,
+            askedAt: now,
+          });
+          log(
+            `[manage] ${m.name} handover asked via hook at ${used}k (band ${bandOf(used ?? 0, tickCompaction.effectiveK, resolvedMarginK(m))}) ` +
+              `target=${askedPath ?? "Notes/TODO.md ## Continue"} reason=${tickHookDecision.reason}`,
+          );
+          note(m, `at ${used}k tokens (${tickHookDecision.reason}) — handover ask left for the hook (session is busy)`);
+          dirty = true;
+          continue;
+        }
         const topUp = m.handoverDoneAt !== undefined && (decision.reason === "refresh" || decision.reason.startsWith("warm-up — work"));
         await typeIntoSession(
           m.sessionId,
@@ -4373,6 +4456,9 @@ async function tick(now = Date.now()): Promise<void> {
         // un-gated ask reaches every managed session, not just the one
         // opted-in session it used to, so the evidence for "this was a safe
         // moment to interrupt it" belongs in the log every single time.
+        log(
+          `[manage] ${m.name} handover asked via typed at ${used}k (band ${bandOf(used ?? 0, tickCompaction.effectiveK, resolvedMarginK(m))})`,
+        );
         log(
           `[manage] ${m.name} asked for handover: context=${used}k band=${bandOf(used ?? 0, tickCompaction.effectiveK, resolvedMarginK(m))} ` +
             `idle=${Math.round(tickIdleMs / 1000)}s target=${askedPath ?? "none"}`,

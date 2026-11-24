@@ -37,3 +37,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/native-peers.test.ts | a | native peer detection from registry dir, path A of #28 |
 | test/pailot-home-launch.test.ts | a | PAILot home launch failed: literal '~' was single-quoted so the shell never expanded it (live 2026-11-24); pins tilde expansion in both launch builders and the nonexistent-dir refusal |
 | test/mailbox-help.test.ts | b | PAI detects mailbox --follow support by reading the help text; a missing flag silently falls back to the one-shot waiter, so the help must advertise it |
+| test/handover-hook.test.ts | a | goal session compacted at 931k with no handover: typed ask idle-gated and trigger from this session only; pins marker-once hook delivery and project-min trigger (2026-11-24) |
