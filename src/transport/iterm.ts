@@ -9,6 +9,7 @@
  */
 
 import { log } from "../core/log.js";
+import { resolveLaunchDir } from "../core/launch-dir.js";
 import {
   isClaudeRunningInSession,
   pasteTextIntoSession,
@@ -29,10 +30,11 @@ const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
 /** Shell line typed into a fresh tab. `resume` is the PAI-style restore start. */
 export function itermLaunchLine(opts: LaunchOptions): string {
-  if (!opts.resume) return `cd ${sq(opts.dir)} && claude`;
+  const dir = resolveLaunchDir(opts.dir);
+  if (!opts.resume) return `cd ${sq(dir)} && claude`;
   const ansiC = opts.name.replace(/'/g, "");
   const prompt = `$'/Name ${ansiC}'`;
-  return `cd ${sq(opts.dir)} && claude --name ${sq(opts.name)} --dangerously-skip-permissions ${prompt}`;
+  return `cd ${sq(dir)} && claude --name ${sq(opts.name)} --dangerously-skip-permissions ${prompt}`;
 }
 
 export class ItermTransport implements SessionTransport {
