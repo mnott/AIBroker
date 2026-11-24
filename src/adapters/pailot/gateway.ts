@@ -44,7 +44,7 @@ import {
 } from "../../core/state.js";
 import { setItermSessionVar, setItermTabName, setItermBadge, autoTabName, createClaudeSession, killSession } from "../iterm/sessions.js";
 import { listPaiProjects, launchPaiProject } from "../../daemon/pai-projects.js";
-import { runItermJxa, withSessionJxa, sendKeystrokeToSession, sendEscapeSequenceToSession, invalidateSnapshotCache } from "../iterm/core.js";
+import { runItermJxa, withSessionJxa, sendKeystrokeToSession, sendEscapeSequenceToSession, invalidateSnapshotCache, isClaudeRunningInSession } from "../iterm/core.js";
 import { pasteTextIntoSession, snapshotAllSessions, typeIntoSession } from "../../transport/sync-facade.js";
 import { hybridManager } from "../../core/hybrid.js";
 import {
@@ -67,6 +67,7 @@ import { readAttachment, withNote, type AttachmentRef, getAfter as mqGetAfter, g
 import { addTrace } from "../../daemon/trace-log.js";
 import { getAllPersistentSessionNames, getPersistentSessionName, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
 import { discoverLiveSessions, isClaudeRelated, listedLiveIds } from "../../core/session-discovery.js";
+import { resolveLaunchDir } from "../../core/launch-dir.js";
 
 /**
  * Enrich snapshots with paiName from the persistent JSON store.
@@ -748,12 +749,21 @@ async function handleRemoveCommand(ws: WebSocket, args: Record<string, unknown>)
   // Claude session, so it drops on its own — no record to "delete" and have
   // rediscovered. If the tab was already closed this is a harmless no-op and the
   // prune in handleSessionsCommand removes the ghost.
-  if (target.backendSessionId) {
+  //
+  // A tab that never started Claude (a failed launch left it on a bare shell)
+  // has nothing to /exit: the guard below must not block removal. Close the tab
+  // outright so a re-enumeration cannot resurrect the row.
+  const running = target.backendSessionId ? await isClaudeRunningInSession(target.backendSessionId) : false;
+  if (target.backendSessionId && running) {
     await typeIntoSession(target.backendSessionId, "/exit");
   }
   const removed = hybridManager.removeByIndex(idx + 1);
   if (removed) {
-    log(`[PAILot] exited ${removed.kind} session "${removed.name}" (${removed.id}) via /exit`);
+    log(`[PAILot] ${running ? "exited" : "closed"} ${removed.kind} session "${removed.name}" (${removed.id})`);
+  }
+  if (target.backendSessionId && !running) {
+    try { await killSession(target.backendSessionId); } catch (e) { log(`[PAILot] killSession failed: ${e}`); }
+    invalidateSnapshotCache();
   }
 
   // Send updated session list
@@ -802,7 +812,10 @@ function claudeLaunchCommand(cwd: string, name: string): string {
   // literal, which collapses `\\n` → `\n`; zsh's $'...' then turns `\n` into a
   // real newline (unused here: a single queued input).
   const prompt = `$'/Name ${ansiC}'`;
-  return `cd ${sq(cwd)} && claude --name ${sq(name)} --dangerously-skip-permissions ${prompt}`;
+  // PAILot sends the home directory as the literal "~"; single-quoting it
+  // stops the shell from expanding it, so expand before quoting (core/launch-dir).
+  const dir = resolveLaunchDir(cwd);
+  return `cd ${sq(dir)} && claude --name ${sq(name)} --dangerously-skip-permissions ${prompt}`;
 }
 
 async function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> = {}): Promise<void> {
@@ -820,8 +833,21 @@ async function handleCreateCommand(ws: WebSocket, args: Record<string, unknown> 
 
   // Launch via clc (the user's launcher: pins model + skip-perms so PAILot can
   // drive the session without a permission prompt). cd into path first if given.
-  const command = path ? `cd ${path.replace(/"/g, '\\"')} && clc` : "clc";
-  const fallbackName = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
+  // A literal "~" from PAILot is expanded before quoting, and a directory that
+  // does not exist is refused instead of opening a tab that fails on `cd`.
+  let command = "clc";
+  let fallbackName = "Claude";
+  if (path) {
+    let dir: string;
+    try {
+      dir = resolveLaunchDir(path);
+    } catch (err) {
+      sendTo(ws, { type: "error", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    command = `cd ${dir.replace(/"/g, '\\"')} && clc`;
+    fallbackName = dir.split("/").filter(Boolean).pop() ?? "Claude";
+  }
 
   const sessionId = await createClaudeSession(command);
   if (!sessionId) {
@@ -1814,7 +1840,10 @@ export async function handleMqttCommand(command: string, args: Record<string, un
           // close the iTerm tab so a re-enumeration can't resurrect it. Refresh
           // the list only AFTER the tab is gone — an immediate refresh re-adds the
           // still-open tab (the "it reappears" bug).
-          if (sid) await typeIntoSession(sid, "/exit");
+          // A tab at a bare shell prompt (Claude never started or already exited)
+          // has nothing to /exit — the guard must not block removal; kill it.
+          const running = sid ? await isClaudeRunningInSession(sid) : false;
+          if (sid && running) await typeIntoSession(sid, "/exit");
           hybridManager.removeByIndex(idx + 1);
           setTimeout(async () => {
             try { if (sid) await killSession(sid); } catch (e) { log(`[MQTT] killSession failed: ${e}`); }
@@ -1863,8 +1892,16 @@ export async function handleMqttCommand(command: string, args: Record<string, un
       if (createThrottled()) { await handleMqttCommand("sessions"); break; }
       const path = args.path as string | undefined;
       const requestedName = typeof args.name === "string" ? args.name.trim() : "";
-      const fallbackName = path ? path.split("/").filter(Boolean).pop() ?? "Claude" : "Claude";
-      const command = claudeLaunchCommand(path ?? "~", requestedName || fallbackName);
+      let fallbackName = "Claude";
+      let command: string;
+      try {
+        const dir = resolveLaunchDir(path ?? "~");
+        fallbackName = dir.split("/").filter(Boolean).pop() ?? "Claude";
+        command = claudeLaunchCommand(dir, requestedName || fallbackName);
+      } catch (err) {
+        mqttPublishControl({ type: "error", message: err instanceof Error ? err.message : String(err) });
+        break;
+      }
       const sessionId = await createClaudeSession(command);
       if (!sessionId) { log("[MQTT] create: failed to create session"); break; }
       // Same guard as the WS create: a reused live tab keeps its chosen name.
@@ -1905,8 +1942,16 @@ export async function handleMqttCommand(command: string, args: Record<string, un
       // Wait for /exit to fully finalize (tab back at a shell prompt) before
       // relaunching, so the end-session work isn't cut short. Short initial delay
       // lets /exit register, then poll atPrompt.
+      let rdir: string;
+      try {
+        rdir = resolveLaunchDir(rpath);
+      } catch (err) {
+        mqttPublishControl({ type: "error", message: err instanceof Error ? err.message : String(err) });
+        await handleMqttCommand("sessions");
+        break;
+      }
       setTimeout(() => { void whenAtShellPrompt(rid, async () => {
-        await typeIntoSession(rid, claudeLaunchCommand(rpath, rname));
+        await typeIntoSession(rid, claudeLaunchCommand(rdir, rname));
         await setItermSessionVar(rid, rname);
         setItermTabName(rid, rname);
         await setItermBadge(rid, rname);
