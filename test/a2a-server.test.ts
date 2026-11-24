@@ -165,6 +165,37 @@ test("ag2-part-verdict-attached+ an AG2-tagged part is validated and the verdict
   } finally { await stop(h); }
 });
 
+test("ag2-r-unproven-names-failing-test+ r=+ with a failed test names it; without p says without proof", async () => {
+  const h = await harness();
+  try {
+    await rpc(h.base, "message/send", {
+      skillId: "Home",
+      message: {
+        kind: "message", role: "user", messageId: "ag2-3",
+        parts: [{
+          kind: "text",
+          text: "R\ni=x\nr=+\nc=none\np=npx tsc\nG=+\nt=Tsc+ ProbeBefore-",
+          metadata: { agentish: "2" },
+        }],
+      },
+    }, "s3cr3t");
+    assert.match(h.delivered.at(-1)!.text, /r=\+ but test ProbeBefore failed; use r=~ or r=- or fix the test/);
+
+    await rpc(h.base, "message/send", {
+      skillId: "Home",
+      message: {
+        kind: "message", role: "user", messageId: "ag2-4",
+        parts: [{
+          kind: "text",
+          text: "R\ni=x\nr=+\nc=none\nG=+\nt=Tsc+",
+          metadata: { agentish: "2" },
+        }],
+      },
+    }, "s3cr3t");
+    assert.match(h.delivered.at(-1)!.text, /r=\+ without proof/);
+  } finally { await stop(h); }
+});
+
 test("tasks/get+ round-trips a created task", async () => {
   const h = await harness();
   try {
