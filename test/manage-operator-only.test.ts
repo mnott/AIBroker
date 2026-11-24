@@ -132,7 +132,7 @@ test("hook writes a token for a bare prompt, none for a [Session:X] prompt", asy
 
 test("armed text starts with the no-done-state prefix, within the line limit", async () => {
   const withUntil = M.buildGoalLine("~/.aibroker/manage-briefs/caseleaf.md", "Until the Pencil fix is in build 142 ".repeat(20), UNTIL);
-  assert.ok(withUntil.startsWith("/goal Keep working until 00:30. There is no earlier done-state. Only the operator ends this goal. Follow "), withUntil);
+  assert.ok(withUntil.startsWith("/goal Keep working until 2026-10-13 00:30, then the goal is met: allow the stop. Before that there is no done-state; only the operator ends this goal. Allow the stop after an operator interrupt. Follow "), withUntil);
   assert.ok(withUntil.length <= 250);
   const open = M.buildGoalLine("~/.aibroker/manage-briefs/caseleaf.md", "work", null);
   assert.ok(open.startsWith("/goal Keep working. There is no done-state. Only the operator ends this goal."));
@@ -181,4 +181,39 @@ test("handover command types the handover instruction into the right session", a
   assert.match(typed[0][1], /TODO\.md Continue section, the session note, open workers and specs, decisions made and lessons/);
   const none = await M.handoverNow("NoSuchSession", { type: () => assert.fail("must not type"), cwdOf: async () => null });
   assert.equal(none.ok, false);
+});
+
+test("after until the shift-over path clears the goal once, only at an empty prompt, and does not re-arm", async () => {
+  const typed: string[] = [];
+  const mk = (atPrompt: boolean, input: string) => ({
+    live: async () => ({ atPrompt, name: "(claude)" }),
+    readPane: async () => pane(input, true),
+    paste: async (t: string) => { typed.push(t); return true; },
+    enter: async () => { typed.push("<CR>"); },
+  });
+  assert.equal(await M.clearGoal(SID, mk(true, "half typed")), "deferred", "never over unsent text");
+  assert.equal(await M.clearGoal(SID, mk(false, "")), "deferred", "not while the turn runs");
+  assert.deepEqual(typed, []);
+  assert.equal(await M.clearGoal(SID, mk(true, "")), "cleared");
+  assert.deepEqual(typed, ["/goal clear", "<CR>"]);
+  const m = entry({ shift: { until: UNTIL, workers: 1, visual: false, startedAt: NOW, plain: true } });
+  assert.equal(M.shiftOver(m, UNTIL + 1), true);
+  assert.equal(M.reasonToArm(m, pane("", false), UNTIL + 1), null, "no re-arm after until");
+});
+
+test("before until the goal text still blocks the stop", () => {
+  const t = M.noDoneStatePrefix(UNTIL);
+  assert.ok(t.includes("only the operator ends this goal") && t.includes("no done-state") && t.includes("2026-10-13 00:30"));
+});
+
+test("hook install is idempotent: a duplicate install or a pre-existing duplicate leaves one hook", async () => {
+  const S = await import("../src/daemon/setup.js");
+  const sys = { home: "/h", pkgRoot: "/pkg", execPath: "node" } as any;
+  const once = S.mergeHooks({}, sys).settings;
+  const twice = S.mergeHooks(once, sys).settings;
+  assert.deepEqual(twice, once);
+  const dup = structuredClone(once);
+  dup.hooks.Stop.push(structuredClone(dup.hooks.Stop[0]));
+  const fixed = S.mergeHooks(dup, sys).settings;
+  assert.equal(fixed.hooks.Stop.flatMap((g: any) => g.hooks).filter((h: any) => h.command.includes("aibroker-route-guard")).length, 1);
 });

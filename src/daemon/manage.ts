@@ -615,6 +615,8 @@ export interface ManagedSession {
     startedAt: number;
     /** Said once, so the end of a shift is announced and not merely obeyed. */
     endReported?: boolean;
+    /** `/goal clear` was typed after the window ended, once. */
+    goalCleared?: boolean;
     /** The "until passed" line has been logged; proactive typing stays off. */
     lapseNoted?: boolean;
     /** Set by `supervise`: a bounded stretch with no issue-work rules in the brief. */
@@ -3154,8 +3156,40 @@ export function buildGoalLine(briefPath: string, objective: string, until: numbe
  */
 export function noDoneStatePrefix(until: number | null): string {
   return until !== null
-    ? `Keep working until ${hhmm(until)}. There is no earlier done-state. Only the operator ends this goal.`
+    ? `Keep working until ${dateHhmm(until)}, then the goal is met: allow the stop. Before that there is no done-state; only the operator ends this goal. Allow the stop after an operator interrupt.`
     : "Keep working. There is no done-state. Only the operator ends this goal.";
+}
+
+/** Absolute end for the goal text: a bare hh:mm is ambiguous once the goal outlives its evening. */
+const dateHhmm = (t: number) => {
+  const d = new Date(t);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${hhmm(t)}`;
+};
+
+export type ClearGoalResult = "cleared" | "deferred";
+
+/**
+ * Ends Claude Code's native goal (`/goal clear`) so its Stop-hook evaluator stops
+ * blocking after the shift. Typed only into a Claude pane sitting at a prompt
+ * with an EMPTY input line — never over unsent text, never into a shell; any
+ * other state defers to the next tick.
+ */
+export async function clearGoal(
+  sessionId: string,
+  deps: {
+    live: () => Promise<{ atPrompt: boolean; name?: string } | null>;
+    readPane: () => Promise<string>;
+    paste: (text: string) => Promise<boolean>;
+    enter: () => Promise<unknown>;
+  },
+): Promise<ClearGoalResult> {
+  const live = await deps.live();
+  if (!live || !live.atPrompt || !isClaudePane(live.name ?? "")) return "deferred";
+  if (promptUnsentText(await deps.readPane())) return "deferred";
+  if (!await deps.paste("/goal clear")) return "deferred";
+  await deps.enter();
+  return "cleared";
 }
 
 /** Everything that does not fit on the typed line, as the file it points to. */
@@ -4082,6 +4116,21 @@ async function tick(now = Date.now()): Promise<void> {
       }
       logOnly(m, `shift over after ${Math.round((now - m.shift.startedAt) / 3_600_000)}h — no longer arming; the objective is kept, \`resume\` continues it`);
       dirty = true;
+    }
+    // After the window the native goal must stop blocking the session's Stop.
+    // Once per shift; retried each tick until the pane is at an empty prompt.
+    if (m.shift && now >= m.shift.until && !m.shift.goalCleared) {
+      const r = await clearGoal(m.sessionId, {
+        live: () => readSessionContentAsync(m.sessionId, 5),
+        readPane: () => readPaneAsync(m.sessionId, { fresh: true }),
+        paste: (t) => pasteTextIntoSession(m.sessionId, t),
+        enter: () => sendEnterKey(m.sessionId),
+      });
+      if (r === "cleared") {
+        m.shift.goalCleared = true;
+        logOnly(m, "goal window ended — cleared the session's goal (/goal clear) so it no longer blocks the stop");
+        dirty = true;
+      }
     }
 
     /**
