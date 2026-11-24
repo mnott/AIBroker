@@ -201,7 +201,7 @@ export async function runMailbox(args: string[]): Promise<void> {
     process.exit(0);
   }
   if (verb !== "wait") {
-    console.error("Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] [--heartbeat <s>] [--settle <s>] | waiters>");
+    console.error("Usage: aibroker mailbox <wait [--session <id>] [--timeout <s>] [--heartbeat <s>] [--settle <s>] [--follow] | waiters>");
     process.exit(1);
   }
   const client = new WatcherClient(DAEMON_SOCKET_PATH);
