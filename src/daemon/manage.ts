@@ -2237,16 +2237,33 @@ function readOverridePct(pid: string | null): OverrideReading | undefined {
   return reading;
 }
 
-const measuredCompactCache = new Map<string, { mtime: number; result: ReturnType<typeof measuredCompactK> }>();
+type TranscriptCompaction = { measured: ReturnType<typeof measuredCompactK>; model: string | undefined };
+const measuredCompactCache = new Map<string, { mtime: number; result: TranscriptCompaction }>();
+
+/** Window classes tell a ~200-270k window apart from a 1M one by where it compacted. */
+const SMALL_WINDOW_MAX_K = 300;
+function windowClass(k: number): "small" | "large" {
+  return k <= SMALL_WINDOW_MAX_K ? "small" : "large";
+}
+
+/** The model named by the newest assistant entry in a transcript tail. */
+export function transcriptModel(lines: string[]): string | undefined {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i];
+    if (!l.includes('"model"')) continue;
+    try {
+      const j = JSON.parse(l);
+      if (j.type === "assistant" && typeof j.message?.model === "string") return j.message.model;
+    } catch { /* truncated line */ }
+  }
+  return undefined;
+}
 
 /**
- * measuredCompactK, wired to ONE session's own transcript (<sessionId>.jsonl).
- * Other sessions in the same project directory may run a different model with
- * a different window, so their compactions say nothing about this one; only
- * automatic compactions count (measuredCompactK). Reads a tail of the file,
- * cached by mtime.
+ * One transcript's auto-compactions plus its model (read from the transcript
+ * metadata). Reads a tail of the file, cached by mtime.
  */
-export function measuredCompactForTranscript(file: string): ReturnType<typeof measuredCompactK> {
+function transcriptCompaction(file: string): TranscriptCompaction | undefined {
   let mtime: number;
   try {
     mtime = statSync(file).mtimeMs;
@@ -2265,42 +2282,56 @@ export function measuredCompactForTranscript(file: string): ReturnType<typeof me
     });
     lines = raw.split("\n");
   } catch { /* file raced a delete, or tail refused */ }
-  const result = measuredCompactK(lines);
+  const result = { measured: measuredCompactK(lines), model: transcriptModel(lines) };
   measuredCompactCache.set(file, { mtime, result });
   return result;
 }
 
+/** measuredCompactK for ONE session's own transcript; automatic compactions only. */
+export function measuredCompactForTranscript(file: string): ReturnType<typeof measuredCompactK> {
+  return transcriptCompaction(file)?.measured;
+}
+
 /**
- * The lowest measured auto-compaction point across the project's transcripts
- * (every <sessionId>.jsonl beside `file`), not only this session's. A session's
- * own history is often one event or none, and one measured too high (931k real
- * against a 950k estimate) leaves every band above the real wall. Cheap
- * failure direction is low, so the minimum wins; each file is mtime-cached.
- * The 40 newest files bound the work.
+ * The measured compaction point for THIS session, in order of authority:
+ *  (a) this session's own auto-compactions;
+ *  (b) else auto-compactions of other transcripts in the project, but only
+ *      those with the same model and the same window class (a 259k event from
+ *      a smaller-window session must never pull a 1M session's trigger down);
+ *      manual /compact is excluded by measuredCompactK;
+ *  (c) else undefined (caller falls back to the settings override).
+ * `source` names which of these answered. The 40 newest files bound the work.
  */
-export function measuredCompactForProject(file: string): ReturnType<typeof measuredCompactK> {
+export function measuredCompactForProject(
+  file: string,
+  windowK = 1000,
+): (NonNullable<ReturnType<typeof measuredCompactK>> & { source: "own" | "project" }) | undefined {
+  const own = transcriptCompaction(file);
+  if (own?.measured) return { ...own.measured, source: "own" };
+
   const dir = dirname(file);
   let files: string[] = [];
   try {
     files = readdirSync(dir)
       .filter((f) => f.endsWith(".jsonl"))
       .map((f) => join(dir, f))
+      .filter((f) => f !== file)
       .map((f) => ({ f, t: (() => { try { return statSync(f).mtimeMs; } catch { return 0; } })() }))
       .sort((a, b) => b.t - a.t)
       .slice(0, 40)
       .map((x) => x.f);
   } catch { /* directory gone */ }
-  if (!files.includes(file)) files.push(file);
-  let best: ReturnType<typeof measuredCompactK>;
+  const wantClass = windowClass(windowK);
   const all: { at: string; preTokens: number }[] = [];
   for (const f of files) {
-    const r = measuredCompactForTranscript(f);
-    if (!r) continue;
-    all.push(...r.events);
-    if (!best || r.k < best.k) best = r;
+    const r = transcriptCompaction(f);
+    if (!r?.measured) continue;
+    if (own?.model && r.model && r.model !== own.model) continue;
+    all.push(...r.measured.events.filter((e) => windowClass(e.preTokens / 1000) === wantClass));
   }
-  if (!best) return undefined;
-  return { k: best.k, events: all.sort((a, b) => a.preTokens - b.preTokens).slice(0, 3) };
+  if (!all.length) return undefined;
+  all.sort((a, b) => a.preTokens - b.preTokens);
+  return { k: Math.round(all[0].preTokens / 1000), events: all.slice(0, 3), source: "project" };
 }
 
 /**
@@ -2311,7 +2342,7 @@ export function measuredCompactForProject(file: string): ReturnType<typeof measu
  */
 function compactionReading(m: ManagedSession, pid: string | null, file: string | null | undefined): { effectiveK: number; label: string } {
   const windowK = m.contextWindowK ?? 1000;
-  const measured = file ? measuredCompactForProject(file) : undefined;
+  const measured = file ? measuredCompactForProject(file, windowK) : undefined;
   const override = readOverridePct(pid);
   const effectiveK = effectiveCompactK({ windowK, overridePct: override?.pct, measuredK: measured?.k });
 
@@ -2322,7 +2353,7 @@ function compactionReading(m: ManagedSession, pid: string | null, file: string |
     label = `${src}; measured ${measured.k.toLocaleString("en-US")}k is stale-high and ignored`;
   } else if (measured) {
     const vals = measured.events.map((e) => e.preTokens.toLocaleString("en-US")).join(" / ");
-    label = `measured: min of ${measured.events.length} event${measured.events.length > 1 ? "s" : ""} ${vals} across this project's transcripts`;
+    label = `measured: min of ${measured.events.length} event${measured.events.length > 1 ? "s" : ""} ${vals} ${measured.source === "own" ? "in this session" : "across this project's same-model, same-window transcripts"}`;
   } else if (override) {
     label = `${override.source} override=${override.pct}`;
   } else {
