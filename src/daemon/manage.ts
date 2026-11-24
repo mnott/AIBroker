@@ -1137,6 +1137,14 @@ export function handoverDue(input: {
   const idleSec = Math.round(input.idleMs / 1000);
 
   if (used >= immediateK) {
+    // A handover that just landed holds the next ask off, hook or typed alike:
+    // the gap floor and the new-work floor apply in every band.
+    if (input.lastAskAt !== undefined && input.now - input.lastAskAt < HANDOVER_MIN_GAP_MS) {
+      return { due: false, reason: `band immediate but a handover landed ${Math.round((input.now - input.lastAskAt) / 1000)}s ago (min gap ${Math.round(HANDOVER_MIN_GAP_MS / 60000)} min)` };
+    }
+    if (input.handoverDoneK !== undefined && used - input.handoverDoneK < HANDOVER_MIN_NEW_K) {
+      return { due: false, reason: `band immediate but only ${used - input.handoverDoneK}k of new work since the last handover (min ${HANDOVER_MIN_NEW_K}k)` };
+    }
     if (input.idleMs < HANDOVER_IDLE_FLOOR_IMMEDIATE_MS) {
       return { due: false, reason: `band immediate but busy (idle ${idleSec}s)` };
     }

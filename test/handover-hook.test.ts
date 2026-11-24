@@ -88,3 +88,13 @@ test("same-model same-window project measurement is used", () => {
   assert.equal(m?.source, "project");
   assert.equal(effectiveCompactK({ windowK: 1000, overridePct: 95, measuredK: m?.k }), 931);
 });
+
+test("immediate band honours the re-ask gap and new-work floor after a handover landed", () => {
+  const now = Date.now();
+  const base = { contextK: 685, effectiveK: 690, idleMs: Number.MAX_SAFE_INTEGER, now };
+  const held = handoverDue({ ...base, lastAskAt: now - 20_000, handoverDoneK: 676 });
+  assert.equal(held.due, false);
+  assert.equal(handoverDue({ ...base, lastAskAt: now - 20 * 60_000, handoverDoneK: 676 }).due, false);
+  assert.equal(handoverDue({ ...base, lastAskAt: now - 20 * 60_000, handoverDoneK: 640 }).due, true);
+  assert.equal(handoverDue({ ...base }).due, true);
+});
