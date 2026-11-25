@@ -588,22 +588,39 @@ server.tool("aibroker_discover", "Re-scan iTerm2 sessions and refresh registry",
 
 server.tool(
   "aibroker_voice_config",
-  "Get or set TTS voice configuration",
+  `Get or set TTS voice configuration. Global config when no session scope is given; with a session scope, per-session settings (replyInVoice, speed, voice) that do not change anyone else's defaults.
+
+Natural-language mapping for this session:
+- "reply in voice until further notice" -> {action:"set", replyInVoice:true}
+- "back to text" / "stop replying in voice" -> {action:"set", replyInVoice:false}
+- "slower" -> {action:"set", speedDelta:-0.1}; "faster" -> {action:"set", speedDelta:+0.1}
+- "repeat" -> aibroker_repeat_speech
+- "other speaker" / "use voice X" -> {action:"set", voice:"X"} (list voices with aibroker_list_voices)
+- "stop" -> aibroker_stop_speech`,
   {
     action: z.enum(["get", "set"]).describe("Action: get or set"),
-    defaultVoice: z.string().optional().describe("Default TTS voice (e.g. 'bm_fable')"),
+    session: z.string().optional().describe('Session scope for per-session settings. Omit, or "self", to mean the caller\'s own session; pass a session name to target another.'),
+    replyInVoice: z.boolean().optional().describe("Session-scoped: answer this session's prompts by voice (aibroker_speak) until changed"),
+    speed: z.number().min(0.5).max(2).optional().describe("Session-scoped absolute speech speed 0.5-2 (clamped, rounded to 0.05)"),
+    speedDelta: z.number().optional().describe("Session-scoped speed nudge, e.g. -0.1 for slower, +0.1 for faster"),
+    voice: z.string().optional().describe("Session-scoped voice override (e.g. 'af_bella'); empty string clears it"),
+    defaultVoice: z.string().optional().describe("Global default TTS voice (e.g. 'bm_fable')"),
     voiceMode: z.boolean().optional().describe("Enable/disable voice mode"),
     localMode: z.boolean().optional().describe("Enable/disable local speaker mode"),
     personas: z.record(z.string(), z.string()).optional().describe("Persona name -> voice mapping"),
   },
-  async ({ action, defaultVoice, voiceMode, localMode, personas }) => {
+  async ({ action, session, replyInVoice, speed, speedDelta, voice, defaultVoice, voiceMode, localMode, personas }) => {
     try {
       const updates: Record<string, unknown> = {};
+      if (replyInVoice !== undefined) updates.replyInVoice = replyInVoice;
+      if (speed !== undefined) updates.speed = speed;
+      if (speedDelta !== undefined) updates.speedDelta = speedDelta;
+      if (voice !== undefined) updates.voice = voice;
       if (defaultVoice !== undefined) updates.defaultVoice = defaultVoice;
       if (voiceMode !== undefined) updates.voiceMode = voiceMode;
       if (localMode !== undefined) updates.localMode = localMode;
       if (personas !== undefined) updates.personas = personas;
-      const r = await hub.call_raw("voice_config", { action, ...updates });
+      const r = await hub.call_raw("voice_config", { action, ...(session !== undefined ? { session } : {}), ...updates });
       return ok(JSON.stringify(r, null, 2));
     } catch (e) { return err(e); }
   },
@@ -611,16 +628,40 @@ server.tool(
 
 server.tool(
   "aibroker_speak",
-  "Speak text aloud through Mac speakers using Kokoro TTS (local, no network send)",
+  "Speak text aloud through Mac speakers using Kokoro TTS (local, no network send). Queued on the playback queue; returns immediately.",
   {
     text: z.string().min(1).describe("Text to speak"),
-    voice: z.string().optional().describe("Voice name (e.g. 'bm_fable', 'af_bella')"),
-    speed: z.number().min(0.5).max(2).optional().describe("Speech speed (default 1.0, e.g. 0.9 slower)"),
+    voice: z.string().optional().describe("Voice name (e.g. 'bm_fable', 'af_bella'). Overrides this session's voice setting, which overrides the global default."),
+    speed: z.number().min(0.5).max(2).optional().describe("Speech speed (overrides this session's setting; default is the session speed)"),
   },
   async ({ text, voice, speed }) => {
     try {
-      await hub.call_raw("speak", { text, voice, speed });
-      return ok("Speaking.");
+      const r = await hub.call_raw("speak", { text, voice, speed });
+      return ok(`Speaking (${(r as any).queued ?? 1} queued).`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_stop_speech",
+  "Stop the current spoken playback and clear the queue.",
+  {},
+  async () => {
+    try {
+      const r = await hub.call_raw("speak_stop", {});
+      return ok(`Stopped (cleared ${(r as any).cleared ?? 0}).`);
+    } catch (e) { return err(e); }
+  },
+);
+
+server.tool(
+  "aibroker_repeat_speech",
+  "Replay the last thing spoken to this session.",
+  {},
+  async () => {
+    try {
+      const r = await hub.call_raw("speak_repeat", {});
+      return ok("Repeated.");
     } catch (e) { return err(e); }
   },
 );

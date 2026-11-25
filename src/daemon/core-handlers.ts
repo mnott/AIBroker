@@ -55,6 +55,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { addRoute, findRoute, noteOwnWrite } from "./inbound.js";
+import { getSessionVoice, setSessionVoice, adjustSessionSpeed, type SessionVoiceSettings } from "./session-voice.js";
 import { broadcastRecipients, createBroadcast, recordBroadcastReply, getBroadcastStatus, notifyBroadcastSummary, parseDeadlineSec } from "./broadcast-core.js";
 import { issueWriteCredential, botIgnoreRule, routeIgnoresAccount } from "./forge-credential.js";
 import { issueOp, whoAmI, READ_VERBS, WRITE_VERBS, type IssueVerb } from "./forge-issues.js";
@@ -475,8 +476,53 @@ export function registerCoreHandlers(
     return { ok: true, result: { status } };
   });
 
+  /**
+   * The session key for a voice request: an explicit `session` param wins;
+   * "self" (or absent) resolves to the caller's own label. Explicit names are
+   * matched against live sessions so a stale name does not silently create a
+   * second settings entry under a different spelling.
+   */
+  async function sessionVoiceKey(req: IpcRequest, session?: string): Promise<string | { error: string }> {
+    if (session && session !== "self") {
+      const live = await snapshotAllSessions();
+      const match = await matchSession([session], live);
+      if (!match) return { error: `Session "${session}" not found` };
+      const snap = live.find((s) => s.id === match.session.id);
+      const name = (snap && lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId)) ?? match.session.id;
+      return `session:${name}`;
+    }
+    return await callerLabel(req);
+  }
+
   server.on("voice_config", async (req) => {
-    const { action, ...updates } = req.params as { action: "get" | "set" } & Record<string, unknown>;
+    const { action, session, ...updates } = req.params as {
+      action: "get" | "set";
+      session?: string;
+    } & Record<string, unknown>;
+
+    // Session-scoped settings live beside the global config, not inside it.
+    if (session !== undefined) {
+      const key = await sessionVoiceKey(req, session);
+      if (typeof key === "object") return { ok: false, error: key.error };
+      if (action === "get") {
+        return { ok: true, result: { session: { key, ...getSessionVoice(key) } } };
+      }
+      const replyInVoice = updates.replyInVoice as boolean | undefined;
+      const speed = updates.speed as number | undefined;
+      const speedDelta = updates.speedDelta as number | undefined;
+      const voice = updates.voice as string | undefined;
+      let settings: SessionVoiceSettings;
+      if (typeof speedDelta === "number") {
+        settings = adjustSessionSpeed(key, speedDelta);
+        if (typeof replyInVoice === "boolean" || typeof speed === "number" || typeof voice === "string") {
+          settings = setSessionVoice(key, { replyInVoice, speed, voice });
+        }
+      } else {
+        settings = setSessionVoice(key, { replyInVoice, speed, voice });
+      }
+      return { ok: true, result: { success: true, session: { key, ...settings } } };
+    }
+
     if (action === "get") {
       return { ok: true, result: { config: voiceConfig } };
     }
@@ -616,18 +662,52 @@ export function registerCoreHandlers(
   });
 
   /**
-   * speak — Play text locally (no network delivery).
+   * speak — Queue text to play locally (no network delivery).
+   *
+   * Enqueues on the playback queue instead of awaiting synthesis, so a long
+   * answer does not block the caller's turn. Effective voice: explicit param >
+   * session setting > global default; effective speed: explicit > session.
    */
   server.on("speak", async (req) => {
     const { text, voice, speed } = req.params as { text?: string; voice?: string; speed?: number };
     if (!text) return { ok: false, error: "text is required" };
 
     try {
-      const { speakLocally } = await import("../adapters/kokoro/tts.js");
-      await speakLocally(text, voice ?? voiceConfig.defaultVoice, speed);
-      return { ok: true, result: { speaking: true } };
+      const key = await callerLabel(req);
+      const settings = getSessionVoice(key);
+      const resolvedVoice = voice ?? settings.voice ?? voiceConfig.defaultVoice;
+      const resolvedSpeed = speed ?? settings.speed;
+      const { enqueueSpeech } = await import("../adapters/kokoro/playback.js");
+      const { queued } = enqueueSpeech({ session: key, text, voice: resolvedVoice, speed: resolvedSpeed });
+      return { ok: true, result: { speaking: true, queued } };
     } catch (err) {
       return { ok: false, error: `Speak failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
+  /**
+   * speak_stop — Stop the current playback and clear the queue.
+   */
+  server.on("speak_stop", async (_req) => {
+    try {
+      const { stopPlayback } = await import("../adapters/kokoro/playback.js");
+      return { ok: true, result: stopPlayback() };
+    } catch (err) {
+      return { ok: false, error: `Stop failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
+  /**
+   * speak_repeat — Replay the last thing spoken to the caller's session.
+   */
+  server.on("speak_repeat", async (req) => {
+    try {
+      const key = await callerLabel(req);
+      const { replayLast } = await import("../adapters/kokoro/playback.js");
+      if (!replayLast(key)) return { ok: false, error: "nothing to repeat" };
+      return { ok: true, result: { repeated: true } };
+    } catch (err) {
+      return { ok: false, error: `Repeat failed: ${err instanceof Error ? err.message : String(err)}` };
     }
   });
 

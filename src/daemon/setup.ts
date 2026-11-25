@@ -97,6 +97,7 @@ export const HOOK_PLAN: HookSpec[] = [
   { event: "UserPromptSubmit", file: "drain-mailbox.mjs" },
   { event: "UserPromptSubmit", file: "manage-hook.mjs" },
   { event: "UserPromptSubmit", file: "handover-due.mjs" },
+  { event: "UserPromptSubmit", file: "voice-reply.mjs" },
   { event: "PostToolUse", file: "handover-due.mjs" },
   { event: "Stop", file: "aibroker-route-guard.mjs" },
   { event: "PreToolUse", matcher: "Task|Agent", file: "aibroker-progress.mjs" },
