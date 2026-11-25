@@ -3894,22 +3894,32 @@ export function goalStillActiveInTranscript(
   const want = expected.replace(/\s+/g, " ").trim();
   if (!want) return null;
 
-  // Oldest first: the LAST match is the most recent /goal entry. (The tail
-  // read by `tail -n` is oldest-first, and this file's own newest-first
-  // comments elsewhere describe a different convention — timestamps decide.)
-  let lastGoalIndex = -1;
-  let lastArgs = "";
-  let lastAt: number | null = null;
-  // The newest `goal_status` attachment seen so far (loop runs oldest-first),
-  // whatever its condition.
-  let lastStatusIndex = -1;
-  let lastStatusMet = false;
-  let lastStatusCond = "";
-  let lastStatusAt: number | null = null;
+  // Oldest first: the newest record that names OUR objective decides. A
+  // `goal_status` attachment quoting a DIFFERENT objective is evidence (it
+  // stops the scan) but must not decide — the typed /goal below it holds until
+  // something names THIS objective as ended (live false re-arm 2026-11-25
+  // 20:41). A user `/goal` entry always names whatever it sets, so it is a
+  // candidate anchor whatever its args; the old code kept the two kinds in
+  // separate variables and picked between them by kind, which lost twice: an
+  // attachment-only tail never compared its condition against `want` (a
+  // replaced objective read as active), and a user `/goal` anywhere below the
+  // newest attachment became the anchor even when the attachment came later —
+  // an old typed goal with different args declared the live managed objective
+  // "replaced" (live: user /goal at 04:43Z, goal_status met:false for the
+  // managed objective at 18:53Z).
+  let anchorIndex = -1;
+  let anchorText = "";
+  let anchorMet = false;
+  let anchorAt: number | null = null;
+  // Newest `goal_status` naming some OTHER objective. Not a verdict while a
+  // typed goal of `want` lives below it (tests 34/37), but if nothing else in
+  // the tail names our objective, it is the only evidence — and an objective
+  // nobody still asks for is replaced, not unknown.
+  let foreignAt: number | null = null;
   for (let i = 0; i < tail.length; i++) {
     const line = tail[i];
     // Strict parse first — the substring test here used to accept tool lines
-    // quoting the marker; only a real user /goal entry arms.
+    // quoting the marker; only a real goal record arms.
     if (!goalEvidenceLine(line)) continue;
     let j: any;
     try {
@@ -3919,52 +3929,49 @@ export function goalStillActiveInTranscript(
     }
     // An absorbed /goal leaves no user entry — its record is a `goal_status`
     // attachment (live false re-arm 2026-11-25 20:41). It arms like a typed
-    // goal, and `met:true` ends it: the newest of either kind wins by position.
+    // goal, and `met:true` ends it — but only for the objective it names: an
+    // attachment quoting some OTHER objective is evidence, not a verdict.
     if (j.type === "attachment" && j.attachment?.type === "goal_status") {
-      // Record whatever condition it carries: a `met:true` ends the goal even
-      // for our objective, and a different condition means it was replaced.
-      lastStatusIndex = i;
-      lastStatusMet = j.attachment.met === true;
-      lastStatusCond = typeof j.attachment.condition === "string" ? String(j.attachment.condition).replace(/\s+/g, " ").trim() : "";
-      lastStatusAt = j.timestamp ? Date.parse(j.timestamp) : null;
+      const cond = typeof j.attachment.condition === "string" ? String(j.attachment.condition).replace(/\s+/g, " ").trim() : "";
+      if (cond !== want) {
+        foreignAt = j.timestamp ? Date.parse(j.timestamp) : null;
+        continue;
+      }
+      anchorIndex = i;
+      anchorMet = j.attachment.met === true;
+      anchorText = cond;
+      anchorAt = j.timestamp ? Date.parse(j.timestamp) : null;
       continue;
     }
-    if (j.type !== "user") continue; // a compact boundary is not a /goal entry
+    if (j.type !== "user") continue; // a compact boundary is not a goal record
     const text = typeof j.message?.content === "string" ? j.message.content : "";
     const name = text.match(/<command-name>\s*\/goal\s*(?:\s+(\S+))?\s*<\/command-name>/);
     if (!name) continue;
     const args = text.match(/<command-args>([\s\S]*)<\/command-args>/)?.[1]?.trim() ?? "";
     const at = j.timestamp ? Date.parse(j.timestamp) : null;
 
-    // Record this as the newest /goal seen so far (the loop runs oldest-first).
-    lastGoalIndex = i;
-    lastArgs = args.replace(/\s+/g, " ").trim();
-    lastAt = at;
+    // Record this as the newest goal seen so far (the loop runs oldest-first).
+    anchorIndex = i;
+    anchorText = args.replace(/\s+/g, " ").trim();
+    anchorAt = at;
   }
-  // A `goal_status` attachment is the newest goal evidence when no user /goal
-  // entry follows it. Its `met` decides — but a record AFTER it (a compaction,
-  // a clear) still ends it, so fall through to the same after-scan with the
-  // attachment's index as the anchor.
-  if (lastGoalIndex === -1 && lastStatusIndex !== -1) {
-    if (lastStatusMet) return { active: false, at: lastStatusAt };
-    lastGoalIndex = lastStatusIndex;
-    lastAt = lastStatusAt;
-  } else if (lastGoalIndex === -1) {
+  if (anchorIndex === -1) {
+    // Only a foreign `goal_status` was seen: our objective is no longer asked
+    // for. Nothing else to compare against — it was replaced.
+    if (foreignAt !== null) return { active: false, at: foreignAt };
     return null; // no goal evidence in the tail — unknown, not evidence of lapsed
   }
-  if (lastGoalIndex === -1) return null; // no goal evidence in the tail — unknown, not evidence of lapsed
-
   // A clear ends the goal regardless of what it cleared.
-  if (/^clear\b/.test(lastArgs)) return { active: false, at: lastAt };
+  if (/^clear\b/.test(anchorText)) return { active: false, at: anchorAt };
 
-  // The most recent /goal names a different objective — this one was replaced.
-  // (A goal_status anchor has already been matched against `want` above.)
-  if (lastGoalIndex !== lastStatusIndex && lastArgs !== want) return { active: false, at: lastAt };
+  // The newest goal record names a different objective — this one was replaced;
+  // or its own condition is met — this one ended. Either way, lapsed.
+  if (anchorMet || anchorText !== want) return { active: false, at: anchorAt };
 
   // The same objective as the managed one is still in force — unless a later
   // record already ended it. `tail` is oldest-first, so every entry AFTER the
   // goal's index is newer than it.
-  for (let i = lastGoalIndex + 1; i < tail.length; i++) {
+  for (let i = anchorIndex + 1; i < tail.length; i++) {
     const l = tail[i];
     if (!l) continue;
     let k: any;
@@ -3976,7 +3983,7 @@ export function goalStillActiveInTranscript(
     // A compaction drops the goal from context: treat as lapsed. The
     // boundary's own summary text can quote the old objective — check the
     // subtype before its content, so a quoted goal never reads as active.
-    if (k.type === "system" && k.subtype === "compact_boundary") return { active: false, at: lastAt };
+    if (k.type === "system" && k.subtype === "compact_boundary") return { active: false, at: anchorAt };
     // A later goal_status attachment decides ONLY for our own objective:
     // `met:true` on it ends the goal. An attachment quoting a DIFFERENT
     // objective is still evidence (it stops the scan) but must not decide —
@@ -3984,15 +3991,15 @@ export function goalStillActiveInTranscript(
     // ended (live false re-arm 2026-11-25 20:41).
     if (k.type === "attachment" && k.attachment?.type === "goal_status") {
       const cond = typeof k.attachment.condition === "string" ? String(k.attachment.condition).replace(/\s+/g, " ").trim() : "";
-      if (cond === want && k.attachment.met === true) return { active: false, at: lastAt };
+      if (cond === want && k.attachment.met === true) return { active: false, at: anchorAt };
     }
     const kt = typeof k.message?.content === "string" ? k.message.content : "";
     // A later /goal clear ends it.
-    if (k.type === "user" && /<command-name>\s*\/goal\s+clear\s*<\/command-name>/.test(kt)) return { active: false, at: lastAt };
+    if (k.type === "user" && /<command-name>\s*\/goal\s+clear\s*<\/command-name>/.test(kt)) return { active: false, at: anchorAt };
     // The Stop hook reporting the condition met ends it.
-    if (/goal has been met|goal achieved|goal is complete|condition (has been )?met/i.test(kt)) return { active: false, at: lastAt };
+    if (/goal has been met|goal achieved|goal is complete|condition (has been )?met/i.test(kt)) return { active: false, at: anchorAt };
   }
-  return { active: true, at: lastAt };
+  return { active: true, at: anchorAt };
 }
 
 /**
