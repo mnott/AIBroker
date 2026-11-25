@@ -489,6 +489,128 @@ test("a real compact_boundary after a deep goal — lapsed, re-arm", () => {
   assert.match(reasonToArm(m, ACTIVE_PANE, NOW) ?? "", /assuming it lapsed/);
 });
 
+// ── the /goal was typed MID-TURN and left no user entry (live false re-arm 2026-11-25 20:41) ──
+
+/**
+ * A `/goal` typed while the session is mid-turn is ABSORBED into the running
+ * turn. Claude Code writes NO user entry with `<command-name>/goal</command-name>`
+ * — it writes a `queue-operation` enqueue, an `attachment` record of type
+ * `goal_status` carrying `condition` and `met`, and a `queue-operation` remove
+ * with reason `absorbed_mid_turn`. The old predicate accepted only user `/goal`
+ * entries and compact boundaries, so the absorbed goal was invisible: the scan
+ * found no evidence, the verdict said "no sign of a new goal", and a live goal
+ * armed at 19:53 was re-armed at 20:41. A `goal_status` attachment is now real
+ * evidence — its `condition` is the goal text, `met:false` means active,
+ * `met:true` means ended; the newest of either kind wins by position.
+ */
+function goalStatusAttachment(condition: string, met: boolean, ts: string): string {
+  return JSON.stringify({
+    type: "attachment",
+    timestamp: ts,
+    attachment: { type: "goal_status", met, sentinel: true, condition },
+  });
+}
+
+function queueOp(operation: string, ts: string, extra?: Record<string, unknown>): string {
+  return JSON.stringify({ type: "queue-operation", operation, timestamp: ts, ...extra });
+}
+
+/** The exact live shape: enqueue + goal_status(met:false) + remove(absorbed_mid_turn). */
+function absorbedGoal(condition: string, ts: string): string[] {
+  return [
+    queueOp("enqueue", new Date(Date.parse(ts) + 1).toISOString(), { content: `Goal set: ${condition}` }),
+    goalStatusAttachment(condition, false, ts),
+    queueOp("remove", new Date(Date.parse(ts) + 2).toISOString(), { reason: "absorbed_mid_turn" }),
+  ];
+}
+
+test("goalEvidenceLine accepts a goal_status attachment", () => {
+  assert.equal(goalEvidenceLine(goalStatusAttachment(OBJ, false, "2026-11-25T18:53:42.128Z")), true);
+  assert.equal(goalEvidenceLine(goalStatusAttachment(OBJ, true, "2026-11-25T18:53:42.128Z")), true);
+  // Other attachments and other queue operations are not goal evidence.
+  assert.equal(goalEvidenceLine(JSON.stringify({ type: "attachment", attachment: { type: "todo" } })), false);
+  assert.equal(goalEvidenceLine(queueOp("enqueue", "2026-11-25T18:53:42.129Z", { content: `Goal set: ${OBJ}` })), false);
+});
+
+test("absorbed goal_status (met:false) after >1 MB of noise — active, no re-arm", () => {
+  // Exactly the live shape: the /goal typed at 18:53Z was absorbed mid-turn,
+  // leaving only queue-operation records and a goal_status attachment; then the
+  // session worked for > 1 MB of quoted-marker noise. On current main the scan
+  // finds no evidence, the verdict is null, and the ceiling re-arms.
+  const m = base(NOW);
+  const lines = [...absorbedGoal(expectedArgs(m), "2026-11-25T18:53:42.128Z"), ...noiseLines(3_000, "2026-11-25T19:00:00.000Z")];
+  assert.ok(lines.join("\n").length > 1_000_000);
+  const mm = bigFile(lines);
+  assert.equal(reasonToArm(mm, ACTIVE_PANE, NOW), null);
+});
+
+test("absorbed goal_status (met:true) — lapsed, re-arm", () => {
+  const m = base(NOW);
+  const lines = [goalStatusAttachment(expectedArgs(m), true, "2026-11-25T18:53:42.128Z"), ...noiseLines(1_500, "2026-11-25T19:00:00.000Z")];
+  const mm = bigFile(lines);
+  assert.match(reasonToArm(mm, ACTIVE_PANE, NOW) ?? "", /assuming it lapsed/);
+});
+
+test("a goal_status met:true for a DIFFERENT objective does not end our typed goal", () => {
+  // The attachment is evidence (stops the scan) but must not decide: the newest
+  // user /goal below it still holds. A `met:true` on OUR own objective genuinely
+  // ends it (the test above), so this pins that a foreign objective's attachment
+  // never lapses the managed goal.
+  const args = expectedArgs(base(NOW));
+  const v = goalStillActiveInTranscript(
+    [typedGoal(args, "2026-11-25T18:00:00.000Z"), goalStatusAttachment("Ship the release now.", true, "2026-11-25T19:30:00.000Z")],
+    args,
+  );
+  assert.ok(v);
+  assert.equal(v.active, true);
+});
+
+test("a typed /goal after an absorbed goal_status still decides (newest wins)", () => {
+  // The goal_status armed the managed objective; a later typed /goal clear ends it.
+  const args = expectedArgs(base(NOW));
+  const v = goalStillActiveInTranscript(
+    [goalStatusAttachment(args, false, "2026-11-25T18:53:42.128Z"), goalClear("2026-11-25T19:30:00.000Z")],
+    args,
+  );
+  assert.ok(v);
+  assert.equal(v.active, false);
+});
+
+test("a goal_status met:true after a typed /goal ends it", () => {
+  const args = expectedArgs(base(NOW));
+  const v = goalStillActiveInTranscript(
+    [typedGoal(args, "2026-11-25T18:00:00.000Z"), goalStatusAttachment(args, true, "2026-11-25T19:30:00.000Z")],
+    args,
+  );
+  assert.ok(v);
+  assert.equal(v.active, false);
+});
+
+test("a goal_status for a DIFFERENT objective does not mask a live typed goal", () => {
+  // The attachment is evidence (stops the scan) but must not decide: the newest
+  // user /goal below it still holds.
+  const args = expectedArgs(base(NOW));
+  // The attachment must quote the goal VERBATIM (a `met:true` on our own
+  // objective genuinely ends it) — so this pins that a DIFFERENT objective's
+  // attachment never decides over a live typed goal.
+  const v = goalStillActiveInTranscript(
+    [typedGoal(args, "2026-11-25T18:00:00.000Z"), goalStatusAttachment("Ship the release now.", true, "2026-11-25T19:30:00.000Z")],
+    args,
+  );
+  assert.ok(v);
+  assert.equal(v.active, true);
+});
+
+test("compact_boundary after an absorbed goal_status — lapsed", () => {
+  const args = expectedArgs(base(NOW));
+  const v = goalStillActiveInTranscript(
+    [...absorbedGoal(args, "2026-11-25T18:53:42.128Z"), compactBoundary("2026-11-25T19:40:00.000Z")],
+    args,
+  );
+  assert.ok(v);
+  assert.equal(v.active, false);
+});
+
 test("goalEvidenceLine — quoting is never evidence", () => {
   assert.equal(goalEvidenceLine('{"type":"assistant","message":{"content":[{"input":{"command":"grep command-name>/goal< f"}}]}}'), false);
   assert.equal(goalEvidenceLine('{"type":"system","subtype":"other","content":"compact_boundary"}'), false);
