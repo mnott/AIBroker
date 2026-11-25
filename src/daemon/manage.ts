@@ -3842,10 +3842,10 @@ export const shiftOver = (m: ManagedSession, now: number): boolean => !!m.shift 
  */
 /**
  * Does a transcript line PARSE as JSON and carry real goal evidence — a user
- * entry with `<command-name>/goal …</command-name>` (with optional args), or a
- * `system`/`compact_boundary` record? This is the ONE predicate shared by the
- * backwards scan (`readGoalRelevantTail`) and the verdict
- * (`goalStillActiveInTranscript`) so they cannot drift.
+ * entry with `<command-name>/goal …</command-name>` (with optional args), an
+ * `attachment`/`goal_status` record, or a `system`/`compact_boundary` record?
+ * This is the ONE predicate shared by the backwards scan (`readGoalRelevantTail`)
+ * and the verdict (`goalStillActiveInTranscript`) so they cannot drift.
  *
  * THE SCAN STOPPED ON A SUBSTRING (live failure 2026-11-25 04:56). The scan's
  * stop test was `line.includes("/goal") || line.includes("compact_boundary")`,
@@ -3866,6 +3866,17 @@ export function goalEvidenceLine(line: string): boolean {
     return false; // truncated or non-JSON — not evidence either way
   }
   if (j.type === "system" && j.subtype === "compact_boundary") return true;
+  // THE /goal WAS TYPED MID-TURN AND LEFT NO USER ENTRY (live false re-arm
+  // 2026-11-25 20:41). Claude Code absorbs a `/goal` typed while the session is
+  // running: it writes no user entry with `<command-name>/goal</command-name>`
+  // at all — instead a `queue-operation` enqueue (whose content Claude Code can
+  // later rewrite) and an `attachment` record of type `goal_status` carrying
+  // `condition` and `met`. The old predicate accepted only user `/goal` entries
+  // and compact boundaries, so the absorbed goal was invisible: the scan found
+  // no evidence, the verdict said "no sign of a new goal", and a live goal
+  // armed at 19:53 was re-armed at 20:41. A `goal_status` attachment is real
+  // evidence — its `condition` is the goal text and `met` says whether it ended.
+  if (j.type === "attachment" && j.attachment?.type === "goal_status") return true;
   if (j.type !== "user") return false;
   const text = typeof j.message?.content === "string" ? j.message.content : "";
   return /<command-name>\s*\/goal\s*(?:\s+(\S+))?\s*<\/command-name>/.test(text);
@@ -3889,6 +3900,12 @@ export function goalStillActiveInTranscript(
   let lastGoalIndex = -1;
   let lastArgs = "";
   let lastAt: number | null = null;
+  // The newest `goal_status` attachment seen so far (loop runs oldest-first),
+  // whatever its condition.
+  let lastStatusIndex = -1;
+  let lastStatusMet = false;
+  let lastStatusCond = "";
+  let lastStatusAt: number | null = null;
   for (let i = 0; i < tail.length; i++) {
     const line = tail[i];
     // Strict parse first — the substring test here used to accept tool lines
@@ -3899,6 +3916,18 @@ export function goalStillActiveInTranscript(
       j = JSON.parse(line);
     } catch {
       continue; // goalEvidenceLine guarantees JSON, but keep the guard cheap
+    }
+    // An absorbed /goal leaves no user entry — its record is a `goal_status`
+    // attachment (live false re-arm 2026-11-25 20:41). It arms like a typed
+    // goal, and `met:true` ends it: the newest of either kind wins by position.
+    if (j.type === "attachment" && j.attachment?.type === "goal_status") {
+      // Record whatever condition it carries: a `met:true` ends the goal even
+      // for our objective, and a different condition means it was replaced.
+      lastStatusIndex = i;
+      lastStatusMet = j.attachment.met === true;
+      lastStatusCond = typeof j.attachment.condition === "string" ? String(j.attachment.condition).replace(/\s+/g, " ").trim() : "";
+      lastStatusAt = j.timestamp ? Date.parse(j.timestamp) : null;
+      continue;
     }
     if (j.type !== "user") continue; // a compact boundary is not a /goal entry
     const text = typeof j.message?.content === "string" ? j.message.content : "";
@@ -3912,13 +3941,25 @@ export function goalStillActiveInTranscript(
     lastArgs = args.replace(/\s+/g, " ").trim();
     lastAt = at;
   }
-  if (lastGoalIndex === -1) return null; // no /goal entry in the tail — unknown, not evidence of lapsed
+  // A `goal_status` attachment is the newest goal evidence when no user /goal
+  // entry follows it. Its `met` decides — but a record AFTER it (a compaction,
+  // a clear) still ends it, so fall through to the same after-scan with the
+  // attachment's index as the anchor.
+  if (lastGoalIndex === -1 && lastStatusIndex !== -1) {
+    if (lastStatusMet) return { active: false, at: lastStatusAt };
+    lastGoalIndex = lastStatusIndex;
+    lastAt = lastStatusAt;
+  } else if (lastGoalIndex === -1) {
+    return null; // no goal evidence in the tail — unknown, not evidence of lapsed
+  }
+  if (lastGoalIndex === -1) return null; // no goal evidence in the tail — unknown, not evidence of lapsed
 
   // A clear ends the goal regardless of what it cleared.
   if (/^clear\b/.test(lastArgs)) return { active: false, at: lastAt };
 
   // The most recent /goal names a different objective — this one was replaced.
-  if (lastArgs !== want) return { active: false, at: lastAt };
+  // (A goal_status anchor has already been matched against `want` above.)
+  if (lastGoalIndex !== lastStatusIndex && lastArgs !== want) return { active: false, at: lastAt };
 
   // The same objective as the managed one is still in force — unless a later
   // record already ended it. `tail` is oldest-first, so every entry AFTER the
@@ -3936,6 +3977,15 @@ export function goalStillActiveInTranscript(
     // boundary's own summary text can quote the old objective — check the
     // subtype before its content, so a quoted goal never reads as active.
     if (k.type === "system" && k.subtype === "compact_boundary") return { active: false, at: lastAt };
+    // A later goal_status attachment decides ONLY for our own objective:
+    // `met:true` on it ends the goal. An attachment quoting a DIFFERENT
+    // objective is still evidence (it stops the scan) but must not decide —
+    // the typed /goal below it holds until something names THIS objective as
+    // ended (live false re-arm 2026-11-25 20:41).
+    if (k.type === "attachment" && k.attachment?.type === "goal_status") {
+      const cond = typeof k.attachment.condition === "string" ? String(k.attachment.condition).replace(/\s+/g, " ").trim() : "";
+      if (cond === want && k.attachment.met === true) return { active: false, at: lastAt };
+    }
     const kt = typeof k.message?.content === "string" ? k.message.content : "";
     // A later /goal clear ends it.
     if (k.type === "user" && /<command-name>\s*\/goal\s+clear\s*<\/command-name>/.test(kt)) return { active: false, at: lastAt };
