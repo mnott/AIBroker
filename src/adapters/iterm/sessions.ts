@@ -356,6 +356,9 @@ function openSessionScript(command: string): string {
       if (!before[sid]) { try { session.close(); } catch (e) {} }
       return "busy:" + sid;
     }
+    // Operator keystrokes typed during the settle wait land in the new tab's
+    // input line; Ctrl-U (kill whole line) first, so the command stands alone.
+    session.write({ text: "\\u0015", newline: false });
     session.write({ text: ${cmd} });`
     : "";
   return `  var session = null;
