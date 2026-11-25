@@ -209,7 +209,7 @@ export async function synthesizeChunked(
   voice: string,
   speed?: number,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  tts: any = ttsInstance,
+  tts?: any,
 ): Promise<{ audio: Float32Array; sampleRate: number }> {
   const pcm: Float32Array[] = [];
   let sampleRate = 24_000;
@@ -233,8 +233,13 @@ export async function* synthesizeSentences(
   speed?: number,
   signal?: AbortSignal,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  tts: any = ttsInstance,
+  tts?: any,
 ): AsyncGenerator<{ audio: Float32Array; sampleRate: number }> {
+  if (!tts) {
+    await ensureInitialized();
+    tts = ttsInstance;
+  }
+  voice = resolveVoice(voice || DEFAULT_VOICE);
   const sentences = splitIntoSentences(text);
   const rate = speed !== undefined && Number.isFinite(speed) && speed > 0 ? speed : 1.0;
   let sampleRate = 24_000;

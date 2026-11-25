@@ -71,8 +71,8 @@ export interface PlaybackDeps {
   synth: (text: string, voice: string, speed: number, signal: AbortSignal) => AsyncGenerator<SentenceAudio>;
   /** Spawn a player for a WAV file; null when this host has no local player. */
   play: () => ((wavPath: string) => PlayerHandle) | null;
-  /** Append trailing silence to every segment except the last. */
-  withPause?: (audio: Float32Array, sampleRate: number) => Float32Array;
+  /** Silence between segments of one job (ms); default PAUSE_SECONDS. */
+  pauseMs?: number;
   onPlayerSpawned?: (seq: number) => void;
 }
 
@@ -87,15 +87,6 @@ function defaultPlay(): ((wavPath: string) => PlayerHandle) | null {
   const cmd = localPlayerCommand();
   if (!cmd) return null;
   return (wavPath) => spawnPlayer(cmd, wavPath);
-}
-
-/** Trailing silence appended to every segment except the last. */
-function withTrailingPause(audio: Float32Array, sampleRate: number): Float32Array {
-  const gap = new Float32Array(Math.round(sampleRate * PAUSE_SECONDS));
-  const out = new Float32Array(audio.length + gap.length);
-  out.set(audio);
-  out.set(gap, audio.length);
-  return out;
 }
 
 /** Filesystem-safe session name for the saved last-speech WAV. */
@@ -113,7 +104,7 @@ export interface PlaybackQueue {
 export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQueue {
   const synth = deps.synth ?? defaultSynth;
   const play = deps.play ?? defaultPlay;
-  const withPause = deps.withPause ?? withTrailingPause;
+  const pauseMs = deps.pauseMs ?? PAUSE_SECONDS * 1000;
 
   let queue: Array<{ session: string; text: string; voice?: string; speed?: number }> = [];
   let running = false;
@@ -122,6 +113,13 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
 
   /** Wake a pump that is parked waiting for recording to end. */
   let wakeRecording: (() => void) | null = null;
+
+  /** Park until recording has ended (dictation must not hear our voice). */
+  async function waitNotRecording(): Promise<void> {
+    while (recordingActive) {
+      await new Promise<void>((resolve) => { wakeRecording = resolve; });
+    }
+  }
 
   async function runJob(job: { session: string; text: string; voice?: string; speed?: number }): Promise<void> {
     const controller = new AbortController();
@@ -142,6 +140,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
     };
 
     try {
+      await waitNotRecording();
       // Replay a saved WAV: play the file directly, no synthesis.
       if (job.text.startsWith("__replay__:")) {
         const handle = playFn(job.text.slice("__replay__:".length));
@@ -160,8 +159,9 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
 
         // synthesize the next sentence before starting playback of this one, so
         // the next player can spawn the instant this one exits (gapless); the
-        // trailing pause is appended to every segment except the last.
+        // pause between sentences is a timed gap, none after the last.
         const nextP = gen.next();
+        nextP.catch(() => { /* surfaced when awaited; avoids unhandled rejection on abort */ });
         const wavPath = join(
           process.env.TMPDIR || "/tmp",
           `aibroker-playback-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`,
@@ -173,8 +173,14 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
         deps.onPlayerSpawned?.(seq);
         seq++;
         await handle.exited;
+        lastHandle = null;
         if (controller.signal.aborted) throw new PlaybackAborted("aborted");
         r = await nextP;
+        // pause between sentences (not after the last), then hold while recording
+        if (!r.done && pauseMs > 0) await new Promise<void>((res) => setTimeout(res, pauseMs));
+        if (controller.signal.aborted) throw new PlaybackAborted("aborted");
+        await waitNotRecording();
+        if (controller.signal.aborted) throw new PlaybackAborted("aborted");
       }
 
       if (segments.length > 0) {
@@ -214,10 +220,6 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
         const job = queue[0];
         await runJob(job);
         if (queue[0] === job) queue.shift();
-        // hold the next job until recording finishes
-        while (recordingActive && queue.length > 0) {
-          await new Promise<void>((resolve) => { wakeRecording = resolve; });
-        }
       }
     } finally {
       running = false;
@@ -226,7 +228,6 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
 
   function resume(): void {
     if (wakeRecording) { const w = wakeRecording; wakeRecording = null; w(); }
-    else if (!running && queue.length > 0) void pump();
   }
 
   return {

@@ -55,7 +55,7 @@ function makeHarness(opts: { synthDelayMs?: number } = {}) {
     };
   }
 
-  const deps: Partial<PlaybackDeps> = { synth: fakeSynth, play: () => fakePlay() };
+  const deps: Partial<PlaybackDeps> = { synth: fakeSynth, play: () => fakePlay(), pauseMs: 0 };
   return { players, deps };
 }
 
@@ -88,7 +88,7 @@ describe("playback queue — streaming", () => {
   it("segments play in synthesis order and never overlap", async () => {
     const h = makeHarness();
     const q = createPlaybackQueue(h.deps);
-    q.enqueue({ session: "s2", text: "A. B. C." });
+    q.enqueue({ session: "s2", text: "Alpha one. Bravo two. Charlie three." });
     await sleep(30);
     // exactly one player at a time until we release it
     assert.equal(h.players.length, 1);
@@ -106,8 +106,8 @@ describe("playback queue — streaming", () => {
   it("jobs run strictly one after another", async () => {
     const h = makeHarness();
     const q = createPlaybackQueue(h.deps);
-    q.enqueue({ session: "a", text: "X. Y." });
-    q.enqueue({ session: "b", text: "Z." });
+    q.enqueue({ session: "a", text: "Xray one. Yankee two." });
+    q.enqueue({ session: "b", text: "Zulu one." });
     await sleep(30);
     assert.equal(h.players.length, 1, "second job waits for the first");
     release(h.players, 0);
@@ -123,8 +123,8 @@ describe("playback queue — streaming", () => {
   it("stop kills the current player, aborts synthesis and clears the queue", async () => {
     const h = makeHarness({ synthDelayMs: 40 });
     const q = createPlaybackQueue(h.deps);
-    q.enqueue({ session: "a", text: "X. Y." });
-    q.enqueue({ session: "b", text: "Z." });
+    q.enqueue({ session: "a", text: "Xray one. Yankee two." });
+    q.enqueue({ session: "b", text: "Zulu one." });
     await sleep(50); // job a playing sentence 1; job b queued
     const res = q.stop();
     assert.equal(res.stopped, true);
@@ -137,7 +137,7 @@ describe("playback queue — streaming", () => {
   it("recording hold suspends the current player and blocks the next segment", async () => {
     const h = makeHarness({ synthDelayMs: 30 });
     const q = createPlaybackQueue(h.deps);
-    q.enqueue({ session: "a", text: "X. Y." });
+    q.enqueue({ session: "a", text: "Xray one. Yankee two." });
     await sleep(50); // sentence 1 playing, sentence 2 synthesized ahead
     assert.equal(h.players.length, 1);
     q.setRecordingActive(true);
