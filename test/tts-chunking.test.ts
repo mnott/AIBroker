@@ -2,7 +2,8 @@ import "./home-guard.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  splitIntoSentences, concatWithPauses, synthesizeChunked, MAX_CHUNK_CHARS,
+  splitIntoSentences, splitFirstChunk, concatWithPauses, synthesizeChunked,
+  synthesizeSentences, MAX_CHUNK_CHARS, FIRST_CHUNK_MAX_CHARS,
 } from "../src/adapters/kokoro/tts.js";
 
 describe("splitIntoSentences", () => {
@@ -19,6 +20,42 @@ describe("splitIntoSentences", () => {
       for (const c of s) assert.ok(c.length <= MAX_CHUNK_CHARS);
       assert.equal(s.join(" ").replace(/\s+/g, " "), t.replace(/\s+/g, " "));
     }
+  });
+});
+
+describe("splitFirstChunk — streaming first audio scales with first chunk length", () => {
+  it("leaves a short first sentence untouched", () => {
+    const s = ["Short opener.", "Second sentence here."];
+    assert.deepEqual(splitFirstChunk(s), s);
+  });
+  it("cuts a long opener at the first clause break after ~25 chars, keeps the rest whole", () => {
+    const first = "The quick brown fox jumps over the lazy dog, and then runs to the far end of the field.";
+    const out = splitFirstChunk([first, "Next sentence."]);
+    assert.equal(out.length, 3);
+    assert.ok(out[0].length <= FIRST_CHUNK_MAX_CHARS, `head ${out[0].length} > ${FIRST_CHUNK_MAX_CHARS}`);
+    assert.ok(out[0].includes(","), "head ends on a clause break");
+    assert.equal(`${out[0]} ${out[1]}`, first);
+    assert.equal(out[2], "Next sentence.");
+  });
+  it("cuts at a word boundary near 60 when there is no clause break", () => {
+    const first = Array.from({ length: 30 }, (_, i) => `word${i}`).join(" ") + "."; // ~180 chars, no commas
+    const out = splitFirstChunk([first, "Tail."]);
+    assert.equal(out.length, 3);
+    assert.ok(out[0].length <= FIRST_CHUNK_MAX_CHARS);
+    assert.ok(/\s/.test(out[0])); // cut on a word boundary, not mid-word
+    assert.equal(`${out[0]} ${out[1]}`, first);
+    assert.equal(out[2], "Tail.");
+  });
+  it("synthesizeSentences feeds the short head first", async () => {
+    const calls: string[] = [];
+    const fake = { generate: async (t: string) => { calls.push(t); return { audio: new Float32Array(10), sampling_rate: 24000 }; } };
+    const text = "The quick brown fox jumps over the lazy dog, and then runs to the far end of the field. Done.";
+    const chunks: string[] = [];
+    for await (const c of synthesizeSentences(text, "bm_fable", 1, undefined, fake)) void c;
+    assert.equal(calls.length, 3);
+    assert.ok(calls[0].length <= FIRST_CHUNK_MAX_CHARS, `first chunk ${calls[0].length} chars`);
+    assert.ok(calls[2] === "Done.");
+    void chunks;
   });
 });
 

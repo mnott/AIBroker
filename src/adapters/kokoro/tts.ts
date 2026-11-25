@@ -41,6 +41,15 @@ const DEFAULT_VOICE: KokoroVoice =
 
 const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
 
+/**
+ * ONNX dtype for synthesis. Measured 2026-11-25 on CPU (one ~15-word sentence):
+ * q8 real-time factor 0.65 (synthesis slower than playback, so streaming stalls
+ * between sentences), fp32 1.15, fp16 1.06, q4 1.20. fp32 is already in the
+ * local model cache; AIBROKER_TTS_DTYPE overrides for experiments.
+ */
+type KokoroDtype = "fp32" | "fp16" | "q8" | "q4" | "q4f16";
+const DTYPE: KokoroDtype = (process.env.AIBROKER_TTS_DTYPE as KokoroDtype | undefined) ?? "fp32";
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let ttsInstance: any | null = null;
 let initPromise: Promise<void> | null = null;
@@ -50,9 +59,9 @@ async function ensureInitialized(): Promise<void> {
   if (initPromise !== null) { await initPromise; return; }
 
   initPromise = (async () => {
-    log(`Initializing Kokoro TTS (model: ${MODEL_ID}, dtype: q8)...`);
+    log(`Initializing Kokoro TTS (model: ${MODEL_ID}, dtype: ${DTYPE})...`);
     const { KokoroTTS } = await import("kokoro-js");
-    ttsInstance = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: "q8", device: "cpu" });
+    ttsInstance = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: DTYPE, device: "cpu" });
     log("Kokoro TTS ready.");
   })();
 
@@ -131,6 +140,11 @@ export function listVoices(): string[] {
 export const MAX_CHUNK_CHARS = 300;
 export const PAUSE_SECONDS = 0.25;
 
+/** Streaming first-chunk limits: cut a long opener at a clause break after ≥25
+ * chars, else at a word boundary near 60 (see splitFirstChunk). */
+export const FIRST_CHUNK_MIN_CHARS = 25;
+export const FIRST_CHUNK_MAX_CHARS = 60;
+
 const ABBREVIATIONS = new Set([
   "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e",
   "inc", "ltd", "no", "approx", "fig", "u.s", "a.m", "p.m",
@@ -189,6 +203,41 @@ export function splitIntoSentences(text: string, maxChars = MAX_CHUNK_CHARS): st
   return sentences.flatMap((s) => splitLong(s, maxChars));
 }
 
+/**
+ * Split the first chunk short for streaming playback: time to first audio scales
+ * with the length of the first chunk, so a long opening sentence is cut at the
+ * first comma/semicolon/dash after ~25 characters, or at a word boundary near 60.
+ * Returns the leading piece plus the remainder; sentences ≤ 60 chars are untouched.
+ */
+export function splitFirstChunk(sentences: string[]): string[] {
+  if (sentences.length === 0) return [];
+  const first = sentences[0];
+  if (first.length <= FIRST_CHUNK_MAX_CHARS) return sentences;
+
+  // Prefer a clause break past the minimum prefix; keep it within the target size.
+  let cut = -1;
+  for (const m of first.matchAll(/[,;—]\s+/g)) {
+    if (m.index >= FIRST_CHUNK_MIN_CHARS && m.index <= FIRST_CHUNK_MAX_CHARS) {
+      cut = m.index + 1; // keep the punctuation with the head
+      break;
+    }
+  }
+  if (cut < 0) {
+    // No clause break: cut at the last word boundary that keeps the prefix ≤ 60.
+    let lastBoundary = -1;
+    for (const m of first.matchAll(/\s+/g)) {
+      if (m.index <= FIRST_CHUNK_MAX_CHARS) lastBoundary = m.index;
+      else break;
+    }
+    cut = lastBoundary > 0 ? lastBoundary : Math.min(FIRST_CHUNK_MAX_CHARS, first.length);
+  }
+
+  const head = first.slice(0, cut).trim();
+  const tail = first.slice(cut).trim();
+  if (!head || !tail) return sentences;
+  return [head, tail, ...sentences.slice(1)];
+}
+
 /** Concatenate PCM chunks with a silence gap between them. */
 export function concatWithPauses(chunks: Float32Array[], sampleRate: number, pauseSeconds = PAUSE_SECONDS): Float32Array {
   const gap = Math.round(sampleRate * pauseSeconds);
@@ -240,7 +289,7 @@ export async function* synthesizeSentences(
     tts = ttsInstance;
   }
   voice = resolveVoice(voice || DEFAULT_VOICE);
-  const sentences = splitIntoSentences(text);
+  const sentences = splitFirstChunk(splitIntoSentences(text));
   const rate = speed !== undefined && Number.isFinite(speed) && speed > 0 ? speed : 1.0;
   let sampleRate = 24_000;
   for (const s of sentences) {
