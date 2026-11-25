@@ -312,6 +312,59 @@ test("goalEvidenceLine accepts the real record shape", () => {
   assert.equal(goalEvidenceLine(typedGoal(expectedArgs(base(NOW)), "2026-11-25T04:56:54.439Z")), true);
 });
 
+// ── the log printed the newest line's time, not the goal's (live 2026-11-25 06:28) ──
+
+/**
+ * "goal still active (last /goal at 06:26 AM)" was printed while the newest
+ * `/goal` user entry was typed at 05:43. The time came from
+ * `newestTranscriptAt(tail)` — the transcript's newest message, which a working
+ * session updates every few minutes — instead of the verdict's own `at`, the
+ * timestamp of the /goal entry that decided "still active". The ceiling now
+ * prints `verdict.at` (24-hour local HH:MM like every other stamp here); a goal
+ * entry with no parseable timestamp prints "?".
+ */
+test("the logged 'last /goal at' is the /goal entry's time, not the newest line's", () => {
+  const dir = mkdtempSync(join(tmpdir(), "aibroker-goaltime-"));
+  try {
+    const file = join(dir, "s1.jsonl");
+    // The goal typed at 04:43Z (05:43 local in the live case); the newest line
+    // is a message ~43 min later — exactly the live shape.
+    writeFileSync(
+      file,
+      [
+        typedGoal(expectedArgs(base(NOW)), "2026-11-25T04:43:16.582Z"),
+        assistant("2026-11-25T05:26:00.000Z"),
+      ].join("\n") + "\n",
+    );
+    const m = base(NOW);
+    m.transcriptFile = file;
+
+    const goalAt = new Date(Date.parse("2026-11-25T04:43:16.582Z"));
+    const p = (n: number) => String(n).padStart(2, "0");
+    const want = `${p(goalAt.getHours())}:${p(goalAt.getMinutes())}`;
+
+    const errChunks: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    try {
+      process.stderr.write = ((chunk: any) => {
+        errChunks.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null); // ceiling suppressed
+    } finally {
+      process.stderr.write = origWrite;
+    }
+
+    const logged = errChunks.filter((c) => c.includes("goal still active"));
+    assert.ok(logged.length >= 1, "the ceiling logged its suppression");
+    const mLog = logged[0].match(/last \/goal at ([\d:?]+)/);
+    assert.ok(mLog, "the log line carries a /goal time");
+    assert.equal(mLog![1], want, `logged ${mLog![1]}, expected the goal entry's local time ${want}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── the tail was too short for a busy session (live failure 2026-11-25 03:25) ──
 
 /**

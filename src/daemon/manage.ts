@@ -4013,20 +4013,6 @@ function readGoalRelevantTail(file: string): string[] {
   }
 }
 
-/** The transcript's newest message timestamp from a raw tail, or null. */
-function newestTranscriptAt(lines: string[]): number | null {
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const j = JSON.parse(lines[i]);
-      if ((j.type === "user" || j.type === "assistant") && typeof j.timestamp === "string") {
-        const t = Date.parse(j.timestamp);
-        if (!Number.isNaN(t)) return t;
-      }
-    } catch { /* truncated first line of a tail is normal */ }
-  }
-  return null;
-}
-
 /**
  * The ceiling, asked the right question.
  *
@@ -4061,9 +4047,14 @@ function ceilingReason(m: ManagedSession, content: string, now: number, quietFor
   // — a ceiling check must not mutate the brief it is only reading against.
   const verdict = goalStillActiveInTranscript(tail ?? [], goalLineFor(m).replace(/^\/goal\s+/, ""));
   if (verdict?.active) {
-    const at = newestTranscriptAt(tail ?? []);
-    const hhmm = at !== null ? new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "?";
-    logOnly(m, `goal still active (last /goal at ${hhmm}) — not re-arming`);
+    // THE LOG SAID A TIME THAT WAS NOT THE GOAL'S. "last /goal at 06:26 AM" was
+    // printed while the newest /goal entry was typed at 05:43 (live 2026-11-25
+    // 06:28): the time came from the transcript's newest message, not the
+    // verdict's own `at` — the timestamp of the /goal entry that decided this.
+    // Print the verdict's time, in local 24-hour HH:MM like every other stamp
+    // here; null (a goal entry with no parseable timestamp) prints "?".
+    const atStr = verdict.at !== null ? hhmm(verdict.at) : "?";
+    logOnly(m, `goal still active (last /goal at ${atStr}) — not re-arming`);
     return null;
   }
   return `armed ${minutesSince(m.lastRearmAt, now)} with no sign of a new goal, and quiet for ${Math.round(quietFor / 1000)}s — assuming it lapsed`;
