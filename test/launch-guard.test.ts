@@ -56,3 +56,20 @@ test("createTerminalTab refuses a busy target the same way", async () => {
     restore();
   }
 });
+
+test("launch script clears the input line before writing the command", async () => {
+  const original = _internal.runItermJxa;
+  const scripts: string[] = [];
+  _internal.runItermJxa = ((s: string) => { scripts.push(s); return "S1"; }) as typeof original;
+  try {
+    await createTerminalTab("echo hi");
+    await createTerminalTab("");
+  } finally {
+    _internal.runItermJxa = original;
+  }
+  const withCmd = scripts[0];
+  const clear = withCmd.indexOf('session.write({ text: "\\u0015", newline: false });');
+  const cmd = withCmd.indexOf('session.write({ text: "echo hi" });');
+  assert.ok(clear >= 0 && cmd > clear, "Ctrl-U (no newline) precedes the command");
+  assert.ok(!scripts[1].includes("u0015"), "no clear without a command");
+});
