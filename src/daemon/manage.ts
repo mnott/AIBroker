@@ -3276,6 +3276,20 @@ export function buildBrief(parts: {
 }
 
 /**
+ * The goal line THIS manager would type for `m`, WITHOUT touching the disk.
+ *
+ * Read-only by construction: it builds the same pointer and objective as
+ * {@link goalText} but never writes or chmods the brief file. The ceiling runs
+ * on every quiet tick past the 46-min mark and must not rewrite the brief — a
+ * read-only check that rewrites state (writeFileSync + chmod, including
+ * pending notes) is not read-only. Expected and typed text stay derived from
+ * the same builder: {@link goalText} calls this after writing the brief.
+ */
+export function goalLineFor(m: ManagedSession): string {
+  return buildGoalLine(foldHome(join(BRIEF_DIR, `${briefSlug(m)}.md`)), m.objective, m.shift?.until ?? null);
+}
+
+/**
  * The line typed at the session, after rewriting its brief file (0600).
  *
  * Rewritten on every arming so standing rules, shift state, the screen grant
@@ -3309,7 +3323,9 @@ export function goalText(m: ManagedSession): { text: string } {
     { mode: 0o600 },
   );
   chmodSync(path, 0o600);
-  return { text: buildGoalLine(foldHome(path), m.objective, m.shift?.until ?? null) };
+  // The line itself is the pure part — same builder as goalLineFor, so the
+  // ceiling's expectation and what arm() types cannot drift.
+  return { text: goalLineFor(m) };
 }
 
 /**
@@ -4036,11 +4052,14 @@ function ceilingReason(m: ManagedSession, content: string, now: number, quietFor
 
   // Compare against the line THIS manager would type now, not the stored
   // objective: the typed line is `/goal <no-done-state prefix> Follow <brief>:
-  // <truncated objective>` (see goalText/buildGoalLine), so matching the raw
+  // <truncated objective>` (see goalLineFor/buildGoalLine), so matching the raw
   // objective against `<command-args>` always read "replaced" and re-armed a
   // live goal every ceiling (live failure 2026-11-25 05:42). Derived from the
   // same builder the arming path uses, so expected and typed cannot drift.
-  const verdict = goalStillActiveInTranscript(tail ?? [], goalText(m).text.replace(/^\/goal\s+/, ""));
+  // Read-only on purpose: goalText would rewrite the brief file (writeFileSync
+  // + chmod, consuming pending notes) on every quiet tick past the 46-min mark
+  // — a ceiling check must not mutate the brief it is only reading against.
+  const verdict = goalStillActiveInTranscript(tail ?? [], goalLineFor(m).replace(/^\/goal\s+/, ""));
   if (verdict?.active) {
     const at = newestTranscriptAt(tail ?? []);
     const hhmm = at !== null ? new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "?";
