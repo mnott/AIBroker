@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { goalStillActiveInTranscript, reasonToArm, type ManagedSession } from "../src/daemon/manage.js";
+import { goalEvidenceLine, goalStillActiveInTranscript, reasonToArm, type ManagedSession } from "../src/daemon/manage.js";
 
 const OBJ = "Audit every module and fix the drift.";
 
@@ -248,6 +248,75 @@ test("assistant lines containing the marker string never count as a goal", () =>
 
   const m2 = bigFile([userGoal(OBJ, "2026-11-25T01:07:00.000Z"), ...toolLines(5_000, "2026-11-25T01:10:00.000Z")]);
   assert.equal(reasonToArm(m2, ACTIVE_PANE, NOW), null);
+});
+
+// ── the scan stopped on a QUOTED marker (live failure 2026-11-25 04:56) ────
+
+/**
+ * The backwards scan's stop test was `line.includes("/goal") ||
+ * line.includes("compact_boundary")`. In a working session the newest megabytes
+ * are full of assistant tool calls and tool results quoting those exact strings
+ * — a `grep -c 'command-name>/goal<' transcript.jsonl` command, a read of
+ * manage.ts, a hook reminder. The scan stopped inside that noise chunk before
+ * reaching the real `/goal` user entry, the verdict found no qualifying entry,
+ * and a goal typed 46 min earlier was declared lapsed ("armed … assuming it
+ * lapsed" live at 04:56:56). The stop test now uses the verdict's own strict
+ * predicate: a line counts only when it PARSES as JSON and IS a user `/goal`
+ * entry or a system `compact_boundary` record.
+ */
+function noiseLines(n: number, startTs: string): string[] {
+  const out: string[] = [];
+  let t = Date.parse(startTs);
+  for (let i = 0; i < n; i++) {
+    t += 1_000;
+    // ~700 bytes each, so `n` lines are > 1 MB of quoted-marker noise. Both
+    // marker strings appear as TEXT inside tool calls and results — never as a
+    // real record — so the strict predicate must skip every one of them.
+    const pad = "x".repeat(700);
+    out.push(
+      JSON.stringify({
+        type: "assistant",
+        timestamp: new Date(t).toISOString(),
+        message: { role: "assistant", content: [
+          { type: "tool_use", name: "Bash", input: { command: `grep -c 'command-name>/goal<' ${pad} transcript.jsonl` } },
+          { type: "text", text: `compact_boundary mentioned in this tool result ${pad}` },
+        ] },
+      }),
+    );
+  }
+  return out;
+}
+
+test("noise quoting both markers after a deep goal — still active, no re-arm", () => {
+  // > 2 MB fixture: one real /goal, then > 1 MB of assistant tool_use /
+  // tool_result lines whose text contains "command-name>/goal<" and
+  // "compact_boundary". Fails on the substring stop test; passes with the
+  // strict shared predicate.
+  const lines = [userGoal(OBJ, "2026-11-25T01:07:00.000Z"), ...noiseLines(3_000, "2026-11-25T01:10:00.000Z")];
+  const m = bigFile(lines);
+  assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
+});
+
+test("a real compact_boundary after a deep goal — lapsed, re-arm", () => {
+  // The strict predicate must still STOP on a genuine boundary: noise quoted
+  // around it, the real system record wins.
+  const lines = [
+    userGoal(OBJ, "2026-11-25T01:07:00.000Z"),
+    ...noiseLines(1_500, "2026-11-25T01:10:00.000Z"),
+    compactBoundary("2026-11-25T01:40:00.000Z"),
+    ...noiseLines(1_500, "2026-11-25T01:41:00.000Z"),
+  ];
+  const m = bigFile(lines);
+  assert.match(reasonToArm(m, ACTIVE_PANE, NOW) ?? "", /assuming it lapsed/);
+});
+
+test("goalEvidenceLine — quoting is never evidence", () => {
+  assert.equal(goalEvidenceLine('{"type":"assistant","message":{"content":[{"input":{"command":"grep command-name>/goal< f"}}]}}'), false);
+  assert.equal(goalEvidenceLine('{"type":"system","subtype":"other","content":"compact_boundary"}'), false);
+  assert.equal(goalEvidenceLine("not json /goal"), false);
+  assert.equal(goalEvidenceLine(""), false);
+  assert.equal(goalEvidenceLine(userGoal(OBJ, "2026-11-25T01:07:00.000Z")), true);
+  assert.equal(goalEvidenceLine(compactBoundary("2026-11-25T01:40:00.000Z")), true);
 });
 
 test("multi-byte content split across a chunk boundary is read whole", () => {
