@@ -62,7 +62,7 @@ async function ensureInitialized(): Promise<void> {
 /**
  * Convert text to an OGG Opus voice note buffer.
  */
-export async function textToVoiceNote(text: string, voice?: string): Promise<Buffer> {
+export async function textToVoiceNote(text: string, voice?: string, speed?: number): Promise<Buffer> {
   if (!text?.trim()) throw new Error("TTS: text must not be empty");
 
   const FFMPEG = resolveFfmpegBin();
@@ -75,11 +75,7 @@ export async function textToVoiceNote(text: string, voice?: string): Promise<Buf
 
   log(`Generating audio: voice=${resolvedVoice}, text="${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`);
 
-  const result = await ttsInstance!.generate(text, { voice: resolvedVoice });
-  const combined: Float32Array = result.audio;
-  const sampleRate: number = result.sampling_rate ?? 24_000;
-
-  if (combined.length === 0) throw new Error("TTS: generate produced no audio");
+  const { audio: combined, sampleRate } = await synthesizeChunked(text, resolvedVoice, speed);
 
   log(`Generated ${combined.length} samples at ${sampleRate} Hz`);
 
@@ -112,7 +108,7 @@ export async function textToVoiceNote(text: string, voice?: string): Promise<Buf
 /**
  * Synthesize text and play locally (afplay on macOS, paplay/aplay/ffplay elsewhere).
  */
-export async function speakLocally(text: string, voice?: string): Promise<void> {
+export async function speakLocally(text: string, voice?: string, speed?: number): Promise<void> {
   if (!text?.trim()) throw new Error("TTS: text must not be empty");
 
   const resolvedVoice = resolveVoice(voice ?? DEFAULT_VOICE);
@@ -120,11 +116,7 @@ export async function speakLocally(text: string, voice?: string): Promise<void> 
 
   log(`Speaking locally: voice=${resolvedVoice}, text="${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`);
 
-  const speakResult = await ttsInstance!.generate(text, { voice: resolvedVoice });
-  const speakAudio: Float32Array = speakResult.audio;
-  const speakSampleRate: number = speakResult.sampling_rate ?? 24_000;
-
-  if (speakAudio.length === 0) throw new Error("TTS: generate produced no audio");
+  const { audio: speakAudio, sampleRate: speakSampleRate } = await synthesizeChunked(text, resolvedVoice, speed);
 
   const wavPath = join(tmpdir(), `aibroker-speak-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`);
   writeFileSync(wavPath, float32ToWav(speakAudio, speakSampleRate));
@@ -146,6 +138,105 @@ export async function speakLocally(text: string, voice?: string): Promise<void> 
 
 export function listVoices(): string[] {
   return [...KNOWN_VOICES];
+}
+
+// ── Chunked synthesis ──
+
+/** kokoro-js truncates input beyond its token window; stay well below it. */
+export const MAX_CHUNK_CHARS = 300;
+export const PAUSE_SECONDS = 0.25;
+
+const ABBREVIATIONS = new Set([
+  "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e",
+  "inc", "ltd", "no", "approx", "fig", "u.s", "a.m", "p.m",
+]);
+
+function endsWithAbbreviation(s: string): boolean {
+  const m = /([A-Za-z][A-Za-z.]*)\.$/.exec(s);
+  if (!m) return false;
+  const w = m[1].toLowerCase();
+  return ABBREVIATIONS.has(w) || /^[a-z]$/.test(w);
+}
+
+/** Split an over-long piece at commas/semicolons/colons, then at word boundaries. */
+function splitLong(piece: string, max: number): string[] {
+  if (piece.length <= max) return [piece];
+  const out: string[] = [];
+  let cur = "";
+  const push = (t: string) => { if (t.trim()) out.push(t.trim()); };
+  const parts = piece.split(/(?<=[,;:\u2014])\s+/);
+  for (const part of parts) {
+    if (part.length > max) {
+      push(cur); cur = "";
+      let w = "";
+      for (const word of part.split(/\s+/)) {
+        if (word.length > max) {
+          push(w); w = "";
+          for (let i = 0; i < word.length; i += max) push(word.slice(i, i + max));
+        } else if (w && w.length + 1 + word.length > max) { push(w); w = word; }
+        else w = w ? `${w} ${word}` : word;
+      }
+      cur = w;
+    } else if (cur && cur.length + 1 + part.length > max) { push(cur); cur = part; }
+    else cur = cur ? `${cur} ${part}` : part;
+  }
+  push(cur);
+  return out;
+}
+
+/**
+ * Split text into sentence-sized chunks, each at most maxChars. Abbreviations
+ * ("Dr.", "e.g.") and decimals ("3.5") do not end a sentence.
+ */
+export function splitIntoSentences(text: string, maxChars = MAX_CHUNK_CHARS): string[] {
+  const flat = text.replace(/\s*\n+\s*/g, " ").trim();
+  if (!flat) return [];
+  const sentences: string[] = [];
+  let cur = "";
+  for (const tok of flat.split(/\s+/)) {
+    cur = cur ? `${cur} ${tok}` : tok;
+    if (/[.!?]["')\]]*$/.test(tok) && !(tok.endsWith(".") && endsWithAbbreviation(tok))) {
+      sentences.push(cur);
+      cur = "";
+    }
+  }
+  if (cur) sentences.push(cur);
+  return sentences.flatMap((s) => splitLong(s, maxChars));
+}
+
+/** Concatenate PCM chunks with a silence gap between them. */
+export function concatWithPauses(chunks: Float32Array[], sampleRate: number, pauseSeconds = PAUSE_SECONDS): Float32Array {
+  const gap = Math.round(sampleRate * pauseSeconds);
+  const total = chunks.reduce((n, c) => n + c.length, 0) + gap * Math.max(0, chunks.length - 1);
+  const out = new Float32Array(total);
+  let off = 0;
+  chunks.forEach((c, i) => {
+    if (i > 0) off += gap;
+    out.set(c, off);
+    off += c.length;
+  });
+  return out;
+}
+
+/** Generate each sentence separately and join into one PCM buffer. */
+export async function synthesizeChunked(
+  text: string,
+  voice: string,
+  speed?: number,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tts: any = ttsInstance,
+): Promise<{ audio: Float32Array; sampleRate: number }> {
+  const sentences = splitIntoSentences(text);
+  const rate = speed !== undefined && Number.isFinite(speed) && speed > 0 ? speed : 1.0;
+  const pcm: Float32Array[] = [];
+  let sampleRate = 24_000;
+  for (const s of sentences) {
+    const r = await tts.generate(s, { voice, speed: rate });
+    sampleRate = r.sampling_rate ?? sampleRate;
+    if (r.audio && r.audio.length > 0) pcm.push(r.audio);
+  }
+  if (pcm.length === 0) throw new Error("TTS: generate produced no audio");
+  return { audio: concatWithPauses(pcm, sampleRate), sampleRate };
 }
 
 // ── Internal helpers ──

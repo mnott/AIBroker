@@ -205,7 +205,7 @@ export class WatcherClient {
     return this.call("history", params as Record<string, unknown>);
   }
 
-  async tts(params: { text: string; voice?: string; jid?: string; recipient?: string; channel?: string }): Promise<Record<string, unknown>> {
+  async tts(params: { text: string; voice?: string; speed?: number; jid?: string; recipient?: string; channel?: string }): Promise<Record<string, unknown>> {
     return this.call("tts", params as Record<string, unknown>);
   }
 
