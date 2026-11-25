@@ -3824,6 +3824,37 @@ export const shiftOver = (m: ManagedSession, now: number): boolean => !!m.shift 
  * fire — the transcript is evidence FOR staying quiet, not a veto against
  * recovery.
  */
+/**
+ * Does a transcript line PARSE as JSON and carry real goal evidence — a user
+ * entry with `<command-name>/goal …</command-name>` (with optional args), or a
+ * `system`/`compact_boundary` record? This is the ONE predicate shared by the
+ * backwards scan (`readGoalRelevantTail`) and the verdict
+ * (`goalStillActiveInTranscript`) so they cannot drift.
+ *
+ * THE SCAN STOPPED ON A SUBSTRING (live failure 2026-11-25 04:56). The scan's
+ * stop test was `line.includes("/goal") || line.includes("compact_boundary")`,
+ * and in a working session the newest megabytes are full of assistant tool
+ * calls and tool results quoting those very strings — a `grep -c
+ * 'command-name>/goal<' transcript.jsonl` command, a read of this file, a hook
+ * reminder. The scan stopped inside that noise chunk before reaching the real
+ * `/goal` user entry, the verdict found no qualifying entry, and a goal typed
+ * 46 min earlier was declared lapsed. A line counts only when it PARSES as
+ * JSON and IS one of these two record kinds — quoting is never evidence.
+ */
+export function goalEvidenceLine(line: string): boolean {
+  if (!line) return false;
+  let j: any;
+  try {
+    j = JSON.parse(line);
+  } catch {
+    return false; // truncated or non-JSON — not evidence either way
+  }
+  if (j.type === "system" && j.subtype === "compact_boundary") return true;
+  if (j.type !== "user") return false;
+  const text = typeof j.message?.content === "string" ? j.message.content : "";
+  return /<command-name>\s*\/goal\s*(?:\s+(\S+))?\s*<\/command-name>/.test(text);
+}
+
 export function goalStillActiveInTranscript(
   tail: string[],
   objective: string,
@@ -3839,14 +3870,16 @@ export function goalStillActiveInTranscript(
   let lastAt: number | null = null;
   for (let i = 0; i < tail.length; i++) {
     const line = tail[i];
-    if (!line || !line.includes("/goal")) continue;
+    // Strict parse first — the substring test here used to accept tool lines
+    // quoting the marker; only a real user /goal entry arms.
+    if (!goalEvidenceLine(line)) continue;
     let j: any;
     try {
       j = JSON.parse(line);
     } catch {
-      continue; // truncated or non-JSON — not evidence either way
+      continue; // goalEvidenceLine guarantees JSON, but keep the guard cheap
     }
-    if (j.type !== "user") continue;
+    if (j.type !== "user") continue; // a compact boundary is not a /goal entry
     const text = typeof j.message?.content === "string" ? j.message.content : "";
     const name = text.match(/<command-name>\s*\/goal\s*(?:\s+(\S+))?\s*<\/command-name>/);
     if (!name) continue;
@@ -3943,8 +3976,12 @@ function readGoalRelevantTail(file: string): string[] {
       }
       pos -= carry.length; // carry belongs to the next (earlier) chunk
       // A /goal user entry or a compact boundary anywhere in what we have read
-      // is enough: everything newer than it is already in `lines`.
-      found = lines.some((l) => l.includes("/goal") || l.includes("compact_boundary"));
+      // is enough: everything newer than it is already in `lines`. The stop
+      // test is the verdict's own strict predicate — a tool line QUOTING
+      // "/goal" or "compact_boundary" must not stop the scan (live failure
+      // 2026-11-25 04:56: a grep command quoting the marker stopped the scan
+      // inside the newest megabyte, hiding the real goal typed 46 min earlier).
+      found = lines.some(goalEvidenceLine);
     }
 
     if (!found && carry) lines.push(carry);
