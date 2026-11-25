@@ -638,3 +638,57 @@ test("multi-byte content split across a chunk boundary is read whole", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── the two anchors were compared by kind, not by position (review of 76b36c7) ──
+/**
+ * `goalStillActiveInTranscript` kept a user `/goal` anchor and a `goal_status`
+ * attachment anchor in SEPARATE variables and picked between them by kind:
+ * 1. an attachment-only tail never compared its condition against `want`, so a
+ *    goal_status naming a DIFFERENT objective read as "active" — the comment
+ *    claiming it had been matched above was false;
+ * 2. any user `/goal` entry anywhere in the tail became the anchor even when a
+ *    `goal_status` came AFTER it, so an old typed goal with different args
+ *    declared the live managed objective "replaced" — the live case tonight:
+ *    user /goal at 04:43Z ("Keep working until … 07:00") and a later
+ *    goal_status met:false (18:53Z) for the managed objective.
+ * The newest goal record naming OUR objective now decides, by position; a
+ * foreign attachment is evidence but never a verdict (pinned above).
+ */
+
+test("old user /goal with other text, then goal_status met:false for want — active", () => {
+  // The live shape: an old typed goal of a different objective, then the managed
+  // objective armed by an absorbed goal_status. Fails on 76b36c7: the user entry
+  // became the anchor, its args !== want read "replaced", and the ceiling
+  // re-armed a live goal.
+  const args = expectedArgs(base(NOW));
+  const v = goalStillActiveInTranscript(
+    [typedGoal("Keep working until 2026-11-25 07:00 something else.", "2026-11-25T04:43:16.582Z"), goalStatusAttachment(args, false, "2026-11-25T18:53:42.128Z")],
+    args,
+  );
+  assert.ok(v);
+  assert.equal(v.active, true);
+});
+
+test("only a goal_status with a different condition — lapsed (replaced)", () => {
+  // Attachment-only evidence naming another objective must read as replaced.
+  // Fails on 76b36c7: the attachment anchor's condition was never compared
+  // against `want`, so this read "active".
+  const args = expectedArgs(base(NOW));
+  const v = goalStillActiveInTranscript(
+    [goalStatusAttachment("Ship the release now.", false, "2026-11-25T18:53:42.128Z")],
+    args,
+  );
+  assert.ok(v);
+  assert.equal(v.active, false);
+});
+
+test("goal_status for want, then a user /goal with other text — lapsed", () => {
+  // The typed entry is newer and names another objective: replaced.
+  const args = expectedArgs(base(NOW));
+  const v = goalStillActiveInTranscript(
+    [goalStatusAttachment(args, false, "2026-11-25T18:00:00.000Z"), typedGoal("Ship the release now.", "2026-11-25T19:30:00.000Z")],
+    args,
+  );
+  assert.ok(v);
+  assert.equal(v.active, false);
+});
