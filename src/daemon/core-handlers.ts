@@ -570,9 +570,10 @@ export function registerCoreHandlers(
    * back to the adapter that requested it (via the "source" field).
    */
   server.on("tts", async (req) => {
-    const { text, voice, source, recipient } = req.params as {
+    const { text, voice, speed, source, recipient } = req.params as {
       text?: string;
       voice?: string;
+      speed?: number;
       source?: string;
       recipient?: string;
     };
@@ -582,7 +583,7 @@ export function registerCoreHandlers(
 
     try {
       const { textToVoiceNote } = await import("../adapters/kokoro/tts.js");
-      const audioBuffer = await textToVoiceNote(text, resolvedVoice);
+      const audioBuffer = await textToVoiceNote(text, resolvedVoice, speed);
 
       // If a source adapter is specified, deliver the voice note through it
       if (source) {
@@ -618,12 +619,12 @@ export function registerCoreHandlers(
    * speak — Play text locally (no network delivery).
    */
   server.on("speak", async (req) => {
-    const { text, voice } = req.params as { text?: string; voice?: string };
+    const { text, voice, speed } = req.params as { text?: string; voice?: string; speed?: number };
     if (!text) return { ok: false, error: "text is required" };
 
     try {
       const { speakLocally } = await import("../adapters/kokoro/tts.js");
-      await speakLocally(text, voice ?? voiceConfig.defaultVoice);
+      await speakLocally(text, voice ?? voiceConfig.defaultVoice, speed);
       return { ok: true, result: { speaking: true } };
     } catch (err) {
       return { ok: false, error: `Speak failed: ${err instanceof Error ? err.message : String(err)}` };
@@ -1852,10 +1853,11 @@ export function registerCoreHandlers(
    * pailot_send — Send text or voice to PAILot app clients via WS gateway.
    */
   server.on("pailot_send", async (req) => {
-    const { text, voice, voiceName, sessionId: callerSessionId, imageBase64, caption, mimeType, image } = req.params as {
+    const { text, voice, voiceName, speed, sessionId: callerSessionId, imageBase64, caption, mimeType, image } = req.params as {
       text?: string;
       voice?: boolean;
       voiceName?: string;
+      speed?: number;
       sessionId?: string;
       imageBase64?: string;
       caption?: string;
@@ -1893,7 +1895,7 @@ export function registerCoreHandlers(
         const groupId = chunks.length > 1 ? randomUUID().slice(0, 12) : undefined;
         for (let i = 0; i < chunks.length; i++) {
           if (i > 0) await new Promise((r) => setTimeout(r, 1500));
-          const audioBuffer = await textToVoiceNote(chunks[i], resolvedVoice);
+          const audioBuffer = await textToVoiceNote(chunks[i], resolvedVoice, speed);
           // Each chunk carries its own text segment as transcript
           const transcript = chunks[i];
           const chunkMeta = groupId ? { groupId, chunkIndex: i, totalChunks: chunks.length } : undefined;

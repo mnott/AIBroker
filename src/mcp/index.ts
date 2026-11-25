@@ -615,10 +615,11 @@ server.tool(
   {
     text: z.string().min(1).describe("Text to speak"),
     voice: z.string().optional().describe("Voice name (e.g. 'bm_fable', 'af_bella')"),
+    speed: z.number().min(0.5).max(2).optional().describe("Speech speed (default 1.0, e.g. 0.9 slower)"),
   },
-  async ({ text, voice }) => {
+  async ({ text, voice, speed }) => {
     try {
-      await hub.call_raw("speak", { text, voice });
+      await hub.call_raw("speak", { text, voice, speed });
       return ok("Speaking.");
     } catch (e) { return err(e); }
   },
@@ -1027,10 +1028,11 @@ server.tool(
     voice: z.string().optional().describe("Voice name (e.g. 'af_bella', 'bm_george')"),
     recipient: z.string().optional().describe("Phone number, JID, or contact name. Omit for self-chat."),
     channel: z.enum(["whatsapp", "pailot"]).optional().describe("'pailot' sends only to PAILot."),
+    speed: z.number().min(0.5).max(2).optional().describe("Speech speed (default 1.0, e.g. 0.9 slower)"),
   },
-  async ({ message, voice, recipient, channel }) => {
+  async ({ message, voice, recipient, channel, speed }) => {
     try {
-      const r = await adapterCall("whazaa", "tts", { text: message, voice, jid: recipient, channel }) as any;
+      const r = await adapterCall("whazaa", "tts", { text: message, voice, jid: recipient, channel, speed }) as any;
       const chunks = r?.chunks ?? 1;
       return ok(chunks > 1 ? `Sent ${chunks} voice notes.` : "Sent.");
     } catch (e) { return err(e); }
@@ -1215,10 +1217,11 @@ server.tool(
     text: z.string().min(1).describe("Text to speak"),
     recipient: z.string().optional().describe("Recipient. Default: Saved Messages."),
     voice: z.string().optional().describe("Voice name"),
+    speed: z.number().min(0.5).max(2).optional().describe("Speech speed (default 1.0, e.g. 0.9 slower)"),
   },
-  async ({ text, recipient, voice }) => {
+  async ({ text, recipient, voice, speed }) => {
     try {
-      const r = await adapterCall("telex", "tts", { text, recipient, voice }) as any;
+      const r = await adapterCall("telex", "tts", { text, recipient, voice, speed }) as any;
       const chunks = r?.chunks ?? 1;
       return ok(chunks > 1 ? `Sent ${chunks} voice notes.` : "Sent.");
     } catch (e) { return err(e); }
@@ -1373,11 +1376,12 @@ server.tool(
   {
     message: z.string().min(1).describe("Text to speak"),
     voice: z.string().optional().describe("Voice name"),
+    speed: z.number().min(0.5).max(2).optional().describe("Speech speed (default 1.0, e.g. 0.9 slower)"),
   },
-  async ({ message, voice }) => {
+  async ({ message, voice, speed }) => {
     try {
       const sessionId = getSessionId();
-      const r = await hub.call_raw("pailot_send", { text: message, voice: true, voiceName: voice, sessionId }) as any;
+      const r = await hub.call_raw("pailot_send", { text: message, voice: true, voiceName: voice, speed, sessionId }) as any;
       const chunks = r?.chunks ?? 1;
       return ok(chunks > 1 ? `Sent ${chunks} voice notes.` : "Sent.");
     } catch (e) { return err(e); }
