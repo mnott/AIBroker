@@ -497,6 +497,13 @@ export interface ManagedSession {
   /** When a goal was last queued behind a running turn; at most one pending. */
   queuedArmAt?: number;
   /**
+   * The transcript file the ceiling check reads for this session, resolved
+   * each tick from the pane's process (the session id is not always a Claude
+   * uuid — `claude attach` panes key differently). Absent means fall back to
+   * looking it up by session id.
+   */
+  transcriptFile?: string;
+  /**
    * When this session was first seen BLOCKED — waiting on a permission
    * prompt or similar, not merely idle. Kept across ticks so the operator
    * can be told how long it has actually been stuck, not just that it is.
@@ -3797,6 +3804,145 @@ export function busyGoalGoneReason(m: ManagedSession, content: string, now: numb
 /** A shift/supervision whose `until` has passed: nothing proactive is typed into the session any more. */
 export const shiftOver = (m: ManagedSession, now: number): boolean => !!m.shift && now >= m.shift.until;
 
+/**
+ * Is the goal still active in the session's own transcript?
+ *
+ * THE CEILING WAS A TIMER GUESSING ABOUT A FILE. The 45-minute ceiling fires
+ * "armed … with no sign of a new goal" whenever the pane goes quiet, but the
+ * session keeps writing its transcript while it works — and the transcript
+ * says exactly what the timer was guessing: whether the last `/goal` typed is
+ * still in force. A user entry carrying `<command-name>/goal</command-name>`
+ * with `<command-args>…</command-args>` arms; a later `/goal clear`, a
+ * `compact_boundary`, or a Stop-hook report of the condition met ends it.
+ *
+ * `tail` is the newest-first lines of the transcript's tail (the same raw text
+ * `transcriptReading` reads). A compact boundary drops the goal from context —
+ * after it there is no `/goal` entry, so the goal is treated as lapsed and the
+ * ceiling re-arms, which is exactly what a compaction needs. A truncated first
+ * line of the tail is skipped like everywhere else in this file: an unreadable
+ * reading returns null (unknown) and never blocks an arm that would otherwise
+ * fire — the transcript is evidence FOR staying quiet, not a veto against
+ * recovery.
+ */
+export function goalStillActiveInTranscript(
+  tail: string[],
+  objective: string,
+): { active: boolean; at: number | null } | null {
+  const want = objective.trim();
+  if (!want) return null;
+
+  // Oldest first: the LAST match is the most recent /goal entry. (The tail
+  // read by `tail -n` is oldest-first, and this file's own newest-first
+  // comments elsewhere describe a different convention — timestamps decide.)
+  let lastGoalIndex = -1;
+  let lastArgs = "";
+  let lastAt: number | null = null;
+  for (let i = 0; i < tail.length; i++) {
+    const line = tail[i];
+    if (!line || !line.includes("/goal")) continue;
+    let j: any;
+    try {
+      j = JSON.parse(line);
+    } catch {
+      continue; // truncated or non-JSON — not evidence either way
+    }
+    if (j.type !== "user") continue;
+    const text = typeof j.message?.content === "string" ? j.message.content : "";
+    const name = text.match(/<command-name>\s*\/goal\s*(?:\s+(\S+))?\s*<\/command-name>/);
+    if (!name) continue;
+    const args = text.match(/<command-args>([\s\S]*)<\/command-args>/)?.[1]?.trim() ?? "";
+    const at = j.timestamp ? Date.parse(j.timestamp) : null;
+
+    // Record this as the newest /goal seen so far (the loop runs oldest-first).
+    lastGoalIndex = i;
+    lastArgs = args.trim();
+    lastAt = at;
+  }
+  if (lastGoalIndex === -1) return null; // no /goal entry in the tail — unknown, not evidence of lapsed
+
+  // A clear ends the goal regardless of what it cleared.
+  if (/^clear\b/.test(lastArgs)) return { active: false, at: lastAt };
+
+  // The most recent /goal names a different objective — this one was replaced.
+  if (lastArgs !== want) return { active: false, at: lastAt };
+
+  // The same objective as the managed one is still in force — unless a later
+  // record already ended it. `tail` is oldest-first, so every entry AFTER the
+  // goal's index is newer than it.
+  for (let i = lastGoalIndex + 1; i < tail.length; i++) {
+    const l = tail[i];
+    if (!l) continue;
+    let k: any;
+    try {
+      k = JSON.parse(l);
+    } catch {
+      continue;
+    }
+    // A compaction drops the goal from context: treat as lapsed. The
+    // boundary's own summary text can quote the old objective — check the
+    // subtype before its content, so a quoted goal never reads as active.
+    if (k.type === "system" && k.subtype === "compact_boundary") return { active: false, at: lastAt };
+    const kt = typeof k.message?.content === "string" ? k.message.content : "";
+    // A later /goal clear ends it.
+    if (k.type === "user" && /<command-name>\s*\/goal\s+clear\s*<\/command-name>/.test(kt)) return { active: false, at: lastAt };
+    // The Stop hook reporting the condition met ends it.
+    if (/goal has been met|goal achieved|goal is complete|condition (has been )?met/i.test(kt)) return { active: false, at: lastAt };
+  }
+  return { active: true, at: lastAt };
+}
+
+/** The transcript's newest message timestamp from a raw tail, or null. */
+function newestTranscriptAt(lines: string[]): number | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const j = JSON.parse(lines[i]);
+      if ((j.type === "user" || j.type === "assistant") && typeof j.timestamp === "string") {
+        const t = Date.parse(j.timestamp);
+        if (!Number.isNaN(t)) return t;
+      }
+    } catch { /* truncated first line of a tail is normal */ }
+  }
+  return null;
+}
+
+/**
+ * The ceiling, asked the right question.
+ *
+ * "Armed … with no sign of a new goal" used to mean only "the timer ran out".
+ * It fired every ~46 min on a session whose goal was plainly still active —
+ * live 2026-11-25, the same objective re-typed at 22:47, 23:35, 00:21, 01:07,
+ * 01:53, 02:39 while the session kept working. The transcript is the record of
+ * what was armed and whether it still stands; consult it before assuming a
+ * lapse. Still arms when the goal was cleared, met, replaced, or dropped by a
+ * compaction (a compact_boundary after the last /goal means the goal left the
+ * context), and when the transcript cannot be read — recovery stays cheap.
+ */
+function ceilingReason(m: ManagedSession, content: string, now: number, quietFor: number): string | null {
+  const armedFor = Math.max(0, now - m.lastRearmAt);
+  if (armedFor <= GOAL_MAX_AGE_MS || quietFor <= NO_GOAL_GRACE_MS) return null;
+
+  let tail: string[] | null = null;
+  try {
+    const file = m.transcriptFile ?? sessionTranscriptFile(m.sessionId);
+    if (!file) return null;
+    const raw = execFileSync("/usr/bin/tail", ["-n", "200", file], {
+      encoding: "utf8",
+      timeout: 4_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    tail = raw.split("\n");
+  } catch { /* unreadable transcript: the timer's reading stands */ }
+
+  const verdict = goalStillActiveInTranscript(tail ?? [], m.objective);
+  if (verdict?.active) {
+    const at = newestTranscriptAt(tail ?? []);
+    const hhmm = at !== null ? new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "?";
+    logOnly(m, `goal still active (last /goal at ${hhmm}) — not re-arming`);
+    return null;
+  }
+  return `armed ${minutesSince(m.lastRearmAt, now)} with no sign of a new goal, and quiet for ${Math.round(quietFor / 1000)}s — assuming it lapsed`;
+}
+
 export function reasonToArm(m: ManagedSession, content: string, now: number): string | null {
   if (m.paused || shiftOver(m, now)) return null;
 
@@ -3838,9 +3984,8 @@ export function reasonToArm(m: ManagedSession, content: string, now: number): st
    * the inference drawn from a timer. So the ceiling now needs both: the goal
    * looks old AND nothing is happening.
    */
-  if (armedFor > GOAL_MAX_AGE_MS && quietFor > NO_GOAL_GRACE_MS) {
-    return `armed ${minutesSince(m.lastRearmAt, now)} with no sign of a new goal, and quiet for ${Math.round(quietFor / 1000)}s — assuming it lapsed`;
-  }
+  const ceiling = ceilingReason(m, content, now, quietFor);
+  if (ceiling) return ceiling;
   return null;
 }
 
@@ -4017,6 +4162,13 @@ async function tick(now = Date.now()): Promise<void> {
     const tickUuid = tickProc?.uuid ?? (tickTty ? liveSnaps.find((s) => s.id === m.sessionId)?.attachUuid : undefined);
     if (tickPid) await primeProcessCwd(tickPid);
     const tickTranscript = tickPid ? transcriptReading(tickPid, tickUuid) : null;
+    // The ceiling check reads the goal's history from this file (see
+    // ceilingReason); recorded here so it is resolved once per tick with the
+    // rest of the process lookups rather than again at arm-decision time.
+    if (tickTranscript?.file && m.transcriptFile !== tickTranscript.file) {
+      m.transcriptFile = tickTranscript.file;
+      dirty = true;
+    }
     // A turn that ended with nothing running is a stop, not work: the 2-minute
     // "recent transcript" window must not hide it.
     const stopped = turnStoppedIdle(tickTranscript, content, now);
