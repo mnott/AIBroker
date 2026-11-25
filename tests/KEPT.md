@@ -38,3 +38,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/pailot-home-launch.test.ts | a | PAILot home launch failed: literal '~' was single-quoted so the shell never expanded it (live 2026-11-24); pins tilde expansion in both launch builders and the nonexistent-dir refusal |
 | test/mailbox-help.test.ts | b | PAI detects mailbox --follow support by reading the help text; a missing flag silently falls back to the one-shot waiter, so the help must advertise it |
 | test/handover-hook.test.ts | a | goal session compacted at 931k with no handover: typed ask idle-gated and trigger from this session only; pins marker-once hook delivery and project-min trigger (2026-11-24) |
+| test/manage-goal-active.test.ts | a | manager re-typed the same /goal into a busy session every ~46 min while its goal was still active (live 2026-11-25: arms at 22:47, 23:35, 00:21, 01:07, 01:53, 02:39); pins the transcript check that stops the re-arm |
