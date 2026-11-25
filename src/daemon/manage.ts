@@ -3282,7 +3282,7 @@ export function buildBrief(parts: {
  * and pending operator notes are always current; pending notes are consumed
  * into the brief, not the line.
  */
-function goalText(m: ManagedSession): { text: string } {
+export function goalText(m: ManagedSession): { text: string } {
   const rules = readStandingRules();
   // The screen rule rides along with EVERY arming: delivered once it lasts
   // only until the session next reads a goal, and silence about the screen is
@@ -3857,9 +3857,14 @@ export function goalEvidenceLine(line: string): boolean {
 
 export function goalStillActiveInTranscript(
   tail: string[],
-  objective: string,
+  expected: string,
 ): { active: boolean; at: number | null } | null {
-  const want = objective.trim();
+  // Collapse every run of whitespace to a single space before comparing: the
+  // text is typed as one line but may be reflowed or padded when recorded in
+  // the transcript (live failure 2026-11-25 05:42 — an exact-string compare
+  // against the stored objective never matched the typed line, so every goal
+  // read as "replaced" and the ceiling re-armed a live goal every 46 min).
+  const want = expected.replace(/\s+/g, " ").trim();
   if (!want) return null;
 
   // Oldest first: the LAST match is the most recent /goal entry. (The tail
@@ -3888,7 +3893,7 @@ export function goalStillActiveInTranscript(
 
     // Record this as the newest /goal seen so far (the loop runs oldest-first).
     lastGoalIndex = i;
-    lastArgs = args.trim();
+    lastArgs = args.replace(/\s+/g, " ").trim();
     lastAt = at;
   }
   if (lastGoalIndex === -1) return null; // no /goal entry in the tail — unknown, not evidence of lapsed
@@ -4029,7 +4034,13 @@ function ceilingReason(m: ManagedSession, content: string, now: number, quietFor
     tail = readGoalRelevantTail(file);
   } catch { /* unreadable transcript: the timer's reading stands */ }
 
-  const verdict = goalStillActiveInTranscript(tail ?? [], m.objective);
+  // Compare against the line THIS manager would type now, not the stored
+  // objective: the typed line is `/goal <no-done-state prefix> Follow <brief>:
+  // <truncated objective>` (see goalText/buildGoalLine), so matching the raw
+  // objective against `<command-args>` always read "replaced" and re-armed a
+  // live goal every ceiling (live failure 2026-11-25 05:42). Derived from the
+  // same builder the arming path uses, so expected and typed cannot drift.
+  const verdict = goalStillActiveInTranscript(tail ?? [], goalText(m).text.replace(/^\/goal\s+/, ""));
   if (verdict?.active) {
     const at = newestTranscriptAt(tail ?? []);
     const hhmm = at !== null ? new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "?";

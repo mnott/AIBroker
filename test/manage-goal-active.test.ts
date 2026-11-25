@@ -17,9 +17,29 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { goalEvidenceLine, goalStillActiveInTranscript, reasonToArm, type ManagedSession } from "../src/daemon/manage.js";
+import { buildGoalLine, foldHome, goalEvidenceLine, goalStillActiveInTranscript, reasonToArm, type ManagedSession } from "../src/daemon/manage.js";
 
 const OBJ = "Audit every module and fix the drift.";
+
+/**
+ * The args a ceiling compares against: exactly what arm() types at the session
+ * (buildGoalLine over the brief path), minus the leading `/goal `. Deriving it
+ * from the same builder is the fix — comparing the stored objective against the
+ * typed line always read "replaced" and re-armed a live goal every ceiling
+ * (live failure 2026-11-25 05:42).
+ */
+function expectedArgs(m: ManagedSession): string {
+  return buildGoalLine(foldHome(join(process.env.HOME ?? "", ".aibroker", "manage-briefs", `${m.name}.md`)), m.objective, m.shift?.until ?? null).replace(/^\/goal\s+/, "");
+}
+
+/** The real transcript record: `/goal` typed at the session, as Claude Code records it. */
+function typedGoal(args: string, ts: string): string {
+  return JSON.stringify({
+    type: "user",
+    timestamp: ts,
+    message: { content: `<command-name>/goal</command-name>\n            <command-message>goal</command-message>\n            <command-args>${args}</command-args>` },
+  });
+}
 
 function userGoal(args: string, ts: string): string {
   return JSON.stringify({
@@ -153,20 +173,20 @@ function withFile(lines: string[], fn: (m: ManagedSession) => void): void {
 }
 
 test("ceiling with an active goal in the transcript — no re-arm", () => {
-  withFile([userGoal(OBJ, "2026-11-25T01:07:00.000Z"), assistant("2026-11-25T01:59:20.000Z")], (m) => {
+  withFile([typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), assistant("2026-11-25T01:59:20.000Z")], (m) => {
     assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
   });
 });
 
 test("ceiling with a cleared goal — re-arm", () => {
-  withFile([userGoal(OBJ, "2026-11-25T01:07:00.000Z"), goalClear("2026-11-25T01:40:00.000Z")], (m) => {
+  withFile([typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), goalClear("2026-11-25T01:40:00.000Z")], (m) => {
     const r = reasonToArm(m, ACTIVE_PANE, NOW);
     assert.match(r ?? "", /assuming it lapsed/);
   });
 });
 
 test("ceiling after a compaction — re-arm", () => {
-  withFile([userGoal(OBJ, "2026-11-25T01:07:00.000Z"), compactBoundary("2026-11-25T01:50:00.000Z"), assistant("2026-11-25T01:59:20.000Z")], (m) => {
+  withFile([typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), compactBoundary("2026-11-25T01:50:00.000Z"), assistant("2026-11-25T01:59:20.000Z")], (m) => {
     const r = reasonToArm(m, ACTIVE_PANE, NOW);
     assert.match(r ?? "", /assuming it lapsed/);
   });
@@ -180,10 +200,116 @@ test("unreadable transcript file — the timer's reading stands (re-arm)", () =>
 });
 
 test("goal still active but pane quiet — ceiling suppressed even past the age", () => {
-  withFile([userGoal(OBJ, "2026-11-25T01:07:00.000Z"), assistant("2026-11-25T01:59:20.000Z")], (m) => {
+  withFile([typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), assistant("2026-11-25T01:59:20.000Z")], (m) => {
     m.lastRearmAt = NOW - 90 * 60_000; // far past the ceiling
     assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
   });
+});
+
+// ── the ceiling compared the STORED objective against the TYPED line ────────
+// (live failure 2026-11-25 05:42)
+/**
+ * The scan now finds the real `/goal` entry, but the verdict still declared it
+ * lapsed every ceiling: `ceilingReason` compared the stored objective with
+ * `<command-args>`, and the args are what `buildGoalLine` types — a no-done-state
+ * prefix, a brief pointer and a truncated objective. The two strings can never
+ * be equal, so every goal read as "replaced" ("armed 46 min … assuming it
+ * lapsed", live at 05:42:41). The ceiling now derives its expected text from the
+ * SAME builder the arming path uses (`goalText` → `buildGoalLine`), so expected
+ * and typed cannot drift, and whitespace reflow is tolerated.
+ */
+test("typed goal line in the transcript — no re-arm (the 05:42 live failure)", () => {
+  // The shift's until is baked into the typed prefix ("Keep working until
+  // …"), so the fixture and the manager under test must carry the SAME shift —
+  // exactly what the live manager had at 05:42.
+  const m = base(NOW);
+  m.shift = { until: Date.parse("2026-11-25T07:00:00.000Z"), startedAt: NOW - 8 * 60_000 } as ManagedSession["shift"];
+  withFile([typedGoal(expectedArgs(m), "2026-11-25T04:56:54.439Z"), assistant("2026-11-25T05:42:00.000Z")], (mm) => {
+    mm.shift = m.shift;
+    assert.equal(reasonToArm(mm, ACTIVE_PANE, NOW), null);
+  });
+});
+
+test("whitespace reflow of the typed line is tolerated", () => {
+  const m = base(NOW);
+  const args = expectedArgs(m).replace(/ /g, "  "); // padded — a reflowed record
+  const v = goalStillActiveInTranscript([typedGoal(args, "2026-11-25T01:07:00.000Z")], expectedArgs(m));
+  assert.ok(v?.active);
+});
+
+test("a /goal with other args — replaced, lapsed", () => {
+  const m = base(NOW);
+  const v = goalStillActiveInTranscript([typedGoal("Fix something else entirely.", "2026-11-25T01:07:00.000Z")], expectedArgs(m));
+  assert.ok(v);
+  assert.equal(v.active, false);
+});
+
+test("the raw stored objective is NOT what the transcript holds — old compare lapsed", () => {
+  // Pins the bug itself: the typed line contains the no-done-state prefix and a
+  // brief pointer, so comparing the objective verbatim against it must be "not
+  // active". Guards against anyone re-introducing `m.objective` as the compare.
+  const m = base(NOW);
+  const v = goalStillActiveInTranscript([typedGoal(expectedArgs(m), "2026-11-25T01:07:00.000Z")], OBJ);
+  assert.ok(v);
+  assert.equal(v.active, false);
+});
+
+test("no shift — the plain no-done-state line still matches", () => {
+  withFile([typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), assistant("2026-11-25T01:59:20.000Z")], (m) => {
+    assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
+  });
+});
+
+test("shift with an until — the dated prefix matches and a bare objective does not", () => {
+  const m = base(NOW);
+  const until = Date.parse("2026-11-25T07:00:00.000Z");
+  m.shift = { until, startedAt: NOW - 8 * 60_000 } as ManagedSession["shift"];
+  const args = expectedArgs(m);
+  // The prefix carries the local date/time of `until` (dateHhmm), not a fixed
+  // UTC string — assert against the same formatter, not a literal.
+  const d = new Date(until);
+  const p = (n: number) => String(n).padStart(2, "0");
+  assert.match(args, new RegExp(`Keep working until ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} \\d{2}:\\d{2}`));
+  const v = goalStillActiveInTranscript([typedGoal(args, "2026-11-25T04:56:54.439Z")], args);
+  assert.ok(v?.active);
+});
+
+test("goal cleared with the typed line present — lapsed", () => {
+  withFile([typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), goalClear("2026-11-25T01:40:00.000Z")], (m) => {
+    const r = reasonToArm(m, ACTIVE_PANE, NOW);
+    assert.match(r ?? "", /assuming it lapsed/);
+  });
+});
+
+test("compact_boundary after the typed line — lapsed", () => {
+  withFile([typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), compactBoundary("2026-11-25T01:50:00.000Z")], (m) => {
+    const r = reasonToArm(m, ACTIVE_PANE, NOW);
+    assert.match(r ?? "", /assuming it lapsed/);
+  });
+});
+
+test("goal met after the typed line — lapsed", () => {
+  withFile([
+    typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"),
+    JSON.stringify({ type: "user", timestamp: "2026-11-25T01:40:00.000Z", message: { role: "user", content: "The goal has been met." } }),
+  ], (m) => {
+    const r = reasonToArm(m, ACTIVE_PANE, NOW);
+    assert.match(r ?? "", /assuming it lapsed/);
+  });
+});
+
+test("the newest typed /goal wins — an older replacement lapses the managed one", () => {
+  withFile([
+    typedGoal(expectedArgs(base(NOW)), "2026-11-25T00:00:00.000Z"),
+    typedGoal("Ship the release now.", "2026-11-25T01:30:00.000Z"),
+  ], (m) => {
+    const r = reasonToArm(m, ACTIVE_PANE, NOW);
+    assert.match(r ?? "", /assuming it lapsed/);
+  });
+});
+
+test("goalEvidenceLine accepts the real record shape", () => {
+  assert.equal(goalEvidenceLine(typedGoal(expectedArgs(base(NOW)), "2026-11-25T04:56:54.439Z")), true);
 });
 
 // ── the tail was too short for a busy session (live failure 2026-11-25 03:25) ──
@@ -224,14 +350,14 @@ function bigFile(lines: string[]): ManagedSession {
 }
 
 test("goal 5000 tool lines before the end — still active, no re-arm", () => {
-  const lines = [userGoal(OBJ, "2026-11-25T01:07:00.000Z"), ...toolLines(5_000, "2026-11-25T01:10:00.000Z")];
+  const lines = [typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), ...toolLines(5_000, "2026-11-25T01:10:00.000Z")];
   const m = bigFile(lines);
   assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
 });
 
 test("compact_boundary after a deep goal — lapsed, re-arm", () => {
   const lines = [
-    userGoal(OBJ, "2026-11-25T01:07:00.000Z"),
+    typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"),
     ...toolLines(3_000, "2026-11-25T01:10:00.000Z"),
     compactBoundary("2026-11-25T01:55:00.000Z"),
     ...toolLines(1_000, "2026-11-25T01:56:00.000Z"),
@@ -246,7 +372,7 @@ test("assistant lines containing the marker string never count as a goal", () =>
   const m = bigFile(toolLines(5_000, "2026-11-25T01:10:00.000Z"));
   assert.match(reasonToArm(m, ACTIVE_PANE, NOW) ?? "", /assuming it lapsed/);
 
-  const m2 = bigFile([userGoal(OBJ, "2026-11-25T01:07:00.000Z"), ...toolLines(5_000, "2026-11-25T01:10:00.000Z")]);
+  const m2 = bigFile([typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), ...toolLines(5_000, "2026-11-25T01:10:00.000Z")]);
   assert.equal(reasonToArm(m2, ACTIVE_PANE, NOW), null);
 });
 
@@ -292,7 +418,7 @@ test("noise quoting both markers after a deep goal — still active, no re-arm",
   // tool_result lines whose text contains "command-name>/goal<" and
   // "compact_boundary". Fails on the substring stop test; passes with the
   // strict shared predicate.
-  const lines = [userGoal(OBJ, "2026-11-25T01:07:00.000Z"), ...noiseLines(3_000, "2026-11-25T01:10:00.000Z")];
+  const lines = [typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"), ...noiseLines(3_000, "2026-11-25T01:10:00.000Z")];
   const m = bigFile(lines);
   assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
 });
@@ -301,7 +427,7 @@ test("a real compact_boundary after a deep goal — lapsed, re-arm", () => {
   // The strict predicate must still STOP on a genuine boundary: noise quoted
   // around it, the real system record wins.
   const lines = [
-    userGoal(OBJ, "2026-11-25T01:07:00.000Z"),
+    typedGoal(expectedArgs(base(NOW)), "2026-11-25T01:07:00.000Z"),
     ...noiseLines(1_500, "2026-11-25T01:10:00.000Z"),
     compactBoundary("2026-11-25T01:40:00.000Z"),
     ...noiseLines(1_500, "2026-11-25T01:41:00.000Z"),
@@ -324,7 +450,7 @@ test("multi-byte content split across a chunk boundary is read whole", () => {
   // multi-byte characters that must survive the chunking.
   const obj = "Fix the drift — über alles ✓ 🎯";
   const pad = toolLines(2_000, "2026-11-25T01:00:00.000Z"); // ~2 MB of filler before the goal
-  const lines = [...pad, userGoal(obj, "2026-11-25T01:30:00.000Z"), ...toolLines(2_000, "2026-11-25T01:35:00.000Z")];
+  const lines = [...pad, typedGoal(expectedArgs({ ...base(NOW), objective: obj }), "2026-11-25T01:30:00.000Z"), ...toolLines(2_000, "2026-11-25T01:35:00.000Z")];
   const dir = mkdtempSync(join(tmpdir(), "aibroker-utf8-"));
   try {
     const file = join(dir, "s1.jsonl");
