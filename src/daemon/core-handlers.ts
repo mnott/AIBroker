@@ -484,8 +484,30 @@ export function registerCoreHandlers(
    */
   async function sessionVoiceKey(req: IpcRequest, session?: string): Promise<string | { error: string }> {
     if (session && session !== "self") {
-      const live = await snapshotAllSessions();
-      const match = await matchSession([session], live);
+      // The same enrichment every other resolver applies before matching: the
+      // persistent name is what a human calls the session (a bare snapshot row
+      // carries null and a renamed session would read as "not found").
+      // discoverLiveSessions fills paiName from the persistent store itself, so
+      // no local enrichment is needed here (and none would reach this scope).
+      const live = await listedSessions();
+      // Human-friendly kinds (send_to_session's own set): a target typed as the
+      // list shows it must resolve, and an ambiguous name is refused rather
+      // than guessed.
+      const hits = await matchAllSessions([session], live, { kinds: ["exact", "normalised", "substring"] });
+      if (hits.length === 0) {
+        // Same fallback send_to_session uses after an unreliable enumeration: a
+        // persisted name survives the outage, so a known session is not "not
+        // found". An unknown name has no entry here and still errors.
+        const persistedId = Object.entries(getAllPersistentSessionNames())
+          .find(([, name]) => name.toLowerCase() === session.toLowerCase())?.[0];
+        if (persistedId) return `session:${getAllPersistentSessionNames()[persistedId] ?? persistedId}`;
+        return { error: `Session "${session}" not found` };
+      }
+      const tied = hits.filter((h) => h.score === hits[0].score);
+      if (tied.length > 1) {
+        return { error: `Target "${session}" is ambiguous — ${tied.map((h) => `"${h.label}" (${h.session.id})`).join(", ")}; name the one by its id` };
+      }
+      const match = hits[0];
       if (!match) return { error: `Session "${session}" not found` };
       const snap = live.find((s) => s.id === match.session.id);
       const name = (snap && lookupPersistentName(getAllPersistentSessionNames(), snap.id, snap.aibrokerId)) ?? match.session.id;

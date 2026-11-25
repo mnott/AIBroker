@@ -42,3 +42,5 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/manage-goal-line-pure.test.ts | a | ceiling (every quiet tick past 46 min) rewrote the brief via goalText — read-only check mutating state; pins goalLineFor purity and goalText==goalLineFor |
 | test/tts-chunking.test.ts | a | aibroker_speak/voice notes cut off long text at kokoro token window; chunked synthesis (2026-11-25) |
 | test/playback.test.ts | a | serial queue, streaming order, recording hold |
+| test/session-voice.test.ts | a | per-session voice settings store: defaults, clamp/round, guarded persistence |
+| test/voice-handlers.test.ts | a | session-scoped voice_config/speak/repeat/stop handlers over the hub socket |
