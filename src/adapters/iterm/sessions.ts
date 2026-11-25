@@ -341,15 +341,24 @@ function openSessionScript(command: string): string {
   // measured 2026-09-23: `is at shell prompt` reads busy for up to ~1s after
   // `create tab` on this machine, settling to true around 0.8s. A guard that
   // checked immediately would refuse every launch, not just the unsafe ones.
-  // A session that is genuinely occupied (Claude or anything else) never
-  // settles to shell-prompt no matter how long this waits, which is exactly
-  // what keeps the guard meaningful after the delay.
+  // Measured 2026-11-25 under load: a fixed 1.5 s wait then ONE check still
+  // refused a perfectly fresh tab — a fresh zsh can need longer than that — so
+  // the settle is now a POLL: check every ~0.25 s up to a deadline and write
+  // as soon as it is true, instead of paying a fixed delay even when the shell
+  // settles in 0.3 s. A session that is genuinely occupied (Claude or anything
+  // else) never reaches the prompt within the deadline, which is exactly what
+  // keeps the guard meaningful.
   // JXA: `app` is bound to the real iTerm process by runItermJxa.
   const cmd = JSON.stringify(command);
   const write = command
     ? `ObjC.import("Foundation");
-    $.NSThread.sleepForTimeInterval(1.5);
-    if (!session.isAtShellPrompt()) {
+    var deadline = Date.now() + 8000;
+    var atPrompt = false;
+    while (Date.now() < deadline) {
+      if (session.isAtShellPrompt()) { atPrompt = true; break; }
+      $.NSThread.sleepForTimeInterval(0.25);
+    }
+    if (!atPrompt) {
       // Close what THIS call opened, so a refused launch leaves no stray tab;
       // a session that already existed (reused tab) is never touched.
       var sid = session.id();

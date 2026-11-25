@@ -73,3 +73,30 @@ test("launch script clears the input line before writing the command", async () 
   assert.ok(clear >= 0 && cmd > clear, "Ctrl-U (no newline) precedes the command");
   assert.ok(!scripts[1].includes("u0015"), "no clear without a command");
 });
+
+test("launch script polls for the shell prompt instead of sleeping a fixed 1.5s", async () => {
+  // Real fault, 2026-11-25: under machine load a freshly created tab's zsh
+  // took longer than the fixed 1.5 s settle to report `is at shell prompt`,
+  // so the guard refused a perfectly fresh tab and closed it (the launch
+  // failed even though two immediate retries succeeded). The settle must be
+  // a bounded poll that writes as soon as the prompt appears, and still
+  // refuse (closing only what this call opened) once the deadline passes.
+  const original = _internal.runItermJxa;
+  const scripts: string[] = [];
+  _internal.runItermJxa = ((s: string) => { scripts.push(s); return "S1"; }) as typeof original;
+  try {
+    await createTerminalTab("echo hi");
+  } finally {
+    _internal.runItermJxa = original;
+  }
+  const script = scripts[0];
+  assert.ok(!script.includes("sleepForTimeInterval(1.5)"), "no fixed 1.5 s settle left");
+  assert.match(script, /while \(Date\.now\(\) < deadline\)/, "prompt check is polled in a loop");
+  assert.match(script, /deadline = Date\.now\(\) \+ \d+/, "the poll has a bounded deadline");
+  assert.ok(script.indexOf("session.isAtShellPrompt()") > script.indexOf("var before = {}"),
+    "the prompt check runs after the tab is resolved");
+  // The busy branch must still close only what THIS call opened.
+  assert.match(script, /if \(!before\[sid\]\) \{ try \{ session\.close\(\); \} catch \(e\) \{\}/);
+  assert.ok(script.indexOf("session.isAtShellPrompt()") < script.indexOf('session.write({ text: "\\u0015", newline: false });'),
+    "the guard still runs before any write");
+});
