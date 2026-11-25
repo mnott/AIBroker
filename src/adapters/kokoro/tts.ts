@@ -7,13 +7,13 @@
  * Pipeline: Kokoro-js → Float32 PCM → WAV → ffmpeg → OGG Opus
  */
 
-import { execSync, spawn } from "node:child_process";
+import { execSync } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { log } from "../../core/log.js";
-import { resolveFfmpegBin, localPlayerCommand } from "../../core/bins.js";
+import { resolveFfmpegBin } from "../../core/bins.js";
 
 
 export type KokoroVoice =
@@ -106,34 +106,19 @@ export async function textToVoiceNote(text: string, voice?: string, speed?: numb
 }
 
 /**
- * Synthesize text and play locally (afplay on macOS, paplay/aplay/ffplay elsewhere).
+ * Synthesize text and play locally. Thin wrapper over the machine-wide playback
+ * queue: synthesis streams sentence by sentence while audio plays, jobs run one
+ * after another, and a recording in progress holds playback. Imported lazily so
+ * tts.js does not depend on playback.js at load time.
  */
 export async function speakLocally(text: string, voice?: string, speed?: number): Promise<void> {
   if (!text?.trim()) throw new Error("TTS: text must not be empty");
 
   const resolvedVoice = resolveVoice(voice ?? DEFAULT_VOICE);
-  await ensureInitialized();
-
   log(`Speaking locally: voice=${resolvedVoice}, text="${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`);
 
-  const { audio: speakAudio, sampleRate: speakSampleRate } = await synthesizeChunked(text, resolvedVoice, speed);
-
-  const wavPath = join(tmpdir(), `aibroker-speak-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`);
-  writeFileSync(wavPath, float32ToWav(speakAudio, speakSampleRate));
-
-  const player = localPlayerCommand();
-  if (!player) {
-    log("Speak: no local audio player (need paplay, aplay or ffplay) — audio not played");
-    try { unlinkSync(wavPath); } catch { /* ignore */ }
-    return;
-  }
-  const child = spawn(player[0], [...player.slice(1), wavPath], { stdio: "ignore", detached: true });
-  // A player that vanishes between resolution and spawn is an 'error' event, not a throw.
-  child.on("error", (err) => log(`Speak: ${player[0]} failed — ${err.message}`));
-  child.on("close", () => {
-    try { unlinkSync(wavPath); } catch { /* ignore */ }
-  });
-  child.unref();
+  const { enqueueSpeech } = await import("./playback.js");
+  enqueueSpeech({ session: "local", text, voice: resolvedVoice, speed });
 }
 
 export function listVoices(): string[] {
@@ -224,24 +209,50 @@ export async function synthesizeChunked(
   voice: string,
   speed?: number,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  tts: any = ttsInstance,
+  tts?: any,
 ): Promise<{ audio: Float32Array; sampleRate: number }> {
-  const sentences = splitIntoSentences(text);
-  const rate = speed !== undefined && Number.isFinite(speed) && speed > 0 ? speed : 1.0;
   const pcm: Float32Array[] = [];
   let sampleRate = 24_000;
-  for (const s of sentences) {
-    const r = await tts.generate(s, { voice, speed: rate });
-    sampleRate = r.sampling_rate ?? sampleRate;
-    if (r.audio && r.audio.length > 0) pcm.push(r.audio);
+  for await (const chunk of synthesizeSentences(text, voice, speed, undefined, tts)) {
+    sampleRate = chunk.sampleRate;
+    if (chunk.audio.length > 0) pcm.push(chunk.audio);
   }
   if (pcm.length === 0) throw new Error("TTS: generate produced no audio");
   return { audio: concatWithPauses(pcm, sampleRate), sampleRate };
 }
 
-// ── Internal helpers ──
+/**
+ * Synthesize sentence by sentence, yielding each chunk as soon as it is ready.
+ * Streaming playback consumes this; the first chunk arrives after only one
+ * sentence's synthesis instead of the whole text's. Aborts between sentences
+ * when `signal` fires so stopPlayback() can end a job mid-synthesis.
+ */
+export async function* synthesizeSentences(
+  text: string,
+  voice: string,
+  speed?: number,
+  signal?: AbortSignal,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tts?: any,
+): AsyncGenerator<{ audio: Float32Array; sampleRate: number }> {
+  if (!tts) {
+    await ensureInitialized();
+    tts = ttsInstance;
+  }
+  voice = resolveVoice(voice || DEFAULT_VOICE);
+  const sentences = splitIntoSentences(text);
+  const rate = speed !== undefined && Number.isFinite(speed) && speed > 0 ? speed : 1.0;
+  let sampleRate = 24_000;
+  for (const s of sentences) {
+    if (signal?.aborted) throw new Error("TTS: synthesis aborted");
+    const r = await tts.generate(s, { voice, speed: rate });
+    sampleRate = r.sampling_rate ?? sampleRate;
+    if (r.audio && r.audio.length > 0) yield { audio: r.audio, sampleRate };
+  }
+}
 
-function float32ToWav(samples: Float32Array, sampleRate: number): Buffer {
+/** Encode Float32 PCM as a 16-bit mono WAV. Exported for the playback queue. */
+export function float32ToWav(samples: Float32Array, sampleRate: number): Buffer {
   const numSamples = samples.length;
   const byteRate = sampleRate * 2;
   const dataSize = numSamples * 2;
