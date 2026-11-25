@@ -13,6 +13,7 @@ import { execFile } from "node:child_process";
 
 import { log } from "../../core/log.js";
 import { resolveSoxBin, resolveWhisperBin } from "../../core/bins.js";
+import { setRecordingActive } from "../kokoro/playback.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -32,39 +33,46 @@ export const WHISPER_MODEL = process.env.AIBROKER_WHISPER_MODEL ?? process.env.M
 export async function recordFromMic(maxDurationSec = 60): Promise<string> {
   const wavPath = join(tmpdir(), `aibroker-dictation-${Date.now()}.wav`);
 
-  // Audible start indicator
-  execFile("afplay", ["/System/Library/Sounds/Tink.aiff"], () => {});
-
-  log(`Dictation: recording to ${wavPath} (max ${maxDurationSec}s)...`);
-
+  // Hold local speech (SIGSTOP the current player, block the next segment) for
+  // the whole recording so the mic never picks up our own voice.
+  setRecordingActive(true);
   try {
-    await execFileAsync(
-      resolveSoxBin(),
-      [
-        "-d", "-r", "16000", "-c", "1", "-b", "16",
-        wavPath,
-        "silence", "1", "0.2", "1%", "1", "2.0", "1%",
-      ],
-      {
-        timeout: maxDurationSec * 1000,
-        env: {
-          ...process.env,
-          PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || "/usr/bin:/bin"}`,
+    // Audible start indicator
+    execFile("afplay", ["/System/Library/Sounds/Tink.aiff"], () => {});
+
+    log(`Dictation: recording to ${wavPath} (max ${maxDurationSec}s)...`);
+
+    try {
+      await execFileAsync(
+        resolveSoxBin(),
+        [
+          "-d", "-r", "16000", "-c", "1", "-b", "16",
+          wavPath,
+          "silence", "1", "0.2", "1%", "1", "2.0", "1%",
+        ],
+        {
+          timeout: maxDurationSec * 1000,
+          env: {
+            ...process.env,
+            PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || "/usr/bin:/bin"}`,
+          },
         },
-      },
-    );
-  } catch (err: unknown) {
-    if (!existsSync(wavPath)) {
-      throw new Error(`Recording failed: ${err instanceof Error ? err.message : String(err)}`);
+      );
+    } catch (err: unknown) {
+      if (!existsSync(wavPath)) {
+        throw new Error(`Recording failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      log("Dictation: sox exited (likely timeout/silence stop) — file exists, continuing.");
     }
-    log("Dictation: sox exited (likely timeout/silence stop) — file exists, continuing.");
+
+    // Audible stop indicator
+    execFile("afplay", ["/System/Library/Sounds/Pop.aiff"], () => {});
+
+    log(`Dictation: recorded ${wavPath}`);
+    return wavPath;
+  } finally {
+    setRecordingActive(false);
   }
-
-  // Audible stop indicator
-  execFile("afplay", ["/System/Library/Sounds/Pop.aiff"], () => {});
-
-  log(`Dictation: recorded ${wavPath}`);
-  return wavPath;
 }
 
 /**
