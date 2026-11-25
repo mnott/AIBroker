@@ -20,7 +20,7 @@
  * says what it did. Everything requiring judgement stays with the person.
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, chmodSync, openSync, readSync, closeSync, fstatSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -3891,6 +3891,70 @@ export function goalStillActiveInTranscript(
   return { active: true, at: lastAt };
 }
 
+/**
+ * Read the slice of a transcript that can decide the goal question — without
+ * reading the whole file.
+ *
+ * THE TAIL WAS TOO SHORT FOR A BUSY SESSION. `tail -n 200` missed the last
+ * `/goal` in a 17.9 MB / 11280-line transcript (the entry was 250 lines back),
+ * so a 46-min ceiling re-armed a goal that was plainly still active — live
+ * 2026-11-25 03:25. A working session writes hundreds of tool lines between
+ * arming and the ceiling, so any fixed tail is too short. Instead: scan
+ * backwards in chunks until the newest `/goal` user entry or a
+ * `compact_boundary` is found, then return that line plus everything after it —
+ * exactly the window the verdict logic needs (the goal itself, and every newer
+ * record that could end it). The whole file is never held in memory; an
+ * unreadable file throws and the caller keeps the timer's reading.
+ */
+function readGoalRelevantTail(file: string): string[] {
+  const fd = openSync(file, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const CHUNK = 1024 * 1024;
+    const lines: string[] = []; // newest-first
+    let pos = size;
+    let carry = ""; // bytes at the front of a chunk that belong to an earlier line
+    let found = false;
+
+    while (pos > 0 && !found) {
+      // Read one byte past the chunk so a line ending exactly at the boundary
+      // is still seen as terminated. A short read means we reached the start of
+      // the file — nothing was lost to it.
+      const want = Math.min(CHUNK, pos) + 1;
+      pos -= want;
+      const buf = Buffer.alloc(want);
+      const got = readSync(fd, buf, 0, want, pos);
+      if (got < want) pos += want - got;
+      // Cut at a UTF-8 boundary so a multi-byte character split across chunks
+      // never decodes to U+FFFD and corrupts the line it belongs to.
+      let cut = got;
+      while (cut > 0 && (buf[cut - 1] & 0xc0) === 0x80) cut--;
+      const text = buf.subarray(0, cut).toString("utf8");
+      // Bytes we skipped over the boundary belong to the carried line too.
+      carry = buf.subarray(cut).toString("utf8") + carry;
+      // A chunk boundary can split a line; `carry` holds its tail so far.
+      const parts = (text + carry).split("\n");
+      carry = parts[0];
+      // The file's trailing newline yields an empty part at the newest end —
+      // drop it, but keep every other line including a truncated first one.
+      for (let i = parts.length - 1; i >= 0; i--) {
+        if (i === parts.length - 1 && parts[i] === "") continue;
+        lines.push(parts[i]);
+      }
+      pos -= carry.length; // carry belongs to the next (earlier) chunk
+      // A /goal user entry or a compact boundary anywhere in what we have read
+      // is enough: everything newer than it is already in `lines`.
+      found = lines.some((l) => l.includes("/goal") || l.includes("compact_boundary"));
+    }
+
+    if (!found && carry) lines.push(carry);
+    lines.reverse(); // oldest-first, the convention goalStillActiveInTranscript expects
+    return lines;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** The transcript's newest message timestamp from a raw tail, or null. */
 function newestTranscriptAt(lines: string[]): number | null {
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -3925,12 +3989,7 @@ function ceilingReason(m: ManagedSession, content: string, now: number, quietFor
   try {
     const file = m.transcriptFile ?? sessionTranscriptFile(m.sessionId);
     if (!file) return null;
-    const raw = execFileSync("/usr/bin/tail", ["-n", "200", file], {
-      encoding: "utf8",
-      timeout: 4_000,
-      maxBuffer: 8 * 1024 * 1024,
-    });
-    tail = raw.split("\n");
+    tail = readGoalRelevantTail(file);
   } catch { /* unreadable transcript: the timer's reading stands */ }
 
   const verdict = goalStillActiveInTranscript(tail ?? [], m.objective);

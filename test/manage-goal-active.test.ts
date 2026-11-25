@@ -14,7 +14,7 @@ import "./home-guard.js";
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { goalStillActiveInTranscript, reasonToArm, type ManagedSession } from "../src/daemon/manage.js";
@@ -184,4 +184,87 @@ test("goal still active but pane quiet — ceiling suppressed even past the age"
     m.lastRearmAt = NOW - 90 * 60_000; // far past the ceiling
     assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
   });
+});
+
+// ── the tail was too short for a busy session (live failure 2026-11-25 03:25) ──
+
+/**
+ * A working session writes hundreds of tool lines between arming and the
+ * ceiling. `tail -n 200` missed the last `/goal` in a 17.9 MB / 11280-line
+ * transcript (the entry was 250 lines back) and re-armed a goal that was
+ * plainly still active. The reader now scans backwards until it finds the
+ * newest `/goal` or a `compact_boundary`, so distance from the end no longer
+ * decides the verdict.
+ */
+function toolLines(n: number, startTs: string): string[] {
+  const out: string[] = [];
+  let t = Date.parse(startTs);
+  for (let i = 0; i < n; i++) {
+    t += 1_000;
+    // An assistant tool-call line that CONTAINS the marker string — only a
+    // type=="user" entry may count, so this must never be read as a /goal.
+    out.push(
+      JSON.stringify({
+        type: "assistant",
+        timestamp: new Date(t).toISOString(),
+        message: { role: "assistant", content: [{ type: "tool_use", name: "Bash", input: { command: `grep -c 'command-name>/goal<' transcript.jsonl` } }] },
+      }),
+    );
+  }
+  return out;
+}
+
+function bigFile(lines: string[]): ManagedSession {
+  const dir = mkdtempSync(join(tmpdir(), "aibroker-big-"));
+  const file = join(dir, "s1.jsonl");
+  writeFileSync(file, lines.join("\n") + "\n");
+  const m = base(NOW);
+  m.transcriptFile = file;
+  return m;
+}
+
+test("goal 5000 tool lines before the end — still active, no re-arm", () => {
+  const lines = [userGoal(OBJ, "2026-11-25T01:07:00.000Z"), ...toolLines(5_000, "2026-11-25T01:10:00.000Z")];
+  const m = bigFile(lines);
+  assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
+});
+
+test("compact_boundary after a deep goal — lapsed, re-arm", () => {
+  const lines = [
+    userGoal(OBJ, "2026-11-25T01:07:00.000Z"),
+    ...toolLines(3_000, "2026-11-25T01:10:00.000Z"),
+    compactBoundary("2026-11-25T01:55:00.000Z"),
+    ...toolLines(1_000, "2026-11-25T01:56:00.000Z"),
+  ];
+  const m = bigFile(lines);
+  assert.match(reasonToArm(m, ACTIVE_PANE, NOW) ?? "", /assuming it lapsed/);
+});
+
+test("assistant lines containing the marker string never count as a goal", () => {
+  // No real /goal entry at all — only tool lines quoting the marker. Unknown,
+  // so the ceiling's reading stands (re-arm), and a deep real goal still wins.
+  const m = bigFile(toolLines(5_000, "2026-11-25T01:10:00.000Z"));
+  assert.match(reasonToArm(m, ACTIVE_PANE, NOW) ?? "", /assuming it lapsed/);
+
+  const m2 = bigFile([userGoal(OBJ, "2026-11-25T01:07:00.000Z"), ...toolLines(5_000, "2026-11-25T01:10:00.000Z")]);
+  assert.equal(reasonToArm(m2, ACTIVE_PANE, NOW), null);
+});
+
+test("multi-byte content split across a chunk boundary is read whole", () => {
+  // Pad so the goal line straddles the 1 MiB read boundary; its args contain
+  // multi-byte characters that must survive the chunking.
+  const obj = "Fix the drift — über alles ✓ 🎯";
+  const pad = toolLines(2_000, "2026-11-25T01:00:00.000Z"); // ~2 MB of filler before the goal
+  const lines = [...pad, userGoal(obj, "2026-11-25T01:30:00.000Z"), ...toolLines(2_000, "2026-11-25T01:35:00.000Z")];
+  const dir = mkdtempSync(join(tmpdir(), "aibroker-utf8-"));
+  try {
+    const file = join(dir, "s1.jsonl");
+    writeFileSync(file, lines.join("\n") + "\n");
+    const m = base(NOW);
+    m.objective = obj;
+    m.transcriptFile = file;
+    assert.equal(reasonToArm(m, ACTIVE_PANE, NOW), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
