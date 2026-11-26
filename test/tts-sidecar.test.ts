@@ -9,7 +9,7 @@ import { PORT_FILE as PORT_FILE_PATH } from "../src/adapters/kokoro/sidecar.js";
 const servers: net.Server[] = [];
 
 /** A fake sidecar on a random port: answers with header + int16 chunks + done. */
-function startFakeSidecar(script: "ok" | "error" | "hang"): Promise<number> {
+function startFakeSidecar(script: "ok" | "error" | "hang" | "burst"): Promise<number> {
   return new Promise((resolve) => {
     const server = net.createServer((sock) => {
       let reqLine = "";
@@ -17,6 +17,21 @@ function startFakeSidecar(script: "ok" | "error" | "hang"): Promise<number> {
         reqLine += d.toString();
         if (!reqLine.includes("\n")) return;
         JSON.parse(reqLine.trim()); // request must be valid JSON
+        if (script === "burst") {
+          // Everything in one write: exercises the gap where the consumer is
+          // suspended playing a previous sentence.
+          const frames = [
+            JSON.stringify({ ok: true, sample_rate: 24000 }),
+            ...[1, 2, 3].map((n) => {
+              const pcm = new Int16Array(96).fill(n);
+              return JSON.stringify({ chunk_b64: Buffer.from(pcm.buffer).toString("base64") });
+            }),
+            JSON.stringify({ done: true }),
+          ];
+          sock.write(frames.join("\n") + "\n");
+          sock.end();
+          return;
+        }
         if (script === "error") {
           sock.write(JSON.stringify({ error: "voice not found" }) + "\n");
           sock.end();
@@ -98,6 +113,23 @@ describe("streamSidecar", () => {
     assert.ok(chunks[1].audio[0] < 0);
     assert.equal(chunks[0].sampleRate, 24000);
   });
+  it("receives every chunk when the sidecar bursts everything at once", async () => {
+    // Live bug 2026-11-26: aibroker_speak played one sentence then stalled.
+    // The old reader attached 'data' listeners only while awaiting, so lines
+    // and 'end' arriving during playback (no listener attached) were dropped
+    // by the flowing socket and readLine hung until an abort fired.
+    const { streamSidecar } = await import("../src/adapters/kokoro/sidecar.js");
+    const port = await startFakeSidecar("burst");
+    const chunks: Float32Array[] = [];
+    for await (const c of streamSidecar(port, { text: "one. two. three.", voice: "bm_fable" })) {
+      chunks.push(c.audio);
+      await new Promise((r) => setTimeout(r, 200)); // simulate playback of this sentence
+    }
+    assert.equal(chunks.length, 3);
+    assert.ok(Math.abs(chunks[0][0] - 1 / 32767) < 1e-4);
+    assert.ok(Math.abs(chunks[2][0] - 3 / 32767) < 1e-4);
+  });
+
   it("throws on an error frame", async () => {
     const { streamSidecar } = await import("../src/adapters/kokoro/sidecar.js");
     const port = await startFakeSidecar("error");
