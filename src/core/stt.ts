@@ -265,3 +265,29 @@ export const realDeps: SttDeps = {
 };
 
 process.on("exit", stopWhisperServer);
+
+let keepWarmTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Start whisper-server now (daemon start) and keep it resident: a periodic
+ * health check restarts it if it died or stopped answering.
+ */
+export function prewarmWhisperServer(env: NodeJS.ProcessEnv = process.env): void {
+  const model = resolveCppModel();
+  if (!model || env.AIBROKER_STT_PREWARM === "0") return;
+  void ensureWhisperServer(model, env).catch((e) => log(`[STT] prewarm failed: ${e}`));
+  if (keepWarmTimer) return;
+  keepWarmTimer = setInterval(async () => {
+    if (starting) return;
+    try {
+      if (serverProc && serverUrl && serverProc.exitCode === null) {
+        const r = await fetch(`${serverUrl}/`, { signal: AbortSignal.timeout(3000) });
+        if (r.status < 500) return;
+      }
+    } catch { /* unhealthy */ }
+    log("[STT] whisper-server unhealthy, restarting");
+    stopWhisperServer();
+    await ensureWhisperServer(model, env).catch(() => null);
+  }, 30_000);
+  keepWarmTimer.unref();
+}

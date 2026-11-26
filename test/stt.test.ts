@@ -99,3 +99,39 @@ describe("stt", () => {
     assert.equal(r.backend, "whisper-server");
   });
 });
+
+// --- voice batch window ---
+import { mock, test } from "node:test";
+import { createVoiceBatcher, voiceBatchWindowMs } from "../src/adapters/pailot/voice-batch.js";
+
+test("voice batch window defaults to 800ms and honours AIBROKER_VOICE_BATCH_MS", () => {
+  assert.equal(voiceBatchWindowMs({}), 800);
+  assert.equal(voiceBatchWindowMs({ AIBROKER_VOICE_BATCH_MS: "250" }), 250);
+  assert.equal(voiceBatchWindowMs({ AIBROKER_VOICE_BATCH_MS: "x" }), 800);
+});
+
+test("voice batch: single note flushes after the window", () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  const out: string[][] = [];
+  const b = createVoiceBatcher((t) => out.push(t), () => 800);
+  b.add("hello");
+  mock.timers.tick(799);
+  assert.equal(out.length, 0);
+  mock.timers.tick(1);
+  assert.deepEqual(out, [["hello"]]);
+  mock.timers.reset();
+});
+
+test("voice batch: two notes within the window are joined", () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  const out: string[][] = [];
+  const b = createVoiceBatcher((t) => out.push(t), () => 800);
+  b.add("one");
+  mock.timers.tick(500);
+  b.add("two");
+  mock.timers.tick(799);
+  assert.equal(out.length, 0);
+  mock.timers.tick(1);
+  assert.deepEqual(out, [["one", "two"]]);
+  mock.timers.reset();
+});

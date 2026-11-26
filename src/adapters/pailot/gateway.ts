@@ -1083,12 +1083,12 @@ function broadcast(msg: Record<string, unknown>, direct?: boolean): void {
   }
 }
 
+import { createVoiceBatcher } from "./voice-batch.js";
 // --- Voice message batching ---
-// When multiple voice messages arrive within BATCH_WINDOW_MS, we combine their
+// When multiple voice messages arrive within voice batch window, we combine their
 // transcripts into a single onMessage call so Claude sees them as one input.
 
-const BATCH_WINDOW_MS = 3000;
-let voiceBatchTimer: ReturnType<typeof setTimeout> | null = null;
+const voiceBatcher = createVoiceBatcher(() => flushVoiceBatch());
 let voiceBatchTranscripts: string[] = [];
 let voiceBatchOnMessage: ((text: string, timestamp: number) => void | Promise<void>) | null = null;
 /** iTerm session ID resolved when the first voice chunk of this batch arrived. */
@@ -1107,7 +1107,6 @@ function flushVoiceBatch(): void {
   voiceBatchTranscripts = [];
   voiceBatchOnMessage = null;
   voiceBatchSessionId = "";
-  voiceBatchTimer = null;
 
   const routeSession = batchSession || activeItermSessionId;
   log(`[PAILot] Flushing voice batch (${combined.length} chars) → session=${routeSession?.slice(0, 8) ?? "none"} (batch=${batchSession?.slice(0, 8) ?? "none"}, active=${activeItermSessionId?.slice(0, 8) ?? "none"})`);
@@ -1183,8 +1182,7 @@ export async function transcribeAndRoute(
     // Batch: accumulate transcripts and reset the timer
     voiceBatchTranscripts.push(transcript);
     voiceBatchOnMessage = onMessage;
-    if (voiceBatchTimer) clearTimeout(voiceBatchTimer);
-    voiceBatchTimer = setTimeout(flushVoiceBatch, BATCH_WINDOW_MS);
+    voiceBatcher.add(transcript);
   } catch (err) {
     log(`[PAILot] Whisper transcription failed: ${err}`);
   } finally {
