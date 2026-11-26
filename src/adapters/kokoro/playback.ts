@@ -19,19 +19,27 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { log } from "../../core/log.js";
-import { localPlayerCommand } from "../../core/bins.js";
+import { localPlayerCommand, resolveBin, resolveSoxBin } from "../../core/bins.js";
 import { PAUSE_SECONDS, concatWithPauses, float32ToWav } from "./tts.js";
 
 /** Per-sentence audio as it is synthesized. */
 export interface SentenceAudio {
   audio: Float32Array;
   sampleRate: number;
+  /** True when this chunk ends a sentence (a pause follows in streaming playback). */
+  endsSentence?: boolean;
 }
 
 export interface PlayerHandle {
   exited: Promise<void>;
   kill(): void;
   suspend(on: boolean): void;
+}
+
+/** One long-lived player fed raw 16-bit mono PCM through stdin. */
+export interface StreamHandle extends PlayerHandle {
+  write(pcm: Buffer): Promise<void>;
+  end(): void;
 }
 
 /** Aborted mid-synthesis or mid-playback; swallowed by the queue, never thrown to callers. */
@@ -66,7 +74,60 @@ function spawnPlayer(cmd: string[], wavPath: string): PlayerHandle {
   };
 }
 
+/** Spawn one stdin-fed PCM player (sox, else ffplay); null when neither exists. */
+function defaultOpenStream(): ((sampleRate: number) => StreamHandle) | null {
+  const sox = resolveSoxBin();
+  let make: (sr: number) => string[];
+  if (sox !== "sox") {
+    make = (sr) => [sox, "-q", "-t", "raw", "-r", String(sr), "-e", "signed-integer", "-b", "16", "-c", "1", "-", "-d"];
+  } else {
+    const ff = resolveBin("ffplay");
+    if (ff === "ffplay") return null;
+    make = (sr) => [ff, "-nodisp", "-autoexit", "-loglevel", "quiet", "-f", "s16le", "-ar", String(sr), "-ac", "1", "-i", "-"];
+  }
+  return (sampleRate) => {
+    const argv = make(sampleRate);
+    const child = spawn(argv[0], argv.slice(1), { stdio: ["pipe", "ignore", "ignore"] });
+    let exited = false;
+    let stopped = false;
+    child.stdin?.on("error", () => { /* player gone */ });
+    const exitedPromise = new Promise<void>((resolve) => {
+      child.on("close", () => { exited = true; resolve(); });
+      child.on("error", (err) => { log(`Playback: ${argv[0]} failed — ${err.message}`); exited = true; resolve(); });
+    });
+    return {
+      exited: exitedPromise,
+      kill() { if (!exited && child.pid) try { process.kill(child.pid, "SIGKILL"); } catch { /* gone */ } },
+      suspend(on: boolean) {
+        if (exited || !child.pid) return;
+        if (on === stopped) return;
+        stopped = on;
+        try { process.kill(child.pid, on ? "SIGSTOP" : "SIGCONT"); } catch { /* gone */ }
+      },
+      write(pcm: Buffer) {
+        const stdin = child.stdin;
+        if (exited || !stdin || stdin.destroyed) return Promise.resolve();
+        return new Promise<void>((resolve) => {
+          if (stdin.write(pcm)) resolve(); else stdin.once("drain", () => resolve());
+        });
+      },
+      end() { try { child.stdin?.end(); } catch { /* gone */ } },
+    };
+  };
+}
+
+/** Float32 [-1,1] to little-endian int16 PCM. */
+export function float32ToPcm16(samples: Float32Array): Buffer {
+  const buf = Buffer.allocUnsafe(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) {
+    buf.writeInt16LE(Math.round(Math.max(-1, Math.min(1, samples[i])) * 32767), i * 2);
+  }
+  return buf;
+}
+
 export interface PlaybackDeps {
+  /** Open one stdin-fed PCM player per job (gapless); null = no streaming player, use per-WAV play. */
+  openStream: () => ((sampleRate: number) => StreamHandle) | null;
   /** Synthesize one sentence at a time; throws when aborted. */
   synth: (text: string, voice: string, speed: number, signal: AbortSignal) => AsyncGenerator<SentenceAudio>;
   /** Spawn a player for a WAV file; null when this host has no local player. */
@@ -105,6 +166,8 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
   const synth = deps.synth ?? defaultSynth;
   const play = deps.play ?? defaultPlay;
   const pauseMs = deps.pauseMs ?? PAUSE_SECONDS * 1000;
+  // Injected per-WAV players (tests) opt out of the real streaming player.
+  const openStream = deps.openStream ?? (deps.play ? () => null : defaultOpenStream);
 
   let queue: Array<{ session: string; text: string; voice?: string; speed?: number }> = [];
   let running = false;
@@ -123,8 +186,9 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
 
   async function runJob(job: { session: string; text: string; voice?: string; speed?: number }): Promise<void> {
     const controller = new AbortController();
-    const playFn = play();
-    if (!playFn) {
+    const streamFn = job.text.startsWith("__replay__:") ? null : openStream();
+    const playFn = streamFn ? null : play();
+    if (!playFn && !streamFn) {
       log(`Playback: no local audio player (need paplay, aplay or ffplay) — ${job.text.slice(0, 40)}… not played`);
       return;
     }
@@ -141,6 +205,12 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
 
     try {
       await waitNotRecording();
+      if (streamFn) {
+        await streamJob(job, streamFn, controller, segments, (h) => { lastHandle = h; });
+        if (segments.length > 0) saveLastSpeech(job.session, segments);
+        return;
+      }
+      if (!playFn) return;
       // Replay a saved WAV: play the file directly, no synthesis.
       if (job.text.startsWith("__replay__:")) {
         const handle = playFn(job.text.slice("__replay__:".length));
@@ -192,6 +262,45 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
     } finally {
       current = null;
     }
+  }
+
+  /** Gapless path: one player process, PCM written to stdin as chunks arrive. */
+  async function streamJob(
+    job: { text: string; voice?: string; speed?: number },
+    open: (sampleRate: number) => StreamHandle,
+    controller: AbortController,
+    segments: Segment[],
+    setHandle: (h: PlayerHandle) => void,
+  ): Promise<void> {
+    const gen = synth(job.text, job.voice ?? "", job.speed ?? 1.0, controller.signal);
+    let handle: StreamHandle | null = null;
+    let pendingPause = false;
+    try {
+      for await (const chunk of gen) {
+        if (controller.signal.aborted) throw new PlaybackAborted("aborted");
+        await waitNotRecording();
+        if (controller.signal.aborted) throw new PlaybackAborted("aborted");
+        segments.push({ audio: chunk.audio, sampleRate: chunk.sampleRate });
+        if (!handle) {
+          handle = open(chunk.sampleRate);
+          setHandle(handle);
+          deps.onPlayerSpawned?.(0);
+        }
+        if (pendingPause && pauseMs > 0) {
+          await handle.write(Buffer.alloc(Math.round((chunk.sampleRate * pauseMs) / 1000) * 2));
+        }
+        pendingPause = chunk.endsSentence === true;
+        await handle.write(float32ToPcm16(chunk.audio));
+      }
+    } catch (err) {
+      handle?.kill();
+      throw err;
+    }
+    if (handle) {
+      handle.end();
+      await handle.exited;
+    }
+    if (controller.signal.aborted) throw new PlaybackAborted("aborted");
   }
 
   function saveLastSpeech(session: string, segments: Segment[]): void {
