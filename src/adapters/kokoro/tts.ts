@@ -289,7 +289,7 @@ export async function* synthesizeSentences(
   signal?: AbortSignal,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   tts?: any,
-): AsyncGenerator<{ audio: Float32Array; sampleRate: number; endsSentence?: boolean }> {
+): AsyncGenerator<{ audio: Float32Array; sampleRate: number }> {
   voice = resolveVoice(voice || DEFAULT_VOICE);
   const sentences = splitFirstChunk(splitIntoSentences(text));
   const rate = speed !== undefined && Number.isFinite(speed) && speed > 0 ? speed : 1.0;
@@ -301,7 +301,7 @@ export async function* synthesizeSentences(
       if (signal?.aborted) throw new Error("TTS: synthesis aborted");
       const r = await tts.generate(s, { voice, speed: rate });
       sampleRate = r.sampling_rate ?? sampleRate;
-      if (r.audio && r.audio.length > 0) yield { audio: r.audio, sampleRate, endsSentence: true };
+      if (r.audio && r.audio.length > 0) yield { audio: r.audio, sampleRate };
     }
     return;
   }
@@ -330,7 +330,7 @@ export async function* synthesizeSentences(
     if (signal?.aborted) throw new Error("TTS: synthesis aborted");
     const r = await ttsInstance!.generate(s, { voice, speed: rate });
     sampleRate = r.sampling_rate ?? sampleRate;
-    if (r.audio && r.audio.length > 0) yield { audio: r.audio, sampleRate, endsSentence: true };
+    if (r.audio && r.audio.length > 0) yield { audio: r.audio, sampleRate };
   }
   log("TTS: served by kokoro-js CPU");
 }
