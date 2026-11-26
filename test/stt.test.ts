@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   transcribeFile, resolveCppModel, wavConvertArgs, cliArgs, SttAudioError, VOICEINK_MODEL_REL,
-  type SttDeps,
+  isHallucination, noSpeechReply, wavStats, type SttDeps,
 } from "../src/core/stt.js";
 
 const PROBE_OK = JSON.stringify({ streams: [{ codec_name: "aac" }], format: { duration: "4.2" } });
@@ -63,6 +63,52 @@ describe("stt", () => {
     assert.equal(r.text, "server text");
     assert.equal(r.audioSec, 4.2);
     assert.deepEqual(calls, ["ffprobe", "ffmpeg"]);
+  });
+
+  it("no-speech: hallucination + low confidence + low RMS is dropped", async () => {
+    const r = await transcribeFile("/in.m4a", fake({
+      serverDetect: async () => ({ lang: "en", prob: 0.4 }),
+      serverDecode: async () => ({ text: "Thank you.", avgLogprob: -0.9, noSpeechProb: 0.5 }),
+      wavStats: () => ({ rms: 0.002, speechRatio: 0 }),
+    }));
+    assert.equal(r.noSpeech, true);
+    assert.equal(r.text, "");
+    assert.equal(r.lang, "en");
+  });
+
+  it("no-speech: short real utterance with normal RMS is delivered", async () => {
+    const r = await transcribeFile("/in.m4a", fake({
+      serverDecode: async () => ({ text: "Ja.", avgLogprob: -0.7, noSpeechProb: 0.4 }),
+      wavStats: () => ({ rms: 0.05, speechRatio: 0.6 }),
+    }));
+    assert.equal(r.text, "Ja.");
+    assert.ok(!r.noSpeech);
+  });
+
+  it("no-speech: low signal but confident model keeps the text", async () => {
+    const r = await transcribeFile("/in.m4a", fake({
+      serverDecode: async () => ({ text: "Okay.", avgLogprob: -0.1, noSpeechProb: 0.01 }),
+      wavStats: () => ({ rms: 0.008, speechRatio: 0.1 }),
+    }));
+    assert.equal(r.text, "Okay.");
+  });
+
+  it("no-speech: long speech is delivered", async () => {
+    const text = "Das ist ein langer Satz mit vielen Wörtern, der klar gesprochen wurde.";
+    const r = await transcribeFile("/in.m4a", fake({
+      serverDecode: async () => ({ text, avgLogprob: -0.2, noSpeechProb: 0.02 }),
+      wavStats: () => ({ rms: 0.06, speechRatio: 0.7 }),
+    }));
+    assert.equal(r.text, text);
+  });
+
+  it("no-speech: helpers", () => {
+    assert.ok(isHallucination("-") && isHallucination("Untertitel der Amara.org-Community") && isHallucination("Sous-titres par ..."));
+    assert.ok(!isHallucination("Ja."));
+    assert.equal(noSpeechReply("de"), "Nichts erkannt – bitte nochmal");
+    assert.equal(noSpeechReply("xx"), "Nothing recognised – please try again");
+    const silent = Buffer.alloc(44 + 32000);
+    assert.equal(wavStats(silent)!.rms, 0);
   });
 
   it("falls back server -> cli -> python", async () => {

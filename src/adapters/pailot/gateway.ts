@@ -24,7 +24,7 @@ const DEBUG_LOG = process.env.PAILOT_DEBUG ? "/tmp/pailot-ws-debug.log" : null;
 function dbg(msg: string): void {
   if (DEBUG_LOG) appendPrivate(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
 }
-import { transcribeFile, SttAudioError } from "../../core/stt.js";
+import { transcribeFile, SttAudioError, noSpeechReply } from "../../core/stt.js";
 import { randomUUID } from "node:crypto";
 import { appendPrivate } from "../../core/private-file.js";
 import { promisify } from "node:util";
@@ -1157,6 +1157,10 @@ export async function transcribeAndRoute(
     try {
       const res = await transcribeFile(audioFile);
       transcript = res.text;
+      if (res.noSpeech) {
+        broadcast({ type: "text", content: noSpeechReply(res.lang) });
+        return;
+      }
     } catch (err) {
       if (err instanceof SttAudioError) {
         log(`[PAILot] Voice note rejected: ${err.message} (${buffer.length} bytes)`);
