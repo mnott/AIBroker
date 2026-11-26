@@ -86,6 +86,7 @@ const sched: Sched = { ctrl: [], bulk: [], cur: [], curIdx: 0, inflight: 0, queu
 let helperFlow = false;
 
 function resetSched(): void {
+  clearLatencyTimer(); latencyLow = false;
   sched.ctrl = []; sched.bulk = []; sched.cur = []; sched.curIdx = 0; sched.inflight = 0; sched.queued = 0;
 }
 
@@ -104,7 +105,40 @@ function counters(): string {
     `rxPartial=${reassembler.pendingBytes}/${reassembler.expectedBytes}B, txQueued=${sched.queued}B, inflight=${sched.inflight}B`;
 }
 
+/** Queued bytes above which the link is switched to low latency (fast interval) for the transfer. */
+const BULK_LOW_LATENCY_BYTES = 8 * 1024;
+/** Quiet time after the last bulk byte before returning to high latency (radio-friendly idle). */
+const LATENCY_IDLE_MS = 1000;
+let latencyLow = false;
+let latencyTimer: ReturnType<typeof setTimeout> | null = null;
+
+function setLatency(mode: "low" | "high"): void {
+  if (latencyLow === (mode === "low")) return;
+  latencyLow = mode === "low";
+  helperSend({ cmd: "latency", mode });
+}
+
+function clearLatencyTimer(): void {
+  if (latencyTimer) { clearTimeout(latencyTimer); latencyTimer = null; }
+}
+
+function noteLatency(): void {
+  if (sched.queued + sched.inflight >= BULK_LOW_LATENCY_BYTES) {
+    clearLatencyTimer();
+    setLatency("low");
+  } else if (latencyLow && sched.queued === 0 && sched.inflight === 0 && !latencyTimer) {
+    latencyTimer = setTimeout(() => { latencyTimer = null; setLatency("high"); }, LATENCY_IDLE_MS);
+    latencyTimer.unref?.();
+  }
+}
+
 function pump(): void {
+  noteLatency();
+  pumpInner();
+  noteLatency();
+}
+
+function pumpInner(): void {
   for (;;) {
     if (helperFlow && sched.inflight >= MAX_INFLIGHT) return;
     if (sched.curIdx >= sched.cur.length) {
@@ -240,8 +274,9 @@ function onHelperEvent(ev: Record<string, unknown>): void {
       helperSend({ cmd: "start", name: state?.name, service: BLE_SERVICE_UUID });
       break;
     case "advertising":
-      status.advertising = true;
-      log(`[BLE] advertising as "${ev.name}"`);
+      status.advertising = ev.on !== false;
+      if (ev.on === false) log("[BLE] advertising stopped (central connected)");
+      else log(`[BLE] advertising as "${ev.name}"`);
       break;
     case "central":
       {

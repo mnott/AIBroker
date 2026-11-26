@@ -55,6 +55,13 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
         mgr.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [serviceUUID], CBAdvertisementDataLocalNameKey: name])
     }
 
+    /// Connection latency: .high = slave latency allowed (idle, radio-friendly), .low = fast interval for bulk.
+    func setLatency(_ mode: String) {
+        guard let c = central else { return }
+        mgr.setDesiredConnectionLatency(mode == "low" ? .low : .high, for: c)
+        elog("latency=\(mode)")
+    }
+
     func drop() {
         // CoreBluetooth cannot disconnect a central; rebuilding the service invalidates its subscription.
         central = nil
@@ -122,6 +129,10 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
         sentBytes = 0
         subscribedAt = Date()
         lastMtu = c.maximumUpdateValueLength
+        // Coexistence with classic BT audio: no advertising while connected, idle-friendly latency.
+        mgr.stopAdvertising()
+        emit(["ev": "advertising", "on": false])
+        mgr.setDesiredConnectionLatency(.high, for: c)
         emit(["ev": "central", "connected": true, "id": c.identifier.uuidString])
         emit(["ev": "mtu", "n": c.maximumUpdateValueLength])
     }
@@ -132,6 +143,7 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
             central = nil
             resetQueue()
             emit(["ev": "central", "connected": false, "id": c.identifier.uuidString])
+            advertise() // service is still registered; resume advertising for the reconnect
         }
     }
 
@@ -164,6 +176,7 @@ DispatchQueue.global().async {
                                  service: o["service"] as? String ?? "7A1F0001-3C5B-4D2E-9A41-5041494C4F54")
             case "tx":
                 if let b = o["b64"] as? String, let data = Data(base64Encoded: b) { peripheral.tx(data) }
+            case "latency": peripheral.setLatency(o["mode"] as? String ?? "high")
             case "drop": peripheral.drop()
             case "quit": exit(0)
             default: break
