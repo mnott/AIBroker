@@ -715,6 +715,7 @@ export async function startDaemon(options?: {
   });
   loadQueue();
   startMqttBroker(getVersion());
+  void import("../core/stt.js").then((m) => m.prewarmWhisperServer()).catch(() => { /* optional */ });
   try { (await import("../adapters/pailot/ble-bridge.js")).startBleBridge(); } catch (e) { log(`BLE: start failed: ${e}`); }
 
   // Wire screenshot handler so PAILot /ss commands work
