@@ -221,3 +221,51 @@ describe("playback queue — streaming", () => {
     await sleep(50); // the error is swallowed inside the queue
   });
 });
+
+describe("playback queue — sidecar-served job", () => {
+  function mlxHarness() {
+    const players: FakePlayer[] = [];
+    const wavs: Buffer[] = [];
+    const deps: Partial<PlaybackDeps> = {
+      synth: () => (async function* (): AsyncGenerator<SentenceAudio> {
+        for (let i = 1; i <= 5; i++) yield { audio: new Float32Array(2400).fill(i / 10), sampleRate: 24000, backend: "mlx" };
+      })(),
+      play: () => (wavPath) => {
+        wavs.push(readFileSync(wavPath));
+        let res: () => void = () => {};
+        const p: FakePlayer = {
+          wavPath, exited: new Promise<void>((r) => { res = r; }), resolve: () => res(), killed: false, suspended: null,
+          kill() { this.killed = true; res(); }, suspend(on: boolean) { this.suspended = on; },
+        };
+        players.push(p);
+        return p;
+      },
+    };
+    return { players, wavs, deps };
+  }
+
+  it("spawns exactly one player with all chunks in one gapless WAV, in order", async () => {
+    const h = mlxHarness();
+    const q = createPlaybackQueue(h.deps);
+    q.enqueue({ session: "m1", text: "One. Two. Three." });
+    await sleep(50);
+    assert.equal(h.players.length, 1);
+    const wav = h.wavs[0];
+    assert.equal(wav.readUInt32LE(40), 5 * 2400 * 2, "all five chunks, no pause samples");
+    const at = (i: number) => wav.readInt16LE(44 + i * 2 * 2400);
+    const vals = [0, 1, 2, 3, 4].map(at);
+    assert.deepEqual(vals, [0.1, 0.2, 0.3, 0.4, 0.5].map((v) => Math.round(v * 32767)));
+    release(h.players, 0);
+    await sleep(30);
+    assert.equal(h.players.length, 1);
+  });
+
+  it("stop kills the single player", async () => {
+    const h = mlxHarness();
+    const q = createPlaybackQueue(h.deps);
+    q.enqueue({ session: "m2", text: "One. Two." });
+    await sleep(50);
+    assert.equal(q.stop().stopped, true);
+    assert.ok(h.players[0].killed);
+  });
+});
