@@ -71,7 +71,56 @@ function newReassembler(): FrameReassembler {
   return r;
 }
 
+/** Un-acked bytes allowed in the helper when it announced flow control. */
+const MAX_INFLIGHT = 64 * 1024;
+
+interface Sched {
+  ctrl: Buffer[][];
+  bulk: Buffer[][];
+  cur: Buffer[];
+  curIdx: number;
+  inflight: number;
+  queued: number;
+}
+const sched: Sched = { ctrl: [], bulk: [], cur: [], curIdx: 0, inflight: 0, queued: 0 };
+let helperFlow = false;
+
+function resetSched(): void {
+  sched.ctrl = []; sched.bulk = []; sched.cur = []; sched.curIdx = 0; sched.inflight = 0; sched.queued = 0;
+}
+
+/** Per-session liveness counters (reset on central connect). */
+const sess = {
+  startedAt: Date.now(), readyAt: 0, lastRx: 0,
+  rxBytes: 0, rxFrames: 0, txBytes: 0, txFrames: 0, pings: 0, pongs: 0,
+};
+function resetCounters(): void {
+  Object.assign(sess, { startedAt: Date.now(), readyAt: 0, lastRx: 0, rxBytes: 0, rxFrames: 0, txBytes: 0, txFrames: 0, pings: 0, pongs: 0 });
+}
+const secs = (t: number): string => (t ? ((Date.now() - t) / 1000).toFixed(1) : "-");
+function counters(): string {
+  return `ready=${status.ready}, rx=${sess.rxBytes}B/${sess.rxFrames}fr, tx=${sess.txBytes}B/${sess.txFrames}fr, ` +
+    `pings=${sess.pings}, pongs=${sess.pongs}, lastRx=${secs(sess.lastRx)}s ago, ` +
+    `rxPartial=${reassembler.pendingBytes}/${reassembler.expectedBytes}B, txQueued=${sched.queued}B, inflight=${sched.inflight}B`;
+}
+
+function pump(): void {
+  for (;;) {
+    if (helperFlow && sched.inflight >= MAX_INFLIGHT) return;
+    if (sched.curIdx >= sched.cur.length) {
+      const next = sched.ctrl.shift() ?? sched.bulk.shift();
+      if (!next) return;
+      sched.cur = next; sched.curIdx = 0;
+    }
+    const c = sched.cur[sched.curIdx++];
+    sched.queued -= c.length;
+    sched.inflight += c.length;
+    helperSend({ cmd: "tx", b64: c.toString("base64") });
+  }
+}
+
 function resetSession(): void {
+  resetSched();
   sessionKey = null;
   rejected = false;
   reassembler = newReassembler();
@@ -98,10 +147,14 @@ function helperSend(obj: Record<string, unknown>): void {
   stdin.write(JSON.stringify(obj) + "\n");
 }
 
-function sendEnvelope(env: BleEnvelope, key: Buffer | null = sessionKey): void {
+function sendEnvelope(env: BleEnvelope, key: Buffer | null = sessionKey, control = false): void {
   if (!status.connected || !key) return;
   const frame = encodeFrame(env, key);
-  for (const c of chunk(frame, status.mtu)) helperSend({ cmd: "tx", b64: c.toString("base64") });
+  const chunks = chunk(frame, status.mtu);
+  sess.txBytes += frame.length; sess.txFrames++;
+  sched.queued += frame.length;
+  (control ? sched.ctrl : sched.bulk).push(chunks);
+  pump();
 }
 
 function sendRetained(): void {
@@ -122,11 +175,12 @@ function onOutbound(topic: string, json: string, opts: { retain: boolean }): voi
 }
 
 function dropLink(why: string): void {
-  log(`[BLE] dropping link: ${why}`);
+  log(`[BLE] dropping link: ${why} (${counters()})`);
   status.ready = false;
   sessionKey = null;
   rejected = true;
   reassembler.reset();
+  resetSched();
   helperSend({ cmd: "drop" });
 }
 
@@ -157,14 +211,22 @@ function onEnvelope(env: BleEnvelope): void {
     sendEnvelope(
       { t: "ble/ready", p: { v: 2, n: serverNonce.toString("hex"), mac: readyMac(ks, clientNonce, serverNonce) } },
       state.k0,
+      true,
     );
     sessionKey = ks;
     status.ready = true;
+    sess.readyAt = Date.now();
     log(`[BLE] link ready (app ${typeof p.app === "string" ? p.app : "?"})`);
     sendRetained();
     return;
   }
-  if (env.t === "ble/ping") { sendEnvelope({ t: "ble/pong", p: {} }); return; }
+  if (env.t === "ble/ping") {
+    sess.pings++;
+    sendEnvelope({ t: "ble/pong", p: {} }, sessionKey, true);
+    sess.pongs++;
+    if (sess.pings % 10 === 0) log(`[BLE] ping summary: pings=${sess.pings}, pongs=${sess.pongs}, ready ${secs(sess.readyAt)}s, rx=${sess.rxBytes}B, tx=${sess.txBytes}B`);
+    return;
+  }
   if (env.t === "ble/hello") return;
   const p = env.p as { type?: unknown } | null;
   if (p && p.type === "voice") log("[BLE] voice note -> local STT");
@@ -174,6 +236,7 @@ function onEnvelope(env: BleEnvelope): void {
 function onHelperEvent(ev: Record<string, unknown>): void {
   switch (ev.ev) {
     case "ready":
+      helperFlow = ev.flow === 1;
       helperSend({ cmd: "start", name: state?.name, service: BLE_SERVICE_UUID });
       break;
     case "advertising":
@@ -181,20 +244,32 @@ function onHelperEvent(ev: Record<string, unknown>): void {
       log(`[BLE] advertising as "${ev.name}"`);
       break;
     case "central":
-      status.connected = ev.connected === true;
-      status.centralId = status.connected ? String(ev.id ?? "") : null;
-      status.ready = false;
-      resetSession();
-      if (!status.connected) status.mtu = DEFAULT_CHUNK;
-      log(`[BLE] central ${status.connected ? "connected" : "disconnected"} ${ev.id ?? ""}`);
+      {
+        const wasConnected = status.connected;
+        const prev = counters();
+        const upFor = ((Date.now() - sess.startedAt) / 1000).toFixed(0);
+        status.connected = ev.connected === true;
+        status.centralId = status.connected ? String(ev.id ?? "") : null;
+        status.ready = false;
+        resetSession();
+        resetCounters();
+        if (!status.connected) status.mtu = DEFAULT_CHUNK;
+        if (!status.connected && wasConnected) log(`[BLE] central disconnected ${ev.id ?? ""} after ${upFor}s ${prev}`);
+        else log(`[BLE] central ${status.connected ? "connected" : "disconnected"} ${ev.id ?? ""}`);
+      }
       break;
     case "mtu":
       if (typeof ev.n === "number" && ev.n > 0) status.mtu = Math.min(512, ev.n);
       break;
+    case "sent":
+      if (typeof ev.n === "number") { sched.inflight = Math.max(0, sched.inflight - ev.n); pump(); }
+      break;
     case "rx": {
       if (typeof ev.b64 !== "string") break;
       try {
-        reassembler.push(Buffer.from(ev.b64, "base64"), onEnvelope);
+        const raw = Buffer.from(ev.b64, "base64");
+        sess.rxBytes += raw.length; sess.lastRx = Date.now();
+        reassembler.push(raw, (e) => { sess.rxFrames++; onEnvelope(e); });
       } catch (err) {
         dropLink(`framing error: ${err instanceof Error ? err.message : err}`);
       }
@@ -240,6 +315,8 @@ function launch(): void {
     status.ready = false;
     status.centralId = null;
     status.mtu = DEFAULT_CHUNK;
+    helperFlow = false;
+    resetSched();
     scheduleRestart();
   });
 }
@@ -286,5 +363,7 @@ export function stopBleBridge(): void {
   retained.clear();
   state = null;
   sessionKey = null;
+  helperFlow = false;
+  resetSched();
   Object.assign(status, { enabled: false, helperRunning: false, advertising: false, connected: false, ready: false, centralId: null, mtu: DEFAULT_CHUNK, authFailures: 0 });
 }

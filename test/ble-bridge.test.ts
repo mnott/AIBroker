@@ -4,13 +4,13 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { startBleBridge, stopBleBridge, getBleStatus } from "../src/adapters/pailot/ble-bridge.js";
-import { setMqttInboundHandler, mqttPublishStatus } from "../src/adapters/pailot/mqtt-broker.js";
+import { setMqttInboundHandler, mqttPublishStatus, mqttPublishText } from "../src/adapters/pailot/mqtt-broker.js";
 import { encodeFrame, chunk, FrameReassembler } from "../src/adapters/pailot/ble-frame.js";
 import { deriveK0, deriveKs, readyMac } from "../src/adapters/pailot/ble-crypto.js";
 
 const CN = Buffer.from("000102030405060708090a0b0c0d0e0f", "hex");
 
-function setup() {
+function setup(flow = false) {
   const child: any = new EventEmitter();
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
@@ -47,7 +47,7 @@ function setup() {
     env: { AIBROKER_BLE: "1", AIBROKER_BLE_TOKEN: "sekret" },
     spawn: () => child,
   });
-  ev({ ev: "ready" });
+  ev(flow ? { ev: "ready", flow: 1 } : { ev: "ready" });
   ev({ ev: "central", connected: true, id: "c1" });
   ev({ ev: "mtu", n: 100 });
   return { child, cmds, ev, app, appRaw, sent, hello, useKs, k0, getKs: () => ks, setKey: (k: Buffer | null) => { key = k; }, reset: () => { ks = null; key = k0; } };
@@ -147,5 +147,111 @@ test("tampered frame after ready is dropped and counted; replay from old session
   await tick();
   assert.equal(getBleStatus().authFailures, 2);
   assert.deepEqual(got, ["text"]);
+  stopBleBridge();
+});
+
+// --- flow control / scheduler / liveness ---
+const wait = (ms = 2) => new Promise((r) => setTimeout(r, ms));
+const big = (n: number) => "x".repeat(n);
+
+test("300KB hub->app with backpressure: in order, bounded in flight, pong overtakes queued bulk", async () => {
+  const h = setup(true);
+  await tick();
+  h.hello();
+  await tick();
+  h.useKs();
+  h.ev({ ev: "mtu", n: 512 });
+  await tick();
+  mqttPublishText("s1", big(300_000), "big1");
+  mqttPublishText("s1", "after", "small2");
+  await wait();
+  const txs = () => h.cmds.filter((c) => c.cmd === "tx");
+  let acked = 0, maxFlight = 0, ackedBytes = 0, pinged = false;
+  for (let guard = 0; guard < 5000; guard++) {
+    const t = txs();
+    const sentBytes = t.reduce((a, c) => a + Buffer.from(c.b64, "base64").length, 0);
+    maxFlight = Math.max(maxFlight, sentBytes - ackedBytes);
+    if (acked === t.length && guard > 5 && t.length > 0 && sentBytes - ackedBytes === 0) break;
+    for (let i = 0; i < 6 && acked < t.length; i++, acked++) {
+      const n = Buffer.from(t[acked].b64, "base64").length;
+      ackedBytes += n;
+      h.ev({ ev: "sent", n });
+    }
+    if (!pinged && acked > 100) { h.app("ble/ping", {}); pinged = true; }
+    await wait();
+  }
+  assert.ok(maxFlight <= 64 * 1024 + 512, `in flight ${maxFlight}`);
+  assert.ok(txs().every((c) => Buffer.from(c.b64, "base64").length <= 512));
+  const frames = h.sent().filter((e) => e.t !== "pailot/status" && e.t !== "ble/ready");
+  assert.deepEqual(frames.map((e) => e.p?.msgId ?? e.t), ["big1", "ble/pong", "small2"]);
+  assert.equal(frames[0].p.content.length, 300_000);
+  assert.equal(getBleStatus().ready, true);
+  stopBleBridge();
+});
+
+test("without flow:1 chunks are written immediately", async () => {
+  const h = setup(false);
+  h.hello();
+  await tick();
+  h.useKs();
+  h.ev({ ev: "mtu", n: 512 });
+  await tick();
+  mqttPublishText("s1", big(200_000), "nf");
+  await tick();
+  assert.ok(h.cmds.filter((c) => c.cmd === "tx").length > 390);
+  stopBleBridge();
+});
+
+test("300KB app->hub in 512B rx events: routed, link up, ping/pong around it; disconnect trace has counters", async () => {
+  const got: any[] = [];
+  setMqttInboundHandler((s, type, payload: any) => got.push({ type, len: payload?.content?.length }));
+  const h = setup(true);
+  await tick();
+  h.hello();
+  await tick();
+  h.useKs();
+  const ks = h.getKs()!;
+  const lines: string[] = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  (process.stderr as any).write = (c: any) => { lines.push(String(c)); return true; };
+  try {
+    h.app("ble/ping", {});
+    for (let k = 0; k < 2; k++) {
+      const frame = encodeFrame({ t: "pailot/s1/in", p: { type: "text", msgId: "b" + k, content: big(300_000) } }, ks);
+      for (const c of chunk(frame, 512)) h.ev({ ev: "rx", b64: c.toString("base64") });
+      h.app("ble/ping", {});
+      await wait(20);
+    }
+    // half a frame buffered at disconnect time
+    const part = encodeFrame({ t: "pailot/s1/in", p: { type: "text", msgId: "p", content: big(5000) } }, ks);
+    h.ev({ ev: "rx", b64: part.subarray(0, 1000).toString("base64") });
+    await tick();
+    assert.equal(getBleStatus().ready, true);
+    assert.deepEqual(got.map((g) => g.len), [300_000, 300_000]);
+    assert.equal(h.sent().filter((e) => e.t === "ble/pong").length, 3);
+    h.ev({ ev: "central", connected: false, id: "c1" });
+    await tick();
+  } finally {
+    (process.stderr as any).write = orig;
+  }
+  const line = lines.find((l) => l.includes("central disconnected"))!;
+  assert.ok(line, "trace line present");
+  assert.match(line, /after \d+s ready=true, rx=\d+B\/\d+fr, tx=\d+B\/\d+fr, pings=3, pongs=3, lastRx=[\d.]+s ago, rxPartial=996\/\d+B, txQueued=\d+B/);
+  stopBleBridge();
+});
+
+test("idle: 5 pings over time each get a session-key pong immediately; link never dropped", async () => {
+  const h = setup(true);
+  await tick();
+  h.hello();
+  await tick();
+  h.useKs();
+  for (let i = 1; i <= 5; i++) {
+    h.app("ble/ping", {});
+    await tick();
+    assert.equal(h.sent().filter((e) => e.t === "ble/pong").length, i);
+  }
+  assert.equal(getBleStatus().ready, true);
+  assert.ok(!h.cmds.some((c) => c.cmd === "drop"));
   stopBleBridge();
 });
