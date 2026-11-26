@@ -3,14 +3,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { startBleBridge, stopBleBridge, getBleStatus } from "../src/adapters/pailot/ble-bridge.js";
-import { setMqttInboundHandler, mqttPublishStatus, mqttPublishText } from "../src/adapters/pailot/mqtt-broker.js";
+import { startBleBridge, stopBleBridge, getBleStatus, routeOutbound } from "../src/adapters/pailot/ble-bridge.js";
+import { setMqttInboundHandler, mqttPublishStatus, mqttPublishText, mqttPublishImage, mqttPublishVoice } from "../src/adapters/pailot/mqtt-broker.js";
 import { encodeFrame, chunk, FrameReassembler } from "../src/adapters/pailot/ble-frame.js";
 import { deriveK0, deriveKs, readyMac } from "../src/adapters/pailot/ble-crypto.js";
 
 const CN = Buffer.from("000102030405060708090a0b0c0d0e0f", "hex");
 
-function setup(flow = false) {
+function setup(flow = false, extra: Record<string, unknown> = {}) {
   const child: any = new EventEmitter();
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
@@ -46,6 +46,7 @@ function setup(flow = false) {
   startBleBridge({
     env: { AIBROKER_BLE: "1", AIBROKER_BLE_TOKEN: "sekret" },
     spawn: () => child,
+    ...extra,
   });
   ev(flow ? { ev: "ready", flow: 1 } : { ev: "ready" });
   ev({ ev: "central", connected: true, id: "c1" });
@@ -276,5 +277,63 @@ test("coexistence: advertise events track connect state; low latency only around
   assert.deepEqual(h.cmds.filter((c) => c.cmd === "latency").map((c) => c.mode), ["low", "high"]);
   h.ev({ ev: "advertising", name: "PAILot Hub" }); // resumed after unsubscribe
   assert.equal(getBleStatus().advertising, true);
+  stopBleBridge();
+});
+
+test("routeOutbound: size/type and mqtt availability", () => {
+  const base = { size: 100, mqttAppClients: 1, bleReady: true };
+  assert.deepEqual(routeOutbound({ ...base, type: "text" }), { ble: true, mqtt: true, large: false, reason: "small" });
+  assert.equal(routeOutbound({ ...base, type: "image" }).ble, false);
+  assert.equal(routeOutbound({ ...base, type: "screenshot" }).mqtt, true);
+  const big = routeOutbound({ ...base, type: "voice", size: 70_000 });
+  assert.equal(big.ble, false);
+  assert.equal(big.mqtt, true);
+  assert.equal(routeOutbound({ ...base, type: "voice", size: 70_000, maxPayload: 100_000 }).ble, true);
+  const noMqtt = routeOutbound({ ...base, type: "image", mqttAppClients: 0 });
+  assert.deepEqual([noMqtt.ble, noMqtt.mqtt], [true, false]);
+  const noBle = routeOutbound({ ...base, type: "image", mqttAppClients: 0, bleReady: false });
+  assert.deepEqual([noBle.ble, noBle.mqtt], [false, true]);
+});
+
+test("large image with MQTT client goes MQTT only (not on BLE)", async () => {
+  const h = setup(false, { mqttAppClients: () => 1, downscaleImage: async () => { throw new Error("no"); } });
+  h.hello(); await tick(); h.sent(); h.useKs();
+  const n0 = h.cmds.filter((c) => c.cmd === "tx").length;
+  mqttPublishImage("s1", "A".repeat(200_000), "cap", "img1");
+  await tick();
+  assert.equal(h.sent().filter((e) => e.p?.type === "image").length, 0);
+  assert.equal(h.cmds.filter((c) => c.cmd === "tx").length, n0);
+  stopBleBridge();
+});
+
+test("large image without MQTT client is downscaled and sent on BLE only", async () => {
+  const calls: string[] = [];
+  const h = setup(false, { mqttAppClients: () => 0, downscaleImage: async (b: string) => { calls.push(b); return "SMALLJPEG"; } });
+  h.hello(); await tick(); h.sent(); h.useKs();
+  mqttPublishImage("s1", "A".repeat(200_000), "cap", "img2");
+  await tick();
+  const imgs = h.sent().filter((e) => e.p?.type === "image");
+  assert.equal(calls.length, 1);
+  assert.equal(imgs.length, 1, "exactly one BLE copy");
+  assert.equal(imgs[0].p.imageBase64, "SMALLJPEG");
+  assert.equal(imgs[0].p.mimeType, "image/jpeg");
+  stopBleBridge();
+});
+
+test("failed downscale drops; oversized voice after compress drops; small ok", async () => {
+  const h = setup(false, {
+    env: { AIBROKER_BLE: "1", AIBROKER_BLE_TOKEN: "sekret", AIBROKER_BLE_MAX_PAYLOAD: "50" },
+    mqttAppClients: () => 0,
+    downscaleImage: async () => null,
+    compressAudio: async (b: string) => (b === "HUGE" ? "B".repeat(1_200_000) : "AAC"),
+  });
+  h.hello(); await tick(); h.sent(); h.useKs();
+  mqttPublishImage("s1", "A".repeat(100), "c", "img3");
+  mqttPublishVoice("s1", "HUGE", "t-".repeat(40), "v1");
+  mqttPublishVoice("s1", "WAV", "t-".repeat(40), "v2");
+  await tick();
+  const out = h.sent();
+  assert.equal(out.filter((e) => e.p?.type === "image").length, 0);
+  assert.deepEqual(out.filter((e) => e.p?.type === "voice").map((e) => e.p.audioBase64), ["AAC"]);
   stopBleBridge();
 });
