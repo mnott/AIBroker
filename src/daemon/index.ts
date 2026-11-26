@@ -715,6 +715,7 @@ export async function startDaemon(options?: {
   });
   loadQueue();
   startMqttBroker(getVersion());
+  try { (await import("../adapters/pailot/push-audio-server.js")).startPushAudioServer(); } catch (e) { log(`PushAudio: start failed: ${e}`); }
   void import("../core/stt.js").then((m) => m.prewarmWhisperServer()).catch(() => { /* optional */ });
   try { (await import("../adapters/pailot/ble-bridge.js")).startBleBridge(); } catch (e) { log(`BLE: start failed: ${e}`); }
 
@@ -756,6 +757,7 @@ export async function startDaemon(options?: {
     adapterRegistry.stopHealthPolling();
     flushQueue();
     stopMqttBroker();
+    try { (await import("../adapters/pailot/push-audio-server.js")).stopPushAudioServer(); } catch { /* ignore */ }
     try { (await import("../adapters/pailot/ble-bridge.js")).stopBleBridge(); } catch { /* ignore */ }
     ipcServer.stop();
     // Belt-and-suspenders: remove socket in case ipcServer.stop() didn't

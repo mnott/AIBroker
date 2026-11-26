@@ -193,7 +193,7 @@ function mqttPublish(topic: string, payload: Record<string, unknown>, opts?: { q
 }
 
 /** Publish a text message to a session output topic. */
-export function mqttPublishText(sessionId: string, content: string, messageId?: string): void {
+export function mqttPublishText(sessionId: string, content: string, messageId?: string): { msgId: string; seq: number } {
   const msgId = messageId ?? randomUUID();
   const payload: Record<string, unknown> = {
     msgId,
@@ -205,6 +205,7 @@ export function mqttPublishText(sessionId: string, content: string, messageId?: 
   const seq = enqueue(sessionId, "text", payload);
   if (seq > 0) payload.seq = seq;
   mqttPublish("pailot/out", payload);
+  return { msgId, seq };
 }
 
 /** Publish a voice message to a session output topic. */
@@ -214,7 +215,7 @@ export function mqttPublishVoice(
   transcript: string,
   messageId?: string,
   chunkMeta?: { groupId: string; chunkIndex: number; totalChunks: number },
-): void {
+): { msgId: string; seq: number } {
   const msgId = messageId ?? randomUUID();
   const payload: Record<string, unknown> = {
     msgId,
@@ -232,6 +233,7 @@ export function mqttPublishVoice(
   const seq = enqueue(sessionId, "voice", payload);
   if (seq > 0) payload.seq = seq;
   mqttPublish("pailot/out", payload);
+  return { msgId, seq };
 }
 
 /** Publish an image message to a session output topic. */
