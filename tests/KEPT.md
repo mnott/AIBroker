@@ -50,3 +50,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/stt.test.ts | a | STT backend order whisper-server > whisper-cli > python, WAV args, empty/invalid audio (2026-11-26 slow+empty PAILot voice note) |
 | test/stt-langs.test.ts | a | 2026-11-26 auto language detection transcribed a short German/English voice note as Portuguese; transcription restricted to allowed set |
 | test/push-payload.test.ts | c | pins APNs encrypted push + push-audio wire contract the iOS extension codes against |
+| test/p2p-bridge.test.ts | a | p2p link auth/ready/large-payload/timeout contract with fake helper; auth bypass would expose hub commands |
