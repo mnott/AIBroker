@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { createPlaybackQueue, type PlaybackDeps, type SentenceAudio } from "../src/adapters/kokoro/playback.js";
-import { splitIntoSentences } from "../src/adapters/kokoro/tts.js";
+import { splitIntoSentences, CHUNK_GAP_SECONDS } from "../src/adapters/kokoro/tts.js";
 
 /** Fake player: spawn is recorded; the caller decides when it exits. */
 interface FakePlayer {
@@ -251,8 +251,9 @@ describe("playback queue — sidecar-served job", () => {
     await sleep(50);
     assert.equal(h.players.length, 1);
     const wav = h.wavs[0];
-    assert.equal(wav.readUInt32LE(40), 5 * 2400 * 2, "all five chunks, no pause samples");
-    const at = (i: number) => wav.readInt16LE(44 + i * 2 * 2400);
+    assert.equal(wav.readUInt32LE(40), (5 * 2400 + 4 * Math.round(24000 * CHUNK_GAP_SECONDS)) * 2, "all five chunks, fixed chunk gap only");
+    const stride = 2400 + Math.round(24000 * CHUNK_GAP_SECONDS);
+    const at = (i: number) => wav.readInt16LE(44 + i * 2 * stride);
     const vals = [0, 1, 2, 3, 4].map(at);
     assert.deepEqual(vals, [0.1, 0.2, 0.3, 0.4, 0.5].map((v) => Math.round(v * 32767)));
     release(h.players, 0);

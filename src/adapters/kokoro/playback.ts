@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 import { log } from "../../core/log.js";
 import { localPlayerCommand } from "../../core/bins.js";
-import { PAUSE_SECONDS, concatWithPauses, float32ToWav } from "./tts.js";
+import { CHUNK_GAP_SECONDS, SENTENCE_GAP_SECONDS, float32ToWav, joinTrimmed, trimSilence } from "./tts.js";
 
 /** Per-sentence audio as it is synthesized. */
 export interface SentenceAudio {
@@ -73,7 +73,7 @@ export interface PlaybackDeps {
   synth: (text: string, voice: string, speed: number, signal: AbortSignal) => AsyncGenerator<SentenceAudio>;
   /** Spawn a player for a WAV file; null when this host has no local player. */
   play: () => ((wavPath: string) => PlayerHandle) | null;
-  /** Silence between segments of one job (ms); default PAUSE_SECONDS. */
+  /** Silence between segments of one job (ms); default SENTENCE_GAP_SECONDS. */
   pauseMs?: number;
   onPlayerSpawned?: (seq: number) => void;
 }
@@ -106,7 +106,7 @@ export interface PlaybackQueue {
 export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQueue {
   const synth = deps.synth ?? defaultSynth;
   const play = deps.play ?? defaultPlay;
-  const pauseMs = deps.pauseMs ?? PAUSE_SECONDS * 1000;
+  const pauseMs = deps.pauseMs ?? SENTENCE_GAP_SECONDS * 1000;
 
   let queue: Array<{ session: string; text: string; voice?: string; speed?: number }> = [];
   let running = false;
@@ -156,7 +156,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
       let r = await gen.next();
 
       // Sidecar-served (~45x real time): synthesize everything first, join the
-      // sub-sentence chunks with no gaps and play ONE WAV with ONE player.
+      // trimmed chunks with a short fixed gap and play ONE WAV with ONE player.
       if (!r.done && r.value.backend === "mlx") {
         while (!r.done) {
           if (controller.signal.aborted) throw new PlaybackAborted("aborted");
@@ -167,7 +167,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
         await waitNotRecording();
         if (controller.signal.aborted) throw new PlaybackAborted("aborted");
         const rate = segments[0].sampleRate;
-        const full = concatWithPauses(segments.map((x) => x.audio), rate, 0);
+        const full = joinTrimmed(segments.map((x) => x.audio), rate, CHUNK_GAP_SECONDS);
         const wavPath = join(
           process.env.TMPDIR || "/tmp",
           `aibroker-playback-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`,
@@ -179,7 +179,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
         await handle.exited;
         lastHandle = null;
         if (controller.signal.aborted) throw new PlaybackAborted("aborted");
-        saveLastSpeech(job.session, segments, 0);
+        saveLastSpeech(job.session, segments, CHUNK_GAP_SECONDS);
         return;
       }
 
@@ -197,7 +197,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
           process.env.TMPDIR || "/tmp",
           `aibroker-playback-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`,
         );
-        writeFileSync(wavPath, float32ToWav(r.value.audio, r.value.sampleRate));
+        writeFileSync(wavPath, float32ToWav(trimSilence(r.value.audio, r.value.sampleRate), r.value.sampleRate));
 
         const handle = playFn(wavPath);
         lastHandle = handle;
@@ -225,7 +225,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
     }
   }
 
-  function saveLastSpeech(session: string, segments: Segment[], pauseSeconds = PAUSE_SECONDS): void {
+  function saveLastSpeech(session: string, segments: Segment[], pauseSeconds = SENTENCE_GAP_SECONDS): void {
     try {
       const dir = join(homedir(), ".aibroker", "last-speech");
       mkdirSync(dir, { recursive: true });
@@ -236,7 +236,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
           try { unlinkSync(join(dir, f)); } catch { /* ignore */ }
         }
       }
-      const full = concatWithPauses(segments.map((s) => s.audio), segments[0].sampleRate, pauseSeconds);
+      const full = joinTrimmed(segments.map((s) => s.audio), segments[0].sampleRate, pauseSeconds);
       writeFileSync(join(dir, `${safe}-${Date.now()}.wav`), float32ToWav(full, segments[0].sampleRate));
     } catch (err) {
       log(`Playback: could not save last speech — ${err instanceof Error ? err.message : String(err)}`);

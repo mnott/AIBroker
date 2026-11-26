@@ -141,6 +141,13 @@ export function listVoices(): string[] {
 export const MAX_CHUNK_CHARS = 300;
 export const PAUSE_SECONDS = 0.25;
 
+/** Kokoro pads every chunk with leading/trailing silence; chunks are trimmed to
+ * these thresholds and re-joined with a fixed gap instead. */
+export const SILENCE_THRESHOLD = 0.01; // |x| below this (~-40 dBFS) counts as silence
+export const EDGE_KEEP_SECONDS = 0.02; // edge kept so word onsets are not clipped
+export const SENTENCE_GAP_SECONDS = 0.13; // between sentences
+export const CHUNK_GAP_SECONDS = 0.06; // between chunks whose boundary kind is unknown
+
 /** Streaming first-chunk limits: cut a long opener at a clause break after ≥25
  * chars, else at a word boundary near 60 (see splitFirstChunk). */
 export const FIRST_CHUNK_MIN_CHARS = 25;
@@ -253,6 +260,23 @@ export function concatWithPauses(chunks: Float32Array[], sampleRate: number, pau
   return out;
 }
 
+/** Trim leading/trailing silence, keeping EDGE_KEEP_SECONDS at each edge. An all-silent chunk is returned unchanged. */
+export function trimSilence(audio: Float32Array, sampleRate: number, keepSeconds = EDGE_KEEP_SECONDS, threshold = SILENCE_THRESHOLD): Float32Array {
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < audio.length; i++) {
+    if (Math.abs(audio[i]) >= threshold) { if (first < 0) first = i; last = i; }
+  }
+  if (first < 0) return audio;
+  const keep = Math.round(sampleRate * keepSeconds);
+  return audio.subarray(Math.max(0, first - keep), Math.min(audio.length, last + 1 + keep));
+}
+
+/** Trim every chunk's edge silence, then join with a fixed gap (so the whole job also starts/ends within the edge keep). */
+export function joinTrimmed(chunks: Float32Array[], sampleRate: number, gapSeconds = SENTENCE_GAP_SECONDS): Float32Array {
+  return concatWithPauses(chunks.map((c) => trimSilence(c, sampleRate)), sampleRate, gapSeconds);
+}
+
 /** Generate each sentence separately and join into one PCM buffer. */
 export async function synthesizeChunked(
   text: string,
@@ -268,7 +292,7 @@ export async function synthesizeChunked(
     if (chunk.audio.length > 0) pcm.push(chunk.audio);
   }
   if (pcm.length === 0) throw new Error("TTS: generate produced no audio");
-  return { audio: concatWithPauses(pcm, sampleRate), sampleRate };
+  return { audio: joinTrimmed(pcm, sampleRate), sampleRate };
 }
 
 /**
