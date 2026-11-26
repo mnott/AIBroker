@@ -33,6 +33,39 @@ export interface SttResult {
   elapsedMs: number;
 }
 
+export interface DetectResult { lang: string; prob: number }
+export interface DecodeResult { text: string; avgLogprob: number }
+
+export const DEFAULT_STT_LANGS = "de,en,fr,pl";
+
+/** Allowed transcription languages (AIBROKER_STT_LANGS, comma list of ISO codes). */
+export function allowedLangs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const l = (env.AIBROKER_STT_LANGS ?? DEFAULT_STT_LANGS).split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  return l.length ? l : DEFAULT_STT_LANGS.split(",");
+}
+
+/**
+ * Transcribe restricted to the allowed set: detect once; if the detected language
+ * is allowed decode with it, otherwise decode with each allowed language and keep
+ * the best avg_logprob. Never returns a language outside the set.
+ */
+export async function transcribeRestricted(
+  url: string, wav: string, langs: string[],
+  d: Pick<SttDeps, "serverDetect" | "serverDecode">,
+): Promise<{ text: string; lang: string; prob: number | null; detected: string }> {
+  const det = await d.serverDetect(url, wav);
+  if (langs.includes(det.lang)) {
+    const r = await d.serverDecode(url, wav, det.lang);
+    return { text: r.text, lang: det.lang, prob: det.prob, detected: det.lang };
+  }
+  let best: { text: string; lang: string; lp: number } | null = null;
+  for (const lang of langs) {
+    const r = await d.serverDecode(url, wav, lang);
+    if (!best || r.avgLogprob > best.lp) best = { text: r.text, lang, lp: r.avgLogprob };
+  }
+  return { text: best!.text, lang: best!.lang, prob: null, detected: det.lang };
+}
+
 export interface AudioInfo {
   durationSec: number;
   codec: string;
@@ -47,8 +80,10 @@ export interface SttDeps {
   run(bin: string, args: string[], timeoutMs: number): Promise<string>;
   readText(path: string): string;
   remove(path: string): void;
-  /** POST a WAV to the server, resolve the transcript. */
-  serverTranscribe(url: string, wavPath: string): Promise<string>;
+  /** Language-ID pass only (no decoding): ISO code + probability of the top language. */
+  serverDetect(url: string, wavPath: string): Promise<DetectResult>;
+  /** Decode with a forced language; avgLogprob is the mean segment avg_logprob. */
+  serverDecode(url: string, wavPath: string, lang: string): Promise<DecodeResult>;
   ensureServer(model: string): Promise<string | null>;
   env: NodeJS.ProcessEnv;
   home: string;
@@ -128,9 +163,10 @@ export async function transcribeFile(audioPath: string, d: SttDeps = realDeps): 
   const id = `aibroker-stt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const wav = join(tmpdir(), `${id}.wav`);
   const cleanup: string[] = [wav, join(tmpdir(), `${id}.txt`)];
+  let langNote = "";
   const finish = (text: string, backend: SttBackend, model: string): SttResult => {
     const elapsedMs = Date.now() - started;
-    log(`[STT] backend=${backend} model=${model} audio=${audioSec ?? "?"}s elapsed=${elapsedMs}ms chars=${text.length}${info ? ` codec=${info.codec}` : ""}`);
+    log(`[STT] backend=${backend} model=${model} audio=${audioSec ?? "?"}s elapsed=${elapsedMs}ms chars=${text.length}${info ? ` codec=${info.codec}` : ""}${langNote}`);
     return { text, backend, model, audioSec, elapsedMs };
   };
 
@@ -148,7 +184,11 @@ export async function transcribeFile(audioPath: string, d: SttDeps = realDeps): 
       if (wavOk) {
         try {
           const url = await d.ensureServer(cppModel);
-          if (url) return finish(cleanTranscript(await d.serverTranscribe(url, wav)), "whisper-server", modelName);
+          if (url) {
+            const r = await transcribeRestricted(url, wav, allowedLangs(d.env), d);
+            langNote = ` lang=${r.lang} detected=${r.detected}${r.prob !== null ? ` p=${r.prob.toFixed(3)}` : " (out-of-set, best avg_logprob)"}`;
+            return finish(cleanTranscript(r.text), "whisper-server", modelName);
+          }
         } catch (err) {
           log(`[STT] whisper-server failed: ${err instanceof Error ? err.message : err}`);
         }
@@ -237,17 +277,31 @@ export function stopWhisperServer(): void {
   serverModel = null;
 }
 
-async function postWav(url: string, wavPath: string): Promise<string> {
+async function postInference(url: string, wavPath: string, fields: Record<string, string>): Promise<any> {
   const form = new FormData();
   form.append("file", new Blob([readFileSync(wavPath)], { type: "audio/wav" }), "audio.wav");
-  form.append("response_format", "json");
-  form.append("language", "auto");
+  form.append("response_format", "verbose_json");
   form.append("temperature", "0.0");
+  for (const [k, v] of Object.entries(fields)) form.append(k, v);
   const r = await fetch(`${url}/inference`, { method: "POST", body: form, signal: AbortSignal.timeout(120_000) });
   if (!r.ok) throw new Error(`whisper-server HTTP ${r.status}`);
-  const j = (await r.json()) as { text?: string; error?: string };
+  const j = (await r.json()) as any;
   if (j.error) throw new Error(`whisper-server: ${j.error}`);
-  return j.text ?? "";
+  return j;
+}
+
+async function postDetect(url: string, wavPath: string): Promise<DetectResult> {
+  const j = await postInference(url, wavPath, { language: "auto", detect_language: "true" });
+  const probs = (j.language_probabilities ?? {}) as Record<string, number>;
+  const [code] = Object.keys(probs);
+  return { lang: code ?? String(j.detected_language ?? ""), prob: Number(j.detected_language_probability ?? 0) };
+}
+
+async function postDecode(url: string, wavPath: string, lang: string): Promise<DecodeResult> {
+  const j = await postInference(url, wavPath, { language: lang });
+  const segs = (j.segments ?? []) as Array<{ avg_logprob?: number }>;
+  const lps = segs.map((x) => x.avg_logprob).filter((x): x is number => typeof x === "number");
+  return { text: String(j.text ?? ""), avgLogprob: lps.length ? lps.reduce((a, b) => a + b, 0) / lps.length : -Infinity };
 }
 
 export const realDeps: SttDeps = {
@@ -258,7 +312,8 @@ export const realDeps: SttDeps = {
   },
   readText: (p) => readFileSync(p, "utf-8"),
   remove: (p) => unlinkSync(p),
-  serverTranscribe: postWav,
+  serverDetect: postDetect,
+  serverDecode: postDecode,
   ensureServer: (m) => ensureWhisperServer(m),
   env: process.env,
   home: homedir(),
