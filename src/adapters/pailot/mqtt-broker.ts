@@ -18,7 +18,9 @@ import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { log } from "../../core/log.js";
+import { hostname } from "node:os";
 import { enqueue } from "./message-queue.js";
+import { listLocalAddresses, startAdvertising, stopAdvertising, watchAddresses } from "./hub-discovery.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -97,8 +99,10 @@ let loopbackReady = false;
 
 let broker: any = null;
 let mqttServer: Server | null = null;
-let bonjourInstance: any = null;
-let bonjourService: any = null;
+let stopAddressWatch: (() => void) | null = null;
+let hubPort = 0;
+let hubTls = false;
+let hubVersion = "";
 
 /** Returns "ip:port" for a connected client, or "unknown" if unavailable. */
 function remoteOf(client: any): string {
@@ -314,14 +318,22 @@ export function mqttPublishTranscript(messageId: string, content: string, sessio
 }
 
 /** Publish daemon status (retained). */
-export function mqttPublishStatus(status: string, version?: string): void {
-  mqttPublish("pailot/status", {
+export function buildStatusPayload(status: string, version?: string): Record<string, unknown> {
+  return {
     msgId: randomUUID(),
     type: "status",
     status,
     ...(version && { version }),
+    addresses: listLocalAddresses(),
+    port: hubPort,
+    tls: hubTls,
+    hubId: hostname(),
     ts: Date.now(),
-  }, { retain: true });
+  };
+}
+
+export function mqttPublishStatus(status: string, version?: string): void {
+  mqttPublish("pailot/status", buildStatusPayload(status, version), { retain: true });
 }
 
 /** Publish a control response (command results, unread, errors). */
@@ -663,19 +675,18 @@ export async function startMqttBroker(version?: string): Promise<void> {
       }
     }, 700);
 
-    // Advertise via Bonjour/mDNS so PAILot app can auto-discover on LAN
-    try {
-      const { Bonjour } = require("bonjour-service");
-      bonjourInstance = new Bonjour();
-      bonjourService = bonjourInstance.publish({
-        name: "AIBroker",
-        type: "mqtt",
-        port: MQTT_PORT,
-      });
-      log(`[MQTT] Bonjour advertising _mqtt._tcp on port ${MQTT_PORT}`);
-    } catch (err) {
-      log(`[MQTT] Bonjour advertising failed (non-fatal): ${err instanceof Error ? err.message : err}`);
-    }
+    // Advertise via Bonjour/mDNS so PAILot app can auto-discover on any shared network
+    hubPort = MQTT_PORT;
+    hubTls = !!tlsCreds;
+    hubVersion = version ?? "";
+    const adv = { port: MQTT_PORT, tls: !!tlsCreds, version: hubVersion, hubId: hostname() };
+    startAdvertising(adv);
+    stopAddressWatch?.();
+    stopAddressWatch = watchAddresses(() => {
+      log("[MQTT] local addresses changed, re-announcing");
+      mqttPublishStatus("ready", hubVersion);
+      startAdvertising(adv);
+    });
   });
 }
 
@@ -688,14 +699,9 @@ export function stopMqttBroker(): void {
     loopbackClient = null;
     loopbackReady = false;
   }
-  if (bonjourService) {
-    try { bonjourService.stop(); } catch { /* ignore */ }
-    bonjourService = null;
-  }
-  if (bonjourInstance) {
-    try { bonjourInstance.destroy(); } catch { /* ignore */ }
-    bonjourInstance = null;
-  }
+  stopAddressWatch?.();
+  stopAddressWatch = null;
+  stopAdvertising();
   if (broker) {
     // Publish shutting_down before closing
     mqttPublishStatus("shutting_down");
