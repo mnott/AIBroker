@@ -2,7 +2,7 @@ import "./home-guard.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  splitIntoSentences, splitFirstChunk, concatWithPauses, synthesizeChunked,
+  splitIntoSentences, splitFirstChunk, concatWithPauses, joinTrimmed, SENTENCE_GAP_SECONDS, synthesizeChunked,
   synthesizeSentences, MAX_CHUNK_CHARS, FIRST_CHUNK_MAX_CHARS,
 } from "../src/adapters/kokoro/tts.js";
 
@@ -60,6 +60,27 @@ describe("splitFirstChunk — streaming first audio scales with first chunk leng
 });
 
 describe("concatenation", () => {
+  it("joinTrimmed strips chunk padding: only the configured gap remains, edges kept", () => {
+    const rate = 24000;
+    const mk = () => {
+      const pad = Math.round(rate * 0.4), tone = Math.round(rate * 0.5);
+      const a = new Float32Array(pad + tone + pad);
+      for (let i = 0; i < tone; i++) a[pad + i] = 0.5 * Math.sin(i / 5);
+      return a;
+    };
+    const out = joinTrimmed([mk(), mk()], rate, 0.13);
+    const loud: number[] = [];
+    out.forEach((v, i) => { if (Math.abs(v) >= 0.01) loud.push(i); });
+    const first = loud[0] / rate;
+    const lastGap = (out.length - 1 - loud[loud.length - 1]) / rate;
+    assert.ok(first >= 0.02 && first <= 0.03, `lead ${first}`);
+    assert.ok(lastGap >= 0.02 && lastGap <= 0.05, `tail ${lastGap}`);
+    let maxGap = 0, run = 0;
+    for (const v of out) { if (Math.abs(v) < 0.01) { run++; maxGap = Math.max(maxGap, run); } else run = 0; }
+    const interior = maxGap / rate;
+    assert.ok(interior > 0.13 && interior < 0.2, `gap ${interior}`); // 130 ms + 2 x 20 ms edges, minus zero-crossings
+    assert.ok(out.length < 2 * mk().length * 0.7);
+  });
   it("length is sum of chunks plus pauses", () => {
     const out = concatWithPauses([new Float32Array(100), new Float32Array(50), new Float32Array(10)], 1000);
     assert.equal(out.length, 160 + 2 * 250);
@@ -73,6 +94,6 @@ describe("concatenation", () => {
     const r = await synthesizeChunked(text, "bm_fable", 0.9, fake);
     assert.equal(calls.length, 40);
     assert.ok(calls.every(([, o]) => o.speed === 0.9 && o.voice === "bm_fable"));
-    assert.equal(r.audio.length, 40 * 2400 + 39 * 6000);
+    assert.equal(r.audio.length, 40 * 2400 + 39 * Math.round(24000 * SENTENCE_GAP_SECONDS));
   });
 });
