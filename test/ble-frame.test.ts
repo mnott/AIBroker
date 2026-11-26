@@ -88,3 +88,15 @@ test("sealed round-trip at every split; key switch mid-push; tamper dropped+coun
   assert.deepEqual(r2.push(Buffer.concat([bad, encodeFrame(b, ks)])), [b]);
   assert.equal(r2.authFailures, 1);
 });
+
+test("reassembler exposes partial frame progress", async () => {
+  const { FrameReassembler: R, encodeFrame: enc } = await import("../src/adapters/pailot/ble-frame.js");
+  const r = new R();
+  const f = enc({ t: "a", p: { x: "y".repeat(100) } }, null);
+  r.push(Buffer.from(f.subarray(0, 50)));
+  assert.equal(r.pendingBytes, 46);
+  assert.equal(r.expectedBytes, f.length - 4);
+  const out = r.push(Buffer.from(f.subarray(50)));
+  assert.equal(out.length, 1);
+  assert.equal(r.pendingBytes, 0);
+});
