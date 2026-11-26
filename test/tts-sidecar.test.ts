@@ -3,11 +3,10 @@ import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { PORT_FILE as PORT_FILE_PATH } from "../src/adapters/kokoro/sidecar.js";
 
-import { resolveBackend, readPortFile, writePortFile, probeSidecar, streamSidecar, PORT_FILE as PORT_FILE_PATH } from "../src/adapters/kokoro/sidecar.js";
-import { synthesizeSentences } from "../src/adapters/kokoro/tts.js";
+/** Track every fake server so teardown can close them; an open listener keeps the process alive. */
+const servers: net.Server[] = [];
 
 /** A fake sidecar on a random port: answers with header + int16 chunks + done. */
 function startFakeSidecar(script: "ok" | "error" | "hang"): Promise<number> {
@@ -33,27 +32,36 @@ function startFakeSidecar(script: "ok" | "error" | "hang"): Promise<number> {
         sock.end();
       });
     });
+    servers.push(server);
     server.listen(0, "127.0.0.1", () => {
       resolve((server.address() as net.AddressInfo).port);
     });
   });
 }
 
+after(() => {
+  for (const s of servers) s.close();
+});
+
 describe("resolveBackend", () => {
-  it("cpu is forced by env", () => {
+  it("cpu is forced by env", async () => {
+    const { resolveBackend } = await import("../src/adapters/kokoro/sidecar.js");
     assert.equal(resolveBackend({ AIBROKER_TTS_BACKEND: "cpu" }), "cpu");
   });
-  it("mlx is forced by env even without a venv", () => {
+  it("mlx is forced by env even without a venv", async () => {
+    const { resolveBackend } = await import("../src/adapters/kokoro/sidecar.js");
     assert.equal(resolveBackend({ AIBROKER_TTS_BACKEND: "mlx" }), "mlx");
   });
-  it("default follows the venv, not an unset value", () => {
+  it("default follows the venv, not an unset value", async () => {
+    const { resolveBackend } = await import("../src/adapters/kokoro/sidecar.js");
     const def = resolveBackend({});
     assert.ok(def === "cpu" || def === "mlx");
   });
 });
 
 describe("port file", () => {
-  it("round-trips a valid port and rejects junk", () => {
+  it("round-trips a valid port and rejects junk", async () => {
+    const { readPortFile, writePortFile } = await import("../src/adapters/kokoro/sidecar.js");
     writePortFile(39123);
     assert.equal(readPortFile(), 39123);
     // home-guard redirects HOME to a per-run sandbox, so this is safe to write
@@ -66,9 +74,11 @@ describe("port file", () => {
 
 describe("probeSidecar", () => {
   it("false when nothing listens", async () => {
+    const { probeSidecar } = await import("../src/adapters/kokoro/sidecar.js");
     assert.equal(await probeSidecar(1, 300), false);
   });
   it("true when a listener answers", async () => {
+    const { probeSidecar } = await import("../src/adapters/kokoro/sidecar.js");
     const port = await startFakeSidecar("ok");
     assert.equal(await probeSidecar(port, 500), true);
   });
@@ -76,6 +86,7 @@ describe("probeSidecar", () => {
 
 describe("streamSidecar", () => {
   it("yields decoded float32 chunks per frame", async () => {
+    const { streamSidecar } = await import("../src/adapters/kokoro/sidecar.js");
     const port = await startFakeSidecar("ok");
     const chunks: { audio: Float32Array; sampleRate: number }[] = [];
     for await (const c of streamSidecar(port, { text: "hello world.", voice: "bm_fable", speed: 1 })) {
@@ -88,6 +99,7 @@ describe("streamSidecar", () => {
     assert.equal(chunks[0].sampleRate, 24000);
   });
   it("throws on an error frame", async () => {
+    const { streamSidecar } = await import("../src/adapters/kokoro/sidecar.js");
     const port = await startFakeSidecar("error");
     await assert.rejects(
       (async () => { for await (const _ of streamSidecar(port, { text: "x", voice: "af_heart" })) void _; })(),
@@ -95,6 +107,7 @@ describe("streamSidecar", () => {
     );
   });
   it("throws on connect timeout when the sidecar hangs", async () => {
+    const { streamSidecar } = await import("../src/adapters/kokoro/sidecar.js");
     const port = await startFakeSidecar("hang");
     // The hang server never closes; abort the stream instead of waiting for a
     // socket close that only arrives when the test process exits.
@@ -109,6 +122,7 @@ describe("streamSidecar", () => {
 
 describe("synthesizeSentences routes to CPU when the sidecar is absent", () => {
   it("uses a fake CPU tts instance (no model load)", async () => {
+    const { synthesizeSentences } = await import("../src/adapters/kokoro/tts.js");
     const fake = {
       generate: async (s: string, opts: { voice: string; speed: number }) => ({
         audio: new Float32Array(100).fill(opts.voice === "bm_fable" ? 0.5 : -0.5),
@@ -124,6 +138,8 @@ describe("synthesizeSentences routes to CPU when the sidecar is absent", () => {
   });
 
   it("falls back to CPU when the port file points at a dead sidecar", async () => {
+    const { writePortFile } = await import("../src/adapters/kokoro/sidecar.js");
+    const { synthesizeSentences } = await import("../src/adapters/kokoro/tts.js");
     writePortFile(1); // port 1: nothing listens → probe false → CPU path
     process.env.AIBROKER_TTS_BACKEND = "cpu"; // never spawn a real sidecar in tests
     const fake = {
@@ -138,6 +154,8 @@ describe("synthesizeSentences routes to CPU when the sidecar is absent", () => {
   });
 
   it("falls back to CPU when the sidecar returns an error frame", async () => {
+    const { writePortFile } = await import("../src/adapters/kokoro/sidecar.js");
+    const { synthesizeSentences } = await import("../src/adapters/kokoro/tts.js");
     const port = await startFakeSidecar("error");
     writePortFile(port); // live listener, but it answers with an error → must fall back
     process.env.AIBROKER_TTS_BACKEND = "mlx";
@@ -153,6 +171,8 @@ describe("synthesizeSentences routes to CPU when the sidecar is absent", () => {
   });
 
   it("streams from the sidecar when it answers", async () => {
+    const { writePortFile } = await import("../src/adapters/kokoro/sidecar.js");
+    const { synthesizeSentences } = await import("../src/adapters/kokoro/tts.js");
     const port = await startFakeSidecar("ok");
     writePortFile(port);
     process.env.AIBROKER_TTS_BACKEND = "mlx";
