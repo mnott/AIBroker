@@ -717,6 +717,7 @@ export async function startDaemon(options?: {
   startMqttBroker(getVersion());
   void import("../core/stt.js").then((m) => m.prewarmWhisperServer()).catch(() => { /* optional */ });
   try { (await import("../adapters/pailot/ble-bridge.js")).startBleBridge(); } catch (e) { log(`BLE: start failed: ${e}`); }
+  try { (await import("../adapters/pailot/p2p-bridge.js")).startP2pBridge(); } catch (e) { log(`P2P: start failed: ${e}`); }
 
   // Wire screenshot handler so PAILot /ss commands work
   setScreenshotHandler(async (source, targetSessionId) => {
@@ -757,6 +758,7 @@ export async function startDaemon(options?: {
     flushQueue();
     stopMqttBroker();
     try { (await import("../adapters/pailot/ble-bridge.js")).stopBleBridge(); } catch { /* ignore */ }
+    try { (await import("../adapters/pailot/p2p-bridge.js")).stopP2pBridge(); } catch { /* ignore */ }
     ipcServer.stop();
     // Belt-and-suspenders: remove socket in case ipcServer.stop() didn't
     try { unlinkSync(socketPath); } catch { /* already gone */ }
