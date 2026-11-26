@@ -6,6 +6,9 @@ import { PassThrough } from "node:stream";
 import { startBleBridge, stopBleBridge, getBleStatus } from "../src/adapters/pailot/ble-bridge.js";
 import { setMqttInboundHandler, mqttPublishStatus } from "../src/adapters/pailot/mqtt-broker.js";
 import { encodeFrame, chunk, FrameReassembler } from "../src/adapters/pailot/ble-frame.js";
+import { deriveK0, deriveKs, readyMac } from "../src/adapters/pailot/ble-crypto.js";
+
+const CN = Buffer.from("000102030405060708090a0b0c0d0e0f", "hex");
 
 function setup() {
   const child: any = new EventEmitter();
@@ -17,13 +20,29 @@ function setup() {
     for (const l of d.toString().split("\n").filter(Boolean)) cmds.push(JSON.parse(l));
   });
   const ev = (o: object) => child.stdout.write(JSON.stringify(o) + "\n");
-  const app = (t: string, p: unknown) => {
-    for (const c of chunk(encodeFrame({ t, p }), 20)) ev({ ev: "rx", b64: c.toString("base64") });
+  const k0 = deriveK0("sekret");
+  let key: Buffer | null = k0; // key the fake app seals with
+  let ks: Buffer | null = null;
+  const appRaw = (frame: Buffer) => {
+    for (const c of chunk(frame, 20)) ev({ ev: "rx", b64: c.toString("base64") });
   };
+  const app = (t: string, p: unknown) => appRaw(encodeFrame({ t, p }, key));
+  const sentRaw = new FrameReassembler(() => (ks ?? k0));
+  let used = 0;
   const sent = () => {
-    const r = new FrameReassembler();
-    return cmds.filter((c) => c.cmd === "tx").flatMap((c) => r.push(Buffer.from(c.b64, "base64")));
+    const txs = cmds.filter((c) => c.cmd === "tx");
+    const out = [];
+    for (; used < txs.length; used++) {
+      for (const e of sentRaw.push(Buffer.from(txs[used].b64, "base64"), (e) => {
+        if (e.t === "ble/ready" && !ks) ks = deriveKs(k0, CN, Buffer.from((e.p as any).n, "hex"));
+      })) out.push(e);
+    }
+    all.push(...out);
+    return all;
   };
+  const all: any[] = [];
+  const hello = (v = 2) => app("ble/hello", { app: "t", v, n: CN.toString("hex") });
+  const useKs = () => { sent(); key = ks; };
   startBleBridge({
     env: { AIBROKER_BLE: "1", AIBROKER_BLE_TOKEN: "sekret" },
     spawn: () => child,
@@ -31,7 +50,7 @@ function setup() {
   ev({ ev: "ready" });
   ev({ ev: "central", connected: true, id: "c1" });
   ev({ ev: "mtu", n: 100 });
-  return { child, cmds, ev, app, sent };
+  return { child, cmds, ev, app, appRaw, sent, hello, useKs, k0, getKs: () => ks, setKey: (k: Buffer | null) => { key = k; }, reset: () => { ks = null; key = k0; } };
 }
 const tick = () => new Promise((r) => setTimeout(r, 30));
 
@@ -51,11 +70,16 @@ test("hello ok -> ready, retained replay, ping/pong, inbound and outbound", asyn
   await tick();
   assert.equal(got.length, 0, "ignored before hello");
   mqttPublishStatus("ready", "2");
-  h.app("ble/hello", { token: "sekret", app: "t" });
+  h.hello();
   await tick();
   assert.equal(getBleStatus().ready, true);
   const sent = h.sent();
   assert.equal(sent[0].t, "ble/ready");
+  const rp = sent[0].p as any;
+  assert.equal(rp.v, 2);
+  assert.equal(rp.mac, readyMac(h.getKs()!, CN, Buffer.from(rp.n, "hex")));
+  assert.ok(!JSON.stringify(h.cmds).includes("sekret"));
+  h.useKs();
   assert.ok(sent.some((e) => e.t === "pailot/status"), "retained state replayed");
   h.app("ble/ping", {});
   h.app("pailot/s1/in", { type: "text", msgId: "m1", content: "hi" });
@@ -72,11 +96,56 @@ test("wrong token -> drop and nothing delivered", async () => {
   const got: any[] = [];
   setMqttInboundHandler((s, type) => got.push(type));
   const h = setup();
-  h.app("ble/hello", { token: "nope" });
+  h.setKey(deriveK0("nope"));
+  h.hello();
   h.app("pailot/s1/in", { type: "text", msgId: "m9", content: "x" });
   await tick();
   assert.equal(getBleStatus().ready, false);
   assert.ok(h.cmds.some((c) => c.cmd === "drop"));
   assert.equal(got.length, 0);
+  assert.equal(h.sent().length, 0, "no ready sent");
+  assert.ok(getBleStatus().authFailures >= 1);
+  stopBleBridge();
+});
+
+test("v1 plaintext hello -> rejected, link dropped", async () => {
+  const h = setup();
+  h.setKey(null);
+  h.app("ble/hello", { token: "sekret", app: "t" });
+  await tick();
+  assert.equal(getBleStatus().ready, false);
+  assert.ok(h.cmds.some((c) => c.cmd === "drop"));
+  assert.equal(h.sent().length, 0);
+  stopBleBridge();
+});
+
+test("tampered frame after ready is dropped and counted; replay from old session rejected", async () => {
+  const got: any[] = [];
+  setMqttInboundHandler((s, type) => got.push(type));
+  const h = setup();
+  h.hello();
+  await tick();
+  h.useKs();
+  const oldKs = h.getKs()!;
+  const bad = Buffer.from(encodeFrame({ t: "pailot/s1/in", p: { type: "text", msgId: "t1", content: "x" } }, oldKs));
+  bad[10] ^= 1;
+  h.appRaw(bad);
+  h.app("pailot/s1/in", { type: "text", msgId: "t2", content: "ok" });
+  await tick();
+  assert.equal(getBleStatus().ready, true);
+  assert.equal(getBleStatus().authFailures, 1);
+  assert.deepEqual(got, ["text"]);
+  // new connection: a frame sealed with the old session key must not be accepted
+  const replay = encodeFrame({ t: "pailot/s1/in", p: { type: "text", msgId: "t3", content: "again" } }, oldKs);
+  h.reset();
+  h.ev({ ev: "central", connected: false });
+  h.ev({ ev: "central", connected: true, id: "c2" });
+  h.hello();
+  await tick();
+  assert.equal(getBleStatus().ready, true);
+  h.appRaw(replay);
+  await tick();
+  assert.equal(getBleStatus().authFailures, 2);
+  assert.deepEqual(got, ["text"]);
   stopBleBridge();
 });

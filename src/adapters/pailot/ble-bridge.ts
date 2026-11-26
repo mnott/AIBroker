@@ -11,13 +11,14 @@
  */
 
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { log } from "../../core/log.js";
 import { handleInboundPublish, setMqttOutTap } from "./mqtt-broker.js";
+import { deriveK0, deriveKs, readyMac } from "./ble-crypto.js";
 import { chunk, DEFAULT_CHUNK, encodeFrame, FrameReassembler, type BleEnvelope } from "./ble-frame.js";
 
 export const BLE_SERVICE_UUID = "7A1F0001-3C5B-4D2E-9A41-5041494C4F54";
@@ -31,6 +32,7 @@ export interface BleStatus {
   ready: boolean;
   mtu: number;
   centralId: string | null;
+  authFailures: number;
 }
 
 export interface BleBridgeOptions {
@@ -46,6 +48,7 @@ const FAKE_CLIENT = { id: "pailot-ble", conn: { remoteAddress: "ble" } };
 let state: {
   opts: BleBridgeOptions;
   token: string;
+  k0: Buffer;
   name: string;
   helperPath: string;
   child: ChildProcess | null;
@@ -56,9 +59,23 @@ let state: {
 
 const status: BleStatus = {
   enabled: false, helperRunning: false, advertising: false,
-  connected: false, ready: false, mtu: DEFAULT_CHUNK, centralId: null,
+  connected: false, ready: false, mtu: DEFAULT_CHUNK, centralId: null, authFailures: 0,
 };
-let reassembler = new FrameReassembler();
+/** Per-connection session key; null until the handshake completes. */
+let sessionKey: Buffer | null = null;
+let reassembler = newReassembler();
+
+function newReassembler(): FrameReassembler {
+  const r = new FrameReassembler(() => sessionKey ?? state?.k0 ?? null);
+  r.onAuthFailure = onAuthFailure;
+  return r;
+}
+
+function resetSession(): void {
+  sessionKey = null;
+  rejected = false;
+  reassembler = newReassembler();
+}
 const retained = new Map<string, string>();
 
 export function getBleStatus(): BleStatus {
@@ -75,24 +92,15 @@ export function resolveBleHelperPath(env: NodeJS.ProcessEnv = process.env): stri
   return candidates.find(existsSync) ?? candidates[0];
 }
 
-function digest(s: string): Buffer {
-  return createHash("sha256").update(s).digest();
-}
-
-export function tokenMatches(given: unknown, expected: string): boolean {
-  if (typeof given !== "string") return false;
-  return timingSafeEqual(digest(given), digest(expected));
-}
-
 function helperSend(obj: Record<string, unknown>): void {
   const stdin = state?.child?.stdin;
   if (!stdin || stdin.destroyed) return;
   stdin.write(JSON.stringify(obj) + "\n");
 }
 
-function sendEnvelope(env: BleEnvelope): void {
-  if (!status.connected) return;
-  const frame = encodeFrame(env);
+function sendEnvelope(env: BleEnvelope, key: Buffer | null = sessionKey): void {
+  if (!status.connected || !key) return;
+  const frame = encodeFrame(env, key);
   for (const c of chunk(frame, status.mtu)) helperSend({ cmd: "tx", b64: c.toString("base64") });
 }
 
@@ -116,26 +124,43 @@ function onOutbound(topic: string, json: string, opts: { retain: boolean }): voi
 function dropLink(why: string): void {
   log(`[BLE] dropping link: ${why}`);
   status.ready = false;
+  sessionKey = null;
+  rejected = true;
   reassembler.reset();
   helperSend({ cmd: "drop" });
 }
 
 let rejected = false;
 
+function onAuthFailure(body: Buffer): void {
+  status.authFailures++;
+  if (status.ready || rejected) return; // after ready: dropped and counted only
+  let v1 = false;
+  try { v1 = JSON.parse(body.toString("utf8"))?.t === "ble/hello"; } catch { /* not json */ }
+  if (v1) log("BLE: rejected v1 peer (plaintext hello) - update PAILot to >=1.1.13");
+  dropLink(v1 ? "v1 plaintext hello" : "handshake authentication failed (wrong token?)");
+}
+
 function onEnvelope(env: BleEnvelope): void {
   if (!state) return;
   if (!status.ready) {
     if (rejected) return;
     if (env.t !== "ble/hello") return; // ignore everything until hello
-    const token = (env.p as { token?: unknown } | null)?.token;
-    if (!tokenMatches(token, state.token)) {
-      rejected = true;
-      dropLink("hello with wrong token");
+    const p = env.p as { app?: unknown; v?: unknown; n?: unknown } | null;
+    if (!p || p.v !== 2 || typeof p.n !== "string" || !/^[0-9a-f]{32}$/i.test(p.n)) {
+      dropLink("hello with bad version or nonce");
       return;
     }
+    const clientNonce = Buffer.from(p.n, "hex");
+    const serverNonce = randomBytes(16);
+    const ks = deriveKs(state.k0, clientNonce, serverNonce);
+    sendEnvelope(
+      { t: "ble/ready", p: { v: 2, n: serverNonce.toString("hex"), mac: readyMac(ks, clientNonce, serverNonce) } },
+      state.k0,
+    );
+    sessionKey = ks;
     status.ready = true;
-    log(`[BLE] link ready (app ${(env.p as { app?: string })?.app ?? "?"})`);
-    sendEnvelope({ t: "ble/ready", p: { v: 1 } });
+    log(`[BLE] link ready (app ${typeof p.app === "string" ? p.app : "?"})`);
     sendRetained();
     return;
   }
@@ -159,8 +184,7 @@ function onHelperEvent(ev: Record<string, unknown>): void {
       status.connected = ev.connected === true;
       status.centralId = status.connected ? String(ev.id ?? "") : null;
       status.ready = false;
-      rejected = false;
-      reassembler = new FrameReassembler();
+      resetSession();
       if (!status.connected) status.mtu = DEFAULT_CHUNK;
       log(`[BLE] central ${status.connected ? "connected" : "disconnected"} ${ev.id ?? ""}`);
       break;
@@ -170,7 +194,7 @@ function onHelperEvent(ev: Record<string, unknown>): void {
     case "rx": {
       if (typeof ev.b64 !== "string") break;
       try {
-        for (const env of reassembler.push(Buffer.from(ev.b64, "base64"))) onEnvelope(env);
+        reassembler.push(Buffer.from(ev.b64, "base64"), onEnvelope);
       } catch (err) {
         dropLink(`framing error: ${err instanceof Error ? err.message : err}`);
       }
@@ -237,14 +261,14 @@ export function startBleBridge(opts: BleBridgeOptions = {}): boolean {
   if (!token) { log("[BLE] AIBROKER_BLE_TOKEN not set — BLE transport disabled"); return false; }
   if (state) stopBleBridge();
   state = {
-    opts, token,
+    opts, token, k0: deriveK0(token),
     name: env.AIBROKER_BLE_NAME || DEFAULT_NAME,
     helperPath: resolveBleHelperPath(env),
     child: null, stopped: false, restartTimer: null, attempt: 0,
   };
   status.enabled = true;
-  reassembler = new FrameReassembler();
-  rejected = false;
+  resetSession();
+  status.authFailures = 0;
   setMqttOutTap(onOutbound);
   log(`[BLE] starting helper ${state.helperPath}`);
   launch();
@@ -261,5 +285,6 @@ export function stopBleBridge(): void {
   setMqttOutTap(null);
   retained.clear();
   state = null;
-  Object.assign(status, { enabled: false, helperRunning: false, advertising: false, connected: false, ready: false, centralId: null, mtu: DEFAULT_CHUNK });
+  sessionKey = null;
+  Object.assign(status, { enabled: false, helperRunning: false, advertising: false, connected: false, ready: false, centralId: null, mtu: DEFAULT_CHUNK, authFailures: 0 });
 }
