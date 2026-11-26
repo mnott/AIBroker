@@ -59,3 +59,8 @@ The helper holds an idle-sleep assertion (`ProcessInfo.beginActivity(.idleSystem
 - Messages in flight when BLE drops rely on the app's catch_up / retry over MQTT.
 - Dropping a link is done by rebuilding the service; the central reconnects and must re-send hello.
 - Not yet tested end to end against the app; the live check covered advertising only.
+
+## Flow control and liveness (hub)
+
+- The helper announces `"flow":1` in its `ready` event, emits `{"ev":"sent","n":bytes}` per chunk accepted by CoreBluetooth and re-slices to the live `maximumUpdateValueLength` (re-announcing `mtu` on change). The bridge keeps at most 64 KB un-acked in the helper and sends frames through a two-priority scheduler: `ble/pong` and `ble/ready` are inserted at the next frame boundary ahead of queued bulk frames (a frame's chunks are never interleaved). Without `flow:1` chunks are written immediately as before. No wire change.
+- On `central disconnected` the hub logs one line with session counters (`after Ns ready=, rx=B/frames, tx=B/frames, pings, pongs, lastRx, rxPartial=buffered/declared, txQueued`); every `dropping link` reason carries the same counters. A ping summary is logged every 10th ping.

@@ -43,7 +43,11 @@ export function chunk(buf: Buffer, size: number = DEFAULT_CHUNK): Buffer[] {
 
 /** Streaming reassembler: accepts arbitrary splits/merges of the frame stream. */
 export class FrameReassembler {
-  private buf: Buffer = Buffer.alloc(0);
+  /** Pending chunks not yet consumed (concatenated only when a frame is complete). */
+  private chunks: Buffer[] = [];
+  private len = 0;
+  /** Declared body length of the frame being assembled, -1 until the 4-byte header is known. */
+  private declared = -1;
   /** Frames dropped because authentication failed. */
   authFailures = 0;
   /** Called with the raw body of every frame that failed authentication. */
@@ -52,22 +56,41 @@ export class FrameReassembler {
   /** keyProvider is re-evaluated per frame (the key switches after hello within one push). */
   constructor(private keyProvider: () => Buffer | null = () => null) {}
 
+  /** Bytes buffered of the partially received frame (header included). */
+  get pendingBytes(): number { return this.len; }
+  /** Declared body length of the partial frame, 0 when unknown/none. */
+  get expectedBytes(): number { return this.declared >= 0 ? this.declared : 0; }
+
+  private take(n: number): Buffer {
+    const all = this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks, this.len);
+    const out = all.subarray(0, n);
+    const rest = all.subarray(n);
+    this.chunks = rest.length ? [rest] : [];
+    this.len = rest.length;
+    return out;
+  }
+
   /**
    * Feed bytes; returns every envelope completed. `each` is invoked per envelope as soon as
    * it is decoded (before the next frame is decoded). Throws FrameTooLargeError (and resets) on oversize.
    */
   push(data: Buffer, each?: (env: BleEnvelope) => void): BleEnvelope[] {
-    this.buf = this.buf.length === 0 ? Buffer.from(data) : Buffer.concat([this.buf, data]);
+    if (data.length) { this.chunks.push(Buffer.from(data)); this.len += data.length; }
     const out: BleEnvelope[] = [];
-    while (this.buf.length >= 4) {
-      const n = this.buf.readUInt32BE(0);
-      if (n > MAX_FRAME_BYTES) {
-        this.reset();
-        throw new FrameTooLargeError(n);
+    for (;;) {
+      if (this.declared < 0) {
+        if (this.len < 4) break;
+        const n = this.take(4).readUInt32BE(0);
+        // take() above consumed the header; keep it simple by tracking declared separately
+        if (n > MAX_FRAME_BYTES) {
+          this.reset();
+          throw new FrameTooLargeError(n);
+        }
+        this.declared = n;
       }
-      if (this.buf.length < 4 + n) break;
-      let body = this.buf.subarray(4, 4 + n);
-      this.buf = this.buf.subarray(4 + n);
+      if (this.len < this.declared) break;
+      let body = this.take(this.declared);
+      this.declared = -1;
       const key = this.keyProvider();
       if (key) {
         try { body = open(key, body); }
@@ -89,6 +112,8 @@ export class FrameReassembler {
   }
 
   reset(): void {
-    this.buf = Buffer.alloc(0);
+    this.chunks = [];
+    this.len = 0;
+    this.declared = -1;
   }
 }

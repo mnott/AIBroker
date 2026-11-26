@@ -21,6 +21,11 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
     var txChar: CBMutableCharacteristic?
     var central: CBCentral?
     var queue: [Data] = []
+    var head = 0                 // index of the next queued chunk (no O(n^2) removeFirst)
+    var queuedBytes = 0
+    var lastMtu = 0
+    var sentBytes = 0            // bytes accepted by updateValue this session
+    var subscribedAt = Date()
 
     override init() {
         super.init()
@@ -53,22 +58,47 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
     func drop() {
         // CoreBluetooth cannot disconnect a central; rebuilding the service invalidates its subscription.
         central = nil
-        queue.removeAll()
+        logDrop("drop cmd")
+        resetQueue()
         emit(["ev": "central", "connected": false, "id": ""])
         setup()
     }
 
+    func resetQueue() {
+        queue.removeAll(); head = 0; queuedBytes = 0
+    }
+
+    func logDrop(_ why: String) {
+        elog("\(why): queued=\(queuedBytes)B sent=\(sentBytes)B afterSubscribe=\(Int(Date().timeIntervalSince(subscribedAt)))s")
+    }
+
     func flush() {
         guard let tx = txChar, let c = central else { return }
-        while let first = queue.first {
-            if mgr.updateValue(first, for: tx, onSubscribedCentrals: [c]) { queue.removeFirst() } else { return }
+        // Never trust a stale MTU: re-read the live limit and announce changes.
+        let max = c.maximumUpdateValueLength
+        if max != lastMtu { lastMtu = max; emit(["ev": "mtu", "n": max]) }
+        while head < queue.count {
+            var d = queue[head]
+            // Re-slice: CoreBluetooth silently truncates oversize notifications (stream framing would desync).
+            var rest: Data? = nil
+            if d.count > max { rest = Data(d.suffix(from: d.startIndex + max)); d = Data(d.prefix(max)) }
+            if mgr.updateValue(d, for: tx, onSubscribedCentrals: [c]) {
+                queuedBytes -= d.count
+                sentBytes += d.count
+                if let r = rest { queue[head] = r } else { head += 1 }
+                emit(["ev": "sent", "n": d.count])
+            } else {
+                if head > 1024 { queue.removeFirst(head); head = 0 } // compact occasionally
+                return
+            }
         }
+        resetQueue()
     }
 
     func peripheralManagerDidUpdateState(_ p: CBPeripheralManager) {
         elog("state=\(p.state.rawValue)")
         switch p.state {
-        case .poweredOn: emit(["ev": "ready"]); setup()
+        case .poweredOn: emit(["ev": "ready", "flow": 1]); setup()
         case .unauthorized: emit(["ev": "error", "msg": "bluetooth unauthorized (TCC denied)"])
         case .poweredOff: emit(["ev": "error", "msg": "bluetooth powered off"])
         case .unsupported: emit(["ev": "error", "msg": "bluetooth unsupported"])
@@ -88,15 +118,19 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
 
     func peripheralManager(_ p: CBPeripheralManager, central c: CBCentral, didSubscribeTo ch: CBCharacteristic) {
         central = c // single central, newest wins
-        queue.removeAll()
+        resetQueue()
+        sentBytes = 0
+        subscribedAt = Date()
+        lastMtu = c.maximumUpdateValueLength
         emit(["ev": "central", "connected": true, "id": c.identifier.uuidString])
         emit(["ev": "mtu", "n": c.maximumUpdateValueLength])
     }
 
     func peripheralManager(_ p: CBPeripheralManager, central c: CBCentral, didUnsubscribeFrom ch: CBCharacteristic) {
         if central?.identifier == c.identifier {
+            logDrop("unsubscribe \(c.identifier.uuidString)")
             central = nil
-            queue.removeAll()
+            resetQueue()
             emit(["ev": "central", "connected": false, "id": c.identifier.uuidString])
         }
     }
@@ -110,7 +144,7 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
         if let first = requests.first { p.respond(to: first, withResult: .success) }
     }
 
-    func tx(_ d: Data) { queue.append(d); flush() }
+    func tx(_ d: Data) { queue.append(d); queuedBytes += d.count; flush() }
 }
 
 let activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated], reason: "PAILot BLE link")
