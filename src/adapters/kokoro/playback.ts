@@ -26,6 +26,8 @@ import { PAUSE_SECONDS, concatWithPauses, float32ToWav } from "./tts.js";
 export interface SentenceAudio {
   audio: Float32Array;
   sampleRate: number;
+  /** "mlx" when served by the fast Metal sidecar; absent for the CPU path. */
+  backend?: "mlx";
 }
 
 export interface PlayerHandle {
@@ -150,9 +152,38 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
         return;
       }
 
-      // One-ahead pipeline: pull the next sentence while the previous one plays.
       const gen = synth(job.text, job.voice ?? "", job.speed ?? 1.0, controller.signal);
       let r = await gen.next();
+
+      // Sidecar-served (~45x real time): synthesize everything first, join the
+      // sub-sentence chunks with no gaps and play ONE WAV with ONE player.
+      if (!r.done && r.value.backend === "mlx") {
+        while (!r.done) {
+          if (controller.signal.aborted) throw new PlaybackAborted("aborted");
+          segments.push({ audio: r.value.audio, sampleRate: r.value.sampleRate });
+          r = await gen.next();
+        }
+        if (controller.signal.aborted) throw new PlaybackAborted("aborted");
+        await waitNotRecording();
+        if (controller.signal.aborted) throw new PlaybackAborted("aborted");
+        const rate = segments[0].sampleRate;
+        const full = concatWithPauses(segments.map((x) => x.audio), rate, 0);
+        const wavPath = join(
+          process.env.TMPDIR || "/tmp",
+          `aibroker-playback-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`,
+        );
+        writeFileSync(wavPath, float32ToWav(full, rate));
+        const handle = playFn(wavPath);
+        lastHandle = handle;
+        deps.onPlayerSpawned?.(0);
+        await handle.exited;
+        lastHandle = null;
+        if (controller.signal.aborted) throw new PlaybackAborted("aborted");
+        saveLastSpeech(job.session, segments, 0);
+        return;
+      }
+
+      // CPU path, one-ahead pipeline: pull the next sentence while the previous one plays.
       while (!r.done) {
         if (controller.signal.aborted) throw new PlaybackAborted("aborted");
         segments.push({ audio: r.value.audio, sampleRate: r.value.sampleRate });
@@ -194,7 +225,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
     }
   }
 
-  function saveLastSpeech(session: string, segments: Segment[]): void {
+  function saveLastSpeech(session: string, segments: Segment[], pauseSeconds = PAUSE_SECONDS): void {
     try {
       const dir = join(homedir(), ".aibroker", "last-speech");
       mkdirSync(dir, { recursive: true });
@@ -205,7 +236,7 @@ export function createPlaybackQueue(deps: Partial<PlaybackDeps> = {}): PlaybackQ
           try { unlinkSync(join(dir, f)); } catch { /* ignore */ }
         }
       }
-      const full = concatWithPauses(segments.map((s) => s.audio), segments[0].sampleRate);
+      const full = concatWithPauses(segments.map((s) => s.audio), segments[0].sampleRate, pauseSeconds);
       writeFileSync(join(dir, `${safe}-${Date.now()}.wav`), float32ToWav(full, segments[0].sampleRate));
     } catch (err) {
       log(`Playback: could not save last speech — ${err instanceof Error ? err.message : String(err)}`);

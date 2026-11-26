@@ -289,7 +289,7 @@ export async function* synthesizeSentences(
   signal?: AbortSignal,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   tts?: any,
-): AsyncGenerator<{ audio: Float32Array; sampleRate: number }> {
+): AsyncGenerator<{ audio: Float32Array; sampleRate: number; backend?: "mlx" }> {
   voice = resolveVoice(voice || DEFAULT_VOICE);
   const sentences = splitFirstChunk(splitIntoSentences(text));
   const rate = speed !== undefined && Number.isFinite(speed) && speed > 0 ? speed : 1.0;
@@ -314,7 +314,7 @@ export async function* synthesizeSentences(
       for await (const chunk of streamSidecar(port, { text: sentences.join(" "), voice, speed: rate }, signal)) {
         sampleRate = chunk.sampleRate;
         served++;
-        yield chunk;
+        yield { ...chunk, backend: "mlx" };
       }
       log(`TTS: served by mlx sidecar (${served} chunks)`);
       return;
