@@ -4,6 +4,8 @@
  *
  * GET /pailot/audio/<msgId> with header X-PAILot-Auth = pushAudioAuth(pushKey, msgId).
  * Body = seal(pushKey, m4aBytes), so plain HTTP over LAN/Tailscale leaks nothing.
+ * Codec: the hub serves m4a (AAC) as-is; the extension converts to PCM caf itself, no hub conversion.
+ * Every request is logged (path, peer, status, bytes; never the auth header).
  * Env: PAILOT_PUSH_AUDIO_PORT (default 0 = disabled), PAILOT_PUSH_AUDIO_BIND (default 0.0.0.0).
  */
 import { createServer, type Server } from "node:http";
@@ -52,16 +54,21 @@ export class AudioCache {
 
 export function createPushAudioServer(cache: AudioCache, pushKey: Buffer): Server {
   return createServer((req, res) => {
+    const from = req.socket.remoteAddress ?? "?";
+    const done = (status: number, body?: Buffer, headers?: Record<string, string | number>) => {
+      res.writeHead(status, headers).end(body);
+      log(`[PushAudio] ${req.method} ${(req.url ?? "").split("?")[0]} from ${from} -> ${status} ${body?.length ?? 0}`);
+    };
     const m = /^\/pailot\/audio\/([^/?#]+)$/.exec(req.url ?? "");
-    if (req.method !== "GET" || !m) { res.writeHead(404).end(); return; }
+    if (req.method !== "GET" || !m) return done(404);
     let msgId: string;
-    try { msgId = decodeURIComponent(m[1]); } catch { res.writeHead(404).end(); return; }
+    try { msgId = decodeURIComponent(m[1]); } catch { return done(404); }
     const hdr = req.headers["x-pailot-auth"];
-    if (typeof hdr !== "string" || !macEquals(hdr, pushAudioAuth(pushKey, msgId))) { res.writeHead(401).end(); return; }
+    if (typeof hdr !== "string" || !macEquals(hdr, pushAudioAuth(pushKey, msgId))) return done(401);
     const bytes = cache.get(msgId);
-    if (!bytes) { res.writeHead(404).end(); return; }
+    if (!bytes) return done(404);
     const body = seal(pushKey, bytes);
-    res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": body.length }).end(body);
+    done(200, body, { "Content-Type": "application/octet-stream", "Content-Length": body.length });
   });
 }
 
