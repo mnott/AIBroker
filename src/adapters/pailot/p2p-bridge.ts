@@ -22,7 +22,13 @@ import { chunk, encodeFrame, FrameReassembler, type BleEnvelope } from "./ble-fr
 
 export const P2P_SERVICE_TYPE = "pailot-p2p";
 export const P2P_CHUNK = 64 * 1024;
-export const P2P_AUTH_TIMEOUT_MS = 5000;
+/** Default must exceed the app's hello retry window (5 s) so a peer needing its last retry is kept. */
+export const P2P_AUTH_TIMEOUT_MS = 15000;
+
+function authTimeoutMs(): number {
+  const n = Number(state?.opts.env?.AIBROKER_P2P_AUTH_TIMEOUT_MS ?? process.env.AIBROKER_P2P_AUTH_TIMEOUT_MS);
+  return state?.opts.authTimeoutMs ?? (Number.isFinite(n) && n > 0 ? n : P2P_AUTH_TIMEOUT_MS);
+}
 const DEFAULT_NAME = "PAILot Hub";
 const FAKE_CLIENT = { id: "pailot-p2p", conn: { remoteAddress: "p2p" } };
 
@@ -108,9 +114,10 @@ function newPeer(id: string): Peer {
     status.authFailures++;
     if (!peer.ready) dropPeer(peer, "handshake authentication failed (wrong token or v1 peer)");
   };
+  const ms = authTimeoutMs();
   peer.timer = setTimeout(() => {
-    if (!peer.ready) dropPeer(peer, `no v2 handshake within ${state?.opts.authTimeoutMs ?? P2P_AUTH_TIMEOUT_MS}ms`);
-  }, state?.opts.authTimeoutMs ?? P2P_AUTH_TIMEOUT_MS);
+    if (!peer.ready) dropPeer(peer, `no v2 handshake within ${ms}ms`);
+  }, ms);
   peer.timer.unref?.();
   return peer;
 }
