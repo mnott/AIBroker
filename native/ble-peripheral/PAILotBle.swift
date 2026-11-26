@@ -38,8 +38,8 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
         guard wantStart else { return }
         mgr.stopAdvertising()
         mgr.removeAllServices()
-        let rx = CBMutableCharacteristic(type: rxUUID, properties: [.write], value: nil, permissions: [.writeEncryptionRequired])
-        let tx = CBMutableCharacteristic(type: txUUID, properties: [.notify], value: nil, permissions: [.readEncryptionRequired])
+        let rx = CBMutableCharacteristic(type: rxUUID, properties: [.write, .writeWithoutResponse], value: nil, permissions: [.writeable])
+        let tx = CBMutableCharacteristic(type: txUUID, properties: [.notify], value: nil, permissions: [.readable])
         txChar = tx
         let svc = CBMutableService(type: serviceUUID, primary: true)
         svc.characteristics = [rx, tx]
