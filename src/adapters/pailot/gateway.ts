@@ -32,7 +32,7 @@ import { execFile } from "node:child_process";
 import { log } from "../../core/log.js";
 import { successorOf } from "../../core/session-history.js";
 import { WHISPER_MODEL } from "../kokoro/media.js";
-import { resolveWhisperBin, resolveFfmpegBin } from "../../core/bins.js";
+import { resolveWhisperBin, resolveFfmpegBin, resolveBin } from "../../core/bins.js";
 import {
   setMessageSource,
   activeItermSessionId,
@@ -64,6 +64,7 @@ import {
   getMqttAppClientCount,
 } from "./mqtt-broker.js";
 import { sendPush as apnsSendPush } from "../../apns/client.js";
+import { cachePushAudio, isPushAudioEnabled, getPushAudioPort } from "./push-audio-server.js";
 import { readAttachment, withNote, type AttachmentRef, getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
 import { getAllPersistentSessionNames, getPersistentSessionName, lookupPersistentName, setPersistentSessionName } from "../../core/persistence.js";
@@ -1523,6 +1524,7 @@ export async function broadcastText(text: string, sessionId?: string, direct?: b
   const traceId = randomUUID().slice(0, 8);
   const contentPreview = text.replace(/\s+/g, " ").trim().slice(0, 80);
 
+  let pushIds: { msgId: string; seq?: number } = { msgId: randomUUID() };
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
   broadcast({ type: "text", content: text, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
 
@@ -1530,7 +1532,8 @@ export async function broadcastText(text: string, sessionId?: string, direct?: b
   if (isMqttRunning()) {
     if (resolvedSession) mqttPublishTyping(resolvedSession, false);
     const payloadBytes = Buffer.byteLength(text, "utf8");
-    mqttPublishText(resolvedSession ?? "global", text);
+    const r = mqttPublishText(resolvedSession ?? "global", text);
+    pushIds = { msgId: r.msgId, seq: r.seq > 0 ? r.seq : undefined };
     log(`[TRACE ${traceId}] published to pailot/${resolvedSession ?? "global"}/out (${payloadBytes} bytes)`);
     addTrace({ traceId, event: "published_text", sessionId: resolvedSession, content_preview: contentPreview });
 
@@ -1565,7 +1568,12 @@ export async function broadcastText(text: string, sessionId?: string, direct?: b
       }
     }
     const preview = text.replace(/\s+/g, " ").trim().slice(0, 100);
-    void apnsSendPush(sessionName, preview || "(no content)", { sessionId: resolvedSession }).catch(() => {});
+    // Alert + mutable-content already wakes the notification extension; a silent
+    // content-available push is deliberately not used (iOS throttles those).
+    void apnsSendPush(sessionName, preview || "(no content)", { sessionId: resolvedSession }, undefined, {
+      msgId: pushIds.msgId, seq: pushIds.seq, sessionId: resolvedSession ?? "global", type: "text",
+      content: text, sessionName, ts: Date.now(),
+    }).catch(() => {});
   }
 }
 
@@ -1586,6 +1594,8 @@ export async function broadcastVoice(
   const traceId = randomUUID().slice(0, 8);
   const contentPreview = transcript.replace(/\s+/g, " ").trim().slice(0, 80);
   broadcast({ type: "typing", typing: false, ...(resolvedSession && { sessionId: resolvedSession }) }, direct);
+  let m4aBuffer: Buffer | undefined;
+  let audioSecs: number | undefined;
   let sendBuffer = audioBuffer;
 
   // Convert OGG Opus → M4A for iOS compatibility
@@ -1601,6 +1611,14 @@ export async function broadcastVoice(
     ]);
     if (existsSync(m4aPath)) {
       sendBuffer = readFileSync(m4aPath);
+      m4aBuffer = sendBuffer;
+      if (isPushAudioEnabled()) {
+        try {
+          const { stdout } = await execFileAsync(resolveBin("ffprobe"), ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", m4aPath]);
+          const d = parseFloat(String(stdout).trim());
+          if (Number.isFinite(d)) audioSecs = Math.round(d * 10) / 10;
+        } catch { /* duration is best effort */ }
+      }
       try { unlinkSync(oggPath); unlinkSync(m4aPath); } catch { /* ignore */ }
     }
   } catch (err) {
@@ -1616,10 +1634,12 @@ export async function broadcastVoice(
     ...(chunkMeta && { groupId: chunkMeta.groupId, chunkIndex: chunkMeta.chunkIndex, totalChunks: chunkMeta.totalChunks }),
   }, direct);
 
+  let voiceIds: { msgId: string; seq?: number } = { msgId: randomUUID() };
   if (isMqttRunning()) {
     if (resolvedSession) mqttPublishTyping(resolvedSession, false);
     const voiceBytes = Buffer.byteLength(voiceBase64, "utf8");
-    mqttPublishVoice(resolvedSession ?? "global", voiceBase64, transcript, undefined, chunkMeta);
+    const vr = mqttPublishVoice(resolvedSession ?? "global", voiceBase64, transcript, undefined, chunkMeta);
+    voiceIds = { msgId: vr.msgId, seq: vr.seq > 0 ? vr.seq : undefined };
     const chunkInfo = chunkMeta ? ` chunk=${chunkMeta.chunkIndex + 1}/${chunkMeta.totalChunks}` : "";
     log(`[TRACE ${traceId}] published voice to pailot/${resolvedSession ?? "global"}/out (${voiceBytes} bytes${chunkInfo})`);
     addTrace({ traceId, event: "published_voice", sessionId: resolvedSession, content_preview: contentPreview, details: chunkMeta ? { chunkIndex: chunkMeta.chunkIndex, totalChunks: chunkMeta.totalChunks } : undefined });
@@ -1651,7 +1671,13 @@ export async function broadcastVoice(
       }
     }
     const preview = transcript.replace(/\s+/g, " ").trim().slice(0, 100);
-    void apnsSendPush(`${voiceSessionName} (voice)`, preview, { sessionId: resolvedSession, type: "voice" }).catch(() => {});
+    const audio = m4aBuffer && cachePushAudio(voiceIds.msgId, m4aBuffer)
+      ? { audioPath: `/pailot/audio/${voiceIds.msgId}`, audioPort: getPushAudioPort(), ...(audioSecs !== undefined && { audioSecs }) }
+      : {};
+    void apnsSendPush(`${voiceSessionName} (voice)`, preview, { sessionId: resolvedSession, type: "voice" }, undefined, {
+      msgId: voiceIds.msgId, seq: voiceIds.seq, sessionId: resolvedSession ?? "global", type: "voice",
+      content: transcript, sessionName: voiceSessionName, ts: Date.now(), ...audio,
+    }).catch(() => {});
   }
 }
 

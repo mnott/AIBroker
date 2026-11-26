@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { log } from "../core/log.js";
 import { GuardedStore } from "../core/json-store.js";
+import { deriveKPush, seal } from "../adapters/pailot/ble-crypto.js";
 
 const require = createRequire(import.meta.url);
 
@@ -153,31 +154,111 @@ export interface PushPayload {
   body: string;
   badge?: number;
   data?: Record<string, unknown>;
+  /** Full message to ride encrypted in the push (see buildPushPayload). */
+  message?: PushMessage;
+}
+
+/** Plaintext sealed into the APNs "pl" key (wire contract v1). */
+export interface PushMessage {
+  v?: 1;
+  msgId: string;
+  seq?: number;
+  sessionId: string;
+  type: "text" | "voice" | "image";
+  content?: string;
+  sessionName: string;
+  ts: number;
+  audioPath?: string;
+  audioSecs?: number;
+  audioPort?: number;
+}
+
+export type PushMode = "full" | "ref" | "plain";
+
+/** Safe budget for the whole JSON payload (APNs limit is 4096). */
+export const PUSH_BUDGET_BYTES = 3800;
+
+export interface BuiltPush {
+  aps: Record<string, unknown>;
+  custom: Record<string, unknown>;
+  mode: PushMode;
+  bytes: number;
+  mutableContent: boolean;
+}
+
+let warnedNoToken = false;
+
+/**
+ * Pure: build the APNs payload and decide full / ref / plain.
+ * full  = encrypted message with content in "pl"
+ * ref   = encrypted metadata only ("ref":true), extension leaves the message to catch_up
+ * plain = alert only (no token, sealing impossible, or nothing fits)
+ * Content is never truncated and never logged.
+ */
+export function buildPushPayload(opts: {
+  title: string;
+  body: string;
+  badge?: number;
+  data?: Record<string, unknown>;
+  message?: PushMessage;
+  token?: string;
+  nonce?: Buffer;
+}): BuiltPush {
+  const data = opts.data ?? {};
+  const baseAps = { alert: { title: opts.title, body: opts.body }, badge: opts.badge ?? 1, sound: "default" };
+  const size = (aps: Record<string, unknown>, custom: Record<string, unknown>) =>
+    Buffer.byteLength(JSON.stringify({ aps, ...custom }), "utf8");
+  const plain = (): BuiltPush => ({ aps: baseAps, custom: data, mode: "plain", bytes: size(baseAps, data), mutableContent: false });
+
+  const m = opts.message;
+  if (!m || !opts.token) return plain();
+  const key = deriveKPush(opts.token);
+
+  const attempt = (pl: Record<string, unknown>, mode: PushMode): BuiltPush | null => {
+    const sealed = seal(key, Buffer.from(JSON.stringify(pl), "utf8"), opts.nonce).toString("base64");
+    const custom = { ...data, pl: sealed, plv: 1, sessionId: m.sessionId };
+    const aps = { ...baseAps, "mutable-content": 1, "thread-id": m.sessionId };
+    const bytes = size(aps, custom);
+    return bytes <= PUSH_BUDGET_BYTES ? { aps, custom, mode, bytes, mutableContent: true } : null;
+  };
+
+  const { content, ...meta } = m;
+  const full = { v: 1, ...m };
+  if (m.type !== "image" && content !== undefined) {
+    const r = attempt(full, "full");
+    if (r) return r;
+  }
+  return attempt({ v: 1, ...meta, ref: true }, "ref") ?? plain();
 }
 
 /**
  * Send a push notification to a single device token.
  * Returns true on success, false on failure.
  */
-export async function sendPushToToken(token: string, payload: PushPayload): Promise<boolean> {
+export async function sendPushToToken(token: string, payload: PushPayload, prebuilt?: BuiltPush): Promise<boolean> {
   const client = getApnsClient();
   if (!client) return false;
 
   try {
     const { Notification } = require("apns2");
+    const built = prebuilt ?? buildPushPayload({
+      title: payload.title, body: payload.body, badge: payload.badge, data: payload.data,
+      message: payload.message, token: process.env.AIBROKER_BLE_TOKEN,
+    });
 
     const notification = new Notification(token, {
-      alert: {
-        title: payload.title,
-        body: payload.body,
-      },
+      alert: { title: payload.title, body: payload.body },
       badge: payload.badge ?? 1,
       sound: "default",
-      data: payload.data ?? {},
+      data: built.custom,
+      ...(built.mutableContent && {
+        mutableContent: true,
+        threadId: (built.aps["thread-id"] as string | undefined),
+      }),
     });
 
     await client.send(notification);
-    log(`[APNs] push sent to ${token.slice(0, 16)}... — "${payload.title}: ${payload.body.slice(0, 40)}"`);
+    log(`[APNs] push sent to ${token.slice(0, 16)}... — "${payload.title}: ${payload.body.slice(0, 40)}" mode=${built.mode} bytes=${built.bytes}`);
     return true;
   } catch (err: any) {
     const reason = err?.response?.reason ?? err?.message ?? String(err);
@@ -200,6 +281,7 @@ export async function sendPush(
   body: string,
   data?: Record<string, unknown>,
   badge?: number,
+  message?: PushMessage,
 ): Promise<number> {
   const tokens = getTokens();
   if (tokens.length === 0) {
@@ -216,8 +298,14 @@ export async function sendPush(
 
   log(`[APNs] sending push to ${tokens.length} token(s): "${title}" (badge=${actualBadge})`);
 
+  const secret = process.env.AIBROKER_BLE_TOKEN;
+  if (message && !secret && !warnedNoToken) {
+    warnedNoToken = true;
+    log("[APNs] AIBROKER_BLE_TOKEN not set — pushes carry no encrypted message");
+  }
+  const built = buildPushPayload({ title, body, badge: actualBadge, data, message, token: secret });
   const results = await Promise.allSettled(
-    tokens.map((token) => sendPushToToken(token, { title, body, badge: actualBadge, data })),
+    tokens.map((token) => sendPushToToken(token, { title, body, badge: actualBadge, data }, built)),
   );
 
   const succeeded = results.filter((r) => r.status === "fulfilled" && r.value === true).length;
