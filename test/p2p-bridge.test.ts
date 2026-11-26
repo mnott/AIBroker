@@ -119,3 +119,31 @@ test("BLE and P2P taps coexist", async () => {
   stopBleBridge();
   stopP2pBridge();
 });
+
+test("default auth timeout keeps a hello at 6s, drops silence at 16s", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const a = setup();
+  t.mock.timers.tick(6000);
+  a.hello();
+  t.mock.timers.tick(1);
+  assert.ok(!a.cmds.some((c) => c.cmd === "disconnect"));
+  stopP2pBridge();
+  const b = setup();
+  t.mock.timers.tick(16000);
+  assert.ok(b.cmds.some((c) => c.cmd === "disconnect" && c.peer === "p1"));
+  stopP2pBridge();
+});
+
+test("AIBROKER_P2P_AUTH_TIMEOUT_MS overrides the default", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = setup();
+  stopP2pBridge();
+  const g = (() => {
+    const c = setup({ env: { AIBROKER_P2P: "1", AIBROKER_P2P_TOKEN: "sekret", AIBROKER_P2P_AUTH_TIMEOUT_MS: "2000" } });
+    return c;
+  })();
+  t.mock.timers.tick(2001);
+  assert.ok(g.cmds.some((c) => c.cmd === "disconnect"));
+  assert.ok(h);
+  stopP2pBridge();
+});
