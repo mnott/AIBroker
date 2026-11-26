@@ -55,3 +55,13 @@ export function open(key: Buffer, sealed: Buffer): Buffer {
     throw new AuthError();
   }
 }
+
+/** Key for APNs push payload sealing and push audio (same token as BLE v2). */
+export function deriveKPush(token: string): Buffer {
+  return hkdf(Buffer.from(token, "utf8"), Buffer.from("pailot-push-v1-salt", "utf8"), "pailot-push-v1");
+}
+
+/** Hex HMAC-SHA256(pushKey, "pailot-push-audio/" + msgId): X-PAILot-Auth header value. */
+export function pushAudioAuth(pushKey: Buffer, msgId: string): string {
+  return createHmac("sha256", pushKey).update(Buffer.from(`pailot-push-audio/${msgId}`, "utf8")).digest("hex");
+}
