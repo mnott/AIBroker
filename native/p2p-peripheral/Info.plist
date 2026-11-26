@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>org.aibroker.pailot-p2p</string>
+  <key>CFBundleName</key><string>pailot-p2p</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>NSLocalNetworkUsageDescription</key><string>AIBroker connects the PAILot app to this Mac over Wi-Fi direct, without a shared network.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_pailot-p2p._tcp</string>
+    <string>_pailot-p2p._udp</string>
+  </array>
+</dict>
+</plist>

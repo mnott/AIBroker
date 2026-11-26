@@ -156,21 +156,24 @@ function evictOldIds(): void {
 /** Tap called for every outbound publish, even with no broker/clients (BLE bridge). */
 export interface MqttOutResult { skipMqtt?: boolean }
 export type MqttOutTap = (topic: string, json: string, opts: { qos: number; retain: boolean }) => MqttOutResult | void;
-let outTap: MqttOutTap | null = null;
+const outTaps = new Map<string, MqttOutTap>();
 
-export function setMqttOutTap(fn: MqttOutTap | null): void {
-  outTap = fn;
+/** Install (or with null remove) the outbound tap in a named slot (default "ble"; p2p uses "p2p"). */
+export function setMqttOutTap(fn: MqttOutTap | null, slot = "ble"): void {
+  if (fn) outTaps.set(slot, fn); else outTaps.delete(slot);
 }
 
 function mqttPublish(topic: string, payload: Record<string, unknown>, opts?: { qos?: number; retain?: boolean }): void {
   const json = JSON.stringify(payload);
-  if (outTap) {
+  let skip = false;
+  for (const tap of outTaps.values()) {
     try {
-      const r = outTap(topic, json, { qos: opts?.qos ?? 1, retain: opts?.retain ?? false });
-      if (r && r.skipMqtt) return;
+      const r = tap(topic, json, { qos: opts?.qos ?? 1, retain: opts?.retain ?? false });
+      if (r && r.skipMqtt) skip = true;
     }
     catch (err) { log(`[MQTT] out tap error on ${topic}: ${err}`); }
   }
+  if (skip) return;
   if (!broker) { log(`[MQTT] publish skipped (no broker): ${topic}`); return; }
   log(`[MQTT] → ${topic} (${json.length} bytes)`);
   const qos = opts?.qos ?? 1;
