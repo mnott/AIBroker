@@ -715,6 +715,7 @@ export async function startDaemon(options?: {
   });
   loadQueue();
   startMqttBroker(getVersion());
+  try { (await import("../adapters/pailot/ble-bridge.js")).startBleBridge(); } catch (e) { log(`BLE: start failed: ${e}`); }
 
   // Wire screenshot handler so PAILot /ss commands work
   setScreenshotHandler(async (source, targetSessionId) => {
@@ -754,6 +755,7 @@ export async function startDaemon(options?: {
     adapterRegistry.stopHealthPolling();
     flushQueue();
     stopMqttBroker();
+    try { (await import("../adapters/pailot/ble-bridge.js")).stopBleBridge(); } catch { /* ignore */ }
     ipcServer.stop();
     // Belt-and-suspenders: remove socket in case ipcServer.stop() didn't
     try { unlinkSync(socketPath); } catch { /* already gone */ }
