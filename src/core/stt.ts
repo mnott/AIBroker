@@ -31,10 +31,81 @@ export interface SttResult {
   model: string;
   audioSec: number | null;
   elapsedMs: number;
+  /** Set when the clip was judged non-speech (text is then empty). */
+  noSpeech?: boolean;
+  /** Detected/used language (whisper-server path only). */
+  lang?: string;
 }
 
 export interface DetectResult { lang: string; prob: number }
-export interface DecodeResult { text: string; avgLogprob: number }
+export interface DecodeResult { text: string; avgLogprob: number; /** max segment no_speech_prob, when the server reports it */ noSpeechProb?: number }
+
+export interface WavStats { rms: number; speechRatio: number }
+
+/** Signal check on 16 kHz mono s16le WAV: overall RMS (0..1) and share of 30 ms frames above a speech floor. */
+export function wavStats(buf: Buffer): WavStats | null {
+  if (buf.length < 44 + 2) return null;
+  const n = Math.floor((buf.length - 44) / 2);
+  const frame = 480;
+  let sum = 0, frames = 0, loud = 0;
+  for (let f = 0; f + frame <= n; f += frame) {
+    let fs = 0;
+    for (let i = 0; i < frame; i++) { const v = buf.readInt16LE(44 + (f + i) * 2) / 32768; fs += v * v; }
+    sum += fs; frames++;
+    if (Math.sqrt(fs / frame) > SPEECH_FRAME_RMS) loud++;
+  }
+  if (!frames) return null;
+  return { rms: Math.sqrt(sum / (frames * frame)), speechRatio: loud / frames };
+}
+
+export const SPEECH_FRAME_RMS = 0.01;
+const LOW_RMS = 0.012;
+const LOW_SPEECH_RATIO = 0.12;
+
+const HALLUCINATIONS = [
+  /^thank(s| you)( so much)?( for (watching|listening))?[.!]*$/i,
+  /^thanks for watching[.!]*$/i,
+  /^you[.!]*$/i,
+  /^(bye|goodbye)[.!]*$/i,
+  /^vielen dank( fürs? (zuschauen|zuhören))?[.!]*$/i,
+  /^danke( fürs? (zuschauen|zuhören))?[.!]*$/i,
+  /^untertitel.*$/i,
+  /^merci( d'avoir regardé.*)?[.!]*$/i,
+  /^sous-?titr.*$/i,
+  /^dziękuję( za uwagę| za oglądanie)?[.!]*$/i,
+  /^napisy.*$/i,
+];
+
+/** Punctuation-only text or a known Whisper filler hallucination (de/en/fr/pl). */
+export function isHallucination(text: string): boolean {
+  const t = text.trim();
+  if (!/[\p{L}\p{N}]/u.test(t)) return true;
+  return HALLUCINATIONS.some((re) => re.test(t));
+}
+
+export interface NoSpeechInput { text: string; avgLogprob: number | null; nsp?: number; langProb: number | null; stats: WavStats | null }
+
+/** Drop only when the signal check AND the model confidence agree. */
+export function judgeNoSpeech(i: NoSpeechInput): boolean {
+  if (!i.stats) return false;
+  const signalLow = i.stats.rms < LOW_RMS || i.stats.speechRatio < LOW_SPEECH_RATIO;
+  if (!signalLow) return false;
+  const lp = i.avgLogprob ?? 0;
+  const nsp = i.nsp ?? 0;
+  const modelLow = nsp > 0.6 || lp < -1.0 || (i.langProb !== null && i.langProb < 0.5) ||
+    (isHallucination(i.text) && (nsp > 0.3 || lp < -0.5 || (i.langProb !== null && i.langProb < 0.7)));
+  return modelLow;
+}
+
+const NO_SPEECH_REPLY: Record<string, string> = {
+  de: "Nichts erkannt – bitte nochmal",
+  en: "Nothing recognised – please try again",
+  fr: "Rien reconnu – veuillez réessayer",
+  pl: "Nic nie rozpoznano – spróbuj ponownie",
+};
+export function noSpeechReply(lang?: string): string {
+  return NO_SPEECH_REPLY[lang ?? "en"] ?? NO_SPEECH_REPLY.en;
+}
 
 export const DEFAULT_STT_LANGS = "de,en,fr,pl";
 
@@ -52,18 +123,18 @@ export function allowedLangs(env: NodeJS.ProcessEnv = process.env): string[] {
 export async function transcribeRestricted(
   url: string, wav: string, langs: string[],
   d: Pick<SttDeps, "serverDetect" | "serverDecode">,
-): Promise<{ text: string; lang: string; prob: number | null; detected: string }> {
+): Promise<{ text: string; lang: string; prob: number | null; detected: string; avgLogprob: number; noSpeechProb?: number }> {
   const det = await d.serverDetect(url, wav);
   if (langs.includes(det.lang)) {
     const r = await d.serverDecode(url, wav, det.lang);
-    return { text: r.text, lang: det.lang, prob: det.prob, detected: det.lang };
+    return { text: r.text, lang: det.lang, prob: det.prob, detected: det.lang, avgLogprob: r.avgLogprob, noSpeechProb: r.noSpeechProb };
   }
-  let best: { text: string; lang: string; lp: number } | null = null;
+  let best: { text: string; lang: string; lp: number; nsp?: number } | null = null;
   for (const lang of langs) {
     const r = await d.serverDecode(url, wav, lang);
-    if (!best || r.avgLogprob > best.lp) best = { text: r.text, lang, lp: r.avgLogprob };
+    if (!best || r.avgLogprob > best.lp) best = { text: r.text, lang, lp: r.avgLogprob, nsp: r.noSpeechProb };
   }
-  return { text: best!.text, lang: best!.lang, prob: null, detected: det.lang };
+  return { text: best!.text, lang: best!.lang, prob: null, detected: det.lang, avgLogprob: best!.lp, noSpeechProb: best!.nsp };
 }
 
 export interface AudioInfo {
@@ -85,6 +156,8 @@ export interface SttDeps {
   /** Decode with a forced language; avgLogprob is the mean segment avg_logprob. */
   serverDecode(url: string, wavPath: string, lang: string): Promise<DecodeResult>;
   ensureServer(model: string): Promise<string | null>;
+  /** Energy stats of the decoded WAV; null when unreadable. Optional (tests). */
+  wavStats?(wavPath: string): WavStats | null;
   env: NodeJS.ProcessEnv;
   home: string;
 }
@@ -164,8 +237,13 @@ export async function transcribeFile(audioPath: string, d: SttDeps = realDeps): 
   const wav = join(tmpdir(), `${id}.wav`);
   const cleanup: string[] = [wav, join(tmpdir(), `${id}.txt`)];
   let langNote = "";
+  let noSpeechInfo: { rms: number; nsp: number | undefined; lang: string } | null = null;
   const finish = (text: string, backend: SttBackend, model: string): SttResult => {
     const elapsedMs = Date.now() - started;
+    if (noSpeechInfo) {
+      log(`[STT] no speech: audio=${audioSec ?? "?"}s rms=${noSpeechInfo.rms.toFixed(4)} nsp=${noSpeechInfo.nsp?.toFixed(2) ?? "?"} text=${JSON.stringify(text)}${langNote}`);
+      return { text: "", backend, model, audioSec, elapsedMs, noSpeech: true, lang: noSpeechInfo.lang };
+    }
     log(`[STT] backend=${backend} model=${model} audio=${audioSec ?? "?"}s elapsed=${elapsedMs}ms chars=${text.length}${info ? ` codec=${info.codec}` : ""}${langNote}`);
     return { text, backend, model, audioSec, elapsedMs };
   };
@@ -187,7 +265,13 @@ export async function transcribeFile(audioPath: string, d: SttDeps = realDeps): 
           if (url) {
             const r = await transcribeRestricted(url, wav, allowedLangs(d.env), d);
             langNote = ` lang=${r.lang} detected=${r.detected}${r.prob !== null ? ` p=${r.prob.toFixed(3)}` : " (out-of-set, best avg_logprob)"}`;
-            return finish(cleanTranscript(r.text), "whisper-server", modelName);
+            const text = cleanTranscript(r.text);
+            const stats = d.wavStats ? d.wavStats(wav) : null;
+            if (text && stats && judgeNoSpeech({ text, avgLogprob: r.avgLogprob, nsp: r.noSpeechProb, langProb: r.prob, stats })) {
+              noSpeechInfo = { rms: stats.rms, nsp: r.noSpeechProb, lang: r.lang };
+            }
+            const res = finish(text, "whisper-server", modelName);
+            return noSpeechInfo ? res : { ...res, lang: r.lang };
           }
         } catch (err) {
           log(`[STT] whisper-server failed: ${err instanceof Error ? err.message : err}`);
@@ -299,9 +383,10 @@ async function postDetect(url: string, wavPath: string): Promise<DetectResult> {
 
 async function postDecode(url: string, wavPath: string, lang: string): Promise<DecodeResult> {
   const j = await postInference(url, wavPath, { language: lang });
-  const segs = (j.segments ?? []) as Array<{ avg_logprob?: number }>;
+  const segs = (j.segments ?? []) as Array<{ avg_logprob?: number; no_speech_prob?: number }>;
+  const nsps = segs.map((x) => x.no_speech_prob).filter((x): x is number => typeof x === "number");
   const lps = segs.map((x) => x.avg_logprob).filter((x): x is number => typeof x === "number");
-  return { text: String(j.text ?? ""), avgLogprob: lps.length ? lps.reduce((a, b) => a + b, 0) / lps.length : -Infinity };
+  return { text: String(j.text ?? ""), avgLogprob: lps.length ? lps.reduce((a, b) => a + b, 0) / lps.length : -Infinity, noSpeechProb: nsps.length ? Math.max(...nsps) : undefined };
 }
 
 export const realDeps: SttDeps = {
@@ -315,6 +400,7 @@ export const realDeps: SttDeps = {
   serverDetect: postDetect,
   serverDecode: postDecode,
   ensureServer: (m) => ensureWhisperServer(m),
+  wavStats: (p) => { try { return wavStats(readFileSync(p)); } catch { return null; } },
   env: process.env,
   home: homedir(),
 };
