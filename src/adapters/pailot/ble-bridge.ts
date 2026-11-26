@@ -181,10 +181,13 @@ function clearLatencyTimer(): void {
 }
 
 function noteLatency(): void {
-  if (sched.queued + sched.inflight >= BULK_LOW_LATENCY_BYTES) {
+  // Inbound bulk: a partially received frame whose header announced >= threshold.
+  const rxBulk = reassembler.expectedBytes >= BULK_LOW_LATENCY_BYTES;
+  if (sched.queued + sched.inflight >= BULK_LOW_LATENCY_BYTES || rxBulk) {
     clearLatencyTimer();
     setLatency("low");
-  } else if (latencyLow && sched.queued === 0 && sched.inflight === 0 && !latencyTimer) {
+  } else if (latencyLow && sched.queued === 0 && sched.inflight === 0) {
+    if (latencyTimer) return;
     latencyTimer = setTimeout(() => { latencyTimer = null; setLatency("high"); }, LATENCY_IDLE_MS);
     latencyTimer.unref?.();
   }
@@ -406,6 +409,7 @@ function onHelperEvent(ev: Record<string, unknown>): void {
         const raw = Buffer.from(ev.b64, "base64");
         sess.rxBytes += raw.length; sess.lastRx = Date.now();
         reassembler.push(raw, (e) => { sess.rxFrames++; onEnvelope(e); });
+        noteLatency();
       } catch (err) {
         dropLink(`framing error: ${err instanceof Error ? err.message : err}`);
       }

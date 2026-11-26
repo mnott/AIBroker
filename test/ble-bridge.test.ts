@@ -280,6 +280,34 @@ test("coexistence: advertise events track connect state; low latency only around
   stopBleBridge();
 });
 
+test("inbound bulk: large announced frame switches to low before completion, high ~1s after; small does not", async () => {
+  const h = setup(true);
+  h.hello();
+  await tick();
+  h.useKs();
+  const lat = () => h.cmds.filter((c) => c.cmd === "latency").map((c) => c.mode);
+  const feed = (b: Buffer) => { for (const c of chunk(b, 20)) h.ev({ ev: "rx", b64: c.toString("base64") }); };
+  // small frame: no latency change
+  h.app("pailot/s1/in", { type: "text", msgId: "s1", content: "hi" });
+  await tick();
+  assert.deepEqual(lat(), []);
+  // large frame: feed only the first part
+  const frame = encodeFrame({ t: "pailot/s1/in", p: { type: "text", msgId: "b1", content: "y".repeat(20_000) } }, h.getKs());
+  feed(frame.subarray(0, 200));
+  await tick();
+  assert.deepEqual(lat(), ["low"], "low before the frame completes");
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.deepEqual(lat(), ["low"], "stays low while a frame is partially received");
+  feed(frame.subarray(200));
+  await tick();
+  const sentBytes = h.cmds.filter((c) => c.cmd === "tx").reduce((n, c) => n + Buffer.from(c.b64, "base64").length, 0);
+  h.ev({ ev: "sent", n: sentBytes }); // helper acks any replies (flow control)
+  assert.deepEqual(lat(), ["low"]);
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.deepEqual(lat(), ["low", "high"]);
+  stopBleBridge();
+});
+
 test("routeOutbound: size/type and mqtt availability", () => {
   const base = { size: 100, mqttAppClients: 1, bleReady: true };
   assert.deepEqual(routeOutbound({ ...base, type: "text" }), { ble: true, mqtt: true, large: false, reason: "small" });
