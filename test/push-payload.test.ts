@@ -160,3 +160,14 @@ test("push audio disabled by default", async () => {
   assert.equal(m.isPushAudioEnabled(), false);
   assert.equal(m.cachePushAudio("m1", Buffer.alloc(1)), false);
 });
+
+test("catch_up keeps the push msgId for text and for voice (downgraded to text)", async () => {
+  const { buildCatchUp } = await import("../src/adapters/pailot/gateway.js");
+  const missed = [
+    { payload: { msgId: "push-voice", seq: 2, type: "voice", sessionId: "s1", audioBase64: "AAAA", transcript: "hi" } },
+    { payload: { msgId: "push-text", seq: 1, type: "text", sessionId: "s1", content: "hello" } },
+  ];
+  const { messages } = buildCatchUp(missed);
+  const ids = messages.map((m) => m.msgId).sort();
+  assert.deepEqual(ids, ["push-text", "push-voice"]);
+});
