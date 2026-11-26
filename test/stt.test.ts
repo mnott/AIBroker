@@ -29,7 +29,8 @@ function fake(over: Partial<SttDeps> & { calls?: string[]; files?: Set<string>; 
     },
     readText: (p) => (p.endsWith("in.txt") ? " python text " : " cli text "),
     remove: (p) => { files.delete(p); },
-    serverTranscribe: async () => " server text [BLANK_AUDIO]",
+    serverDetect: async () => ({ lang: "de", prob: 0.99 }),
+    serverDecode: async () => ({ text: " server text [BLANK_AUDIO]", avgLogprob: -0.1 }),
     ensureServer: async () => "http://127.0.0.1:1",
     env: {},
     home,
@@ -68,7 +69,7 @@ describe("stt", () => {
     const calls: string[] = [];
     const noServer = fake({ calls, ensureServer: async () => null });
     assert.equal((await transcribeFile("/in.m4a", noServer)).backend, "whisper-cli");
-    const failing = fake({ calls, serverTranscribe: async () => { throw new Error("x"); }, failBins: ["whisper-cli"] });
+    const failing = fake({ calls, serverDetect: async () => { throw new Error("x"); }, failBins: ["whisper-cli"] });
     const r = await transcribeFile("/in.m4a", failing);
     assert.equal(r.backend, "python-whisper");
     assert.equal(r.text, "python text");
@@ -94,7 +95,7 @@ describe("stt", () => {
   });
 
   it("empty transcript is returned as empty text with metadata", async () => {
-    const r = await transcribeFile("/in.m4a", fake({ serverTranscribe: async () => "[BLANK_AUDIO]" }));
+    const r = await transcribeFile("/in.m4a", fake({ serverDecode: async () => ({ text: "[BLANK_AUDIO]", avgLogprob: -1 }) }));
     assert.equal(r.text, "");
     assert.equal(r.backend, "whisper-server");
   });
