@@ -48,3 +48,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/ble-frame.test.ts | a | wire framing is a cross-package protocol (hub+app); split/merge/oversize regressions break the link silently |
 | test/ble-bridge.test.ts | a | bridge auth/ready/inbound/outbound contract with fake helper; token bypass would expose hub commands |
 | test/stt.test.ts | a | STT backend order whisper-server > whisper-cli > python, WAV args, empty/invalid audio (2026-11-26 slow+empty PAILot voice note) |
+| test/stt-langs.test.ts | a | 2026-11-26 auto language detection transcribed a short German/English voice note as Portuguese; transcription restricted to allowed set |
