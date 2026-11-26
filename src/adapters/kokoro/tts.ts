@@ -14,7 +14,6 @@ import { join } from "node:path";
 
 import { log } from "../../core/log.js";
 import { resolveFfmpegBin } from "../../core/bins.js";
-import { sidecarSupervisor, streamSidecar, resolveBackend } from "./sidecar.js";
 
 
 export type KokoroVoice =
@@ -81,10 +80,10 @@ export async function textToVoiceNote(text: string, voice?: string, speed?: numb
   }
 
   const resolvedVoice = resolveVoice(voice ?? DEFAULT_VOICE);
+  await ensureInitialized();
 
   log(`Generating audio: voice=${resolvedVoice}, text="${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`);
 
-  // synthesizeChunked routes through the mlx sidecar when it is up; CPU fallback inside.
   const { audio: combined, sampleRate } = await synthesizeChunked(text, resolvedVoice, speed);
 
   log(`Generated ${combined.length} samples at ${sampleRate} Hz`);
@@ -276,11 +275,6 @@ export async function synthesizeChunked(
  * Streaming playback consumes this; the first chunk arrives after only one
  * sentence's synthesis instead of the whole text's. Aborts between sentences
  * when `signal` fires so stopPlayback() can end a job mid-synthesis.
- *
- * Backend: the Metal sidecar (~100 ms to first audio) when it is up; otherwise
- * kokoro-js on CPU (~4.5 s cold). A sidecar failure mid-stream falls back to
- * CPU for the remaining sentences rather than dropping audio. Which path served
- * is logged once per request.
  */
 export async function* synthesizeSentences(
   text: string,
@@ -290,49 +284,20 @@ export async function* synthesizeSentences(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   tts?: any,
 ): AsyncGenerator<{ audio: Float32Array; sampleRate: number }> {
+  if (!tts) {
+    await ensureInitialized();
+    tts = ttsInstance;
+  }
   voice = resolveVoice(voice || DEFAULT_VOICE);
   const sentences = splitFirstChunk(splitIntoSentences(text));
   const rate = speed !== undefined && Number.isFinite(speed) && speed > 0 ? speed : 1.0;
   let sampleRate = 24_000;
-
-  // Explicitly-provided tts instance (tests, experiments) bypasses the router.
-  if (tts) {
-    for (const s of sentences) {
-      if (signal?.aborted) throw new Error("TTS: synthesis aborted");
-      const r = await tts.generate(s, { voice, speed: rate });
-      sampleRate = r.sampling_rate ?? sampleRate;
-      if (r.audio && r.audio.length > 0) yield { audio: r.audio, sampleRate };
-    }
-    return;
-  }
-
-  // Try the Metal sidecar first; on any failure fall back to CPU for what is left.
-  const port = await sidecarSupervisor.currentPort();
-  if (port !== null && resolveBackend() === "mlx") {
-    try {
-      let served = 0;
-      for await (const chunk of streamSidecar(port, { text: sentences.join(" "), voice, speed: rate }, signal)) {
-        sampleRate = chunk.sampleRate;
-        served++;
-        yield chunk;
-      }
-      log(`TTS: served by mlx sidecar (${served} chunks)`);
-      return;
-    } catch (err) {
-      if (err instanceof Error && err.message === "TTS: synthesis aborted") throw err;
-      log(`TTS: sidecar failed (${err instanceof Error ? err.message : String(err)}) — falling back to kokoro-js CPU`);
-      await sidecarSupervisor.ensure(); // mark it dead so the next request retries cleanly
-    }
-  }
-
-  await ensureInitialized();
   for (const s of sentences) {
     if (signal?.aborted) throw new Error("TTS: synthesis aborted");
-    const r = await ttsInstance!.generate(s, { voice, speed: rate });
+    const r = await tts.generate(s, { voice, speed: rate });
     sampleRate = r.sampling_rate ?? sampleRate;
     if (r.audio && r.audio.length > 0) yield { audio: r.audio, sampleRate };
   }
-  log("TTS: served by kokoro-js CPU");
 }
 
 /** Encode Float32 PCM as a 16-bit mono WAV. Exported for the playback queue. */

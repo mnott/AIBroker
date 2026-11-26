@@ -439,17 +439,6 @@ export async function startDaemon(options?: {
     },
   });
 
-  // Metal TTS sidecar: load Kokoro once, warm it, keep it alive. Started here so
-  // the first `speak` of a session answers in ~100 ms instead of paying the CPU
-  // model's ~4.5 s cold path; a dead process is restarted by ensure() on demand.
-  {
-    const { sidecarSupervisor } = await import("../adapters/kokoro/sidecar.js");
-    void sidecarSupervisor.ensure().catch((err) => log(`tts-sidecar: failed to start — ${err instanceof Error ? err.message : String(err)}`));
-    setInterval(() => {
-      void sidecarSupervisor.ensure().catch(() => { /* retried next tick */ });
-    }, 60_000).unref();
-  }
-
   // Prune stale image contexts every 5 minutes (30-minute TTL enforced inside)
   setInterval(() => {
     const evicted = pruneStaleContexts();
@@ -750,7 +739,6 @@ export async function startDaemon(options?: {
     try { await (await import("./inbound.js")).flushHeldGroups(); } catch { /* kept on disk for next start */ }
     stopSocketGuard();
     try { unlinkSync(pidFile); } catch { /* already gone */ }
-    try { (await import("../adapters/kokoro/sidecar.js")).sidecarSupervisor.stop(); } catch { /* ignore */ }
     adapterRegistry.stopHealthPolling();
     flushQueue();
     stopMqttBroker();
