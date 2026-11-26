@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 
 import { log } from "../../core/log.js";
+import { transcribeFile } from "../../core/stt.js";
 import { resolveSoxBin, resolveWhisperBin } from "../../core/bins.js";
 import { setRecordingActive } from "../kokoro/playback.js";
 
@@ -82,44 +83,7 @@ export async function recordFromMic(maxDurationSec = 60): Promise<string> {
  * @returns The raw transcript text.
  */
 export async function transcribeLocalAudio(audioPath: string): Promise<string> {
-  const base = audioPath.replace(/\.[^.]+$/, "");
-  const baseName = base.split("/").pop()!;
-  const outDir = tmpdir();
-
-  const filesToClean: string[] = [
-    join(outDir, `${baseName}.txt`),
-    join(outDir, `${baseName}.json`),
-    join(outDir, `${baseName}.vtt`),
-    join(outDir, `${baseName}.srt`),
-    join(outDir, `${baseName}.tsv`),
-  ];
-
-  try {
-    log(`Dictation: transcribing ${audioPath} (model=${WHISPER_MODEL})...`);
-
-    await execFileAsync(
-      resolveWhisperBin(),
-      [audioPath, "--model", WHISPER_MODEL, "--output_format", "txt", "--output_dir", outDir, "--verbose", "False"],
-      {
-        timeout: 120_000,
-        env: {
-          ...process.env,
-          PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || "/usr/bin:/bin"}`,
-        },
-      },
-    );
-
-    const txtPath = join(outDir, `${baseName}.txt`);
-    if (!existsSync(txtPath)) {
-      throw new Error(`Whisper did not produce output at ${txtPath}`);
-    }
-
-    const transcript = readFileSync(txtPath, "utf-8").trim();
-    log(`Dictation: transcript (${transcript.length} chars): ${transcript.slice(0, 80)}`);
-    return transcript;
-  } finally {
-    for (const f of filesToClean) {
-      try { unlinkSync(f); } catch { /* ignore */ }
-    }
-  }
+  const res = await transcribeFile(audioPath);
+  log(`Dictation: transcript (${res.text.length} chars): ${res.text.slice(0, 80)}`);
+  return res.text;
 }
