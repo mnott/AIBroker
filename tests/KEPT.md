@@ -47,3 +47,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/tts-sidecar.test.ts | c | pins the mlx sidecar wire protocol (JSON request, streamed int16 PCM frames, error frames) that tts-sidecar/server.py and the daemon both depend on; guards CPU fallback when the sidecar is absent |
 | test/ble-frame.test.ts | a | wire framing is a cross-package protocol (hub+app); split/merge/oversize regressions break the link silently |
 | test/ble-bridge.test.ts | a | bridge auth/ready/inbound/outbound contract with fake helper; token bypass would expose hub commands |
+| test/stt.test.ts | a | STT backend order whisper-server > whisper-cli > python, WAV args, empty/invalid audio (2026-11-26 slow+empty PAILot voice note) |

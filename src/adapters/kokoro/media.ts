@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 
 import { log } from "../../core/log.js";
+import { transcribeFile } from "../../core/stt.js";
 import { resolveWhisperBin } from "../../core/bins.js";
 
 const execFileAsync = promisify(execFile);
@@ -67,48 +68,13 @@ export async function transcribeAudio(
   audioPath: string,
   label = "[Audio]",
 ): Promise<string | null> {
-  const base = audioPath.replace(/\.[^.]+$/, "");
-  const baseName = base.split("/").pop()!;
-
-  const filesToClean: string[] = [
-    join(tmpdir(), `${baseName}.txt`),
-    join(tmpdir(), `${baseName}.json`),
-    join(tmpdir(), `${baseName}.vtt`),
-    join(tmpdir(), `${baseName}.srt`),
-    join(tmpdir(), `${baseName}.tsv`),
-  ];
-
   try {
-    log(`Transcribing ${audioPath} (model=${WHISPER_MODEL})...`);
-
-    await execFileAsync(
-      resolveWhisperBin(),
-      [audioPath, "--model", WHISPER_MODEL, "--output_format", "txt", "--output_dir", tmpdir(), "--verbose", "False"],
-      {
-        timeout: 120_000,
-        env: {
-          ...process.env,
-          PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || "/usr/bin:/bin"}`,
-        },
-      },
-    );
-
-    const txtPath = join(tmpdir(), `${baseName}.txt`);
-    if (!existsSync(txtPath)) {
-      log(`Whisper did not produce output at ${txtPath}`);
-      return null;
-    }
-
-    const transcript = readFileSync(txtPath, "utf-8").trim();
-    log(`Transcription: ${transcript.slice(0, 80)}`);
-    return `${label}: ${transcript}`;
+    const res = await transcribeFile(audioPath);
+    log(`Transcription: ${res.text.slice(0, 80)}`);
+    return `${label}: ${res.text}`;
   } catch (err) {
     log(`Audio transcription failed: ${err}`);
     return null;
-  } finally {
-    for (const f of filesToClean) {
-      try { unlinkSync(f); } catch { /* ignore */ }
-    }
   }
 }
 

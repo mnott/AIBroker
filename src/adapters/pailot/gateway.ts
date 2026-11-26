@@ -24,6 +24,7 @@ const DEBUG_LOG = process.env.PAILOT_DEBUG ? "/tmp/pailot-ws-debug.log" : null;
 function dbg(msg: string): void {
   if (DEBUG_LOG) appendPrivate(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
 }
+import { transcribeFile, SttAudioError } from "../../core/stt.js";
 import { randomUUID } from "node:crypto";
 import { appendPrivate } from "../../core/private-file.js";
 import { promisify } from "node:util";
@@ -1150,27 +1151,19 @@ export async function transcribeAndRoute(
     const buffer = Buffer.from(audioBase64, "base64");
     writeFileSync(audioFile, buffer);
     dbg(`Audio saved: ${audioFile} (${buffer.length} bytes)`);
-    log(`[PAILot] Voice note saved (${buffer.length} bytes), running Whisper...`);
+    log(`[PAILot] Voice note saved (${buffer.length} bytes), transcribing...`);
 
-    await execFileAsync(
-      resolveWhisperBin(),
-      [audioFile, "--model", WHISPER_MODEL, "--output_format", "txt", "--output_dir", tmpdir(), "--verbose", "False"],
-      {
-        timeout: 120_000,
-        env: {
-          ...process.env,
-          PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || "/usr/bin:/bin"}`,
-        },
+    let transcript = "";
+    try {
+      const res = await transcribeFile(audioFile);
+      transcript = res.text;
+    } catch (err) {
+      if (err instanceof SttAudioError) {
+        log(`[PAILot] Voice note rejected: ${err.message} (${buffer.length} bytes)`);
+        return;
       }
-    );
-
-    const txtPath = join(tmpdir(), `${base}.txt`);
-    if (!existsSync(txtPath)) {
-      log(`[PAILot] Whisper did not produce output`);
-      return;
+      throw err;
     }
-
-    const transcript = readFileSync(txtPath, "utf-8").trim();
     if (!transcript) {
       log(`[PAILot] Empty transcript`);
       return;
