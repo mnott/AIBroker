@@ -154,7 +154,8 @@ function evictOldIds(): void {
 // --- MQTT publish helpers ---
 
 /** Tap called for every outbound publish, even with no broker/clients (BLE bridge). */
-export type MqttOutTap = (topic: string, json: string, opts: { qos: number; retain: boolean }) => void;
+export interface MqttOutResult { skipMqtt?: boolean }
+export type MqttOutTap = (topic: string, json: string, opts: { qos: number; retain: boolean }) => MqttOutResult | void;
 let outTap: MqttOutTap | null = null;
 
 export function setMqttOutTap(fn: MqttOutTap | null): void {
@@ -164,7 +165,10 @@ export function setMqttOutTap(fn: MqttOutTap | null): void {
 function mqttPublish(topic: string, payload: Record<string, unknown>, opts?: { qos?: number; retain?: boolean }): void {
   const json = JSON.stringify(payload);
   if (outTap) {
-    try { outTap(topic, json, { qos: opts?.qos ?? 1, retain: opts?.retain ?? false }); }
+    try {
+      const r = outTap(topic, json, { qos: opts?.qos ?? 1, retain: opts?.retain ?? false });
+      if (r && r.skipMqtt) return;
+    }
     catch (err) { log(`[MQTT] out tap error on ${topic}: ${err}`); }
   }
   if (!broker) { log(`[MQTT] publish skipped (no broker): ${topic}`); return; }

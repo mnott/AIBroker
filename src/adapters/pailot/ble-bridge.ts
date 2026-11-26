@@ -10,14 +10,16 @@
  * See docs/ble-transport.md.
  */
 
-import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { spawn as nodeSpawn, execFile, type ChildProcess } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { log } from "../../core/log.js";
-import { handleInboundPublish, setMqttOutTap } from "./mqtt-broker.js";
+import { getMqttAppClientCount, handleInboundPublish, setMqttOutTap, type MqttOutResult } from "./mqtt-broker.js";
 import { deriveK0, deriveKs, readyMac } from "./ble-crypto.js";
 import { chunk, DEFAULT_CHUNK, encodeFrame, FrameReassembler, type BleEnvelope } from "./ble-frame.js";
 
@@ -41,7 +43,63 @@ export interface BleBridgeOptions {
   spawn?: (cmd: string, args: string[]) => ChildProcess;
   /** Test seam: backoff base in ms. */
   backoffMs?: number;
+  /** Test seam: MQTT app client count (default getMqttAppClientCount). */
+  mqttAppClients?: () => number;
+  /** Test seam: image downscaler (base64 in -> base64 JPEG out, null = failed). */
+  downscaleImage?: (b64: string) => Promise<string | null>;
+  /** Test seam: audio compressor (base64 in -> base64 m4a out, null = failed). */
+  compressAudio?: (b64: string) => Promise<string | null>;
 }
+
+const BULK_TYPES = new Set(["image", "screenshot", "file"]);
+export const DEFAULT_BLE_MAX_PAYLOAD = 64 * 1024;
+export const BLE_AUDIO_MAX = 1024 * 1024;
+
+export interface RouteInput {
+  type: string;
+  size: number;
+  mqttAppClients: number;
+  bleReady: boolean;
+  maxPayload?: number;
+}
+export interface RouteDecision { ble: boolean; mqtt: boolean; large: boolean; reason: string }
+
+/** Pure per-message link decision. Large payloads use exactly one link (BLE xor MQTT). */
+export function routeOutbound(i: RouteInput): RouteDecision {
+  const max = i.maxPayload ?? DEFAULT_BLE_MAX_PAYLOAD;
+  const large = BULK_TYPES.has(i.type) || i.size > max;
+  if (!large) return { ble: i.bleReady, mqtt: true, large, reason: "small" };
+  if (i.mqttAppClients > 0) return { ble: false, mqtt: true, large, reason: "large, mqtt client connected" };
+  if (i.bleReady) return { ble: true, mqtt: false, large, reason: "large, no mqtt client, ble only (reduced)" };
+  return { ble: false, mqtt: true, large, reason: "large, no ble" };
+}
+
+function run(cmd: string, args: string[]): Promise<void> {
+  return new Promise((res, rej) => execFile(cmd, args, { timeout: 30000 }, (e) => (e ? rej(e) : res())));
+}
+
+async function viaTemp(b64: string, inName: string, outName: string, args: (i: string, o: string) => [string, string[]]): Promise<string | null> {
+  const dir = await mkdtemp(join(tmpdir(), "aib-ble-"));
+  try {
+    const i = join(dir, inName), o = join(dir, outName);
+    await writeFile(i, Buffer.from(b64, "base64"));
+    const [cmd, a] = args(i, o);
+    await run(cmd, a);
+    return (await readFile(o)).toString("base64");
+  } catch (err) {
+    log(`[BLE] ${args("", "")[0]} failed: ${err}`);
+    return null;
+  } finally { await rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}
+
+export const sipsDownscale = (b64: string): Promise<string | null> =>
+  viaTemp(b64, "in.img", "out.jpg", (i, o) => ["sips", ["-s", "format", "jpeg", "-s", "formatOptions", "70", "-Z", "1280", i, "--out", o]]);
+
+export const afconvertAac = (b64: string): Promise<string | null> => {
+  const head = Buffer.from(b64.slice(0, 16), "base64");
+  if (head.subarray(4, 8).toString() === "ftyp") return Promise.resolve(b64); // already m4a
+  return viaTemp(b64, "in.audio", "out.m4a", (i, o) => ["afconvert", ["-f", "m4af", "-d", "aac", i, o]]);
+};
 
 const FAKE_CLIENT = { id: "pailot-ble", conn: { remoteAddress: "ble" } };
 
@@ -197,15 +255,57 @@ function sendRetained(): void {
   }
 }
 
-function onOutbound(topic: string, json: string, opts: { retain: boolean }): void {
+function sendLogged(topic: string, p: unknown): void {
+  try { sendEnvelope({ t: topic, p }); }
+  catch (err) { log(`[BLE] outbound ${topic} failed: ${err}`); }
+}
+
+/** Shrink a large payload for BLE. Returns the payload to send, or null to drop. */
+async function reduceForBle(topic: string, p: Record<string, unknown>, type: string): Promise<Record<string, unknown> | null> {
+  const o = state?.opts ?? {};
+  if (type === "image" || type === "screenshot") {
+    const src = typeof p.imageBase64 === "string" ? p.imageBase64 : null;
+    if (!src) { log(`[BLE] drop ${topic} type=${type}: no imageBase64`); return null; }
+    const out = await (o.downscaleImage ?? sipsDownscale)(src);
+    if (!out) { log(`[BLE] drop ${topic} type=${type}: downscale failed`); return null; }
+    return { ...p, imageBase64: out, mimeType: "image/jpeg" };
+  }
+  if (type === "voice") {
+    const src = typeof p.audioBase64 === "string" ? p.audioBase64 : null;
+    if (!src) return p;
+    const out = await (o.compressAudio ?? afconvertAac)(src);
+    if (!out) { log(`[BLE] drop ${topic} type=voice: compress failed`); return null; }
+    if (out.length > BLE_AUDIO_MAX) { log(`[BLE] drop ${topic} type=voice: ${out.length}B after compress > ${BLE_AUDIO_MAX}`); return null; }
+    return { ...p, audioBase64: out };
+  }
+  if (Buffer.byteLength(JSON.stringify(p)) > BLE_AUDIO_MAX) { log(`[BLE] drop ${topic} type=${type}: too large for BLE`); return null; }
+  return p;
+}
+
+function onOutbound(topic: string, json: string, opts: { retain: boolean }): MqttOutResult | void {
   if (opts.retain) {
     if (!json) { retained.delete(topic); return; }
     retained.set(topic, json);
   }
   if (!json) return;
-  if (!status.ready) return;
-  try { sendEnvelope({ t: topic, p: JSON.parse(json) }); }
-  catch (err) { log(`[BLE] outbound ${topic} failed: ${err}`); }
+  let p: Record<string, unknown> | null = null;
+  try { p = JSON.parse(json); } catch { /* not json */ }
+  const type = p && typeof p.type === "string" ? p.type : "?";
+  const maxPayload = Number(state?.opts.env?.AIBROKER_BLE_MAX_PAYLOAD ?? process.env.AIBROKER_BLE_MAX_PAYLOAD) || DEFAULT_BLE_MAX_PAYLOAD;
+  const d = routeOutbound({
+    type, size: json.length, maxPayload, bleReady: status.ready && p !== null,
+    mqttAppClients: (state?.opts.mqttAppClients ?? getMqttAppClientCount)(),
+  });
+  const link = d.ble && d.mqtt ? "both" : d.ble ? "ble" : "mqtt";
+  log(`[LINK] out topic=${topic} type=${type} bytes=${json.length} -> ${link} (${d.reason})`);
+  if (d.ble && p) {
+    if (!d.large || (type !== "image" && type !== "screenshot" && type !== "voice")) {
+      if (json.length > BLE_AUDIO_MAX) log(`[BLE] drop ${topic} type=${type}: too large for BLE`);
+      else sendLogged(topic, p);
+    } else void reduceForBle(topic, p, type).then((r) => { if (r && status.ready) sendLogged(topic, r); })
+      .catch((err) => log(`[BLE] reduce ${topic} failed: ${err}`));
+  }
+  return { skipMqtt: !d.mqtt };
 }
 
 function dropLink(why: string): void {
@@ -263,6 +363,7 @@ function onEnvelope(env: BleEnvelope): void {
   }
   if (env.t === "ble/hello") return;
   const p = env.p as { type?: unknown } | null;
+  log(`[LINK] in topic=${env.t} type=${typeof p?.type === "string" ? p.type : "?"} bytes=${JSON.stringify(env.p ?? {}).length} via ble`);
   if (p && p.type === "voice") log("[BLE] voice note -> local STT");
   handleInboundPublish({ topic: env.t, payload: Buffer.from(JSON.stringify(env.p ?? {})) }, FAKE_CLIENT);
 }
