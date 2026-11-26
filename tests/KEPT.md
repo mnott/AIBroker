@@ -44,3 +44,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/playback.test.ts | a | serial queue, streaming order, recording hold |
 | test/session-voice.test.ts | a | per-session voice settings store: defaults, clamp/round, guarded persistence |
 | test/voice-handlers.test.ts | a | session-scoped voice_config/speak/repeat/stop handlers over the hub socket |
+| test/tts-sidecar.test.ts | c | pins the mlx sidecar wire protocol (JSON request, streamed int16 PCM frames, error frames) that tts-sidecar/server.py and the daemon both depend on; guards CPU fallback when the sidecar is absent |
