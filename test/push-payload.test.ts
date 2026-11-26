@@ -171,3 +171,40 @@ test("catch_up keeps the push msgId for text and for voice (downgraded to text)"
   const ids = messages.map((m) => m.msgId).sort();
   assert.deepEqual(ids, ["push-text", "push-voice"]);
 });
+
+test("audio server logs every request (200, 401, 404) without the auth value", async () => {
+  const cache = new AudioCache();
+  cache.put("m1", Buffer.from("x"));
+  const srv = createPushAudioServer(cache, key);
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  const lines: string[] = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((c: string | Uint8Array) => { lines.push(String(c)); return true; }) as typeof process.stderr.write;
+  const auth = pushAudioAuth(key, "m1");
+  try {
+    await fetch(`${base}/pailot/audio/m1`, { headers: { "X-PAILot-Auth": auth } });
+    await fetch(`${base}/pailot/audio/m1`, { headers: { "X-PAILot-Auth": "00" } });
+    await fetch(`${base}/pailot/audio/miss`, { headers: { "X-PAILot-Auth": pushAudioAuth(key, "miss") } });
+    await fetch(`${base}/other`);
+  } finally {
+    process.stderr.write = orig;
+    srv.close();
+  }
+  const out = lines.join("");
+  assert.match(out, /\[PushAudio\] GET \/pailot\/audio\/m1 from \S+ -> 200 \d+/);
+  assert.match(out, /GET \/pailot\/audio\/m1 from \S+ -> 401 0/);
+  assert.match(out, /GET \/pailot\/audio\/miss from \S+ -> 404 0/);
+  assert.match(out, /GET \/other from \S+ -> 404 0/);
+  assert.equal(out.includes(auth), false);
+});
+
+test("voice push with audio fields is full and carries audioPath/audioPort/msgId", () => {
+  const b = buildPushPayload({ title: "PAI", body: "t", token: TOKEN,
+    message: msg({ type: "voice", content: "hi", audioPath: "/pailot/audio/m1", audioPort: 8099, audioSecs: 3.2 }) });
+  assert.equal(b.mode, "full");
+  const pl = decode(b);
+  assert.equal(pl.audioPath, "/pailot/audio/m1");
+  assert.equal(pl.audioPort, 8099);
+  assert.equal(pl.msgId, "m1");
+});
