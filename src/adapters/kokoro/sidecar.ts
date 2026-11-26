@@ -92,35 +92,39 @@ export async function* streamSidecar(
   try {
     sock.write(JSON.stringify(req) + "\n");
 
+    // One persistent listener set. Data arriving while the generator is
+    // suspended (playback of a previous sentence) must be buffered, not
+    // dropped: a flowing net.Socket discards it when no 'data' handler is
+    // attached, which left readLine waiting forever after the first chunk.
     let buf = "";
+    let closed = false;
+    let socketErr: Error | null = null;
+    let notify: (() => void) | null = null;
+    const wake = () => { notify?.(); notify = null; };
+    sock.on("data", (d: Buffer) => { buf += d.toString("utf-8"); wake(); });
+    sock.once("end", () => { closed = true; wake(); });
+    sock.once("error", (e: Error) => { socketErr = e; wake(); });
+
     let sampleRate = 24_000;
     const readLine = async (): Promise<string> => {
       for (;;) {
         if (signal?.aborted) throw new Error("TTS: synthesis aborted");
+        if (socketErr) throw socketErr;
         const nl = buf.indexOf("\n");
         if (nl >= 0) {
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
           return line;
         }
-        const data = await new Promise<Buffer>((resolve, reject) => {
-          const onAbort = () => done(() => reject(new Error("TTS: synthesis aborted")));
-          const onData = (d: Buffer) => done(() => resolve(d));
-          const onErr = (e: Error) => done(() => reject(e));
-          const onEnd = () => done(() => reject(new Error("sidecar closed stream")));
-          const done = (fn: () => void) => {
-            sock.off("data", onData);
-            sock.off("error", onErr);
-            sock.off("end", onEnd);
-            signal?.removeEventListener("abort", onAbort);
-            fn();
-          };
-          sock.on("data", onData);
-          sock.on("error", onErr);
-          sock.on("end", onEnd);
+        if (closed) throw new Error("sidecar closed stream");
+        await new Promise<void>((resolve) => {
+          notify = resolve;
+          const onAbort = () => { notify = null; resolve(); };
           signal?.addEventListener("abort", onAbort, { once: true });
+          // Do NOT wake() here: resolving the promise we just created would
+          // spin forever (buf has no newline yet). Data arriving later calls
+          // wake(); abort is handled by its own listener.
         });
-        buf += data.toString("utf-8");
       }
     };
 
