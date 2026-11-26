@@ -255,3 +255,26 @@ test("idle: 5 pings over time each get a session-key pong immediately; link neve
   assert.ok(!h.cmds.some((c) => c.cmd === "drop"));
   stopBleBridge();
 });
+
+test("coexistence: advertise events track connect state; low latency only around bulk, then high", async () => {
+  const h = setup(true);
+  h.ev({ ev: "advertising", name: "PAILot Hub" });
+  assert.equal(getBleStatus().advertising, true);
+  h.ev({ ev: "advertising", on: false }); // helper stops advertising on subscribe
+  await tick();
+  assert.equal(getBleStatus().advertising, false);
+  h.hello();
+  await tick();
+  assert.equal(h.cmds.filter((c) => c.cmd === "latency").length, 0, "no latency request for idle/control traffic");
+  mqttPublishText("s1", "x".repeat(20_000), "m1");
+  await tick();
+  assert.deepEqual(h.cmds.filter((c) => c.cmd === "latency"), [{ cmd: "latency", mode: "low" }]);
+  // drain: helper acks everything
+  const sentBytes = h.cmds.filter((c) => c.cmd === "tx").reduce((n, c) => n + Buffer.from(c.b64, "base64").length, 0);
+  h.ev({ ev: "sent", n: sentBytes });
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.deepEqual(h.cmds.filter((c) => c.cmd === "latency").map((c) => c.mode), ["low", "high"]);
+  h.ev({ ev: "advertising", name: "PAILot Hub" }); // resumed after unsubscribe
+  assert.equal(getBleStatus().advertising, true);
+  stopBleBridge();
+});

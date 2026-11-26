@@ -64,3 +64,15 @@ The helper holds an idle-sleep assertion (`ProcessInfo.beginActivity(.idleSystem
 
 - The helper announces `"flow":1` in its `ready` event, emits `{"ev":"sent","n":bytes}` per chunk accepted by CoreBluetooth and re-slices to the live `maximumUpdateValueLength` (re-announcing `mtu` on change). The bridge keeps at most 64 KB un-acked in the helper and sends frames through a two-priority scheduler: `ble/pong` and `ble/ready` are inserted at the next frame boundary ahead of queued bulk frames (a frame's chunks are never interleaved). Without `flow:1` chunks are written immediately as before. No wire change.
 - On `central disconnected` the hub logs one line with session counters (`after Ns ready=, rx=B/frames, tx=B/frames, pings, pongs, lastRx, rxPartial=buffered/declared, txQueued`); every `dropping link` reason carries the same counters. A ping summary is logged every 10th ping.
+
+## Coexistence with Bluetooth audio
+
+Observed 2026-11-26: with the PAILot link up, AirPods Max (classic A2DP/HFP) on the same Mac flapped between connected and disconnected; with BLE off it stopped. Classic audio and the BLE peripheral share one radio, so airtime used by BLE directly competes with the audio link. Suspects reviewed:
+
+- Advertising while connected (fixed): the helper kept advertising after a central subscribed. Advertising consumes airtime on all three channels for no benefit once connected (CoreBluetooth `CBPeripheralManager.stopAdvertising()`). The helper now stops advertising on `didSubscribeTo` and calls `startAdvertising` again on `didUnsubscribeFrom`. Event `{"ev":"advertising","on":false}` tells the hub (`status.advertising`).
+- Connection parameters (fixed): the default interval/latency is aggressive. On subscribe the helper requests `setDesiredConnectionLatency(.high, for: central)` (peripheral latency, fewer connection events). The hub sends `{"cmd":"latency","mode":"low"}` only when at least 8 KB are queued or in flight (bulk transfer), and `"high"` again 1 s after the queue drained. Ping/pong and other control traffic stay on high latency. The request is a hint; the central (iOS) decides.
+- Notify bursts: updateValue is already paced by flow control (64 KB max un-acked); no change.
+- Service rebuild (`drop`): only runs on auth/framing failures, not in steady state; not a cause of periodic flapping.
+- Idle-sleep assertion (`beginActivity(.idleSystemSleepDisabled)`): a power assertion, no radio activity; unchanged.
+
+Helper protocol additions: command `latency {mode: "low"|"high"}`; event `advertising {on:false}`. Not verified on hardware with AirPods; check after deploy.
