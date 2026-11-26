@@ -13,8 +13,8 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, homedir } from "node:os";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import net from "node:net";
 
 import { log } from "../../core/log.js";
@@ -104,9 +104,21 @@ export async function* streamSidecar(
           return line;
         }
         const data = await new Promise<Buffer>((resolve, reject) => {
-          sock.once("data", resolve);
-          sock.once("error", reject);
-          sock.once("end", () => reject(new Error("sidecar closed stream")));
+          const onAbort = () => done(() => reject(new Error("TTS: synthesis aborted")));
+          const onData = (d: Buffer) => done(() => resolve(d));
+          const onErr = (e: Error) => done(() => reject(e));
+          const onEnd = () => done(() => reject(new Error("sidecar closed stream")));
+          const done = (fn: () => void) => {
+            sock.off("data", onData);
+            sock.off("error", onErr);
+            sock.off("end", onEnd);
+            signal?.removeEventListener("abort", onAbort);
+            fn();
+          };
+          sock.on("data", onData);
+          sock.on("error", onErr);
+          sock.on("end", onEnd);
+          signal?.addEventListener("abort", onAbort, { once: true });
         });
         buf += data.toString("utf-8");
       }

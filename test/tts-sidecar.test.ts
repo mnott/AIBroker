@@ -2,6 +2,7 @@ import "./home-guard.js";
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 

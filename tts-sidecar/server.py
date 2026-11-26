@@ -134,7 +134,8 @@ def main() -> None:
                         a = getattr(r, "audio", None)
                         if a is None or a.shape[-1] == 0:
                             continue
-                        pcm = a.to_numpy().astype("float32")
+                        import numpy as np
+                        pcm = np.array(a, dtype=np.float32).reshape(-1)
                         pcm = pcm.clip(-1.0, 1.0)
                         int16 = (pcm * 32767.0).astype("<i2").tobytes()
                         self.send({"chunk_b64": base64.b64encode(int16).decode("ascii")})
