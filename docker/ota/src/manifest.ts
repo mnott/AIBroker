@@ -1,5 +1,6 @@
 import { Request } from "express";
 import { AppMeta } from "./paths.js";
+import { escapeXml as e } from "./escape.js";
 
 // manifest URL must be derived from req — iOS fails silently on host mismatch
 export function renderManifest(req: Request, slug: string, meta: AppMeta): string {
@@ -7,7 +8,7 @@ export function renderManifest(req: Request, slug: string, meta: AppMeta): strin
   const host = req.headers.host ?? "localhost";
   const base = `${proto}://${host}`;
   const ipaFile = meta.ipaFile ?? "";
-  const assetUrl = `${base}/install/${slug}/${ipaFile}`;
+  const assetUrl = `${base}/install/${encodeURIComponent(slug)}/${encodeURIComponent(ipaFile)}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -23,19 +24,19 @@ export function renderManifest(req: Request, slug: string, meta: AppMeta): strin
           <key>kind</key>
           <string>software-package</string>
           <key>url</key>
-          <string>${assetUrl}</string>
+          <string>${e(assetUrl)}</string>
         </dict>
       </array>
       <key>metadata</key>
       <dict>
         <key>bundle-identifier</key>
-        <string>${meta.bundleId}</string>
+        <string>${e(meta.bundleId)}</string>
         <key>bundle-version</key>
-        <string>${meta.version}</string>
+        <string>${e(meta.version)}</string>
         <key>kind</key>
         <string>software</string>
         <key>title</key>
-        <string>${meta.name}</string>
+        <string>${e(meta.name)}</string>
       </dict>
     </dict>
   </array>
