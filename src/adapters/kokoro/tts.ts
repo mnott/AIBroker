@@ -332,7 +332,7 @@ export async function* synthesizeSentences(
 
   // Try the Metal sidecar first; on any failure fall back to CPU for what is left.
   const port = await sidecarSupervisor.currentPort();
-  if (port !== null && resolveBackend() === "mlx") {
+  if (port !== null && resolveBackend() !== "cpu") {
     try {
       let served = 0;
       for await (const chunk of streamSidecar(port, { text: sentences.join(" "), voice, speed: rate }, signal)) {

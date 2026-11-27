@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""TTS sidecar — Kokoro-82M on Apple Metal via mlx-audio.
+"""TTS sidecar — Kokoro-82M, pluggable backend: mlx (Apple Metal), torch (CUDA/CPU), onnx.
+
+Backend: --backend <name> or AIBROKER_TTS_BACKEND (default mlx). Imports are lazy,
+so each venv only needs its own packages. The socket protocol is the same for all.
 
 The daemon spawns this with the cached venv interpreter (`-I`) and talks to it
 over 127.0.0.1 TCP: one JSON request per line, streamed PCM back. The model is
@@ -25,8 +28,6 @@ import math
 import os
 import sys
 import time
-
-from mlx_audio.tts.utils import load_model
 
 MODEL_ID = "mlx-community/Kokoro-82M-bf16"
 WARM_TEXT = "The report is ready, and the numbers on the hard set changed quite a lot overnight."
@@ -76,6 +77,87 @@ def lang_code(voice: str) -> str:
     return "a"
 
 
+class Backend:
+    """A loaded Kokoro model. generate() yields float32 mono numpy arrays."""
+
+    sample_rate = 24000
+
+    def load(self) -> None:
+        raise NotImplementedError
+
+    def generate(self, text: str, voice: str, speed: float, lang: str):
+        raise NotImplementedError
+
+
+class MlxBackend(Backend):
+    def load(self) -> None:
+        from mlx_audio.tts.utils import load_model  # lazy: only in the mlx venv
+
+        self.model = load_model(MODEL_ID)
+        self.sample_rate = int(getattr(self.model, "sample_rate", 24000))
+
+    def generate(self, text, voice, speed, lang):
+        for r in self.model.generate(text=text, voice=voice, speed=speed, lang_code=lang):
+            a = getattr(r, "audio", None)
+            if a is not None and a.shape[-1] > 0:
+                import numpy as np
+                yield np.array(a, dtype=np.float32).reshape(-1)
+
+
+class TorchBackend(Backend):
+    def load(self) -> None:
+        import torch  # lazy: only in the torch venv
+        from kokoro import KPipeline
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.pipelines = {}
+        self.KPipeline = KPipeline
+        self._pipeline("a")
+
+    def _pipeline(self, lang):
+        if lang not in self.pipelines:
+            self.pipelines[lang] = self.KPipeline(lang_code=lang, repo_id="hexgrad/Kokoro-82M", device=self.device)
+        return self.pipelines[lang]
+
+    def generate(self, text, voice, speed, lang):
+        import numpy as np
+        for _gs, _ps, audio in self._pipeline(lang)(text, voice=voice, speed=speed):
+            if audio is not None and len(audio) > 0:
+                yield np.asarray(audio, dtype=np.float32).reshape(-1)
+
+
+class OnnxBackend(Backend):
+    def load(self) -> None:
+        from huggingface_hub import snapshot_download
+        from kokoro_onnx import Kokoro  # lazy: only in the onnx venv
+
+        d = snapshot_download("onnx-community/Kokoro-82M-v1.0-ONNX")
+        self.kokoro = Kokoro(os.path.join(d, "onnx", "model.onnx"), os.path.join(d, "voices.bin"))
+
+    def generate(self, text, voice, speed, lang):
+        samples, sr = self.kokoro.create(text, voice=voice, speed=speed, lang="en-gb" if lang == "b" else "en-us")
+        self.sample_rate = int(sr)
+        if len(samples) > 0:
+            import numpy as np
+            yield np.asarray(samples, dtype=np.float32).reshape(-1)
+
+
+BACKENDS = {"mlx": MlxBackend, "torch": TorchBackend, "onnx": OnnxBackend}
+
+
+def pick_backend() -> Backend:
+    name = os.environ.get("AIBROKER_TTS_BACKEND", "mlx")
+    if "--backend" in sys.argv:
+        i = sys.argv.index("--backend")
+        if i + 1 < len(sys.argv):
+            name = sys.argv[i + 1]
+    name = name.lower().strip()
+    if name not in BACKENDS:
+        print(f"tts-sidecar: unknown backend {name!r} (mlx|torch|onnx)", file=sys.stderr)
+        sys.exit(2)
+    return BACKENDS[name]()
+
+
 def main() -> None:
     port = int(os.environ.get("AIBROKER_TTS_SIDECAR_PORT", "0"))
     if port <= 0:
@@ -83,16 +165,16 @@ def main() -> None:
         sys.exit(2)
 
     t0 = time.time()
-    model = load_model(MODEL_ID)
-    sample_rate = int(getattr(model, "sample_rate", 24000))
+    backend = pick_backend()
+    backend.load()
+    sample_rate = backend.sample_rate
     print(f"tts-sidecar: loaded {MODEL_ID} in {1000*(time.time()-t0):.0f} ms", file=sys.stderr, flush=True)
 
     # Warm-up: the first Metal generate pays kernel compilation (~8 s).
     t0 = time.time()
     n = 0
-    for r in model.generate(text=WARM_TEXT, voice="bm_fable", speed=1.0, lang_code="b"):
-        if getattr(r, "audio", None) is not None:
-            n += int(r.audio.shape[-1])
+    for a in backend.generate(WARM_TEXT, "bm_fable", 1.0, "b"):
+        n += int(a.shape[-1])
     print(f"tts-sidecar: warm-up {n} samples in {1000*(time.time()-t0):.0f} ms", file=sys.stderr, flush=True)
 
     import socketserver
@@ -130,12 +212,7 @@ def main() -> None:
                 for i, s in enumerate(sentences):
                     if i > 0:
                         self.send({"chunk_b64": base64.b64encode(bytes(gap * 2)).decode("ascii")})
-                    for r in model.generate(text=s, voice=voice, speed=speed, lang_code=lang):
-                        a = getattr(r, "audio", None)
-                        if a is None or a.shape[-1] == 0:
-                            continue
-                        import numpy as np
-                        pcm = np.array(a, dtype=np.float32).reshape(-1)
+                    for pcm in backend.generate(s, voice, speed, lang):
                         pcm = pcm.clip(-1.0, 1.0)
                         int16 = (pcm * 32767.0).astype("<i2").tobytes()
                         self.send({"chunk_b64": base64.b64encode(int16).decode("ascii")})
