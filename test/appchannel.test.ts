@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import "./home-guard.js";
+import { describe, it, afterEach, mock } from "node:test";
+import assert from "node:assert/strict";
 import { WebSocketServer } from "ws";
 import type { AddressInfo } from "node:net";
 import { parseClientFrame, formatChannelPrefix, formatInbound, type HubFrame } from "../src/adapters/appchannel/protocol.js";
@@ -7,10 +9,22 @@ import { attachAppChannel, parseTokens } from "../src/adapters/appchannel/server
 import { AppChannelClient } from "../src/adapters/appchannel/client.js";
 import { deliveryFor } from "../src/daemon/ingress.js";
 
+// toMatchObject equivalent: every key in `exp` must match recursively in `act`.
+function subset(act: any, exp: any): boolean {
+  if (exp === null || typeof exp !== "object") return Object.is(act, exp);
+  if (act === null || typeof act !== "object") return false;
+  return Object.keys(exp).every((k) => subset(act[k], exp[k]));
+}
+function match(act: unknown, exp: object) { assert.ok(subset(act, exp), `expected ${JSON.stringify(act)} to match ${JSON.stringify(exp)}`); }
+async function waitFor(fn: () => void, ms = 2000) {
+  const end = Date.now() + ms;
+  for (;;) { try { fn(); return; } catch (e) { if (Date.now() > end) throw e; await new Promise((r) => setTimeout(r, 10)); } }
+}
+
 const hello = { v: 1 as const, type: "hello" as const, app: "CaseLeaf", paneId: "p1", token: "secret" };
 function conn() { const sent: HubFrame[] = []; return { sent, send: (f: HubFrame) => { sent.push(f); } }; }
 function mk(opts: { sessions?: string[]; now?: () => number; actionTtlMs?: number; rateLimit?: number } = {}) {
-  const deliver = vi.fn();
+  const deliver = mock.fn();
   const ch = new AppChannel(
     { deliver, sessionExists: (id) => (opts.sessions ?? ["s1", "s2"]).includes(id), now: opts.now },
     { tokens: { CaseLeaf: ["secret"] }, actionTtlMs: opts.actionTtlMs, rateLimit: opts.rateLimit },
@@ -22,13 +36,13 @@ const pane = (ch: AppChannel, c = conn(), h = hello) => ({ c, p: ch.registerPane
 
 describe("protocol", () => {
   it("accepts valid frames", () => {
-    expect(parseClientFrame(JSON.stringify(hello)).ok).toBe(true);
-    expect(parseClientFrame(JSON.stringify({ v: 1, type: "ping" })).ok).toBe(true);
-    expect(parseClientFrame(JSON.stringify({ v: 1, type: "confirm", actionId: "a", approve: false })).ok).toBe(true);
-    expect(parseClientFrame(JSON.stringify(msg("s", "t", { doc: { fileId: "f", page: 3, marks: ["a"] } }))).ok).toBe(true);
+    assert.equal(parseClientFrame(JSON.stringify(hello)).ok, true);
+    assert.equal(parseClientFrame(JSON.stringify({ v: 1, type: "ping" })).ok, true);
+    assert.equal(parseClientFrame(JSON.stringify({ v: 1, type: "confirm", actionId: "a", approve: false })).ok, true);
+    assert.equal(parseClientFrame(JSON.stringify(msg("s", "t", { doc: { fileId: "f", page: 3, marks: ["a"] } }))).ok, true);
   });
   it("rejects bad input", () => {
-    const bad = (x: unknown) => expect(parseClientFrame(typeof x === "string" ? x : JSON.stringify(x)).ok).toBe(false);
+    const bad = (x: unknown) => assert.equal(parseClientFrame(typeof x === "string" ? x : JSON.stringify(x)).ok, false);
     bad("not json");
     bad("[]");
     bad({ v: 2, type: "ping" });
@@ -46,62 +60,62 @@ describe("protocol", () => {
 
 describe("prefix", () => {
   it("formats doc context", () => {
-    expect(formatChannelPrefix("CaseLeaf", { doc: { fileId: "f1", page: 3, marks: ["a", "b"], selection: "some text" } }))
-      .toBe('[CaseLeaf:doc file=f1 page=3 marks=a,b] "some text" ');
+    assert.equal(formatChannelPrefix("CaseLeaf", { doc: { fileId: "f1", page: 3, marks: ["a", "b"], selection: "some text" } }),
+      '[CaseLeaf:doc file=f1 page=3 marks=a,b] "some text" ');
   });
   it("collapses newlines and strips brackets/control chars", () => {
     const out = formatInbound("Case Leaf!]\n", "line1\nline2", {
       doc: { fileId: "f]\n[evil", selection: "a\nb\r\nc\u0007\"] injected" , marks: ["x]y"] },
     });
-    expect(out).not.toMatch(/[\n\r\u0007]/);
-    expect(out.startsWith("[CaseLeaf:doc file=fevil")).toBe(true);
-    expect(out.match(/\]/g)!.length).toBe(2); // prefix close + the quoted selection's own "]" only
-    expect(out.endsWith("line1 line2")).toBe(true);
-    expect(out).toContain("marks=xy");
+    assert.doesNotMatch(out, /[\n\r\u0007]/);
+    assert.equal(out.startsWith("[CaseLeaf:doc file=fevil"), true);
+    assert.equal(out.match(/\]/g)!.length, 2); // prefix close + the quoted selection's own "]" only
+    assert.equal(out.endsWith("line1 line2"), true);
+    assert.ok(out.includes("marks=xy"));
   });
 });
 
 describe("channel", () => {
   it("rejects bad token, unknown app", () => {
     const { ch } = mk();
-    const a = conn(); expect(ch.registerPane(a, { ...hello, token: "nope" })).toBeNull();
-    expect(a.sent[0]).toMatchObject({ type: "error", code: "auth" });
-    const b = conn(); expect(ch.registerPane(b, { ...hello, app: "Other" })).toBeNull();
-    expect(b.sent[0]).toMatchObject({ code: "auth" });
-    expect(ch.reply("s1", "x")).toBe(0);
+    const a = conn(); assert.equal(ch.registerPane(a, { ...hello, token: "nope" }), null);
+    match(a.sent[0], { type: "error", code: "auth" });
+    const b = conn(); assert.equal(ch.registerPane(b, { ...hello, app: "Other" }), null);
+    match(b.sent[0], { code: "auth" });
+    assert.equal(ch.reply("s1", "x"), 0);
   });
   it("delivers prefixed text and acks", async () => {
     const { ch, deliver } = mk();
     const { c, p } = pane(ch);
-    expect(c.sent[0]).toMatchObject({ type: "ready" });
+    match(c.sent[0], { type: "ready" });
     await ch.handleMessage(p, msg("s1", "check this", { doc: { fileId: "f9", page: 2 } }));
-    expect(deliver).toHaveBeenCalledWith("s1", "[CaseLeaf:doc file=f9 page=2] check this");
-    expect(c.sent.at(-1)).toEqual({ v: 1, type: "ack", id: "m1" });
+    assert.deepEqual(deliver.mock.calls.map((c) => c.arguments), [["s1", "[CaseLeaf:doc file=f9 page=2] check this"]]);
+    assert.deepEqual(c.sent.at(-1), { v: 1, type: "ack", id: "m1" });
   });
   it("unknown session errors", async () => {
     const { ch, deliver } = mk();
     const { c, p } = pane(ch);
     await ch.handleMessage(p, msg("zzz"));
-    expect(deliver).not.toHaveBeenCalled();
-    expect(c.sent.at(-1)).toMatchObject({ code: "session_not_found" });
+    assert.equal(deliver.mock.calls.length, 0);
+    match(c.sent.at(-1), { code: "session_not_found" });
   });
   it("routes replies only to the pane that spoke; drops otherwise; expires", async () => {
     let t = 1000;
     const { ch } = mk({ now: () => t });
     const A = pane(ch), B = pane(ch, conn(), { ...hello, paneId: "p2" });
-    expect(ch.reply("s1", "nobody")).toBe(0);
+    assert.equal(ch.reply("s1", "nobody"), 0);
     await ch.handleMessage(A.p, msg("s1"));
-    expect(ch.reply("s1", "yo")).toBe(1);
-    expect(A.c.sent.at(-1)).toMatchObject({ type: "reply", session: "s1", text: "yo" });
-    expect(B.c.sent.filter((f) => f.type === "reply")).toHaveLength(0);
-    expect(ch.reply("s2", "other")).toBe(0);
+    assert.equal(ch.reply("s1", "yo"), 1);
+    match(A.c.sent.at(-1), { type: "reply", session: "s1", text: "yo" });
+    assert.equal(B.c.sent.filter((f) => f.type === "reply").length, 0);
+    assert.equal(ch.reply("s2", "other"), 0);
     t += 31 * 60_000;
-    expect(ch.reply("s1", "late")).toBe(0);
+    assert.equal(ch.reply("s1", "late"), 0);
     await ch.handleMessage(A.p, msg("s1")); ch.unregister(A.p);
-    expect(ch.reply("s1", "gone")).toBe(0);
+    assert.equal(ch.reply("s1", "gone"), 0);
   });
   it("action confirm / deny / timeout / wrong pane", async () => {
-    vi.useFakeTimers();
+    mock.timers.enable({ apis: ["setTimeout"] });
     try {
       const { ch } = mk({ actionTtlMs: 1000 });
       const A = pane(ch), B = pane(ch, conn(), { ...hello, paneId: "p2" });
@@ -109,26 +123,26 @@ describe("channel", () => {
       const act = (c: ReturnType<typeof conn>) => c.sent.filter((f) => f.type === "action").at(-1) as any;
       const r1 = ch.requestAction("s1", { kind: "mark", args: { page: 1 } });
       const a1 = act(A.c);
-      expect(a1).toMatchObject({ needsConfirm: true, action: { kind: "mark" } });
-      expect(act(B.c)).toBeUndefined();
-      expect(ch.handleConfirm(B.p, { actionId: a1.actionId, approve: true })).toBe(false);
-      expect(B.c.sent.at(-1)).toMatchObject({ code: "unknown_action" });
-      expect(ch.handleConfirm(A.p, { actionId: a1.actionId, approve: true })).toBe(true);
-      await expect(r1).resolves.toEqual({ approved: true });
+      match(a1, { needsConfirm: true, action: { kind: "mark" } });
+      assert.equal(act(B.c), undefined);
+      assert.equal(ch.handleConfirm(B.p, { actionId: a1.actionId, approve: true }), false);
+      match(B.c.sent.at(-1), { code: "unknown_action" });
+      assert.equal(ch.handleConfirm(A.p, { actionId: a1.actionId, approve: true }), true);
+      assert.deepEqual(await r1, { approved: true });
       const r2 = ch.requestAction("s1", { kind: "revise", args: {} });
       ch.handleConfirm(A.p, { actionId: act(A.c).actionId, approve: false });
-      await expect(r2).resolves.toEqual({ approved: false });
+      assert.deepEqual(await r2, { approved: false });
       const r3 = ch.requestAction("s1", { kind: "reply", args: {} });
-      vi.advanceTimersByTime(1500);
-      await expect(r3).resolves.toEqual({ timeout: true });
-    } finally { vi.useRealTimers(); }
+      mock.timers.tick(1500);
+      assert.deepEqual(await r3, { timeout: true });
+    } finally { mock.timers.reset(); }
   });
   it("rate limits", async () => {
     const { ch, deliver } = mk({ rateLimit: 2 });
     const { c, p } = pane(ch);
     await ch.handleMessage(p, msg()); await ch.handleMessage(p, msg()); await ch.handleMessage(p, msg());
-    expect(deliver).toHaveBeenCalledTimes(2);
-    expect(c.sent.at(-1)).toMatchObject({ code: "rate_limited" });
+    assert.equal(deliver.mock.calls.length, 2);
+    match(c.sent.at(-1), { code: "rate_limited" });
   });
 });
 
@@ -152,19 +166,19 @@ describe("server + client", () => {
     const reply = new Promise<any>((r) => client!.onReply(r));
     const action = new Promise<any>((r) => client!.onAction(r));
     client.send("s1", "hello", { doc: { fileId: "f1", page: 1, selection: "sel" } });
-    await vi.waitFor(() => expect(deliver).toHaveBeenCalledWith("s1", '[CaseLeaf:doc file=f1 page=1] "sel" hello'));
-    expect(ch.reply("s1", "answer")).toBe(1);
-    expect(await reply).toMatchObject({ session: "s1", text: "answer" });
+    await waitFor(() => assert.deepEqual(deliver.mock.calls.map((c) => c.arguments), [["s1", '[CaseLeaf:doc file=f1 page=1] "sel" hello']]));
+    assert.equal(ch.reply("s1", "answer"), 1);
+    match(await reply, { session: "s1", text: "answer" });
     const res = ch.requestAction("s1", { kind: "mark", args: { page: 1 } });
     const a = await action;
     client.confirm(a.actionId, true);
-    await expect(res).resolves.toEqual({ approved: true });
+    assert.deepEqual(await res, { approved: true });
   });
 
   it("rejects bad token", async () => {
     const { url } = await up();
     client = new AppChannelClient();
-    await expect(client.connect({ url, app: "CaseLeaf", paneId: "p", token: "bad" })).rejects.toThrow(/auth/);
+    await assert.rejects(client.connect({ url, app: "CaseLeaf", paneId: "p", token: "bad" }), /auth/);
   });
 
   it("closes when no hello arrives", async () => {
@@ -181,11 +195,11 @@ describe("server + client", () => {
     const ws = new WS(url);
     const got = new Promise<any>((r) => ws.on("message", (d) => r(JSON.parse(d.toString()))));
     ws.on("open", () => ws.send(JSON.stringify({ v: 1, type: "ping" })));
-    expect(await got).toMatchObject({ code: "hello_required" });
+    match(await got, { code: "hello_required" });
   });
 });
 
 describe("misc", () => {
-  it("parses tokens env", () => { expect(parseTokens("a=1, b=2,bad,=x")).toEqual({ a: ["1"], b: ["2"] }); });
-  it("ingress types appchannel", () => { expect(deliveryFor("appchannel")).toBe("type"); });
+  it("parses tokens env", () => { assert.deepEqual(parseTokens("a=1, b=2,bad,=x"), { a: ["1"], b: ["2"] }); });
+  it("ingress types appchannel", () => { assert.equal(deliveryFor("appchannel"), "type"); });
 });
