@@ -54,3 +54,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/hub-discovery.test.ts | a | hub address publication + mDNS start/stop with fake |
 | test/ota-build.test.ts | c | OTA upload form contract: build field and 'V (B)' version split |
 | test/manage-leftover-clear.test.ts | a | Regression: Ctrl-U-immune leftover input line left a session unarmed all night with 425 identical alerts (2026-11-27) |
+| test/system-chat.test.ts | a | daemon alert (sessionId global) push carried no sessionId and the app had no chat for it; 2026-11-27 load watchdog alert unfindable |
