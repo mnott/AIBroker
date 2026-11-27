@@ -2,7 +2,9 @@
  * ota/publish.ts — the one publish call to the OTA install hub, shared by the
  * MCP tool `ota_publish` and the CLI `aibroker ota publish`.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { otaCurlArgs } from "../mcp/ota-args.js";
 import { OTA_PORT } from "../daemon/ota.js";
@@ -48,8 +50,26 @@ function tool(cmd: string, args: string[], input?: Buffer): Buffer | null {
   return r.status === 0 && !r.error ? r.stdout : null;
 }
 
+/** aapt/aapt2 candidates: PATH first, then Android SDK build-tools (highest version first). */
+export function aaptCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+  const out = ["aapt", "aapt2"];
+  const sdks = [env.ANDROID_HOME, env.ANDROID_SDK_ROOT, join(homedir(), "Library/Android/sdk")];
+  for (const sdk of sdks) {
+    if (!sdk) continue;
+    const bt = join(sdk, "build-tools");
+    let vers: string[] = [];
+    try { vers = readdirSync(bt); } catch { continue; }
+    vers.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    for (const v of vers) for (const n of ["aapt", "aapt2"]) {
+      const p = join(bt, v, n);
+      if (existsSync(p)) out.push(p);
+    }
+  }
+  return out;
+}
+
 /** Best effort: CFBundleVersion of an .ipa or versionCode of an .apk; undefined when unavailable. */
-export function deriveBuild(filePath: string, platform: string): string | undefined {
+export function deriveBuild(filePath: string, platform: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   try {
     if (platform === "ios") {
       const list = tool("unzip", ["-Z1", filePath])?.toString("utf-8").split("\n");
@@ -60,8 +80,12 @@ export function deriveBuild(filePath: string, platform: string): string | undefi
       const v = tool("plutil", ["-extract", "CFBundleVersion", "raw", "-o", "-", "-"], plist)?.toString("utf-8").trim();
       return v || undefined;
     }
-    const out = tool("aapt", ["dump", "badging", filePath])?.toString("utf-8");
-    return out ? /versionCode='([^']+)'/.exec(out)?.[1] : undefined;
+    for (const bin of aaptCandidates(env)) {
+      const out = tool(bin, ["dump", "badging", filePath])?.toString("utf-8");
+      const v = out ? /versionCode='([^']+)'/.exec(out)?.[1] : undefined;
+      if (v) return v;
+    }
+    return undefined;
   } catch { return undefined; }
 }
 
