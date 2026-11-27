@@ -22,6 +22,7 @@ import type { AdapterRegistry } from "./adapter-registry.js";
 import type { APIBackend } from "../backend/api.js";
 import type { HybridSessionManager } from "../core/hybrid.js";
 import { randomUUID } from "node:crypto";
+import { getAppChannel } from "../adapters/appchannel/server.js";
 import { registerToken as apnsRegisterToken, getTokens as apnsGetTokens } from "../apns/client.js";
 import { createBrokerMessage } from "../types/broker.js";
 import type { BrokerMessage } from "../types/broker.js";
@@ -2017,6 +2018,7 @@ export function registerCoreHandlers(
         } else {
           await broadcastText(text!, sessionId);
         }
+        if (sessionId) { try { getAppChannel().reply(sessionId, text!); } catch { /* best effort */ } }
       }
       return { ok: true, result: { sent: true } };
     } catch (e) {
