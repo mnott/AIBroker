@@ -34,12 +34,13 @@ You do not need AIBroker for this. Agentish is an A2A **extension**, declared in
 **Validate** — dependency-free, works in CI, no daemon:
 
 ```bash
-npx aibroker agentish check message.txt --json   # exit 0 clean, 1 on errors, 2 on usage
+npx -p aibroker agentish check message.txt --json   # exit 0 clean, 1 on errors, 2 on usage
+npx -p aibroker agentish check-log traffic.jsonl     # a whole message stream, per-message verdict + summary
 ```
 
 Stable error codes (`E_R_UNPROVEN`, `E_T_OMITTED`, …) mean you can gate a pipeline on it. If a peer has not activated the extension, fall back to prose — it is optional by design.
 
-The format is small enough to keep in a system prompt; `npx aibroker agentish spec` prints it.
+The format is small enough to keep in a system prompt; `agentish spec` prints it. See [docs/agentish.md](docs/agentish.md#use-in-ci).
 
 ---
 

@@ -230,19 +230,77 @@ aibroker agentish stats --since 2026-09-05
 
 ## Use in CI
 
-A team with no AIBroker daemon can still run the validator: it lives in one
-dependency-free module (`src/agentish/index.ts`), so vendoring that file (or,
-once split out, installing it as its own package) is enough for a CI step
-that checks a message file before it goes anywhere:
+The validator ships as a standalone `agentish` command. It imports only
+`dist/agentish/index.js`: no daemon, no other AIBroker module, no network.
+
+Install it, or vendor two files:
 
 ```sh
-node dist/daemon/cli.js agentish check message.txt --json
-echo "exit: $?"   # 0 valid · 1 invalid content · 2 bad usage or unreadable file
+npm i -g aibroker            # provides both `aibroker` and `agentish`
+# or, with no install at all: copy dist/agentish/index.js and
+# dist/agentish/cli.js into your repo and run  node vendor/cli.js <verb>
 ```
 
-Branch on `errors[].code` from the JSON output rather than on `message` text
-— codes are the stable part of this contract (see the table above); messages
-may be reworded.
+Verbs:
+
+```sh
+agentish check <file|-> [earlier...] [--json]   # one message; earlier files supply @n symbols and the T for an R
+agentish expand <file|-> [earlier...] [--json]  # inline every @n reference
+agentish check-log <file|-> [--json]            # a stream of messages
+agentish spec [--json]                          # the format itself
+```
+
+`check-log` reads either a file whose messages are separated by blank lines,
+or JSONL with a `body` field per line (the shape of
+`~/.aibroker/audit.jsonl`). It prints one verdict per message (`#3 R FAIL
+E_R_UNPROVEN`) and a summary: `total`, `valid`, `invalid` and a count per
+error code.
+
+Exit codes, for every verb: `0` all valid, `1` some message invalid, `2` bad
+usage or an unreadable file.
+
+JSON shapes (`version` is `"2"`):
+
+```jsonc
+// check --json
+{ "version": "2", "kind": "R", "fields": {...}, "ok": false,
+  "errors": [{ "code": "E_R_UNPROVEN", "message": "...", "line": 3 }] }
+// check-log --json
+{ "version": "2",
+  "results": [{ "index": 1, "kind": "R", "ok": false, "codes": ["E_R_UNPROVEN"] }],
+  "summary": { "total": 1, "valid": 0, "invalid": 1, "codes": { "E_R_UNPROVEN": 1 } } }
+```
+
+Branch on `errors[].code` / `summary.codes`, not on `message` text — codes
+are the stable part of this contract (see the table above); messages may be
+reworded. The daemon verb `aibroker agentish check` behaves the same.
+
+GitHub Actions:
+
+```yaml
+- uses: actions/setup-node@v4
+  with: { node-version: 22 }
+- run: npm i -g aibroker
+- name: Agent reports must prove what they claim
+  run: agentish check-log reports/agent-messages.jsonl
+```
+
+## Validated against real traffic
+
+The validator is pinned to recorded inter-agent traffic from a live AIBroker
+install (`test/agentish-traffic.test.ts`, fixtures in
+`test/fixtures/agentish-traffic/`, home paths rewritten to `/home/user`).
+Extraction run: 56,966 audit bodies and log lines scanned; 746 distinct
+AG2-looking messages (a kind line followed by two or more `k=v` lines) found;
+497 left after dropping every message that might carry a token, password,
+email, phone number, IP address or key. Of those 497, **13 are valid and 484
+are invalid**. Codes that occur: `E_REQUIRED` 365 messages, `E_KEY` 228,
+`E_Z_LEN` 153, `E_SHAPE` 110, `E_R_UNPROVEN` 44, `E_DUP` 35 (a message can
+carry several). The fixtures keep all 13 valid messages and 74 invalid ones
+covering every code, including real reports that claim `r=+` with no proof
+(`E_R_UNPROVEN`). The reading: real agents mostly drift from the format
+(missing required keys, unknown keys, long notes, success claimed without
+proof) — which is exactly what a CI gate is for.
 
 ## Origin
 
