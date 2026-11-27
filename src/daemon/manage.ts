@@ -27,13 +27,13 @@ import { homedir } from "node:os";
 import { log } from "../core/log.js";
 import { timeCall } from "../core/call-timing.js";
 import { readSessionContent, readSessionContentAsync } from "./session-content.js";
-import { typeIntoSession, pasteTextIntoSession, sendControlU, sendEnterKey, escapeInputMode, wasLastEnumerationReliable } from "../transport/sync-facade.js";
+import { typeIntoSession, pasteTextIntoSession, sendControlU, sendStrongClear, sendBackspaces, sendEnterKey, escapeInputMode, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { findItermBundleIdImpostors, findItermBundleIdImpostorsAsync, runCaptureAsync } from "../adapters/iterm/core.js";
 import { processCwd, primeProcessCwd } from "../core/bins.js";
 import { parseAttachUuid, parseSessionIdArg } from "../core/claude-attach.js";
 import { discoverLiveSessions, discoverLiveSessionsAsync } from "../core/session-discovery.js";
 import { hasPailotClients } from "../adapters/pailot/gateway.js";
-import { getAibpBridge } from "../core/state.js";
+import { getAibpBridge, depositToSessionMailbox } from "../core/state.js";
 import { captureSessionPng } from "./screenshot.js";
 import { listDialogs, answerDialog, listDialogsAsync, answerDialogAsync } from "./dialogs.js";
 import {
@@ -1653,6 +1653,13 @@ function note(m: ManagedSession, what: string): void {
  * working; it must not stop doing that because a notification did not go out.
  */
 function alertOperator(text: string): void {
+  // Same text within ALERT_DEDUP_MS goes out once: a wall of identical bubbles
+  // (425 in one night, 2026-11-27) must be impossible whatever the caller does.
+  const now = Date.now();
+  const last = recentAlerts.get(text);
+  if (last !== undefined && now - last < ALERT_DEDUP_MS) return;
+  recentAlerts.set(text, now);
+  if (recentAlerts.size > 200) for (const [k, t] of recentAlerts) if (now - t >= ALERT_DEDUP_MS) recentAlerts.delete(k);
   try {
     getAibpBridge()?.routeToMobile("", text, "TEXT");
   } catch (e) {
@@ -3443,6 +3450,99 @@ export async function clearLineUntilEmpty(deps: {
   return { cleared: !remaining, remaining, attempts };
 }
 
+/** Back-off between leftover resolutions that did not end with an empty line. */
+export const LEFTOVER_BACKOFF_MS = [20_000, 60_000, 5 * 60_000, 15 * 60_000];
+/** Same-text manage alerts to the phone are suppressed for this long. */
+export const ALERT_DEDUP_MS = 30 * 60_000;
+
+/**
+ * Text typed by the machine (pointers, goals, slash commands) as opposed to a
+ * human's own draft. A human's leftover is submitted; machine text is deleted.
+ */
+export function looksMachineTyped(text: string): boolean {
+  return /^\s*(\/goal\b|\[Session:|\[Telex|\[Whazaa|\[PAILot|\[Mailbox|→ mailbox)/i.test(text);
+}
+
+export interface ClearResolveDeps {
+  read: () => Promise<string>;
+  sleep: (ms: number) => Promise<void>;
+  ctrlU: () => void | Promise<unknown>;
+  /** End + Ctrl-U (+ Esc Esc when the session is idle). */
+  strongClear: () => void | Promise<unknown>;
+  backspaces: (n: number) => void | Promise<unknown>;
+  enter: () => void | Promise<unknown>;
+  /** Persist leftover text before it is submitted or deleted. */
+  save: (text: string, how: "submitted" | "deleted") => void;
+  delayMs?: number;
+}
+
+export type ClearResolution =
+  | { empty: true; how: "clean" | "ctrl-u" | "strong" | "submitted" | "deleted"; leftover?: string }
+  | { empty: false; remaining: string };
+
+/**
+ * Get the input line empty, no matter what: Ctrl-U x3, then the stronger
+ * clear, and only if text STILL survives resolve it — save it, then submit it
+ * (a human's own unsent draft) or delete it (machine text). Operator rule
+ * 2026-11-27: a session must never sit unarmed all night behind a line a
+ * Ctrl-U cannot clear (Capgemini, 425 identical alerts).
+ */
+export async function clearInputResolving(d: ClearResolveDeps): Promise<ClearResolution> {
+  const delayMs = d.delayMs ?? CLEAR_VERIFY_READ_MS;
+  const first = await clearLineUntilEmpty({ send: () => void d.ctrlU(), read: d.read, sleep: d.sleep, delayMs });
+  if (first.cleared) return { empty: true, how: first.attempts ? "ctrl-u" : "clean" };
+  let left = first.remaining;
+  for (let i = 0; i < 2 && left; i++) {
+    await d.strongClear();
+    await d.sleep(delayMs);
+    left = await d.read();
+  }
+  if (!left) return { empty: true, how: "strong" };
+  const leftover = left;
+  if (!looksMachineTyped(leftover)) {
+    d.save(leftover, "submitted");
+    await d.enter();
+    await d.sleep(delayMs * 2);
+    left = await d.read();
+    if (!left) return { empty: true, how: "submitted", leftover };
+  } else {
+    d.save(leftover, "deleted");
+  }
+  await d.backspaces(Math.max(left.length, leftover.length) + 20);
+  await d.sleep(delayMs);
+  left = await d.read();
+  if (!left) return { empty: true, how: "deleted", leftover };
+  return { empty: false, remaining: left };
+}
+
+/** Per session: the leftover last alerted about, and the retry back-off. */
+const leftoverState = new Map<string, { text: string; fails: number; nextTryAt: number }>();
+const recentAlerts = new Map<string, number>();
+
+/** Test hook. */
+export function resetLeftoverState(): void {
+  leftoverState.clear();
+  recentAlerts.clear();
+}
+
+/**
+ * One alert per (session, leftover text) and exponential retry back-off.
+ * Returns true when the caller may try again now.
+ */
+export function leftoverMayRetry(id: string, now: number): boolean {
+  const s = leftoverState.get(id);
+  return !s || now >= s.nextTryAt;
+}
+
+/** Records a failed resolution; returns true when this (session, text) was not yet alerted. */
+export function leftoverFailed(id: string, text: string, now: number): boolean {
+  const s = leftoverState.get(id);
+  const fresh = !s || s.text !== text;
+  const fails = fresh ? 1 : s.fails + 1;
+  leftoverState.set(id, { text, fails, nextTryAt: now + LEFTOVER_BACKOFF_MS[Math.min(fails - 1, LEFTOVER_BACKOFF_MS.length - 1)] });
+  return fresh;
+}
+
 /**
  * Wrap `run` so a call made while the previous one is still pending is skipped
  * (onSkip) instead of started. The tick yields to the event loop on every pane
@@ -3494,6 +3594,26 @@ export async function tryExclusive<T>(busy: Set<string>, id: string, fn: () => P
  * applyArmResult).
  */
 export type ArmResult = "armed" | "failed" | "untyped" | "skipped";
+
+/** Clear the session's input line via clearInputResolving, logging and saving any leftover. */
+async function resolveInputLine(m: ManagedSession, idle: boolean): Promise<ClearResolution> {
+  const res = await clearInputResolving({
+    read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
+    sleep,
+    ctrlU: () => sendControlU(m.sessionId),
+    strongClear: () => sendStrongClear(m.sessionId, { escape: idle }),
+    backspaces: (n) => sendBackspaces(m.sessionId, n),
+    enter: () => sendEnterKey(m.sessionId),
+    save: (text, how) => {
+      log(`[manage:${m.name}] leftover on input line (${how}): ${JSON.stringify(text)}`);
+      depositToSessionMailbox(m.sessionId, "aibroker-manage", `Leftover input-line text ${how === "submitted" ? "submitted with Enter" : "deleted"} before arming: ${text}`);
+    },
+  });
+  if (res.empty && res.leftover !== undefined) {
+    note(m, res.how === "submitted" ? `leftover submitted: "${res.leftover.slice(0, 60)}" (${res.leftover.length} chars, the operator's own draft)` : `leftover deleted, saved to mailbox: "${res.leftover.slice(0, 60)}" (${res.leftover.length} chars)`);
+  }
+  return res;
+}
 
 export async function arm(m: ManagedSession, reason: string): Promise<ArmResult> {
   const { text } = goalText(m);
@@ -3553,20 +3673,16 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   const onLine = promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true }));
   inputLineTracking.delete(m.sessionId);
   if (onLine) {
+    if (!leftoverMayRetry(m.sessionId, Date.now())) return "untyped";
     note(m, `arm replaces the input line: clearing "${onLine.slice(0, 60)}" (${onLine.length} chars) before typing (${reason})`);
-    const clear = await clearLineUntilEmpty({
-      send: async () => { await sendControlU(m.sessionId); },
-      read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
-      sleep,
-    });
-    if (!clear.cleared) {
-      alert(
-        m,
-        `an arm (${reason}) could NOT clear the input line: ${clear.remaining.length} chars survive ${clear.attempts} Ctrl-U's ` +
-          `("${clear.remaining.slice(0, 60)}") — not typing onto it, NOT armed`,
-      );
+    const res = await resolveInputLine(m, armIdle);
+    if (!res.empty) {
+      const fresh = leftoverFailed(m.sessionId, res.remaining, Date.now());
+      const msg = `an arm (${reason}) could NOT clear the input line even after Ctrl-U, End+Ctrl-U, Esc Esc, submit and backspaces: ${res.remaining.length} chars survive ("${res.remaining.slice(0, 60)}") — not typing onto it, NOT armed; retrying with back-off`;
+      if (fresh) alert(m, msg); else note(m, msg);
       return "untyped";
     }
+    leftoverState.delete(m.sessionId);
   }
   delete m.forcedArmHoldNotedAt;
 
@@ -3579,13 +3695,11 @@ export async function arm(m: ManagedSession, reason: string): Promise<ArmResult>
   let onLineNow = promptUnsentText(preTypePane);
   if (onLineNow) {
     note(m, `arm: ${onLineNow.length} chars on the line just before typing — clearing again before the paste`);
-    const secondClear = await clearLineUntilEmpty({
-      send: async () => { await sendControlU(m.sessionId); },
-      read: async () => promptUnsentText(await readPaneAsync(m.sessionId, { fresh: true })) ?? "",
-      sleep,
-    });
-    if (!secondClear.cleared) {
-      alert(m, `an arm (${reason}) found ${onLineNow.length} chars on the input line just before typing ("${onLineNow.slice(0, 60)}") and ${secondClear.remaining.length} survive ${secondClear.attempts} more Ctrl-U's — not pasting onto it, NOT armed`);
+    const secondClear = await resolveInputLine(m, armIdle);
+    if (!secondClear.empty) {
+      const fresh = leftoverFailed(m.sessionId, secondClear.remaining, Date.now());
+      const msg = `an arm (${reason}) found ${onLineNow.length} chars on the input line just before typing ("${onLineNow.slice(0, 60)}") and ${secondClear.remaining.length} survive every clear — not pasting onto it, NOT armed`;
+      if (fresh) alert(m, msg); else note(m, msg);
       return "untyped";
     }
     preTypePane = await readPaneAsync(m.sessionId, { fresh: true });
