@@ -52,3 +52,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/push-payload.test.ts | c | pins APNs encrypted push + push-audio wire contract the iOS extension codes against |
 | test/p2p-bridge.test.ts | a | p2p link auth/ready/large-payload/timeout contract with fake helper; auth bypass would expose hub commands |
 | test/hub-discovery.test.ts | a | hub address publication + mDNS start/stop with fake |
+| test/ota-build.test.ts | c | OTA upload form contract: build field and 'V (B)' version split |

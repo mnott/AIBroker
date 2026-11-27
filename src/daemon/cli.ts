@@ -127,7 +127,7 @@ if (helpRequested && command !== undefined && command !== "help" && command !== 
       "",
       "Scaffold a new adapter project from the built-in template.",
     ],
-    ota: ["Usage: aibroker ota <up|down|status|logs|setup-serve|publish>", "", "OTA install hub (Docker + Tailscale Serve).", "publish: aibroker ota publish --slug S --name N --bundle B --version V --platform ios|android <file>  (prints the install URL)."],
+    ota: ["Usage: aibroker ota <up|down|status|logs|setup-serve|publish>", "", "OTA install hub (Docker + Tailscale Serve).", "publish: aibroker ota publish --slug S --name N --bundle B --version V --platform ios|android [--build N] <file>  (prints the install URL)."],
     sessions: ["Usage: aibroker sessions <snapshot|restore|checkpoint|list|install>", "", "Session backup."],
     dispatch: ["Usage: aibroker dispatch <project> [--stdin --json]", "", "Deliver a work order to a project's session."],
     ask: ["Usage: aibroker ask <project> [--stdin --json]", "", "Ask a session a question and wait for its reply."],

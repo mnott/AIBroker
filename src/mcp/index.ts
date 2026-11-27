@@ -1505,13 +1505,14 @@ server.tool(
     slug: z.string().min(1).regex(/^[a-z0-9-]+$/).describe("App slug (lowercase alphanumeric + hyphens)"),
     name: z.string().min(1).describe("Display name"),
     bundleId: z.string().min(1).describe("Bundle ID / package name"),
-    version: z.string().min(1).describe("Version string"),
+    version: z.string().min(1).describe('Version string; "1.1.23 (40)" is split into version and build'),
     platform: z.enum(["ios", "android"]).describe("ios or android"),
     filePath: z.string().min(1).describe("Absolute host path to .ipa or .apk"),
+    build: z.string().optional().describe("Build number (optional; derived from the IPA/APK when omitted)"),
   },
-  async ({ slug, name, bundleId, version, platform, filePath }) => {
+  async ({ slug, name, bundleId, version, platform, filePath, build }) => {
     try {
-      const { installUrl, raw } = publishOta({ slug, name, bundleId, version, platform, filePath });
+      const { installUrl, raw } = publishOta({ slug, name, bundleId, version, platform, filePath, build });
       if (installUrl) {
         return ok(`Published. Install URL: ${installUrl}`);
       }

@@ -6,12 +6,12 @@
 import { publishOta } from "../ota/publish.js";
 
 export const OTA_PUBLISH_USAGE =
-  "Usage: aibroker ota publish --slug <slug> --name <name> --bundle <bundle id> --version <v> --platform ios|android <file>";
+  "Usage: aibroker ota publish --slug <slug> --name <name> --bundle <bundle id> --version <v> --platform ios|android [--build <n>] <file>";
 
 export function runOtaPublish(args: string[]): void {
   const opts: Record<string, string> = {};
   const files: string[] = [];
-  const known = new Set(["--slug", "--name", "--bundle", "--version", "--platform"]);
+  const known = new Set(["--slug", "--name", "--bundle", "--version", "--platform", "--build"]);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (known.has(a)) {
@@ -23,13 +23,13 @@ export function runOtaPublish(args: string[]): void {
       return fail(`Unknown option ${a}`);
     } else files.push(a);
   }
-  for (const k of known) if (!opts[k]) return fail(`Missing ${k}`);
+  for (const k of known) if (k !== "--build" && !opts[k]) return fail(`Missing ${k}`);
   if (files.length !== 1) return fail(files.length === 0 ? "Missing <file>" : "Only one <file> allowed");
 
   try {
     const r = publishOta({
       slug: opts["--slug"], name: opts["--name"], bundleId: opts["--bundle"],
-      version: opts["--version"], platform: opts["--platform"], filePath: files[0],
+      version: opts["--version"], platform: opts["--platform"], filePath: files[0], build: opts["--build"],
     });
     if (!r.installUrl) return fail("Hub response has no installUrl");
     console.log(r.installUrl);

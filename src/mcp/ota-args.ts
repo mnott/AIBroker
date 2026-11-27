@@ -1,7 +1,7 @@
 /** curl argv for the OTA upload. No shell is involved, so values stay single argv elements. */
 export function otaCurlArgs(
   port: number,
-  f: { slug: string; name: string; bundleId: string; version: string; platform: string; filePath: string },
+  f: { slug: string; name: string; bundleId: string; version: string; platform: string; filePath: string; build?: string },
 ): string[] {
   return [
     "-sf", "-X", "POST",
@@ -12,6 +12,7 @@ export function otaCurlArgs(
     "--form-string", `bundleId=${f.bundleId}`,
     "--form-string", `version=${f.version}`,
     "--form-string", `platform=${f.platform}`,
+    ...(f.build ? ["--form-string", `build=${f.build}`] : []),
     "-F", `file=@${f.filePath}`,
   ];
 }
