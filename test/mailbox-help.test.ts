@@ -17,11 +17,14 @@ import { join, dirname } from "node:path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLI = join(__dirname, "..", "src", "daemon", "cli.ts");
 
+// Reuse this process's own tsx loader (execArgv): `npx tsx` re-resolved tsx
+// over the network on every call (10-20 s, >30 s under load) since tsx is not
+// a dependency.
 function runHelp(args: string[]): string {
-  const r = spawnSync("npx", ["tsx", CLI, ...args], {
+  const r = spawnSync(process.execPath, [...process.execArgv, CLI, ...args], {
     env: { ...process.env, __CFBundleIdentifier: "" },
     encoding: "utf8",
-    timeout: 30000,
+    timeout: 60000,
   });
   assert.equal(r.status, 0, `help exited ${r.status}: ${r.stderr}`);
   return r.stdout + r.stderr;
