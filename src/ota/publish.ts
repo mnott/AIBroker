@@ -3,7 +3,7 @@
  * MCP tool `ota_publish` and the CLI `aibroker ota publish`.
  */
 import { existsSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { otaCurlArgs } from "../mcp/ota-args.js";
 import { OTA_PORT } from "../daemon/ota.js";
 
@@ -14,6 +14,8 @@ export interface OtaPublishInput {
   version: string;
   platform: string;
   filePath: string;
+  /** Optional build number; derived from the file when absent. */
+  build?: string;
 }
 
 export interface OtaPublishResult {
@@ -35,10 +37,45 @@ export function validateOtaInput(f: OtaPublishInput): void {
   if (!existsSync(f.filePath)) throw new Error(`File not found: ${f.filePath}`);
 }
 
+/** "1.1.23 (40)" -> version 1.1.23, build 40. Anything else passes through. */
+export function splitVersion(version: string): { version: string; build?: string } {
+  const m = /^\s*(\S+)\s*\((\w[\w.-]*)\)\s*$/.exec(version);
+  return m ? { version: m[1], build: m[2] } : { version };
+}
+
+function tool(cmd: string, args: string[], input?: Buffer): Buffer | null {
+  const r = spawnSync(cmd, args, { input, maxBuffer: 16 * 1024 * 1024 });
+  return r.status === 0 && !r.error ? r.stdout : null;
+}
+
+/** Best effort: CFBundleVersion of an .ipa or versionCode of an .apk; undefined when unavailable. */
+export function deriveBuild(filePath: string, platform: string): string | undefined {
+  try {
+    if (platform === "ios") {
+      const list = tool("unzip", ["-Z1", filePath])?.toString("utf-8").split("\n");
+      const entry = list?.find((l) => /^Payload\/[^/]+\.app\/Info\.plist$/.test(l));
+      if (!entry) return undefined;
+      const plist = tool("unzip", ["-p", filePath, entry]);
+      if (!plist) return undefined;
+      const v = tool("plutil", ["-extract", "CFBundleVersion", "raw", "-o", "-", "-"], plist)?.toString("utf-8").trim();
+      return v || undefined;
+    }
+    const out = tool("aapt", ["dump", "badging", filePath])?.toString("utf-8");
+    return out ? /versionCode='([^']+)'/.exec(out)?.[1] : undefined;
+  } catch { return undefined; }
+}
+
+/** Split a "V (B)" version and fill a missing build from the file. */
+export function resolveOtaInput(f: OtaPublishInput): OtaPublishInput {
+  const s = splitVersion(f.version);
+  const build = f.build || s.build || deriveBuild(f.filePath, f.platform);
+  return { ...f, version: s.version, ...(build ? { build } : {}) };
+}
+
 /** Upload the build via curl (multipart, no FormData polyfill needed). */
 export function publishOta(f: OtaPublishInput, port: number = OTA_PORT): OtaPublishResult {
   validateOtaInput(f);
-  const raw = execFileSync("curl", otaCurlArgs(port, f), { encoding: "utf-8" });
+  const raw = execFileSync("curl", otaCurlArgs(port, resolveOtaInput(f)), { encoding: "utf-8" });
   const parsed = JSON.parse(raw);
   return { installUrl: parsed?.installUrl || undefined, raw };
 }
