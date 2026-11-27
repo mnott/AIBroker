@@ -56,4 +56,3 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/manage-leftover-clear.test.ts | a | Regression: Ctrl-U-immune leftover input line left a session unarmed all night with 425 identical alerts (2026-11-27) |
 | test/ota-escape.test.ts | a | OTA landing/manifest must escape publisher fields |
 | test/public-sanitizer.test.ts | b | pins the deny-list that blocks site details and secrets before any public GitHub post (forge #7) |
-| test/mcp-skills.test.ts | c | MCP skill resources/prompts and short instructions: external contract MCP clients read (resources/list+read, prompts/list+get) |
