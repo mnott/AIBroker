@@ -19,6 +19,7 @@
   ],
   "bin": {
     "aibroker": "dist/daemon/cli.js",
+    "agentish": "dist/agentish/cli.js",
     "aibroker-mcp": "dist/mcp/index.js"
   },
   "scripts": {

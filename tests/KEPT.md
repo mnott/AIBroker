@@ -58,3 +58,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/appchannel.test.ts | a | app channel protocol, routing, auth, confirm flow |
 | test/public-sanitizer.test.ts | b | pins the deny-list that blocks site details and secrets before any public GitHub post (forge #7) |
 | test/mcp-skills.test.ts | c | MCP skill resources/prompts and short instructions: external contract MCP clients read (resources/list+read, prompts/list+get) |
+| test/agentish-traffic.test.ts | c | AG2 validator pinned to recorded real inter-agent traffic (issue #1) |

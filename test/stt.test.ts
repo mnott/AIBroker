@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   transcribeFile, resolveCppModel, wavConvertArgs, cliArgs, SttAudioError, VOICEINK_MODEL_REL,
-  isHallucination, noSpeechReply, wavStats, type SttDeps,
+  isHallucination, noSpeechReply, wavStats, syncWhisperServerModel, type SttDeps,
 } from "../src/core/stt.js";
 
 const PROBE_OK = JSON.stringify({ streams: [{ codec_name: "aac" }], format: { duration: "4.2" } });
@@ -46,6 +46,43 @@ describe("stt", () => {
     assert.equal(resolveCppModel({ exists: () => false, env: {}, home: "/nonexistent-h" }), null);
     const vi = `/h/${VOICEINK_MODEL_REL}`;
     assert.equal(resolveCppModel({ exists: (p) => p === vi, env: {}, home: "/h" }), vi);
+  });
+
+  it("model: dictation.json modelId picks ggml-<id>.bin, env wins, falls back when missing", () => {
+    const vi = `/h/${VOICEINK_MODEL_REL}`;
+    const medium = "/h/.pai/models/whisper/ggml-medium.bin";
+    const files = new Set([vi, medium, "/h/.pai/dictation.json"]);
+    const readText = () => JSON.stringify({ modelId: "medium" });
+    const exists = (p: string) => files.has(p);
+    assert.equal(resolveCppModel({ exists, env: {}, home: "/h", readText }), medium);
+    assert.equal(resolveCppModel({ exists, env: { AIBROKER_WHISPER_CPP_MODEL: vi }, home: "/h", readText }), vi);
+    assert.equal(resolveCppModel({ exists, env: {}, home: "/h", readText: () => JSON.stringify({ modelId: "small" }) }), vi);
+    assert.equal(resolveCppModel({ exists, env: {}, home: "/h", readText: () => "{bad" }), vi);
+    const cache = "/h/.cache/aibroker-stt/ggml-base.bin";
+    files.add(cache);
+    assert.equal(resolveCppModel({ exists, env: {}, home: "/h", readText: () => JSON.stringify({ modelId: "base" }) }), cache);
+  });
+
+  it("syncWhisperServerModel is a no-op without a running server", async () => {
+    let called = 0;
+    const r = await syncWhisperServerModel({}, { exists: () => true, home: "/h", readText: () => JSON.stringify({ modelId: "medium" }) }, async () => { called++; return null; });
+    assert.equal(r, false);
+    assert.equal(called, 0);
+  });
+
+  it("transcribeFile re-resolves the model per call", async () => {
+    const seen: string[] = [];
+    const files = new Set<string>();
+    let id = "medium";
+    const base = fake({ files });
+    files.add("/h/.pai/dictation.json");
+    files.add("/h/.pai/models/whisper/ggml-medium.bin");
+    files.add("/h/.pai/models/whisper/ggml-small.bin");
+    const d: SttDeps = { ...base, readText: (p) => (p.endsWith("dictation.json") ? JSON.stringify({ modelId: id }) : base.readText(p)), ensureServer: async (m) => { seen.push(m); return null; } };
+    await transcribeFile("/in.m4a", d);
+    id = "small";
+    await transcribeFile("/in.m4a", d);
+    assert.deepEqual(seen, ["/h/.pai/models/whisper/ggml-medium.bin", "/h/.pai/models/whisper/ggml-small.bin"]);
   });
 
   it("wav args: 16k mono pcm; cli args auto language", () => {
