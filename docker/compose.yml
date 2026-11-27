@@ -19,6 +19,7 @@ services:
     environment:
       - DATA_DIR=/data
       - PORT=8767
+      # required: empty refuses all writes
       - AIBROKER_OTA_PUBLISHERS=${AIBROKER_OTA_PUBLISHERS:-}
       - TRUST_HEADER=${TRUST_HEADER:-true}
     user: "${UID}:${GID}"
