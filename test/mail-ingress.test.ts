@@ -290,7 +290,7 @@ test("auto-launch: two mails during launch -> one dispatch, second delivered nor
   const h = harness([NO_SESSION, NO_SESSION, { ok: true, detail: "delivered" }], async () => { await gateP; return { outcome: "spawned", reason: "" }; });
   const a = handleMessage(mb, await mailWith("al3a"), BOX, id, goodResolver, h.deps);
   const b = handleMessage(mb, await mailWith("al3b"), BOX, id, goodResolver, h.deps);
-  await new Promise((r) => setTimeout(r, 20));
+  await new Promise((r) => setTimeout(r, 300));
   release();
   const [ra, rb] = await Promise.all([a, b]);
   assert.equal(ra.action, "accepted");
