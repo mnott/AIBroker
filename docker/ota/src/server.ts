@@ -25,6 +25,7 @@ const UploadSchema = z.object({
   name: z.string().min(1),
   bundleId: z.string().min(1),
   version: z.string().min(1),
+  build: z.string().min(1).optional(),
   platform: z.enum(["ios", "android"]),
 });
 
@@ -53,7 +54,7 @@ app.post("/api/apps", requirePublisher, upload.single("file"), async (req: Reque
     return;
   }
 
-  const { slug, name, bundleId, version, platform } = parsed.data;
+  const { slug, name, bundleId, version, platform, build } = parsed.data;
   const ext = extname(req.file.originalname).toLowerCase();
 
   if (platform === "ios" && ext !== ".ipa") {
@@ -82,6 +83,7 @@ app.post("/api/apps", requirePublisher, upload.single("file"), async (req: Reque
   const meta: AppMeta = {
     ...(previous ?? {}),
     name, bundleId, version, platform,
+    ...(build ? { build } : { build: undefined }),
     updatedAt: new Date().toISOString(),
     updatedBy: callerLogin(req),
     ...(platform === "ios" ? { ipaFile: fileName } : { apkFile: fileName }),

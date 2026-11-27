@@ -22,6 +22,8 @@ export interface AppMeta {
   name: string;
   bundleId: string;
   version: string;
+  /** Optional build number (CFBundleVersion / versionCode). */
+  build?: string;
   platform: "ios" | "android";
   ipaFile?: string;
   apkFile?: string;

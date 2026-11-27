@@ -20,6 +20,7 @@ export function renderLanding(req: Request, slug: string, meta: AppMeta): string
     const itmsUrl = `itms-services://?action=download-manifest&url=${encodeURIComponent(manifestUrl)}`;
     buttons.push(`<a class="btn ios" href="${itmsUrl}">Install on iOS</a>`);
     notes.push("iOS: ad-hoc build — your device UDID must be in the provisioning profile.");
+    notes.push("Close the app first (swipe it away in the app switcher), then tap Install. The install runs in the background; the icon shows progress.");
   }
   if (meta.apkFile) {
     const apkUrl = `${base}/install/${slug}/${meta.apkFile}`;
@@ -38,7 +39,8 @@ a.android{background:#3ddc84;color:#000}</style>
 </head>
 <body>
 <h1>${meta.name}</h1>
-<p>Version ${meta.version}</p>
+<p>Version ${meta.version}${meta.build ? ` (build ${meta.build})` : ""}<br>
+<span style="font-size:13px;color:#888">Published ${meta.updatedAt}</span></p>
 ${meta.icon ? `<img src="/install/${slug}/icon.png" width="120" height="120" style="border-radius:22px">` : ""}
 <br>
 ${buttons.join("\n")}
