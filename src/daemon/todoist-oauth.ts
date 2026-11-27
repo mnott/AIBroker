@@ -20,7 +20,7 @@
  * this exchange.
  */
 
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, openSync, closeSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -107,7 +107,7 @@ export function consumeState(got: string | null): { ok: true } | { ok: false; re
     unlinkSync(PENDING_FILE);
     return { ok: false, reason: "the authorisation attempt expired — run `aibroker todoist auth` again" };
   }
-  if (!got || !safeEqual(got, pending.state)) return { ok: false, reason: "state did not match the pending authorisation" };
+  if (!got || got !== pending.state) return { ok: false, reason: "state did not match the pending authorisation" };
   unlinkSync(PENDING_FILE);
   return { ok: true };
 }
@@ -498,16 +498,6 @@ export async function forceRefreshAccessToken(fetchImpl: typeof fetch = fetch): 
   return next && next.access_token !== t.access_token ? next : null;
 }
 
-/** Escape text for interpolation into HTML (this page is public and unauthenticated). */
-export function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-}
-
-function safeEqual(a: string, b: string): boolean {
-  const x = Buffer.from(a), y = Buffer.from(b);
-  return x.length === y.length && timingSafeEqual(x, y);
-}
-
 function page(title: string, detail: string, ok: boolean): string {
   const accent = ok ? "#2d7a4b" : "#a33";
   return `<!doctype html><meta charset="utf-8"><title>${title}</title>
@@ -546,7 +536,7 @@ export async function handleOAuthCallback(
 
   const denied = url.searchParams.get("error");
   if (denied) {
-    return fail(400, "Authorisation declined", `Todoist reported <code>${escapeHtml(denied)}</code>. Nothing was changed.`,
+    return fail(400, "Authorisation declined", `Todoist reported <code>${denied}</code>. Nothing was changed.`,
       `authorisation declined by Todoist: ${denied}`);
   }
 
@@ -567,7 +557,7 @@ export async function handleOAuthCallback(
 
   const state = consumeState(url.searchParams.get("state"));
   if (!state.ok) {
-    return fail(400, "Unexpected callback", escapeHtml(state.reason), `state check failed: ${state.reason}`);
+    return fail(400, "Unexpected callback", state.reason, `state check failed: ${state.reason}`);
   }
 
   try {
@@ -582,11 +572,11 @@ export async function handleOAuthCallback(
     return {
       status: 200,
       html: page("Authorised",
-        `AIBroker can now act on this Todoist account${token.scope ? ` with <code>${escapeHtml(token.scope)}</code>` : ""}. ` +
+        `AIBroker can now act on this Todoist account${token.scope ? ` with <code>${token.scope}</code>` : ""}. ` +
         "Webhooks will be delivered from now on. You can close this tab.", true),
     };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    return fail(502, "Exchange failed", escapeHtml(reason), reason);
+    return fail(502, "Exchange failed", reason, reason);
   }
 }
