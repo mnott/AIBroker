@@ -22,7 +22,6 @@ const INGRESS_DELIVERY: Record<string, "type" | "machine" | "external"> = {
   whazaa: "type",
   whatsapp: "type",
   pailot: "type",
-  appchannel: "type",
   // Third parties in a WhatsApp group a session subscribed to. Never typed, and
   // never a pointer either: always mailbox-only, waiter or not.
   "whatsapp-external": "external",

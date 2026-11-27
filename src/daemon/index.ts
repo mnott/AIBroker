@@ -38,7 +38,6 @@ import type { CommandContext } from "./command-context.js";
 import { WatcherClient } from "../ipc/client.js";
 import { fileURLToPath } from "node:url";
 import { AibpBridge } from "../aibp/bridge.js";
-import { getAppChannel } from "../adapters/appchannel/server.js";
 import { findClaudeSession } from "../adapters/iterm/core.js";
 import { reassertPersistentTitles } from "../adapters/iterm/sessions.js";
 import { getPersistentSessionName, ITERM_UUID_KEY, pruneSessionNames, setHolderLivenessProbe } from "../core/persistence.js";
@@ -177,7 +176,6 @@ export async function startDaemon(options?: {
         const p = aibpMsg.payload as { content: string };
         // direct=true: explicit pailot_send replies bypass session gate
         await broadcastText(p.content, sessionId, true);
-        if (sessionId) { try { getAppChannel().reply(sessionId, p.content); } catch { /* best effort */ } }
         break;
       }
       case "VOICE": {
@@ -717,12 +715,6 @@ export async function startDaemon(options?: {
   });
   loadQueue();
   startMqttBroker(getVersion());
-  try {
-    (await import("../adapters/appchannel/server.js")).startAppChannelServer({
-      deliver: (sessionId, text) => { aibpBridge.routeFromMobile(sessionId, text); },
-      sessionExists: (id) => manager.knownSessions().some((x) => x.backendSessionId === id) || manager.listSessions().some((x) => x.backendSessionId === id),
-    });
-  } catch (e) { log(`AppChannel: start failed: ${e}`); }
   try { (await import("../adapters/pailot/push-audio-server.js")).startPushAudioServer(); } catch (e) { log(`PushAudio: start failed: ${e}`); }
   void import("../core/stt.js").then((m) => m.prewarmWhisperServer()).catch(() => { /* optional */ });
   try { (await import("../adapters/pailot/ble-bridge.js")).startBleBridge(); } catch (e) { log(`BLE: start failed: ${e}`); }
@@ -766,7 +758,6 @@ export async function startDaemon(options?: {
     adapterRegistry.stopHealthPolling();
     flushQueue();
     stopMqttBroker();
-    try { (await import("../adapters/appchannel/server.js")).stopAppChannelServer(); } catch { /* ignore */ }
     try { (await import("../adapters/pailot/push-audio-server.js")).stopPushAudioServer(); } catch { /* ignore */ }
     try { (await import("../adapters/pailot/ble-bridge.js")).stopBleBridge(); } catch { /* ignore */ }
     try { (await import("../adapters/pailot/p2p-bridge.js")).stopP2pBridge(); } catch { /* ignore */ }

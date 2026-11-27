@@ -46,8 +46,6 @@ Every daemon-mediated cross-session action, refusals included, is appended to `~
 
 → [docs/audit.md](docs/audit.md)
 
-App channel (a chat pane inside an app such as CaseLeaf): → [docs/appchannel.md](docs/appchannel.md)
-
 ## Architecture and AIBP Protocol
 
 The hub is the runtime; adapters are thin transport plugins. Internally every message flows through AIBP, an IRC-inspired routing layer with explicit source and destination addresses, typed channels and plugin registration. `/aibp` inspects the live state.
