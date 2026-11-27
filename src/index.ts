@@ -199,3 +199,11 @@ export type { BrokerMessage, BrokerMessageType, BrokerMessagePayload, RouteResul
 // travelling, so the primitive belongs here rather than in each consumer.
 export { loadJson, saveJson, GuardedStore } from "./core/json-store.js";
 export type { LoadResult } from "./core/json-store.js";
+
+// ── Adapters > App channel (chat pane inside an app) ──
+export * from "./adapters/appchannel/protocol.js";
+export { AppChannel } from "./adapters/appchannel/channel.js";
+export type { AppChannelDeps, AppChannelOpts, PaneConn, Pane, ActionResult } from "./adapters/appchannel/channel.js";
+export { startAppChannelServer, stopAppChannelServer, getAppChannel, appChannel, getAppChannelPort, parseTokens } from "./adapters/appchannel/server.js";
+export { AppChannelClient } from "./adapters/appchannel/client.js";
+export type { ConnectOpts } from "./adapters/appchannel/client.js";
