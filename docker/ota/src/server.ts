@@ -5,7 +5,7 @@ import { existsSync, createReadStream, readdirSync } from "node:fs";
 import { join, extname, basename } from "node:path";
 import { rename } from "node:fs/promises";
 import {
-  ensureDirs, slugDir, listSlugs, readMeta, writeMeta,
+  ensureDirs, slugDir, isValidSlug, safeFileName, isSafeFileInDir, listSlugs, readMeta, writeMeta,
   APPS_DIR, TMP_DIR, AppMeta,
 } from "./paths.js";
 import { requirePublisher, callerLogin } from "./auth.js";
@@ -43,6 +43,14 @@ app.get("/api/apps", (_req, res) => {
   res.json(apps);
 });
 
+app.param("slug", (_req, res, next, slug) => {
+  if (!isValidSlug(slug)) {
+    res.status(404).json({ error: "Invalid slug" });
+    return;
+  }
+  next();
+});
+
 app.post("/api/apps", requirePublisher, upload.single("file"), async (req: Request, res: Response) => {
   const parsed = UploadSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -55,6 +63,10 @@ app.post("/api/apps", requirePublisher, upload.single("file"), async (req: Reque
   }
 
   const { slug, name, bundleId, version, platform, build } = parsed.data;
+  if (!isValidSlug(slug)) {
+    res.status(400).json({ error: "Invalid slug (use a-z, 0-9, -)" });
+    return;
+  }
   const ext = extname(req.file.originalname).toLowerCase();
 
   if (platform === "ios" && ext !== ".ipa") {
@@ -68,7 +80,7 @@ app.post("/api/apps", requirePublisher, upload.single("file"), async (req: Reque
   }
 
   const dir = slugDir(slug);
-  const fileName = `${name}-${version}${ext}`;
+  const fileName = safeFileName(name, version, ext);
   const dest = join(dir, fileName);
 
   // ensureDirs for this slug
@@ -140,14 +152,15 @@ app.get("/install/:slug/manifest.plist", (req: Request, res: Response) => {
 // Stream IPA / APK / icon files
 app.get("/install/:slug/:file", (req: Request, res: Response) => {
   const { slug, file } = req.params;
-  const filePath = join(slugDir(slug), file);
-  if (!existsSync(filePath)) {
-    res.status(404).send("Not found");
+  const dir = slugDir(slug);
+  // Prevent path traversal (before touching the filesystem)
+  if (!isSafeFileInDir(dir, file)) {
+    res.status(403).send("Forbidden");
     return;
   }
-  // Prevent path traversal
-  if (!filePath.startsWith(APPS_DIR)) {
-    res.status(403).send("Forbidden");
+  const filePath = join(dir, file);
+  if (!existsSync(filePath)) {
+    res.status(404).send("Not found");
     return;
   }
   const ext = extname(file).toLowerCase();
