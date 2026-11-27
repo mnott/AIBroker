@@ -16,7 +16,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, readdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { resolveBin, resolveFfmpegBin, resolveWhisperBin } from "./bins.js";
 import { log } from "./log.js";
@@ -166,10 +166,29 @@ const PATH_ENV = () => `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || "
 
 export const VOICEINK_MODEL_REL = "Library/Application Support/com.prakashjoshipax.VoiceInk/WhisperModels/ggml-large-v3-turbo-q5_0.bin";
 
+/** modelId from ~/.pai/dictation.json (written by the PAI menu bar app), or null. */
+function dictationModelId(d: Pick<SttDeps, "exists" | "home"> & Partial<Pick<SttDeps, "readText">>): string | null {
+  const p = join(d.home, ".pai/dictation.json");
+  try {
+    if (!d.exists(p)) return null;
+    const j = JSON.parse((d.readText ?? ((x: string) => readFileSync(x, "utf-8")))(p));
+    const id = j?.modelId;
+    return typeof id === "string" && /^[A-Za-z0-9._-]+$/.test(id) ? id : null;
+  } catch { return null; }
+}
+
 /** Model path for whisper.cpp, or null when none is configured/available. */
-export function resolveCppModel(d: Pick<SttDeps, "exists" | "env" | "home"> = realDeps): string | null {
+export function resolveCppModel(d: Pick<SttDeps, "exists" | "env" | "home"> & Partial<Pick<SttDeps, "readText">> = realDeps): string | null {
   const env = d.env.AIBROKER_WHISPER_CPP_MODEL;
   if (env) return d.exists(env) ? env : null;
+  const voiceinkDir = join(d.home, dirname(VOICEINK_MODEL_REL));
+  const id = dictationModelId(d);
+  if (id) {
+    for (const dir of [join(d.home, ".pai/models/whisper"), join(d.home, ".cache/aibroker-stt"), voiceinkDir]) {
+      const f = join(dir, `ggml-${id}.bin`);
+      if (d.exists(f)) return f;
+    }
+  }
   const voiceink = join(d.home, VOICEINK_MODEL_REL);
   if (d.exists(voiceink)) return voiceink;
   const cacheDir = join(d.home, ".cache/aibroker-stt");
@@ -354,6 +373,24 @@ export async function ensureWhisperServer(model: string, env: NodeJS.ProcessEnv 
   return starting;
 }
 
+/**
+ * Restart the resident whisper-server when the configured model (env /
+ * dictation.json) no longer matches the one it runs. No-op when no server is
+ * running. Returns true when a restart was triggered.
+ */
+export async function syncWhisperServerModel(
+  env: NodeJS.ProcessEnv = process.env,
+  deps: Pick<SttDeps, "exists" | "home"> & Partial<Pick<SttDeps, "readText">> = realDeps,
+  ensure: (model: string, env: NodeJS.ProcessEnv) => Promise<string | null> = ensureWhisperServer,
+): Promise<boolean> {
+  if (!serverProc || serverProc.exitCode !== null || starting) return false;
+  const model = resolveCppModel({ exists: deps.exists, home: deps.home, readText: deps.readText, env });
+  if (!model || model === serverModel) return false;
+  log(`[STT] dictation model changed, restarting whisper-server (${model.split("/").pop()})`);
+  await ensure(model, env).catch(() => null);
+  return true;
+}
+
 export function stopWhisperServer(): void {
   if (serverProc) { try { serverProc.kill(); } catch { /* ignore */ } }
   serverProc = null;
@@ -414,11 +451,14 @@ let keepWarmTimer: ReturnType<typeof setInterval> | null = null;
  * health check restarts it if it died or stopped answering.
  */
 export function prewarmWhisperServer(env: NodeJS.ProcessEnv = process.env): void {
-  const model = resolveCppModel();
-  if (!model || env.AIBROKER_STT_PREWARM === "0") return;
+  const model0 = resolveCppModel();
+  if (!model0 || env.AIBROKER_STT_PREWARM === "0") return;
+  const model = model0;
   void ensureWhisperServer(model, env).catch((e) => log(`[STT] prewarm failed: ${e}`));
   if (keepWarmTimer) return;
   keepWarmTimer = setInterval(async () => {
+    if (starting) return;
+    await syncWhisperServerModel(env).catch(() => false);
     if (starting) return;
     try {
       if (serverProc && serverUrl && serverProc.exitCode === null) {
@@ -428,7 +468,7 @@ export function prewarmWhisperServer(env: NodeJS.ProcessEnv = process.env): void
     } catch { /* unhealthy */ }
     log("[STT] whisper-server unhealthy, restarting");
     stopWhisperServer();
-    await ensureWhisperServer(model, env).catch(() => null);
+    await ensureWhisperServer(resolveCppModel() ?? model, env).catch(() => null);
   }, 30_000);
   keepWarmTimer.unref();
 }
