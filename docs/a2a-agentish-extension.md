@@ -174,7 +174,8 @@ own stack, in any language, only needs three things to interoperate:
    `mediaType: "text/x-agentish"`) alongside `A2A-Extensions:
    urn:aibroker:a2a:ext:agentish:2` on the request that carries it.
 3. **Validate incoming AG2 text with the standalone validator** —
-   `npx aibroker agentish check <file|->` — rather than reimplementing the
+   the `agentish` bin (`agentish check <file|->`, `agentish check-log` for a
+   stream; it imports only `dist/agentish/index.js`) — rather than reimplementing the
    grammar; that binds all interoperating peers to one source of truth for
    what counts as valid AG2, whether or not they run any other part of
    AIBroker.

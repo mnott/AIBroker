@@ -1,0 +1,50 @@
+[
+ {
+  "id": "aib-dirty-tree-2026-10-02",
+  "msgs": [
+   "T\ni=aib-dirty-tree-2026-10-02\ng=whose are the uncommitted AIBroker changes from 14:46?\np=/home/user/dev/ai/AIBroker working tree, mtime 14:46, untouched since: src/adapters/pailot/gateway.ts, src/daemon/dispatch.ts, src/daemon/pai-projects.ts, src/transport/{iterm,screen,session-transport}.ts, test/tmux-launch.test.ts, new test/pai-projects-failure.test.ts (96+/41- excl. my manage.ts).\na=if yours: are they finished and tested, may they go live with a daemon restart? If not yours, say so. I hold the restart until you answer.\nr=R z=<mine/not mine, ready y/n> to Session:AIBroker",
+   "R\ni=aib-dirty-tree-2026-10-02\nr=+\nz=mine (PAILot session), ready y\nc=pai-projects.ts: failed `pai project names` returns last good list, never cached; kill logged as timeout with ms|gateway.ts, iterm.ts, session-transport.ts, pai-projects.ts: preamble is `/Name <name>` only, no `go`; initialPrompt still appended|dispatch.ts, screen.ts: comments only|test/tmux-launch.test.ts updated, test/pai-projects-failure.test.ts new\nt=build+|npm test 1146 tests 0 fail+\ny=root cause: PAILot got 0 projects at 14:30:53 because sync osascript enumeration (spawnSync in src/adapters/iterm/core.ts) blocked the loop ~11s past the 5s CLI timeout and the empty failure was cached 30s\nx=restart may go live with thes"
+  ],
+  "expectCodes": [
+   "E_SHAPE",
+   "E_SHAPE",
+   "E_R_UNPROVEN",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED"
+  ]
+ },
+ {
+  "id": "aib-dirty-tree-2026-10-02",
+  "msgs": [
+   "T\ni=aib-dirty-tree-2026-10-02\ng=whose are the uncommitted AIBroker changes from 14:46?\np=/home/user/dev/ai/AIBroker working tree, mtime 14:46, untouched since: src/adapters/pailot/gateway.ts, src/daemon/dispatch.ts, src/daemon/pai-projects.ts, src/transport/{iterm,screen,session-transport}.ts, test/tmux-launch.test.ts, new test/pai-projects-failure.test.ts (96+/41- excl. my manage.ts).\na=if yours: are they finished and tested, may they go live with a daemon restart? If not yours, say so. I hold the restart until you answer.\nr=R z=<mine/not mine, ready y/n> to Session:AIBroker",
+   "R\ni=aib-dirty-tree-2026-10-02\nr=+\nz=mine (PAILot session), ready y\nc=pai-projects.ts: failed `pai project names` returns last good list, never cached; kill logged as timeout with ms|gateway.ts, iterm.ts, session-transport.ts, pai-projects.ts: preamble is `/Name <name>` only, no `go`; initialPrompt still appended|dispatch.ts, screen.ts: comments only|test/tmux-launch.test.ts updated, test/pai-projects-failure.test.ts new\nt=build+|npm test 1146 tests 0 fail+\ny=root cause: PAILot got 0 projects at 14:30:53 because sync osascript enumeration (spawnSync in src/adapters/iterm/core.ts) blocked the loop ~11s past the 5s CLI timeout and the empty failure was cached 30s\nx=restart may go live with these. Uncommitted: operator has not ordered a commit. Known nit: gateway.ts:686-688 comment about the double backslash is stale. Open, not done: making iTerm enumeration async."
+  ],
+  "expectCodes": [
+   "E_SHAPE",
+   "E_SHAPE",
+   "E_R_UNPROVEN",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED",
+   "E_T_UNREQUESTED"
+  ]
+ },
+ {
+  "id": "c1r-rule-serial-local",
+  "msgs": [
+   "T\ni=c1r-rule-serial-local\ng=operator rule for every remaining tier-1 brief\nd=17:38 u4 tier1 started 2 Sonnet implement workers (providers, config) with no local attempt because the local slot was busy; both killed, goal note sent to the running tier1. KICKOFF-c1r.md line 15 now says: \"A busy local slot is never a reason for Sonnet: queue the part and wait (the wait is part of the measurement).\" Re-read line 15 and copy that sentence into every brief from u5 on. Log the u4 deviation (2 Sonnet workers killed ~1 min, output discarded) in c1r-log.md with the u4 END line.\nz=ack with one line, then continue",
+   "R\ni=c1r-rule-serial-local\nr=+\nz=line 15 sentence copied into the shared brief block used by every tier-1 brief from u5 on; u4 deviation will be logged with u4 END."
+  ],
+  "expectCodes": [
+   "E_REQUIRED",
+   "E_REQUIRED",
+   "E_R_UNPROVEN"
+  ]
+ }
+]
