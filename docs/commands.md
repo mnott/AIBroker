@@ -291,6 +291,15 @@ Sends the command reference as a formatted text reply.
 
 Alias: `/help`
 
+#### `/aibp [status|plugins|channels|commands|peers|help]` — AIBP Inspection
+
+Inspects the AIBP bridge (`src/daemon/commands.ts`, `/aibp` handler). With no argument it runs `status`: sessions, plugins and adapters in one overview. `plugins`, `channels`, `commands` and `peers` list the registered AIBP plugins, channels with activity, plugin-declared commands and connected mesh peers. An unknown subcommand answers `Unknown subcommand: <x>. Try /aibp help`. It is not listed in the `/h` text.
+
+```
+/aibp peers
+→ "No mesh peers connected."
+```
+
 #### `/restart` — Restart Adapter
 
 Signals the originating adapter to restart itself. The hub cannot restart adapters directly — this is forwarded back to the adapter's own restart logic.
@@ -385,8 +394,11 @@ interface CommandContext {
   reply(text: string): Promise<void>;
   replyImage(imageBuffer: Buffer, caption: string): Promise<void>;
   replyVoice(audioBuffer: Buffer, caption: string): Promise<void>;
+  typing(active: boolean): void;  // typing indicator on/off
   source: string;      // "pailot" | "telex" | "whazaa" | "hub"
   recipient?: string;  // Optional target for direct message replies
+  fromOperator?: boolean;  // set by the caller when the sender is the operator
+  sessionId?: string;  // originating session, keys the image context
 }
 ```
 

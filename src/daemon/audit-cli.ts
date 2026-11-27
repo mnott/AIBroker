@@ -13,7 +13,7 @@ function usage(): void {
                  [--since ISO] [--limit N] [--bodies] [--json]
 
   --session NAME   only events where NAME acted or was acted upon
-  --action A       send | dispatch | ask | launch | refuse
+  --action A       one action kind: send, dispatch, ask, launch, refuse, inbound, webhook, ...
   --trace ID       follow one causation chain, both directions
   --since ISO      events at or after this timestamp (e.g. 2026-08-01)
   --limit N        last N events (default 40)

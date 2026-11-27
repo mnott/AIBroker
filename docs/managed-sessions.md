@@ -86,12 +86,42 @@ confirmed by finding the objective's own words in the transcript — not by the
 content hash changing, which cannot tell a delivered goal from stranded text.
 
 **Two writers, one input line.** A manager and a person typing into the same
-session will overwrite each other. Stop the manager before arming by hand.
+session still collide, but an arm no longer destroys the person's text: it is
+saved first and submitted (see "Arming over leftover input" below). Stop the
+manager before arming by hand anyway; a submitted draft is sent as a message,
+not kept as a draft.
 
 **A hook that has never been observed firing has not been shown to fire.**
 `/tmp/manage-hook.log` records every invocation, because "the hook did not run"
 and "the hook ran and did nothing" look identical from the terminal, and telling
 them apart by reasoning is how an evening goes on the wrong half.
+
+## Arming over leftover input
+
+An arm always replaces the input line (`arm`, `src/daemon/manage.ts`). Whatever
+is on the line is resolved by `clearInputResolving`, in this order:
+
+1. Ctrl-U, read back, up to 3 times (`CLEAR_VERIFY_ATTEMPTS`), 300 ms between
+   reads (`CLEAR_VERIFY_READ_MS`).
+2. The stronger clear (End + Ctrl-U, plus Esc Esc when the session is idle),
+   up to 2 times, reading back after each.
+3. If text still survives, it is saved first (log line plus a deposit in the
+   session's mailbox from `aibroker-manage`), then:
+   - a human's unsent draft is submitted with Enter;
+   - machine-typed text is deleted with backspaces. `looksMachineTyped` means
+     the text starts with `/goal`, `[Session:`, `[Telex`, `[Whazaa`, `[PAILot`,
+     `[Mailbox` or `→ mailbox`.
+   If the line is still not empty after that, the arm gives up on this tick.
+
+A failed resolution is not retried every tick. Back-off between failed
+attempts per session (`LEFTOVER_BACKOFF_MS`): 20 s, 60 s, 5 min, then 15 min
+for every further failure; a changed leftover text restarts at 20 s, and a
+success resets it. One alert per (session, leftover text); repeats are only
+noted in the log.
+
+Independently of this, every manage alert sent to the phone is deduplicated:
+identical text within 30 minutes (`ALERT_DEDUP_MS`) goes out once
+(`alertOperator`). This was added after 425 identical alerts in one night.
 
 ## Known limits
 
