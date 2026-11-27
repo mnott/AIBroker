@@ -58,8 +58,8 @@ The container trusts this header (`TRUST_HEADER=true`) because it only binds to 
 **Known assumption / security caveat:** Local processes on the host Mac can craft arbitrary
 `Tailscale-User-Login` headers when connecting to `127.0.0.1:8767` directly.
 The threat model is remote attackers, not local root. If you need stronger local isolation,
-run behind a stricter proxy. An empty `AIBROKER_OTA_PUBLISHERS` refuses all writes (403);
-logins are matched exactly, case-insensitively.
+set `AIBROKER_OTA_PUBLISHERS=` to empty (disabling the allowlist check, accepting any tailnet user)
+or run behind a stricter proxy.
 
 ## iOS signing reality
 
@@ -121,7 +121,7 @@ Only `meta.json` files need backing up.
 | Variable | Default | Description |
 |---|---|---|
 | `DATA_DIR` | `/data` | Root data directory |
-| `AIBROKER_OTA_PUBLISHERS` | `` | Comma-separated Tailscale login emails allowed to write (required; empty = writes refused) |
+| `AIBROKER_OTA_PUBLISHERS` | `` | Comma-separated Tailscale login emails allowed to write |
 | `TRUST_HEADER` | `true` | Trust `Tailscale-User-Login` header; set false to block all writes |
 
 ## Misc commands
