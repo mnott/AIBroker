@@ -49,7 +49,7 @@ function printCommandList(): void {
   console.log("  mail send          Guarded reply from a mail-ingress mailbox (--mailbox --to --subject --body-file [--in-reply-to])");
   console.log("  mailbox wait       Block until this session's mailbox has a message (background wake-up; --timeout <s>, --heartbeat <s>, exit 2 on timeout; --follow streams one line per message and never exits — run it under the Monitor tool)");
   console.log("  ping               Quick heartbeat check");
-  console.log("  setup              Install service, MCP entry, hooks, env (--no-service --no-mcp --no-hooks --dry-run --force)");
+  console.log("  setup              Install service, MCP entry, hooks, env (--no-service --no-mcp --no-hooks --no-tts --yes --dry-run --force)");
   console.log("  doctor             Check the install; non-zero exit on a required failure");
   console.log("  uninstall          Remove what setup added (--purge also deletes ~/.aibroker)");
   console.log("  create-adapter     Scaffold a new adapter project");
@@ -119,7 +119,7 @@ if (helpRequested && command !== undefined && command !== "help" && command !== 
       "prefixed [Broadcast:<sender>]. --ask invites short answers; after the",
       "deadline an unanswered ask reads 'silent' unless --default-ok was passed.",
     ],
-    setup: ["Usage: aibroker setup [--no-service --no-mcp --no-hooks --dry-run --force]", "", "Install service, MCP entry, hooks, env."],
+    setup: ["Usage: aibroker setup [--no-service --no-mcp --no-hooks --no-tts --yes --dry-run --force]", "", "Install service, MCP entry, hooks, env."],
     doctor: ["Usage: aibroker doctor", "", "Check the install; non-zero exit on a required failure."],
     uninstall: ["Usage: aibroker uninstall [--purge]", "", "Remove what setup added; --purge also deletes ~/.aibroker."],
     "create-adapter": [

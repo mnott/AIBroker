@@ -216,3 +216,114 @@ describe("synthesizeSentences routes to CPU when the sidecar is absent", () => {
     delete process.env.AIBROKER_TTS_BACKEND;
   });
 });
+
+// ── backend selection (PAI#34) ────────────────────────────────────────────
+import { mkdtempSync, mkdirSync as mkdirP } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pjoin } from "node:path";
+import {
+  detectBackend, installPlan, runInstall, loadTtsConfig, saveTtsConfig, venvPythonFor, type DetectProbe,
+} from "../src/adapters/kokoro/backend-select.js";
+
+const probe = (o: Partial<DetectProbe> & { gpu?: boolean }): DetectProbe => ({
+  platform: "linux", arch: "x64", env: {}, hasCmd: (c) => c === "nvidia-smi" && !!o.gpu, ...o,
+});
+
+describe("detectBackend", () => {
+  it("matrix", () => {
+    assert.equal(detectBackend(probe({ platform: "darwin", arch: "arm64" })), "mlx");
+    assert.equal(detectBackend(probe({ platform: "darwin", arch: "x64" })), "cpu");
+    assert.equal(detectBackend(probe({ gpu: true })), "torch");
+    assert.equal(detectBackend(probe({})), "onnx");
+    assert.equal(detectBackend(probe({ platform: "win32" })), "cpu");
+  });
+  it("env override wins, junk ignored", () => {
+    assert.equal(detectBackend(probe({ platform: "win32", env: { AIBROKER_TTS_BACKEND: "Torch" } })), "torch");
+    assert.equal(detectBackend(probe({ env: { AIBROKER_TTS_BACKEND: "bogus" } })), "onnx");
+  });
+});
+
+describe("installPlan", () => {
+  it("is data: venv under the cache, misaki[en], steps in order, cpu empty", () => {
+    for (const b of ["mlx", "torch", "onnx"] as const) {
+      const p = installPlan(b, "/h");
+      assert.equal(p.venvDir, `/h/.cache/aibroker-tts/${b}-venv`);
+      assert.ok(p.packages.includes("misaki[en]"));
+      assert.ok(p.approxDownloadMB > 0);
+      assert.deepEqual(p.steps.map((s) => s.label), ["create venv", "install packages", "download weights"]);
+      assert.equal(p.steps[0].cmd, "uv");
+    }
+    assert.deepEqual(installPlan("cpu", "/h").steps, []);
+  });
+});
+
+describe("runInstall", () => {
+  const plan = installPlan("onnx", "/h");
+  it("runs all steps, measures", async () => {
+    const ran: string[] = [];
+    const r = await runInstall(plan, { exec: async (s) => { ran.push(s.label); return { ok: true }; }, measure: async () => 120, now: () => new Date(0) });
+    assert.deepEqual(ran.length, 3);
+    assert.deepEqual(r, { backend: "onnx", firstAudioMs: 120, installedAt: "1970-01-01T00:00:00.000Z" });
+  });
+  it("failed step falls back to cpu with the error, stops, never throws", async () => {
+    let n = 0;
+    const r = await runInstall(plan, { exec: async () => (++n === 2 ? { ok: false, out: "boom" } : { ok: true }), measure: async () => 1 });
+    assert.equal(r.backend, "cpu");
+    assert.match(r.error ?? "", /install packages failed.*boom/);
+    assert.equal(n, 2);
+  });
+  it("measure throwing or exec rejecting falls back to cpu", async () => {
+    assert.equal((await runInstall(plan, { exec: async () => ({ ok: true }), measure: async () => { throw new Error("x"); } })).backend, "cpu");
+    assert.equal((await runInstall(plan, { exec: async () => { throw new Error("y"); }, measure: async () => 1 })).error, "y");
+  });
+});
+
+describe("resolveBackend with stored config", () => {
+  const home = () => mkdtempSync(pjoin(tmpdir(), "tts-"));
+  it("config round trip", () => {
+    const h = home();
+    assert.equal(loadTtsConfig(h), null);
+    saveTtsConfig(h, { backend: "torch", firstAudioMs: 90, installedAt: "t" });
+    assert.deepEqual(loadTtsConfig(h), { backend: "torch", firstAudioMs: 90, installedAt: "t" });
+  });
+  it("stored backend used when its venv exists, cpu when missing", async () => {
+    const { resolveBackend } = await import("../src/adapters/kokoro/sidecar.js");
+    const h = home();
+    saveTtsConfig(h, { backend: "onnx", firstAudioMs: null, installedAt: "t" });
+    assert.equal(resolveBackend({}, h), "cpu");
+    mkdirP(pjoin(venvPythonFor(h, "onnx"), ".."), { recursive: true });
+    writeFileSync(venvPythonFor(h, "onnx"), "");
+    assert.equal(resolveBackend({}, h), "onnx");
+    assert.equal(resolveBackend({ AIBROKER_TTS_BACKEND: "cpu" }, h), "cpu");
+  });
+  it("no config: legacy mlx venv or cpu", async () => {
+    const { resolveBackend } = await import("../src/adapters/kokoro/sidecar.js");
+    const h = home();
+    assert.equal(resolveBackend({}, h), "cpu");
+    mkdirP(pjoin(venvPythonFor(h, "mlx"), ".."), { recursive: true });
+    writeFileSync(venvPythonFor(h, "mlx"), "");
+    assert.equal(resolveBackend({}, h), "mlx");
+  });
+});
+
+describe("setup tts step and doctor remeasure", () => {
+  it("--yes installs via injected deps and stores; --no-tts skips; failure stores cpu", async () => {
+    const { ttsStep } = await import("../src/daemon/setup.js");
+    const { remeasureTts } = await import("../src/daemon/doctor.js");
+    const h = mkdtempSync(pjoin(tmpdir(), "tts-"));
+    const s = { home: h, platform: "linux", env: {}, which: () => null } as any;
+    const out: string[] = [];
+    const deps = (ok: boolean) => ({ exec: async () => ({ ok }), measure: async () => 77, confirm: async () => false, interactive: false });
+    await ttsStep(s, ["--no-tts"], deps(true), (l) => out.push(l));
+    assert.equal(loadTtsConfig(h), null);
+    await ttsStep(s, [], deps(true), (l) => out.push(l));
+    assert.equal(loadTtsConfig(h), null, "non-interactive without --yes skips");
+    await ttsStep(s, ["--yes", "--force"], deps(false), (l) => out.push(l));
+    assert.equal(loadTtsConfig(h)?.backend, "cpu");
+    await ttsStep(s, ["--yes", "--force"], deps(true), (l) => out.push(l));
+    assert.deepEqual([loadTtsConfig(h)?.backend, loadTtsConfig(h)?.firstAudioMs], ["onnx", 77]);
+    await remeasureTts(s, async () => 55, (l) => out.push(l));
+    assert.equal(loadTtsConfig(h)?.firstAudioMs, 55);
+    assert.ok(out.some((l) => /55 ms/.test(l)));
+  });
+});

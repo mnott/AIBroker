@@ -4,7 +4,7 @@
  * The daemon spawns a Python process that loads Kokoro-82M on Apple Metal once
  * and answers synthesis requests over 127.0.0.1 TCP (~100 ms to first audio vs
  * ~4.5 s cold on the kokoro-js CPU path). This module owns:
- *   - backend selection (AIBROKER_TTS_BACKEND=cpu|mlx; mlx when the venv exists)
+ *   - backend selection (AIBROKER_TTS_BACKEND=cpu|mlx|torch|onnx; stored by setup)
  *   - spawning / restarting the sidecar and writing its port file
  *   - a streaming client that yields Float32 PCM chunks per sentence
  * Every failure — missing venv, dead process, protocol error — is swallowed by
@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import net from "node:net";
 
 import { log } from "../../core/log.js";
+import { loadTtsConfig, parseBackend, venvPythonFor, type TtsBackend } from "./backend-select.js";
 
 export const SIDECAR_SCRIPT_REL = "tts-sidecar/server.py";
 export const VENV_PYTHON = join(homedir(), ".cache", "aibroker-tts", "mlx-venv", "bin", "python");
@@ -26,12 +27,22 @@ export const PORT_FILE = join(homedir(), ".aibroker", "tts-sidecar.port");
 
 const CONNECT_TIMEOUT_MS = 2_000;
 
-/** Which backend serves speech: cpu|mlx; mlx only when the venv interpreter exists. */
-export function resolveBackend(env: NodeJS.ProcessEnv = process.env): "cpu" | "mlx" {
-  const forced = (env.AIBROKER_TTS_BACKEND ?? "").toLowerCase().trim();
-  if (forced === "cpu") return "cpu";
-  if (forced === "mlx") return "mlx";
-  return existsSync(VENV_PYTHON) ? "mlx" : "cpu";
+/**
+ * Which backend serves speech. Order: AIBROKER_TTS_BACKEND (explicit, honored as
+ * given) > backend stored by `aibroker setup` > legacy mlx venv. A stored or
+ * implied backend whose venv interpreter is missing falls back to cpu.
+ */
+export function resolveBackend(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+  exists: (p: string) => boolean = existsSync,
+): TtsBackend {
+  const forced = parseBackend(env.AIBROKER_TTS_BACKEND);
+  if (forced) return forced;
+  const stored = loadTtsConfig(home)?.backend;
+  const chosen: TtsBackend = stored ?? "mlx";
+  if (chosen === "cpu") return "cpu";
+  return exists(venvPythonFor(home, chosen)) ? chosen : "cpu";
 }
 
 /** Absolute path of the sidecar script, resolved against the repo root. */
@@ -188,7 +199,8 @@ export class SidecarSupervisor {
     if (this.restarting) return null;
     this.restarting = true;
     try {
-      const python = this.deps.python ?? VENV_PYTHON;
+      const backend = resolveBackend();
+      const python = this.deps.python ?? venvPythonFor(homedir(), backend);
       const script = this.deps.script ?? sidecarScriptPath();
       if (!existsSync(python)) { log(`tts-sidecar: venv python missing at ${python} — using CPU path`); return null; }
       if (!existsSync(script)) { log(`tts-sidecar: script missing at ${script} — using CPU path`); return null; }
@@ -204,7 +216,7 @@ export class SidecarSupervisor {
       } catch { /* log to stderr of the daemon instead */ }
 
       const proc = spawnFn(python, ["-I", script], {
-        env: { ...process.env, AIBROKER_TTS_SIDECAR_PORT: String(port) },
+        env: { ...process.env, AIBROKER_TTS_SIDECAR_PORT: String(port), AIBROKER_TTS_BACKEND: backend },
         stdio: ["ignore", out.fd ?? "inherit", out.fd ?? "inherit"],
         detached: false,
       });
@@ -220,7 +232,7 @@ export class SidecarSupervisor {
         if (await probeSidecar(port)) {
           this.port = port;
           (this.deps.writePort ?? writePortFile)(port);
-          log(`tts-sidecar: ready on 127.0.0.1:${port} (Metal)`);
+          log(`tts-sidecar: ready on 127.0.0.1:${port} (${backend})`);
           return port;
         }
         if (proc.killed) break;

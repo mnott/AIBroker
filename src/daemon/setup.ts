@@ -13,6 +13,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathS
 import { userInfo } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { detectBackend, installPlan, loadTtsConfig, runInstall, saveTtsConfig, type InstallDeps } from "../adapters/kokoro/backend-select.js";
 import { resolveBin } from "../core/bins.js";
 import { plistEnvEntries, serviceEnv, xmlEscape } from "../core/service-env.js";
 
@@ -510,7 +511,7 @@ export function uninstall(s: Sys, opts: Opts, say: Say = console.log): number {
 }
 
 const FLAGS = {
-  setup: ["--no-service", "--no-mcp", "--no-hooks", "--dry-run", "--force"],
+  setup: ["--no-service", "--no-mcp", "--no-hooks", "--no-tts", "--yes", "--dry-run", "--force"],
   uninstall: ["--no-service", "--no-mcp", "--no-hooks", "--dry-run", "--purge"],
 };
 
@@ -526,9 +527,62 @@ export function checkArgs(cmd: keyof typeof FLAGS, argv: string[], say: Say = co
   return 1;
 }
 
-export async function runSetup(argv: string[], s?: Sys, say: Say = console.log): Promise<void> {
+export interface TtsStepDeps extends InstallDeps {
+  /** Ask a yes/no question; true = yes. */
+  confirm(question: string): Promise<boolean>;
+  interactive: boolean;
+}
+
+/**
+ * TTS backend step: detect, show backend + download size, ask once, install,
+ * measure, store. Skipped by --no-tts and --dry-run; --yes (or a non-interactive
+ * shell with --yes) answers for the user. Never fails setup: a bad install
+ * falls back to the cpu path and says why.
+ */
+export async function ttsStep(s: Sys, argv: string[], deps: TtsStepDeps, say: Say = console.log): Promise<void> {
+  say("tts:");
+  if (argv.includes("--no-tts")) return say("  skipped (--no-tts)");
+  const backend = detectBackend({ platform: s.platform, arch: process.arch, env: s.env, hasCmd: (c) => s.which(c) !== null });
+  const plan = installPlan(backend, s.home);
+  if (!plan.steps.length) {
+    if (!argv.includes("--dry-run")) saveTtsConfig(s.home, { backend, firstAudioMs: null, installedAt: new Date().toISOString() });
+    return say(`  backend ${backend}: bundled kokoro-js, nothing to install`);
+  }
+  say(`  backend ${backend}: ~${plan.approxDownloadMB} MB download into ${plan.venvDir}`);
+  if (argv.includes("--dry-run")) return say(`  would run: ${plan.steps.map((x) => x.label).join(", ")}`);
+  const stored = loadTtsConfig(s.home);
+  if (stored?.backend === backend && !argv.includes("--force")) return say(`  already installed (first audio ${stored.firstAudioMs ?? "?"} ms)`);
+  const yes = argv.includes("--yes");
+  if (!yes && !deps.interactive) return say("  skipped (not interactive; rerun with --yes)");
+  if (!yes && !(await deps.confirm(`  Install the ${backend} voice backend (~${plan.approxDownloadMB} MB)? [y/N] `))) return say("  skipped");
+  const r = await runInstall(plan, deps);
+  saveTtsConfig(s.home, { backend: r.backend, firstAudioMs: r.firstAudioMs, installedAt: r.installedAt });
+  if (r.error) say(`  install failed, using cpu: ${r.error}`);
+  else say(`  ${r.backend} ready, first audio ${r.firstAudioMs} ms`);
+}
+
+async function realTtsDeps(): Promise<TtsStepDeps> {
+  const { realExec, realMeasure } = await import("../adapters/kokoro/backend-real.js");
+  const interactive = Boolean(process.stdin.isTTY);
+  return {
+    exec: realExec,
+    measure: (b) => realMeasure(b),
+    interactive,
+    confirm: async (q) => {
+      const { createInterface } = await import("node:readline/promises");
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      try { return /^y/i.test((await rl.question(q)).trim()); } finally { rl.close(); }
+    },
+  };
+}
+
+export async function runSetup(argv: string[], s?: Sys, say: Say = console.log, tts?: TtsStepDeps): Promise<void> {
   const early = checkArgs("setup", argv, say);
-  process.exitCode = early ?? (setup(s ?? realSys(), parseOpts(argv), say) ? 1 : 0);
+  if (early !== null) { process.exitCode = early; return; }
+  const sys = s ?? realSys();
+  const failed = setup(sys, parseOpts(argv), say);
+  try { await ttsStep(sys, argv, tts ?? await realTtsDeps(), say); } catch (err) { say(`  tts step error: ${err instanceof Error ? err.message : String(err)}`); }
+  process.exitCode = failed ? 1 : 0;
 }
 
 export async function runUninstall(argv: string[], s?: Sys, say: Say = console.log): Promise<void> {

@@ -13,6 +13,7 @@ import {
   HOOK_PLAN, PLIST_LABEL, UNIT_NAME, daemonLogPath, envFilePath, plistPath, readMcpEntry, realSys, settingsPath, unitPath, type Sys,
 } from "./setup.js";
 import { readFileSync } from "node:fs";
+import { loadTtsConfig, saveTtsConfig, venvPythonFor, type TtsBackend } from "../adapters/kokoro/backend-select.js";
 
 export type Level = "ok" | "warn" | "FAIL";
 export interface Check { level: Level; name: string; detail: string; fix?: string }
@@ -70,6 +71,7 @@ export async function diagnose(s: Sys, probes: Probes): Promise<Check[]> {
   else add("ok", "mcp entry", mcp.target);
 
   hookChecks(s, add);
+  ttsCheck(s, add);
 
   const env = envFilePath(s);
   if (!existsSync(env)) add("warn", "env file", `${env} missing`, "aibroker setup");
@@ -102,6 +104,15 @@ function serviceChecks(s: Sys, add: (l: Level, n: string, d: string, f?: string)
   }
 }
 
+function ttsCheck(s: Sys, add: (l: Level, n: string, d: string, f?: string) => void): void {
+  const cfg = loadTtsConfig(s.home);
+  if (!cfg) return add("warn", "tts", "no backend chosen (cpu path)", "aibroker setup");
+  if (cfg.backend !== "cpu" && !existsSync(venvPythonFor(s.home, cfg.backend))) {
+    return add("warn", "tts", `${cfg.backend} venv missing, using cpu`, "aibroker setup --force");
+  }
+  add("ok", "tts", `${cfg.backend}, first audio ${cfg.firstAudioMs === null ? "not measured" : `${cfg.firstAudioMs} ms`}`);
+}
+
 function hookChecks(s: Sys, add: (l: Level, n: string, d: string, f?: string) => void): void {
   let settings: Record<string, any> = {};
   try { settings = JSON.parse(readFileSync(settingsPath(s), "utf8")); } catch { /* none or unreadable: every hook reads as missing */ }
@@ -112,7 +123,24 @@ function hookChecks(s: Sys, add: (l: Level, n: string, d: string, f?: string) =>
   else add("FAIL", "hooks", `missing: ${missing.map((h) => h.file).join(", ")}`, "aibroker setup");
 }
 
-export async function runDoctor(_argv: string[], s: Sys = realSys(), probes: Probes = realProbes, say: (l: string) => void = console.log): Promise<void> {
+/** Re-measure time to first audio for the stored backend and store it. */
+export async function remeasureTts(s: Sys, measure: (b: TtsBackend) => Promise<number>, say: (l: string) => void): Promise<void> {
+  const cfg = loadTtsConfig(s.home);
+  if (!cfg || cfg.backend === "cpu") return say("  tts: no sidecar backend to measure");
+  try {
+    const ms = await measure(cfg.backend);
+    saveTtsConfig(s.home, { ...cfg, firstAudioMs: ms });
+    say(`  tts: ${cfg.backend} first audio ${ms} ms (was ${cfg.firstAudioMs ?? "unmeasured"})`);
+  } catch (err) {
+    say(`  tts: measure failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+export async function runDoctor(argv: string[], s: Sys = realSys(), probes: Probes = realProbes, say: (l: string) => void = console.log, measure?: (b: TtsBackend) => Promise<number>): Promise<void> {
+  if (argv.includes("--remeasure")) {
+    const m = measure ?? (await import("../adapters/kokoro/backend-real.js")).realMeasure;
+    await remeasureTts(s, (b) => m(b), say);
+  }
   const checks = await diagnose(s, probes);
   for (const c of checks) say(`  ${c.level.padEnd(4)}  ${c.name.padEnd(13)} ${c.detail}${c.fix && c.level !== "ok" ? `\n        fix: ${c.fix}` : ""}`);
   const failed = checks.filter((c) => c.level === "FAIL").length;
