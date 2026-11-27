@@ -381,3 +381,32 @@ export async function itermViewerSessionId(tmuxPaneId: string): Promise<string |
 export function logTransportPolicy(): void {
   log(`sync-facade: transports permitted = [${[allowIterm ? "iterm" : null, allowTmux ? "tmux" : null].filter(Boolean).join(", ")}] (availability checked live per enumeration)`);
 }
+
+/** One raw key for the input-clearing fallbacks: tmux key name or iTerm char code. */
+async function sendRawKey(id: string, tmuxKey: string, code: number): Promise<boolean> {
+  if (routeToTmux(id)) return tmuxTransport.sendKeyAsync(id, tmuxKey);
+  return iterm.sendKeystrokeToSession(id, code);
+}
+
+/**
+ * Stronger clear than a bare Ctrl-U (which only kills from the cursor back to
+ * the start of the CURRENT line, so it leaves the tail of a line whose cursor
+ * is mid-text and everything on other lines of a multi-line draft): End of
+ * line (Ctrl-E), kill to line start (Ctrl-U), and — only when `escape` is
+ * allowed, i.e. the session is idle, because Esc mid-turn can cancel the turn —
+ * Escape twice, which Claude Code answers by clearing the whole prompt.
+ */
+export async function sendStrongClear(id: string, opts: { escape: boolean }): Promise<void> {
+  await sendRawKey(id, "C-e", 5);
+  await sendRawKey(id, "C-u", 21);
+  if (opts.escape) {
+    await sendRawKey(id, "Escape", 27);
+    await sendRawKey(id, "Escape", 27);
+  }
+}
+
+/** Delete `n` characters backwards (cursor first moved to the end). */
+export async function sendBackspaces(id: string, n: number): Promise<void> {
+  await sendRawKey(id, "C-e", 5);
+  for (let i = 0; i < n; i++) await sendRawKey(id, "BSpace", 127);
+}
