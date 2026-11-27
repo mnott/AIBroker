@@ -161,6 +161,9 @@ export function snapshotAllSessions(opts: { fresh?: boolean } = {}): Promise<Ses
 /** Alias — every path here is async now. */
 export const snapshotAllSessionsAsync = snapshotAllSessions;
 
+/** Forget the memoized merged session list so the next snapshot enumerates fresh. */
+export function dropSessionMemo(): void { merged = null; }
+
 let transportsInFlight: Promise<SessionSnapshot[]> | null = null;
 
 async function enumerateTransports(opts: { fresh?: boolean }, now: number): Promise<SessionSnapshot[]> {

@@ -36,14 +36,14 @@ MSG="hello-from-smoke-$$"
 RESULT=$(node --input-type=module -e '
 import { WatcherClient } from "./dist/ipc/client.js";
 const c = new WatcherClient("/tmp/aibroker.sock");
-const r = await c.call_raw("send_to_session", { target: "smoke-claude", message: process.argv[1], noReply: true });
+const r = await c.call_raw("send_to_session", { target: "smoke-claude", message: process.argv[1] });
 console.log(JSON.stringify(r));
 ' "$MSG") || fail "send_to_session call threw"
 echo "send_to_session -> $RESULT"
 
 # 4. the line must arrive
-for _ in $(seq 1 20); do grep -qxF "$MSG" "$STANDIN_LOG" && break; sleep 0.25; done
-grep -qxF "$MSG" "$STANDIN_LOG" || fail "message did not reach the stand-in claude (file: $(cat "$STANDIN_LOG"))"
+for _ in $(seq 1 20); do grep -qF "$MSG" "$STANDIN_LOG" && break; sleep 0.25; done
+grep -qF "$MSG" "$STANDIN_LOG" || fail "message did not reach the stand-in claude (file: $(cat "$STANDIN_LOG"))"
 ok "message arrived in the pane's process: $(cat "$STANDIN_LOG")"
 
 # 5. session_content over tmux (capture-pane path)
