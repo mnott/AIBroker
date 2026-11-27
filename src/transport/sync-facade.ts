@@ -150,6 +150,11 @@ function refreshMergedInBackground(opts: { fresh?: boolean }): void {
  */
 export function snapshotAllSessions(opts: { fresh?: boolean } = {}): Promise<SessionSnapshot[]> {
   const now = Date.now();
+  // A tmux-only host (Linux) enumerates in milliseconds, so an explicit `fresh` is answered
+  // by a real enumeration: a memo taken before the first pane existed (daemon boot) would
+  // otherwise serve "no sessions" for a pane that is already there. Only iTerm's slow
+  // osascript enumeration is kept off the handler path.
+  if (opts.fresh && !effectivePolicy().allowIterm) return enumerateTransports(opts, now);
   if (merged && merged.epoch === iterm.snapshotCacheEpoch() && now - merged.at < STALE_LIMIT_MS) {
     // A recent result exists: handlers never spawn. Refresh behind it once it is past the memo TTL.
     if (opts.fresh || now - merged.at >= MEMO_TTL_MS) refreshMergedInBackground(opts);
