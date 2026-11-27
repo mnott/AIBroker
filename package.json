@@ -25,6 +25,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/daemon/cli.js start",
+    "pretest": "tsc",
     "test": "npx tsx --experimental-test-module-mocks --import ./test/home-guard.ts --test --test-concurrency=2 test/*.test.ts",
     "build:ble": "bash scripts/build-ble-helper.sh",
     "build:p2p": "bash scripts/build-p2p-helper.sh",
