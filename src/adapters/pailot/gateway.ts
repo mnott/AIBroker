@@ -64,7 +64,6 @@ import {
   getMqttAppClientCount,
 } from "./mqtt-broker.js";
 import { sendPush as apnsSendPush } from "../../apns/client.js";
-import { pushRouting, SYSTEM_SESSION_NAME } from "./system-chat.js";
 import { cachePushAudio, isPushAudioEnabled, getPushAudioPort } from "./push-audio-server.js";
 import { readAttachment, withNote, type AttachmentRef, getAfter as mqGetAfter, getLatestSeq as mqGetLatestSeq, enqueue as mqEnqueue, isContentType as mqIsContentType } from "./message-queue.js";
 import { addTrace } from "../../daemon/trace-log.js";
@@ -1559,8 +1558,7 @@ export async function broadcastText(text: string, sessionId?: string, direct?: b
   // We can't reliably detect background state because iOS suspends the TCP socket
   // but the MQTT keepalive timeout (30s) hasn't fired yet.
   {
-    const route = pushRouting(resolvedSession);
-    let sessionName = route.isSystem ? SYSTEM_SESSION_NAME : "PAI";
+    let sessionName = "PAI";
     if (resolvedSession) {
       // Try hybrid manager first; if empty, scan iTerm directly for session name
       if (hybridManager && hybridManager.knownSessions().length > 0) {
@@ -1576,8 +1574,8 @@ export async function broadcastText(text: string, sessionId?: string, direct?: b
     const preview = text.replace(/\s+/g, " ").trim().slice(0, 100);
     // Alert + mutable-content already wakes the notification extension; a silent
     // content-available push is deliberately not used (iOS throttles those).
-    void apnsSendPush(sessionName, preview || "(no content)", { sessionId: route.sessionId }, undefined, {
-      msgId: pushIds.msgId, seq: pushIds.seq, sessionId: route.sessionId, type: "text",
+    void apnsSendPush(sessionName, preview || "(no content)", { sessionId: resolvedSession }, undefined, {
+      msgId: pushIds.msgId, seq: pushIds.seq, sessionId: resolvedSession ?? "global", type: "text",
       content: text, sessionName, ts: Date.now(),
     }).catch(() => {});
   }
@@ -1680,7 +1678,7 @@ export async function broadcastVoice(
     const audio = m4aBuffer && cachePushAudio(voiceIds.msgId, m4aBuffer)
       ? { audioPath: `/pailot/audio/${voiceIds.msgId}`, audioPort: getPushAudioPort(), ...(audioSecs !== undefined && { audioSecs }) }
       : {};
-    void apnsSendPush(`${voiceSessionName} (voice)`, preview, { sessionId: pushRouting(resolvedSession).sessionId, type: "voice" }, undefined, {
+    void apnsSendPush(`${voiceSessionName} (voice)`, preview, { sessionId: resolvedSession, type: "voice" }, undefined, {
       msgId: voiceIds.msgId, seq: voiceIds.seq, sessionId: resolvedSession ?? "global", type: "voice",
       content: transcript, sessionName: voiceSessionName, ts: Date.now(), ...audio,
     }).catch(() => {});
