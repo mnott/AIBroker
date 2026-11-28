@@ -125,7 +125,7 @@ export async function onLabelEvent(ev: LabelEvent, deps: TwinDeps): Promise<stri
     deps.store.markClosed(n);
     return "closed";
   }
-  if (existing) return "exists";
+  if (existing && !existing.closed) return "exists";
   let draft = draftTwin(ev.forgeIssue, deps.denyTerms);
   if (!deps.approve) return "denied";
   const verdict = await deps.approve(draft);

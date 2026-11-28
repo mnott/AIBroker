@@ -125,3 +125,11 @@ test("replyToTwin refuses a path", async () => {
   await replyToTwin(3, "thanks", m.deps);
   assert.deepEqual(m.calls, ["create", "comment"]);
 });
+
+test("relabel after unlabel opens a fresh twin instead of staying closed", async () => {
+  const m = mk();
+  await onLabelEvent(lab(), m.deps);
+  await onLabelEvent(lab({ action: "unlabeled" }), m.deps);
+  assert.equal(await onLabelEvent(lab(), m.deps), "created");
+  assert.equal(m.deps.store.getByForge(3)?.closed, undefined);
+});
