@@ -69,6 +69,8 @@ export interface GithubClient {
   createIssue(i: { title: string; body: string }): Promise<{ number: number; url: string }>;
   comment(m: number, body: string): Promise<void>;
   closeIssue(m: number): Promise<void>;
+  /** Find an issue whose body contains `marker` (idempotent create after a crash). */
+  findIssueByMarker?(marker: string): Promise<{ number: number; url: string } | null>;
   listComments(m: number): Promise<GhComment[]>;
   listNewIssues(sinceIso: string): Promise<GhIssue[]>;
   listPulls(): Promise<GhPull[]>;
@@ -89,6 +91,9 @@ export function realGit(cwd?: string): Git {
 export interface Draft { ok: boolean; title: string; body: string; hits: SanitizeHit[] }
 export interface Override { title: string; body: string }
 
+const twinMarker = (forge: number): string => `<!-- aibroker-twin:forge-${forge} -->`;
+/** Hidden tag on every comment we post to GitHub, so syncComments can skip them. */
+const OWN_MARKER = "<!-- aibroker-twin-reply -->";
 const TEMPLATE = "Tracking issue mirrored from the project tracker.";
 
 export function draftTwin(issue: ForgeIssue, denyTerms: string[] = [], override?: Override): Draft {
@@ -120,7 +125,7 @@ export async function onLabelEvent(ev: LabelEvent, deps: TwinDeps): Promise<stri
   const existing = deps.store.getByForge(n);
   if (ev.action === "unlabeled") {
     if (!existing || existing.closed) return "no-twin";
-    await deps.github.comment(existing.github, "This issue is no longer tracked publicly. Closing.");
+    await deps.github.comment(existing.github, `This issue is no longer tracked publicly. Closing.\n\n${OWN_MARKER}`);
     await deps.github.closeIssue(existing.github);
     deps.store.markClosed(n);
     return "closed";
@@ -135,7 +140,10 @@ export async function onLabelEvent(ev: LabelEvent, deps: TwinDeps): Promise<stri
   if (!draft.ok) return "refused";
   assertPublicSafe(draft.title, deps.denyTerms);
   assertPublicSafe(draft.body, deps.denyTerms);
-  const gh = await deps.github.createIssue({ title: draft.title, body: draft.body });
+  // Hidden marker lets a retry find a twin created before store.put landed.
+  const marker = twinMarker(n);
+  const found = await deps.github.findIssueByMarker?.(marker);
+  const gh = found ?? await deps.github.createIssue({ title: draft.title, body: `${draft.body}\n\n${marker}` });
   deps.store.put({ forge: n, github: gh.number, repo: deps.repo, seenComments: { forge: [], github: [] } });
   await deps.forge.comment(n, `Public twin: ${gh.url}`);
   return "created";
@@ -147,6 +155,12 @@ export async function syncComments(deps: TwinDeps): Promise<number> {
     if (e.closed) continue;
     for (const c of await deps.github.listComments(e.github)) {
       if (e.seenComments.github.includes(c.id)) continue;
+      if (c.body.includes(OWN_MARKER)) {
+        // Our own reply: remember it, never echo it back to the forge.
+        e.seenComments.github.push(c.id);
+        deps.store.flush();
+        continue;
+      }
       await deps.forge.comment(e.forge, `From GitHub (@${c.user}): ${c.body}`);
       e.seenComments.github.push(c.id);
       deps.store.flush();
@@ -161,7 +175,7 @@ export async function replyToTwin(forgeNumber: number, text: string, deps: TwinD
   const e = deps.store.getByForge(forgeNumber);
   if (!e || e.closed) throw new Error(`no open twin for forge #${forgeNumber}`);
   assertPublicSafe(text, deps.denyTerms);
-  await deps.github.comment(e.github, text);
+  await deps.github.comment(e.github, `${text}\n\n${OWN_MARKER}`);
 }
 
 export async function syncNewGithubIssues(deps: TwinDeps, sinceIso = "1970-01-01T00:00:00Z"): Promise<number> {
