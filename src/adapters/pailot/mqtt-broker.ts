@@ -528,23 +528,9 @@ export function mqttCredentialsValid(
   return given.length === want.length && timingSafeEqual(given, want);
 }
 
-function isLoopbackHost(h: string): boolean {
-  return h === "localhost" || h === "::1" || h === "127.0.0.1" || /^127\.\d+\.\d+\.\d+$/.test(h);
-}
-
-/**
- * Pick the listen host. Token set: MQTT_BIND or all interfaces (undefined).
- * No token: loopback only; an explicit non-loopback bind throws.
- */
-export function resolveMqttBindHost(token: string | undefined, bindEnv?: string): string | undefined {
-  if (token) return bindEnv || undefined;
-  if (!bindEnv) return "127.0.0.1";
-  if (!isLoopbackHost(bindEnv)) {
-    throw new Error(
-      `[MQTT] refusing to start: MQTT_TOKEN is not set and MQTT_BIND=${bindEnv} is not loopback. ` +
-      "Set MQTT_TOKEN or bind to 127.0.0.1.");
-  }
-  return bindEnv;
+/** Pick the listen host: MQTT_BIND if set, else all interfaces (undefined). */
+export function resolveMqttBindHost(_token: string | undefined, bindEnv?: string): string | undefined {
+  return bindEnv || undefined;
 }
 
 /**
@@ -559,9 +545,9 @@ export async function startMqttBroker(version?: string): Promise<void> {
 
   const MQTT_PORT = parseInt(process.env.MQTT_PORT ?? process.env.PAILOT_PORT ?? "8765", 10);
   const MQTT_TOKEN = process.env.MQTT_TOKEN;
-  // Without a token the broker is unauthenticated: loopback only, or refuse.
   const bindHost = resolveMqttBindHost(MQTT_TOKEN, process.env.MQTT_BIND);
-  log(`[MQTT] bind host: ${bindHost ?? "all interfaces"}${MQTT_TOKEN ? "" : " (no token configured, loopback only)"}`);
+  log(`[MQTT] bind host: ${bindHost ?? "all interfaces"}`);
+  if (!MQTT_TOKEN) log("[MQTT] no MQTT_TOKEN: unauthenticated broker on all interfaces (TLS); set MQTT_TOKEN to require auth");
 
   // Build aedes options
   const aedesOpts: Record<string, unknown> = {
