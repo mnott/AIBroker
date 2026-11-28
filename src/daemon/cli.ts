@@ -58,7 +58,13 @@ function printCommandList(): void {
   console.log("  dispatch <project> Deliver a work order to a project's session (--stdin --json)");
   console.log("  ask <project>      Ask a session a question and wait for its reply (--stdin --json)");
   console.log("  audit              What one session did to another (--session|--trace|--bodies)");
-  console.log("  todoist <sub>      Todoist inbound channel: auth|status|pause|resume");
+  console.log("  todoist <sub>      Todoist inbound channel: auth|status|pause|resume|ingress");
+  console.log("  inbound <sub>      Webhook receivers: list|add|remove|fields (add <name> <session> [--mode message|task] [--fields a,b] [--note ...])");
+  console.log("  outbound <sub>     Webhook targets: list|add|remove (add <name> <https-url> [--header H] [--secret S] [--note ...])");
+  console.log("  issue <repo> <verb> Forge issues: list|get|comments|new|comment|close|... (--body - reads stdin, --json)");
+  console.log("  a2a <verb>         A2A agent-to-agent: setup|expose|unexpose|exposed|tasks|reply|send|get|cancel|check|card");
+  console.log("  peer <sub>         Fleet pairing: invite|join|forget|list|fleet|standup (also `aibroker fleet`)");
+  console.log("  budget [sub]       Usage budget guard: status|on|off|ceiling <n>|managed <n|off>|resets <time>");
   console.log("  owner rename <old> <new> [--dry-run]  Rewrite a renamed session/project name in AIBroker state");
   console.log("  agentish <verb>    AG2 wire format: spec|check|measure");
   console.log("  help               Show this help");

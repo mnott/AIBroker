@@ -56,7 +56,7 @@ The hub is the runtime; adapters are thin transport plugins. Internally every me
 
 ## MCP Tools
 
-One unified MCP server exposes 43 tools (`whatsapp_*`, `telegram_*`, `pailot_*`, `aibroker_*`). Message prefixes such as `[Whazaa:voice]` tell Claude which channel to reply through.
+One unified MCP server exposes 72 tools (`whatsapp_*`, `telegram_*`, `pailot_*`, `todoist_*`, `ota_publish`, `aibroker_*`). Message prefixes such as `[Whazaa:voice]` tell Claude which channel to reply through.
 
 → [docs/mcp-tools.md](docs/mcp-tools.md)
 
@@ -119,6 +119,8 @@ MIT — Matthias Nott
 ## Publishing to the OTA hub
 
 `aibroker ota publish --slug myapp --name "My App" --bundle com.example.app --version 1.0.0 --platform ios build/app.ipa` uploads an IPA or APK to the OTA install hub and prints the install URL (only that, on stdout). Any failure exits non-zero with a one-line reason on stderr. It is the CLI twin of the MCP tool `ota_publish`.
+
+Optional `--build <n>` sets the build number. Without it, the build is taken from a `"1.1.23 (40)"` style `--version` (split into version `1.1.23` and build `40`), else derived from the file: `CFBundleVersion` of the IPA's `Info.plist`, or `versionCode` of the APK via `aapt`/`aapt2` (looked up on `PATH`, then in Android SDK `build-tools` under `ANDROID_HOME`, `ANDROID_SDK_ROOT` or `~/Library/Android/sdk`, highest version first). Derivation is best effort: if nothing is found, no build is sent. The hub escapes publisher metadata (name, bundle id, host) in the install landing page and the manifest.
 
 ## Mail ingress
 

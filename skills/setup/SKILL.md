@@ -17,9 +17,9 @@ Work through the phases in order. Run the check of a phase first; if it already 
 
 ## 1. Prerequisites
 
-Check: `node --version` (needs 20 or newer), `claude --version`. macOS is the primary platform (launchd); Linux works with a systemd user unit and tmux (see docs/linux.md).
+Check: `node --version` (needs 22 or newer, package.json engines), `claude --version`. macOS is the primary platform (launchd); Linux works with a systemd user unit and tmux (see docs/linux.md).
 
-- Node missing or older than 20: install a current LTS (brew, nvm, or the system package manager).
+- Node missing or older than 22: install a current LTS (brew, nvm, or the system package manager).
 - Claude Code missing: install it from its official installer, then run `claude` once to log in.
 - If `npm i -g` fails with EACCES, set a prefix in the home directory: `npm config set prefix ~/.npm-global` and put `~/.npm-global/bin` on PATH.
 
@@ -43,7 +43,7 @@ aibroker setup --dry-run   # show the plan, write nothing
 aibroker setup             # background service (launchd / systemd user unit), MCP entry, Claude Code hooks, ~/.aibroker/env
 ```
 
-`setup` is idempotent and prints what it did per step. `--no-service`, `--no-mcp`, `--no-hooks` skip a step; `--force` redoes it. Tell the user the MCP tools appear in Claude Code from its next start.
+`setup` is idempotent and prints what it did per step. `--no-service`, `--no-mcp`, `--no-hooks`, `--no-tts` skip a step; `--yes` answers the one TTS-backend question (detect, show download size, install) without asking; `--force` redoes a step. Tell the user the MCP tools appear in Claude Code from its next start.
 
 ## 4. Daemon
 
