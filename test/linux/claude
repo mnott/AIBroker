@@ -2,7 +2,11 @@
 # Stand-in for Claude Code: draws the same input box (rule, ❯ line, rule, status)
 # and appends every line it reads to $STANDIN_LOG.
 # Re-exec as "claude" so the pane's foreground command reads like the real thing (not "bash").
-[ -z "${STANDIN_REEXEC:-}" ] && STANDIN_REEXEC=1 exec -a claude bash "$0" "$@"
+# a symlink named claude: exec -a only sets argv[0]; tmux pane_current_command comes from the exec path
+if [ -z "${STANDIN_REEXEC:-}" ]; then
+  LINK="$(mktemp -d)/claude"; ln -s "$(command -v bash)" "$LINK"
+  STANDIN_REEXEC=1 exec "$LINK" "$0" "$@"
+fi
 LOG="${STANDIN_LOG:-/tmp/standin-received.txt}"
 transcript=()
 draw() {

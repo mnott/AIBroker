@@ -41,7 +41,7 @@ import { isGroupJid, decideTranscribe, subscribeGroup, unsubscribeGroup, listSub
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
-import { snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
+import { dropSessionMemo, snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { sameClaudeSession } from "../core/claude-attach.js";
 import { resolveSelfSessionId, readPaiSessionMap, paneSuffix } from "./pai-session-map.js";
 import { readClaudeRegistry, isNativePeer } from "../core/native-peers.js";
@@ -370,6 +370,9 @@ export function registerCoreHandlers(
     // The note that used to sit here — "manager.listSessions() is always empty
     // (nothing populates the internal registry)" — described the defect and
     // routed around it; the registry now populates itself.
+    // An explicit listing must show windows opened seconds ago (e.g. `aibroker launch` twice
+    // in a row must see the first): do not serve the memoized list behind a background refresh.
+    dropSessionMemo();
     const snapshots = await listedSessions();
     // Path A of the hybrid messaging design: report only, deliver as before.
     const registry = readClaudeRegistry();

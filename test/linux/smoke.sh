@@ -36,14 +36,15 @@ MSG="hello-from-smoke-$$"
 RESULT=$(node --input-type=module -e '
 import { WatcherClient } from "./dist/ipc/client.js";
 const c = new WatcherClient("/tmp/aibroker.sock");
-const r = await c.call_raw("send_to_session", { target: "smoke-claude", message: process.argv[1], noReply: true });
+const r = await c.call_raw("send_to_session", { target: "smoke-claude", message: process.argv[1] });
 console.log(JSON.stringify(r));
 ' "$MSG") || fail "send_to_session call threw"
 echo "send_to_session -> $RESULT"
 
-# 4. the line must arrive
-for _ in $(seq 1 20); do grep -qxF "$MSG" "$STANDIN_LOG" && break; sleep 0.25; done
-grep -qxF "$MSG" "$STANDIN_LOG" || fail "message did not reach the stand-in claude (file: $(cat "$STANDIN_LOG"))"
+# 4. the one-line mailbox pointer (never the body, see sendToSessionDelivery) must arrive;
+#    it carries the message as its preview. noReply would be mailbox-only: nothing typed.
+for _ in $(seq 1 20); do grep -qF "$MSG" "$STANDIN_LOG" && break; sleep 0.25; done
+grep -qF "$MSG" "$STANDIN_LOG" || fail "message did not reach the stand-in claude (file: $(cat "$STANDIN_LOG"))"
 ok "message arrived in the pane's process: $(cat "$STANDIN_LOG")"
 
 # 5. session_content over tmux (capture-pane path)
@@ -112,12 +113,22 @@ echo "$LISTING" | grep "myproject" | grep -q "tmux" || fail "sessions does not l
 echo "$LISTING" | grep "myproject" | grep -q "$PROJ" || fail "sessions does not show the directory"
 ok "aibroker sessions lists myproject (tmux, $PROJ)"
 
-# 10. send by name reaches the launched session
+# 10. send by name: `aibroker send` is noReply, so it is mailbox-only by design (nothing typed);
+#     the message must be waiting in the launched session's mailbox
 LMSG="hello-launch-$$"
-$AIB send myproject "$LMSG" || fail "send failed"
-for _ in $(seq 1 20); do grep -qxF "$LMSG" "$STANDIN_LOG" && break; sleep 0.25; done
-grep -qxF "$LMSG" "$STANDIN_LOG" || fail "send by name did not arrive (file: $(cat "$STANDIN_LOG"))"
-ok "aibroker send myproject arrived: $LMSG"
+LID=$(echo "$LAUNCH" | awk '/^  tmux /{print $2; exit}')
+SENT=$($AIB send myproject "$LMSG") || fail "send failed"
+echo "$SENT"
+echo "$SENT" | grep -q "Queued for myproject" || fail "send did not report the queued message"
+# (noReply deposits kind=beat, which `mailbox wait` ignores, so peek the mailbox directly)
+WAITING=$(node --input-type=module -e '
+import { WatcherClient } from "./dist/ipc/client.js";
+const c = new WatcherClient("/tmp/aibroker.sock");
+const r = await c.call_raw("session_mailbox_peek", { sessionId: process.argv[1] });
+console.log(JSON.stringify(r.messages ?? []));
+' "$LID") || fail "mailbox peek threw"
+echo "$WAITING" | grep -qF "$LMSG" || fail "mailbox does not hold the sent message (got: $WAITING; id '$LID')"
+ok "aibroker send myproject reached its mailbox: $LMSG"
 
 # 11. pidfile, restart and stop without lsof and without a service
 PIDFILE="$HOME/.aibroker/daemon.pid"

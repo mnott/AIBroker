@@ -21,6 +21,7 @@ test("stale memo: background refresh starts one enumeration, no recursion", asyn
       await facade.snapshotAllSessions(opts); // joins the in-flight refresh, no second start
     } finally { Date.now = realNow; }
     await new Promise((r) => setTimeout(r, 20));
-    assert.equal(calls, 1);
+    // tmux-only host: an explicit `fresh` is a real enumeration per call (no memo), a plain call joins one refresh.
+    assert.equal(calls, (opts as any).fresh ? 2 : 1);
   }
 });
