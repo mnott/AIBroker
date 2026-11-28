@@ -203,3 +203,14 @@ describe("misc", () => {
   it("parses tokens env", () => { assert.deepEqual(parseTokens("a=1, b=2,bad,=x"), { a: ["1"], b: ["2"] }); });
   it("ingress types appchannel", () => { assert.equal(deliveryFor("appchannel"), "type"); });
 });
+
+describe("appchannel bind default", () => {
+  afterEach(async () => { (await import("../src/adapters/appchannel/server.js")).stopAppChannelServer(); });
+  it("binds 127.0.0.1 unless APPCHANNEL_BIND is set; refuses without tokens", async () => {
+    const m = await import("../src/adapters/appchannel/server.js");
+    assert.equal(m.startAppChannelServer({ deliver: () => undefined }, { APPCHANNEL_PORT: "0", APPCHANNEL_TOKENS: "CaseLeaf=secret" }), false);
+    assert.equal(m.startAppChannelServer({ deliver: () => undefined }, { APPCHANNEL_PORT: "47999", APPCHANNEL_BIND: "0.0.0.0" }), false);
+    assert.equal(m.startAppChannelServer({ deliver: () => undefined }, { APPCHANNEL_PORT: "47999", APPCHANNEL_TOKENS: "CaseLeaf=secret" }), true);
+    assert.equal(m.getAppChannelBind(), "127.0.0.1");
+  });
+});

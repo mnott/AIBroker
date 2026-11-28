@@ -61,13 +61,21 @@ let current: AppChannel = appChannel;
 export function getAppChannel(): AppChannel { return current; }
 export function getAppChannelPort(): number { return activePort; }
 
+let activeBind = "";
+export function getAppChannelBind(): string { return activeBind; }
+
+const isLoopback = (h: string): boolean => h === "localhost" || h === "::1" || /^127\./.test(h);
+
 export function startAppChannelServer(deps: AppChannelDeps, env: NodeJS.ProcessEnv = process.env): boolean {
   const port = Number(env.APPCHANNEL_PORT ?? 0);
   if (!Number.isInteger(port) || port <= 0) { log("[AppChannel] APPCHANNEL_PORT not set — app channel disabled"); return false; }
   const tokens = parseTokens(env.APPCHANNEL_TOKENS);
   if (!Object.keys(tokens).length) { log("[AppChannel] APPCHANNEL_TOKENS empty — app channel disabled"); return false; }
   if (wss) return true;
-  const bind = env.APPCHANNEL_BIND || "0.0.0.0";
+  // Loopback unless explicitly configured; exposure is only ever opt-in, and tokens are already required above.
+  const bind = env.APPCHANNEL_BIND || "127.0.0.1";
+  if (!isLoopback(bind)) log(`[AppChannel] WARNING: bound to non-loopback ${bind} (APPCHANNEL_BIND), token auth required`);
+  activeBind = bind;
   channel = new AppChannel(deps, { tokens });
   current = channel;
   const s = new WebSocketServer({ port, host: bind, path: APPCHANNEL_PATH, maxPayload: MAX_FRAME_BYTES });

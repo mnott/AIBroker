@@ -187,3 +187,33 @@ test("relabel after unlabel opens a fresh twin instead of staying closed", async
   assert.equal(await onLabelEvent(lab(), m.deps), "created");
   assert.equal(m.deps.store.getByForge(3)?.closed, undefined);
 });
+
+test("retry after crash between createIssue and store.put reuses existing twin (no duplicate)", async () => {
+  const m = mk();
+  const created: any[] = [];
+  m.deps.github.createIssue = async (i) => { created.push(i); return { number: 7, url: "https://github.com/o/r/issues/7" }; };
+  m.deps.github.findIssueByMarker = async (marker) => {
+    const hit = created.find((c) => c.body.includes(marker));
+    return hit ? { number: 7, url: "https://github.com/o/r/issues/7" } : null;
+  };
+  const realPut = m.deps.store.put.bind(m.deps.store);
+  m.deps.store.put = () => { throw new Error("crash"); };
+  await assert.rejects(onLabelEvent(lab(), m.deps), /crash/);
+  m.deps.store.put = realPut;
+  assert.equal(await onLabelEvent(lab(), m.deps), "created");
+  assert.equal(created.length, 1);
+  assert.equal(m.deps.store.getByForge(3)?.github, 7);
+});
+
+test("syncComments skips comments we authored (reply marker)", async () => {
+  const m = mk();
+  await onLabelEvent(lab(), m.deps);
+  let posted = "";
+  m.deps.github.comment = async (_n, b) => { posted = b; };
+  await replyToTwin(3, "Thanks, fixed.", m.deps);
+  m.deps.github.listComments = async () => [{ id: 50, user: "bot", body: posted }];
+  m.forgeComments.length = 0;
+  assert.equal(await syncComments(m.deps), 0);
+  assert.equal(m.forgeComments.length, 0);
+  assert.ok(m.deps.store.getByForge(3)!.seenComments.github.includes(50));
+});

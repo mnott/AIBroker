@@ -444,6 +444,43 @@ export const realDeps: SttDeps = {
 
 process.on("exit", stopWhisperServer);
 
+export interface KeepWarmDeps {
+  isStarting: () => boolean;
+  syncModel: (env: NodeJS.ProcessEnv) => Promise<boolean>;
+  /** true when a live server answers healthily */
+  healthy: () => Promise<boolean>;
+  stop: () => void;
+  ensure: (model: string, env: NodeJS.ProcessEnv) => Promise<string | null>;
+  resolveModel: () => string | null;
+}
+const realKeepWarmDeps: KeepWarmDeps = {
+  isStarting: () => !!starting,
+  syncModel: (env) => syncWhisperServerModel(env).catch(() => false),
+  healthy: async () => {
+    try {
+      if (serverProc && serverUrl && serverProc.exitCode === null) {
+        const r = await fetch(`${serverUrl}/`, { signal: AbortSignal.timeout(3000) });
+        if (r.status < 500) return true;
+      }
+    } catch { /* unhealthy */ }
+    return false;
+  },
+  stop: () => stopWhisperServer(),
+  ensure: (m, e) => ensureWhisperServer(m, e),
+  resolveModel: () => resolveCppModel(),
+};
+
+/** One keep-warm health check; restarts whisper-server when unhealthy. Deps injectable for tests. */
+export async function keepWarmTick(env: NodeJS.ProcessEnv, model: string, deps: KeepWarmDeps = realKeepWarmDeps): Promise<void> {
+  if (deps.isStarting()) return;
+  await deps.syncModel(env);
+  if (deps.isStarting()) return;
+  if (await deps.healthy()) return;
+  log("[STT] whisper-server unhealthy, restarting");
+  deps.stop();
+  await deps.ensure(deps.resolveModel() ?? model, env).catch(() => null);
+}
+
 let keepWarmTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
@@ -456,19 +493,6 @@ export function prewarmWhisperServer(env: NodeJS.ProcessEnv = process.env): void
   const model = model0;
   void ensureWhisperServer(model, env).catch((e) => log(`[STT] prewarm failed: ${e}`));
   if (keepWarmTimer) return;
-  keepWarmTimer = setInterval(async () => {
-    if (starting) return;
-    await syncWhisperServerModel(env).catch(() => false);
-    if (starting) return;
-    try {
-      if (serverProc && serverUrl && serverProc.exitCode === null) {
-        const r = await fetch(`${serverUrl}/`, { signal: AbortSignal.timeout(3000) });
-        if (r.status < 500) return;
-      }
-    } catch { /* unhealthy */ }
-    log("[STT] whisper-server unhealthy, restarting");
-    stopWhisperServer();
-    await ensureWhisperServer(resolveCppModel() ?? model, env).catch(() => null);
-  }, 30_000);
+  keepWarmTimer = setInterval(() => { void keepWarmTick(env, model); }, 30_000);
   keepWarmTimer.unref();
 }
