@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   transcribeFile, resolveCppModel, wavConvertArgs, cliArgs, SttAudioError, VOICEINK_MODEL_REL,
-  isHallucination, noSpeechReply, wavStats, syncWhisperServerModel, type SttDeps,
+  isHallucination, noSpeechReply, wavStats, syncWhisperServerModel, keepWarmTick, type SttDeps,
 } from "../src/core/stt.js";
 
 const PROBE_OK = JSON.stringify({ streams: [{ codec_name: "aac" }], format: { duration: "4.2" } });
@@ -218,4 +218,21 @@ test("voice batch: two notes within the window are joined", () => {
   mock.timers.tick(1);
   assert.deepEqual(out, [["one", "two"]]);
   mock.timers.reset();
+});
+
+describe("keepWarmTick", () => {
+  const mkDeps = (healthy: boolean, calls: string[]) => ({
+    isStarting: () => false, syncModel: async () => false, healthy: async () => healthy,
+    stop: () => { calls.push("stop"); }, ensure: async (m: string) => { calls.push(`ensure:${m}`); return null; }, resolveModel: () => "/m/new.bin",
+  });
+  it("healthy server: no restart", async () => {
+    const calls: string[] = [];
+    await keepWarmTick({}, "/m/old.bin", mkDeps(true, calls));
+    assert.deepEqual(calls, []);
+  });
+  it("unhealthy: stop then ensure with injected deps only", async () => {
+    const calls: string[] = [];
+    await keepWarmTick({}, "/m/old.bin", mkDeps(false, calls));
+    assert.deepEqual(calls, ["stop", "ensure:/m/new.bin"]);
+  });
 });
