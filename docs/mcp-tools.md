@@ -17,6 +17,18 @@ Claude Code ──► MCP: aibroker (stdio)
 
 The MCP server has no platform-specific code. All adapter communication goes through the hub's `adapter_call` IPC handler, which proxies the call to the correct adapter socket. See [ipc.md](./ipc.md) for the `adapter_call` protocol.
 
+## Skills over MCP
+
+The server also serves its guidance skills as MCP resources and prompts. The single source is `skills/<dir>/SKILL.md` (shipped in the package, resolved relative to `src/mcp/skills.ts`); resource and prompt both read it at request time. Resources use `mimeType: text/markdown`; the prompt returns the same text as one user message.
+
+| Skill | Resource URI | Prompt | Content |
+|-------|--------------|--------|---------|
+| routing | `skill://aibroker/routing/SKILL.md` | `aibroker-routing` | Full channel routing, Task, mailbox and session orchestration rules |
+| handover | `skill://aibroker/handover/SKILL.md` | `aibroker-handover` | Handing a session over to or from AIBroker |
+| setup | `skill://aibroker/setup/SKILL.md` | `aibroker-setup` | Install, configure and verify AIBroker |
+
+The server `instructions` carry only the essentials and point at the routing skill for clients that support resources.
+
 ## Session Identity
 
 At startup, the MCP server determines which iTerm2 session it belongs to via two methods:
@@ -522,7 +534,7 @@ Get or set TTS voice configuration. Global config when no session scope is given
 
 Natural-language mapping for this session: "reply in voice until further notice" → `{action:"set", replyInVoice:true}`; "back to text" → `replyInVoice:false`; "slower"/"faster" → `speedDelta:-0.1`/`+0.1`; "repeat" → `aibroker_repeat_speech`; "use voice X" → `{action:"set", voice:"X"}`; "stop" → `aibroker_stop_speech`.
 
-Voice config persists to `~/.aibroker/voice-config.json`. Default personas: Nicole, George, Daniel, Fable.
+Voice config persists to `~/.aibroker/voice-config.json`. Default personas: Nicole, George, Daniel, Fable. There is no `aibroker_list_voices` MCP tool: the hub IPC method `list_voices` exists, but it is not exposed over MCP. To switch voice, set `voice` by name.
 
 ---
 
