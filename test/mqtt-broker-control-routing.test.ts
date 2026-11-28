@@ -66,11 +66,10 @@ test("mqtt-auth: exact token accepted, wrong/short/long/missing rejected", () =>
   assert.equal(mqttCredentialsValid("s3cr3t", "other", Buffer.from("s3cr3t")), false);
 });
 
-test("mqtt-bind: no token binds loopback only, non-loopback refused", () => {
-  assert.equal(resolveMqttBindHost(undefined, undefined), "127.0.0.1");
+test("mqtt-bind: no token still binds network (warning), MQTT_BIND overrides", () => {
+  assert.equal(resolveMqttBindHost(undefined, undefined), undefined);
   assert.equal(resolveMqttBindHost(undefined, "127.0.0.1"), "127.0.0.1");
-  assert.throws(() => resolveMqttBindHost(undefined, "0.0.0.0"), /refusing to start/);
-  assert.throws(() => resolveMqttBindHost(undefined, "192.168.1.5"), /MQTT_TOKEN/);
+  assert.equal(resolveMqttBindHost(undefined, "0.0.0.0"), "0.0.0.0");
   assert.equal(resolveMqttBindHost("tok", undefined), undefined);
   assert.equal(resolveMqttBindHost("tok", "0.0.0.0"), "0.0.0.0");
 });
