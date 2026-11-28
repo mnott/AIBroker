@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TwinStore, onLabelEvent, syncComments, syncNewGithubIssues, syncPulls, onMergedPr, replyToTwin, type TwinDeps } from "../src/daemon/public-twin.js";
+import { TwinStore, onLabelEvent, syncComments, syncNewGithubIssues, syncPulls, onMergedPr, replyToTwin, draftTwin, type TwinDeps, type ForgeIssue } from "../src/daemon/public-twin.js";
+import { twinTick } from "../src/daemon/twin-watch.js";
 
 function mk(approve: TwinDeps["approve"] = async () => true) {
   const calls: string[] = [];
@@ -61,11 +62,64 @@ test("approval denied -> no GitHub call", async () => {
 });
 
 test("site details refused", async () => {
-  for (const body of ["host 10.0.0.5 down", "see /Users/x/f", "git.mnsoft.org broke"]) {
+  for (const t of ["host 10.0.0.5 down", "see /Users/x/f", "git.mnsoft.org broke"]) {
     const m = mk();
-    assert.equal(await onLabelEvent(lab({ forgeIssue: issue(body) }), m.deps), "refused");
+    assert.equal(await onLabelEvent(lab({ forgeIssue: { number: 3, title: t, body: "x" } }), m.deps), "refused");
     assert.deepEqual(m.calls, []);
   }
+});
+
+test("default draft never carries the raw forge body", () => {
+  const d = draftTwin({ number: 3, title: "Dark mode", body: "secret 10.0.0.5 details" });
+  assert.ok(d.ok);
+  assert.ok(!d.body.includes("secret"));
+  assert.match(d.body, /Dark mode/);
+});
+
+function tickDeps(pub: ForgeIssue[], mergeSha: () => string | undefined = () => undefined) {
+  const m = mk();
+  const state = { pub };
+  m.deps.forge.listPublicIssues = async () => state.pub;
+  m.deps.git = { fetchPr: async () => {}, mergeShaFor: async () => mergeSha() };
+  return { ...m, state };
+}
+const opts = { repoUrl: "https://github.com/o/r" };
+
+test("tick: label add -> twin, label removed -> closed, idempotent", async () => {
+  const t = tickDeps([issue()]);
+  const r1 = await twinTick(t.deps, opts);
+  assert.equal(r1.created, 1);
+  assert.equal(t.deps.store.getByForge(3)?.github, 7);
+  const r2 = await twinTick(t.deps, opts);
+  assert.equal(r2.created, 0);
+  assert.equal(r2.closed, 0);
+  assert.equal(r2.comments, 0);
+  assert.equal(r2.pulls, 0);
+  t.state.pub = [];
+  const r3 = await twinTick(t.deps, opts);
+  assert.equal(r3.closed, 1);
+  assert.equal(t.deps.store.getByForge(3)?.closed, true);
+  assert.equal((await twinTick(t.deps, opts)).closed, 0);
+});
+
+test("tick: merged PR closed once with commit link", async () => {
+  let sha: string | undefined;
+  const t = tickDeps([], () => sha);
+  assert.equal((await twinTick(t.deps, opts)).pulls, 1);
+  assert.equal(t.closedPulls.length, 0);
+  sha = "abc123";
+  assert.equal((await twinTick(t.deps, opts)).closedPulls, 1);
+  assert.equal((await twinTick(t.deps, opts)).closedPulls, 0);
+  assert.equal(t.closedPulls.length, 1);
+  assert.match(t.closedPulls[0][1], /github\.com\/o\/r\/commit\/abc123/);
+});
+
+test("tick: failing comment sync does not block PR closing", async () => {
+  const t = tickDeps([issue()], () => "abc123");
+  t.deps.github.listComments = async () => { throw new Error("boom"); };
+  const r = await twinTick(t.deps, opts);
+  assert.equal(r.closedPulls, 1);
+  assert.ok(r.errors.some((e) => e.startsWith("comments:")));
 });
 
 test("operator override accepted, but still sanitized", async () => {
