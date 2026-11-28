@@ -126,7 +126,7 @@ if (helpRequested && command !== undefined && command !== "help" && command !== 
       "deadline an unanswered ask reads 'silent' unless --default-ok was passed.",
     ],
     setup: ["Usage: aibroker setup [--no-service --no-mcp --no-hooks --no-tts --yes --dry-run --force]", "", "Install service, MCP entry, hooks, env."],
-    doctor: ["Usage: aibroker doctor", "", "Check the install; non-zero exit on a required failure."],
+    doctor: ["Usage: aibroker doctor [--remeasure]", "", "Check the install; non-zero exit on a required failure.", "  --remeasure  Re-time the TTS backend and store the new first-audio figure."],
     uninstall: ["Usage: aibroker uninstall [--purge]", "", "Remove what setup added; --purge also deletes ~/.aibroker."],
     "create-adapter": [
       "Usage: aibroker create-adapter <adapter-name> [--display-name <Name>] [--output <dir>]",

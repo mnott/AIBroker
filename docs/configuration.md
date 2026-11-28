@@ -140,6 +140,7 @@ Variables that control AIBroker behavior at startup:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AIBROKER_TTS_VOICE` | `"bm_fable"` | Default TTS voice ID |
+| `AIBROKER_TTS_BACKEND` | auto-detected | Force the TTS backend: `cpu`, `mlx`, `torch` or `onnx`. See [tts.md](tts.md) |
 | `MSGBRIDGE_TTS_VOICE` | — | Legacy alias for TTS voice |
 | `WHAZAA_TTS_VOICE` | — | Legacy alias for TTS voice |
 | `AIBROKER_WHISPER_MODEL` | `"small"` | Whisper model size (`tiny`, `base`, `small`, `medium`, `large`) |
