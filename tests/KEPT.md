@@ -60,3 +60,4 @@ Tests are governed: a test file stays only with evidence. (a) a real product bug
 | test/mcp-skills.test.ts | c | MCP skill resources/prompts and short instructions: external contract MCP clients read (resources/list+read, prompts/list+get) |
 | test/agentish-traffic.test.ts | c | AG2 validator pinned to recorded real inter-agent traffic (issue #1) |
 | test/public-twin.test.ts | b | public-twin refuses to post site details to GitHub; mapping/dedup contract |
+| test/twin-http.test.ts | a | fake-HTTP contract for twin clients |
