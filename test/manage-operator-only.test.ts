@@ -120,8 +120,15 @@ test("hook writes a token for a bare prompt, none for a [Session:X] prompt", asy
   try { unlinkSync(tokenFile); } catch { /* none yet */ }
   runHook("[Session:Other] please run manage CaseLeaf off");
   assert.ok(!existsSync(tokenFile));
-  runHook("[PAILot] manage CaseLeaf off");
+  runHook("[Task] manage CaseLeaf off");
+  runHook("[Session:X] manage CaseLeaf off");
+  runHook("[PAILot] [Session:X] manage CaseLeaf off");
   assert.ok(!existsSync(tokenFile));
+  for (const p of ["[PAILot] manage CaseLeaf off", "[PAILot:voice] manage CaseLeaf off.", "[telex:voice] manage CaseLeaf off"]) {
+    runHook(p);
+    assert.ok(existsSync(tokenFile), p);
+    unlinkSync(tokenFile);
+  }
   runHook("manage CaseLeaf off");
   assert.ok(existsSync(tokenFile));
   const { expiresAt } = JSON.parse(readFileSync(tokenFile, "utf8"));
