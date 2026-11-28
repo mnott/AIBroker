@@ -54,3 +54,23 @@ test("catch_up on pailot/control/in is forwarded exactly as before", () => {
   assert.equal(forwarded!.type, "command");
   assert.equal((forwarded!.payload as Record<string, unknown>).command, "catch_up");
 });
+
+import { mqttCredentialsValid, resolveMqttBindHost } from "../src/adapters/pailot/mqtt-broker.js";
+
+test("mqtt-auth: exact token accepted, wrong/short/long/missing rejected", () => {
+  assert.equal(mqttCredentialsValid("s3cr3t", "pailot", Buffer.from("s3cr3t")), true);
+  assert.equal(mqttCredentialsValid("s3cr3t", "pailot", Buffer.from("s3cr3x")), false);
+  assert.equal(mqttCredentialsValid("s3cr3t", "pailot", Buffer.from("s3c")), false);
+  assert.equal(mqttCredentialsValid("s3cr3t", "pailot", Buffer.from("s3cr3t!")), false);
+  assert.equal(mqttCredentialsValid("s3cr3t", "pailot", undefined), false);
+  assert.equal(mqttCredentialsValid("s3cr3t", "other", Buffer.from("s3cr3t")), false);
+});
+
+test("mqtt-bind: no token binds loopback only, non-loopback refused", () => {
+  assert.equal(resolveMqttBindHost(undefined, undefined), "127.0.0.1");
+  assert.equal(resolveMqttBindHost(undefined, "127.0.0.1"), "127.0.0.1");
+  assert.throws(() => resolveMqttBindHost(undefined, "0.0.0.0"), /refusing to start/);
+  assert.throws(() => resolveMqttBindHost(undefined, "192.168.1.5"), /MQTT_TOKEN/);
+  assert.equal(resolveMqttBindHost("tok", undefined), undefined);
+  assert.equal(resolveMqttBindHost("tok", "0.0.0.0"), "0.0.0.0");
+});

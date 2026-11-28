@@ -716,7 +716,7 @@ export async function startDaemon(options?: {
     }
   });
   loadQueue();
-  startMqttBroker(getVersion());
+  startMqttBroker(getVersion()).catch((err) => log(`[MQTT] not started: ${err instanceof Error ? err.message : err}`));
   try {
     (await import("../adapters/appchannel/server.js")).startAppChannelServer({
       deliver: (sessionId, text) => { aibpBridge.routeFromMobile(sessionId, text); },
