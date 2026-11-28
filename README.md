@@ -70,7 +70,7 @@ Adapters are standalone npm packages. `aibroker create-adapter my-signal` scaffo
 
 TTS (Kokoro), STT (Whisper), image generation (Pollinations by default, Replicate, Cloudflare, Hugging Face or your own provider), image and video analysis, screenshots. Image generation is conversational and refines on follow-ups.
 
-→ [docs/media.md](docs/media.md)
+→ [docs/media.md](docs/media.md) · [docs/tts.md](docs/tts.md) (voice backend selection)
 
 ## PAILot Companion App
 
