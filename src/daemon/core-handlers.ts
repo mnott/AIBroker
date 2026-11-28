@@ -41,7 +41,7 @@ import { isGroupJid, decideTranscribe, subscribeGroup, unsubscribeGroup, listSub
 import { statusCache, hashContent } from "../core/status-cache.js";
 import { clearAllPaiNames, findItermBundleIdImpostors } from "../adapters/iterm/core.js";
 import type { SessionSnapshot } from "../adapters/iterm/core.js";
-import { dropSessionMemo, snapshotAllSessions,typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
+import { dropSessionMemo, snapshotAllSessions, typeIntoSession, setSessionTitle, itermViewerSessionId, aibrokerIdForPane, isClaudeSession, wasLastEnumerationReliable } from "../transport/sync-facade.js";
 import { sameClaudeSession } from "../core/claude-attach.js";
 import { resolveSelfSessionId, readPaiSessionMap, paneSuffix } from "./pai-session-map.js";
 import { readClaudeRegistry, isNativePeer } from "../core/native-peers.js";
@@ -1493,14 +1493,6 @@ export function registerCoreHandlers(
      */
     for (let attempt = 0; !itermSessionId && !match.ambiguous && !wasLastEnumerationReliable() && attempt < 2; attempt++) {
       await new Promise((r) => setTimeout(r, 400));
-      snapshots = withPersistentNames(await listedSessions());
-      match = await resolveTarget(snapshots);
-      itermSessionId = match.id;
-      resolvedName = match.name;
-    }
-    // A miss may come from the memoized merged list (taken before the window existed): drop it and look once more.
-    if (!itermSessionId && !match.ambiguous) {
-      dropSessionMemo();
       snapshots = withPersistentNames(await listedSessions());
       match = await resolveTarget(snapshots);
       itermSessionId = match.id;
