@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
 import { log } from "../../core/log.js";
 import { hostname } from "node:os";
 import { enqueue } from "./message-queue.js";
@@ -517,6 +518,35 @@ export function handleInboundPublish(packet: any, client: any): void {
   }
 }
 
+/** Constant-time MQTT credential check; a length mismatch rejects. */
+export function mqttCredentialsValid(
+  token: string, username: string | undefined, password: Buffer | string | undefined,
+): boolean {
+  if (username !== "pailot" || password === undefined) return false;
+  const given = Buffer.isBuffer(password) ? password : Buffer.from(password);
+  const want = Buffer.from(token);
+  return given.length === want.length && timingSafeEqual(given, want);
+}
+
+function isLoopbackHost(h: string): boolean {
+  return h === "localhost" || h === "::1" || h === "127.0.0.1" || /^127\.\d+\.\d+\.\d+$/.test(h);
+}
+
+/**
+ * Pick the listen host. Token set: MQTT_BIND or all interfaces (undefined).
+ * No token: loopback only; an explicit non-loopback bind throws.
+ */
+export function resolveMqttBindHost(token: string | undefined, bindEnv?: string): string | undefined {
+  if (token) return bindEnv || undefined;
+  if (!bindEnv) return "127.0.0.1";
+  if (!isLoopbackHost(bindEnv)) {
+    throw new Error(
+      `[MQTT] refusing to start: MQTT_TOKEN is not set and MQTT_BIND=${bindEnv} is not loopback. ` +
+      "Set MQTT_TOKEN or bind to 127.0.0.1.");
+  }
+  return bindEnv;
+}
+
 /**
  * Start the embedded aedes MQTT broker.
  * @param version — daemon version string for status messages
@@ -529,6 +559,9 @@ export async function startMqttBroker(version?: string): Promise<void> {
 
   const MQTT_PORT = parseInt(process.env.MQTT_PORT ?? process.env.PAILOT_PORT ?? "8765", 10);
   const MQTT_TOKEN = process.env.MQTT_TOKEN;
+  // Without a token the broker is unauthenticated: loopback only, or refuse.
+  const bindHost = resolveMqttBindHost(MQTT_TOKEN, process.env.MQTT_BIND);
+  log(`[MQTT] bind host: ${bindHost ?? "all interfaces"}${MQTT_TOKEN ? "" : " (no token configured, loopback only)"}`);
 
   // Build aedes options
   const aedesOpts: Record<string, unknown> = {
@@ -544,7 +577,7 @@ export async function startMqttBroker(version?: string): Promise<void> {
       password: Buffer | undefined,
       callback: (error: Error | null, authenticated: boolean) => void,
     ) => {
-      const valid = username === "pailot" && password?.toString() === MQTT_TOKEN;
+      const valid = mqttCredentialsValid(MQTT_TOKEN, username, password);
       if (!valid) {
         log(`[MQTT] auth failed for user="${username ?? "(none)"}"`);
       }
@@ -633,7 +666,7 @@ export async function startMqttBroker(version?: string): Promise<void> {
     log(`[MQTT] server error: ${err.message}`);
   });
 
-  mqttServer.listen(MQTT_PORT, async () => {
+  const onListening = async () => {
     log(`[MQTT] broker listening on port ${MQTT_PORT}${MQTT_TOKEN ? " (auth enabled)" : " (no auth)"}${tlsCreds ? " [TLS]" : " [PLAIN TCP]"}`);
 
     // Start loopback MQTT client for server-side publishing.
@@ -651,7 +684,7 @@ export async function startMqttBroker(version?: string): Promise<void> {
       }
       const protocol = tlsCreds ? "mqtts" : "mqtt";
       if (tlsCreds) connectOpts.rejectUnauthorized = false;
-      loopbackClient = mqtt.connect(`${protocol}://localhost:${MQTT_PORT}`, connectOpts);
+      loopbackClient = mqtt.connect(`${protocol}://127.0.0.1:${MQTT_PORT}`, connectOpts);
       loopbackClient.on("connect", () => {
         loopbackReady = true;
         log("[MQTT] loopback client connected");
@@ -687,7 +720,9 @@ export async function startMqttBroker(version?: string): Promise<void> {
       mqttPublishStatus("ready", hubVersion);
       startAdvertising(adv);
     });
-  });
+  };
+  if (bindHost) mqttServer.listen(MQTT_PORT, bindHost, onListening);
+  else mqttServer.listen(MQTT_PORT, onListening);
 }
 
 /**
