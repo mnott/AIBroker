@@ -7,8 +7,9 @@
  * (5 minutes) that the daemon consumes on the matching call.
  *
  * Only `payload.prompt` is read, never tool output. A prompt that starts with
- * "[" ("[Session:X] …", "[Task…", "[PAILot] …") came from an agent or a channel
- * and never counts. Prints nothing; the prompt goes through untouched.
+ * "[" ("[Session:X] …", "[Task…") came from an agent and never counts;
+ * the operator channels ([PAILot], [Whazaa], [Telex], each also ":voice") are
+ * stripped once and the rest is matched. Prints nothing; the prompt goes through untouched.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -26,7 +27,12 @@ function run() {
   done = true;
   let prompt = "";
   try { prompt = String(JSON.parse(raw).prompt ?? ""); } catch { /* not a hook payload */ }
-  if (/^\s*\[/.test(prompt) || prompt.includes("\n")) process.exit(0);
+  if (prompt.includes("\n")) process.exit(0);
+  // The operator's own channels are typed into the input line as "[PAILot] …";
+  // strip exactly one such prefix. Any other "[" prefix is agent/machine traffic.
+  prompt = prompt.replace(/^\s*\[(?:PAILot|Whazaa|Telex)(?::voice)?\]\s*/i, "");
+  if (/^\s*\[/.test(prompt)) process.exit(0);
+  prompt = prompt.replace(/[.!]+\s*$/, ""); // voice transcripts end with punctuation
 
   const ACTION = "(off|stop|pause|shift\\s+(?:off|stop|end|stand\\s+down))";
   const head = "^\\s*(?:(?:aibroker|broker)\\s+manage|/manage|manage)\\s+";
