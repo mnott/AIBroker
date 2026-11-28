@@ -103,6 +103,17 @@ EOF
 - **One concern per PR** — keep PRs focused. Mixed refactors + features slow review.
 - **Add a test or a manual repro** — if you fix a bug, include steps to verify it.
 
+## Pull requests
+
+Pull requests are accepted on GitHub. The maintainers do not merge on GitHub; instead:
+
+1. The PR is fetched into a branch on the project's private forge named `gh-pr-<n>`.
+2. It is reviewed, tested and merged there.
+3. The mirror syncs `main` to GitHub.
+4. The GitHub PR is closed with a comment linking the merge commit.
+
+Please use conventional commits, and include tests for new behavior and bug fixes (`npm test` must pass). Issues labelled `good first issue` or `help wanted` are good places to start.
+
 ---
 
 ## Code Style

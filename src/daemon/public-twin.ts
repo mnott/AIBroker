@@ -18,15 +18,15 @@ export interface TwinEntry {
   seenComments: { forge: number[]; github: number[] };
 }
 
-interface TwinState { entries: TwinEntry[]; pulls: number[] }
+interface TwinState { entries: TwinEntry[]; pulls: number[]; closedPulls: number[] }
 
 /** Mapping store over a JSON file; refuses to write when the file is unreadable. */
 export class TwinStore {
-  private state: TwinState = { entries: [], pulls: [] };
+  private state: TwinState = { entries: [], pulls: [], closedPulls: [] };
   private blocked: string | undefined;
   constructor(private path: string) {
     const r = loadJson<TwinState>(path);
-    if (r.status === "ok") this.state = { entries: r.data.entries ?? [], pulls: r.data.pulls ?? [] };
+    if (r.status === "ok") this.state = { entries: r.data.entries ?? [], pulls: r.data.pulls ?? [], closedPulls: r.data.closedPulls ?? [] };
     else if (r.status === "unreadable") this.blocked = r.error;
   }
   private save(): void {
@@ -49,6 +49,12 @@ export class TwinStore {
   /** Persist in-place changes made to an entry (seenComments). */
   flush(): void { this.save(); }
   hasPull(n: number): boolean { return this.state.pulls.includes(n); }
+  pulls(): number[] { return [...this.state.pulls]; }
+  isPullClosed(n: number): boolean { return this.state.closedPulls.includes(n); }
+  markPullClosed(n: number): void {
+    if (!this.state.closedPulls.includes(n)) this.state.closedPulls.push(n);
+    this.save();
+  }
   addPull(n: number): void {
     if (!this.state.pulls.includes(n)) this.state.pulls.push(n);
     this.save();
@@ -61,6 +67,8 @@ export interface ForgeClient {
   comment(n: number, body: string): Promise<void>;
   createIssue(i: { title: string; body: string; labels: string[] }): Promise<{ number: number }>;
   labels(n: number): Promise<string[]>;
+  /** Open issues carrying label `public`, labels filled. */
+  listPublicIssues?(): Promise<ForgeIssue[]>;
 }
 export interface GhComment { id: number; user: string; body: string }
 export interface GhIssue { number: number; title: string; body?: string; user: string; url: string; pullRequest?: boolean }
@@ -74,7 +82,11 @@ export interface GithubClient {
   listPulls(): Promise<GhPull[]>;
   closePull(n: number, body: string): Promise<void>;
 }
-export interface Git { fetchPr(n: number): Promise<void> }
+export interface Git {
+  fetchPr(n: number): Promise<void>;
+  /** Sha of the merge commit on main of branch gh-pr-<n>, if merged. */
+  mergeShaFor?(prNumber: number): Promise<string | undefined>;
+}
 
 const run = promisify(execFile);
 /** Real Git: `git fetch github pull/<n>/head:gh-pr-<n>` (args array, no shell). */
@@ -82,6 +94,20 @@ export function realGit(cwd?: string): Git {
   return {
     async fetchPr(n: number) {
       await run("git", ["fetch", "github", `pull/${n}/head:${twinBranchName(n)}`], { cwd });
+    },
+    async mergeShaFor(n: number) {
+      const branch = twinBranchName(n);
+      try {
+        await run("git", ["merge-base", "--is-ancestor", branch, "main"], { cwd });
+      } catch { return undefined; }
+      const { stdout } = await run(
+        "git", ["log", "main", "--merges", "--ancestry-path", `^${branch}`, "--reverse", "--format=%H", "-n", "1"],
+        { cwd },
+      );
+      const sha = stdout.trim().split("\n")[0];
+      if (sha) return sha;
+      const g = await run("git", ["log", "main", "--merges", "--grep", branch, "--format=%H", "-n", "1"], { cwd });
+      return g.stdout.trim() || undefined;
     },
   };
 }
@@ -93,7 +119,7 @@ const TEMPLATE = "Tracking issue mirrored from the project tracker.";
 
 export function draftTwin(issue: ForgeIssue, denyTerms: string[] = [], override?: Override): Draft {
   const title = override?.title ?? issue.title;
-  const body = override?.body ?? (issue.body ? `${TEMPLATE}\n\n${issue.body}` : TEMPLATE);
+  const body = override?.body ?? `${TEMPLATE}\n\n${title}`;
   const t = checkPublicText(title, denyTerms);
   const b = checkPublicText(body, denyTerms);
   const hits = [...t.hits, ...b.hits];

@@ -21,7 +21,10 @@ export * from "./types/index.js";
 export { log, setLogPrefix } from "./core/log.js";
 export { MIME_MAP, lookupMime } from "./core/mime.js";
 export { checkPublicText, assertPublicSafe, twinBranchName } from "./core/public-sanitizer.js";
+export { twinTick } from "./daemon/twin-watch.js";
 export type { SanitizeHit } from "./core/public-sanitizer.js";
+export { githubHttpClient, forgeHttpClient } from "./daemon/twin-http.js";
+export type { TwinHttpOpts } from "./daemon/twin-http.js";
 export { applySharedMarkdownTransforms, markdownToWhatsApp, stripMarkdown } from "./core/markdown.js";
 export {
   sessionRegistry,
