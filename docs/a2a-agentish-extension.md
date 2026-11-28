@@ -189,22 +189,17 @@ simply unavailable for it. Nothing about task delivery, streaming, or task
 lifecycle changes; only the `text` inside `Part`s and whether it is checked
 against `AG2_SPEC` does.
 
-## Not yet provided
+## Implementation status
 
-This module is a definition and a pair of helpers — nothing here sends a
-byte. Serving AG2-capable A2A traffic still needs, roughly:
+Shipped:
 
-- a JSON-RPC endpoint implementing `message/send` (and, for streaming
-  replies, `message/stream`) — currently there is no A2A server anywhere in
-  this project;
-- a mapping from an incoming `tasks/send`-shaped request onto AIBroker's own
-  session mailbox, so an AG2 `T` arriving over A2A reaches the same place an
-  AG2 `T` arriving over the daemon's own IPC does;
-- an `AgentCard` served from the funnel host (see `docs/mesh.md`), with
-  `agentCardExtension()`'s output placed in `capabilities.extensions`.
+- `src/a2a/server.ts` — JSON-RPC `message/send` (plus the legacy `tasks/send` alias), a public `/.well-known/agent-card.json` carrying `agentCardExtension()`, and delivery into the session mailbox.
+- `src/a2a/exposure.ts` — opt-in: nothing is reachable until `aibroker a2a expose <session>`.
+- `src/a2a/client.ts` — outbound client.
+- `src/agentish/cli.ts` — standalone `agentish` validator (`check`, `expand`, `check-log`); no daemon, no network; usable in CI.
+- Tests: `test/a2a-server.test.ts`, `test/agentish-traffic.test.ts`.
 
-None of that is implemented, attempted, or scoped further here — this
-document only names it so the next piece of work knows where it starts.
+Not yet provided: `message/stream` (streaming replies).
 
 ## See also
 
