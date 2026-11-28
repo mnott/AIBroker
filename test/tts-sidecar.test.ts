@@ -326,4 +326,26 @@ describe("setup tts step and doctor remeasure", () => {
     assert.equal(loadTtsConfig(h)?.firstAudioMs, 55);
     assert.ok(out.some((l) => /55 ms/.test(l)));
   });
+  it("--dry-run prints one line per plan step, runs nothing, writes nothing", async () => {
+    const { ttsStep } = await import("../src/daemon/setup.js");
+    for (const [which, backend, pkg] of [
+      [() => null, "onnx", "kokoro-onnx"],
+      [(c: string) => (c === "nvidia-smi" ? "/usr/bin/nvidia-smi" : null), "torch", "torch"],
+    ] as const) {
+      const h = mkdtempSync(pjoin(tmpdir(), "tts-"));
+      const s = { home: h, platform: "linux", env: {}, which } as any;
+      let calls = 0;
+      const deps = { exec: async () => { calls++; return { ok: true }; }, measure: async () => 1, confirm: async () => true, interactive: true };
+      const out: string[] = [];
+      await ttsStep(s, ["--dry-run", "--yes"], deps, (l) => out.push(l));
+      const lines = out.filter((l) => l.startsWith("  would run ("));
+      assert.equal(lines.length, 3, backend);
+      assert.match(lines[0], /^  would run \(create venv\): uv venv .*-venv$/);
+      assert.match(lines[1], new RegExp(`^  would run \\(install packages\\): uv pip install --python .* .*${pkg}`));
+      assert.match(lines[2], /^  would run \(download weights\): .* -I -c /);
+      assert.ok(out.some((l) => l.includes(`backend ${backend}`)));
+      assert.equal(calls, 0);
+      assert.equal(loadTtsConfig(h), null);
+    }
+  });
 });

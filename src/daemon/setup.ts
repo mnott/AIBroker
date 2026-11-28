@@ -549,7 +549,7 @@ export async function ttsStep(s: Sys, argv: string[], deps: TtsStepDeps, say: Sa
     return say(`  backend ${backend}: bundled kokoro-js, nothing to install`);
   }
   say(`  backend ${backend}: ~${plan.approxDownloadMB} MB download into ${plan.venvDir}`);
-  if (argv.includes("--dry-run")) return say(`  would run: ${plan.steps.map((x) => x.label).join(", ")}`);
+  if (argv.includes("--dry-run")) { for (const x of plan.steps) say(`  would run (${x.label}): ${[x.cmd, ...x.args].join(" ")}`); return; }
   const stored = loadTtsConfig(s.home);
   if (stored?.backend === backend && !argv.includes("--force")) return say(`  already installed (first audio ${stored.firstAudioMs ?? "?"} ms)`);
   const yes = argv.includes("--yes");
