@@ -124,6 +124,28 @@ test("a declined authorisation is reported, not swallowed", async () => {
   assert.match(r.html, /access_denied/);
 });
 
+test("error param is HTML-escaped (reflected XSS)", async () => {
+  cleanup();
+  const r = await handleOAuthCallback(
+    new URL("http://x/oauth?error=" + encodeURIComponent("<script>alert(1)</script>")),
+    { clientId: "cid", clientSecret: "secret" });
+  assert.equal(r.html.includes("<script>"), false);
+  assert.match(r.html, /&lt;script&gt;/);
+});
+
+test("upstream scope is HTML-escaped on the success page", async () => {
+  cleanup();
+  const state = beginAuth();
+  const fake = (async () => new Response(JSON.stringify({
+    access_token: "tok", token_type: "Bearer", scope: "<script>alert(1)</script>",
+  }), { status: 200 })) as unknown as typeof fetch;
+  const r = await handleOAuthCallback(
+    new URL(`http://x/oauth?code=c&state=${state}`),
+    { clientId: "cid", clientSecret: "secret", fetchImpl: fake });
+  assert.equal(r.status, 200);
+  assert.equal(r.html.includes("<script>"), false);
+});
+
 test("a code arriving with no pending state is not exchanged", async () => {
   cleanup();
   let called = false;
